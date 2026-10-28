@@ -1371,17 +1371,24 @@ function petMeowCheck(now) {
     requestRender();
   }
 }
-// Route line: a thin line from the pet through the next route points to the goal, drawn through the model.
-// While a route search runs it shows a straight hint to the goal.
-const routeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: ECHO_COLOR, transparent: true, opacity: 0.7, depthTest: false }));
+// Route line: animated dashes from the pet through the next route points to the goal, drawn through the model.
+// The dashes march toward the goal. While a route search runs it shows a straight hint to the goal.
+const ROUTE_DASH = 0.6, ROUTE_GAP = 0.4, ROUTE_DASH_SPEED = 0.8; // feet, and feet per second: slow and calm
+const routeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: ECHO_COLOR, transparent: true, opacity: 0.7, depthTest: false, dashSize: ROUTE_DASH, gapSize: ROUTE_GAP }));
 routeLine.visible = false; routeLine.frustumCulled = false; routeLine.renderOrder = 9; scene.add(routeLine);
-function updateRoute() {
+function updateRoute(now) {
   if (!pet.goal) { routeLine.visible = false; return; }
   const pts = [pet.pos];
   if (pet.target) pts.push(pet.target);
   for (const q of pet.path) pts.push(q);
   if (pet.planning) pts.push(pet.goal);
   routeLine.geometry.setFromPoints(pts.map(q => new THREE.Vector3(q[0], q[1], q[2] + 0.04 * pet.scale)));
+  routeLine.computeLineDistances();
+  // March the dashes toward the goal: shift the distances back by a slow phase.
+  const dist = routeLine.geometry.getAttribute('lineDistance');
+  const phase = ((now / 1000) * ROUTE_DASH_SPEED) % (ROUTE_DASH + ROUTE_GAP);
+  for (let i = 0; i < dist.count; i++) dist.array[i] -= phase;
+  dist.needsUpdate = true;
   routeLine.visible = pts.length > 1;
 }
 function petTick(now) {
@@ -1389,7 +1396,7 @@ function petTick(now) {
   petStep(pet, dt, petEnv);
   echoMark.visible = !!pet.goal; // the goal marker pulses while the pet walks, and goes when it arrives or stops
   if (pet.goal) echoMark.scale.setScalar(echoUnit() * (0.55 + 0.1 * Math.sin(now / 130)));
-  updateRoute(); petMeowCheck(now); petFxCheck(now);
+  updateRoute(now); petMeowCheck(now); petFxCheck(now);
   if (now - petRenderAt >= 1000 / petFps(pet) - 2) { petRenderAt = now; petApply(petModel, pet); requestRender(); }
   petRaf = requestAnimationFrame(petTick);
 }
