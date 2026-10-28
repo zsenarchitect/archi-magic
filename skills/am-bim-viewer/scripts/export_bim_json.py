@@ -206,6 +206,12 @@ def export():
         options.DetailLevel = ViewDetailLevel.Medium
         collector = FilteredElementCollector(doc)
         source_name = "Whole model"
+    section_box = False  # a section box in the 3D view limits the export to what is inside it
+    if use_view:
+        try:
+            section_box = bool(view.IsSectionBoxActive)
+        except Exception:
+            pass
     collector = collector.WhereElementIsNotElementType()
     wanted = set(CATEGORIES)
     elements = []
@@ -279,7 +285,7 @@ def export():
     with codecs.open(path, "w", "utf-8") as handle:
         handle.write(text)
 
-    print(json.dumps({"path": path, "source": source_name, "elements": len(elements), "triangles": triangles, "skipped": skipped}))
+    print(json.dumps({"path": path, "source": source_name, "elements": len(elements), "triangles": triangles, "sectionBox": section_box, "skipped": skipped}))
 
 
 export()

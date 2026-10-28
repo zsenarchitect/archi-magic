@@ -69,9 +69,11 @@ Optional add-ons, installed only when the user needs them:
 
 | Add-on | Install | Needs |
 |---|---|---|
-| 3D viewer mod | `/plugin install am-bim-viewer@archi-magic` | Claude Code 2.1.299 or later (the desktop app's bundled version) |
+| 3D viewer mod | `/plugin install am-bim-viewer@archi-magic` | Claude Code 2.1.299 or later (the desktop app's bundled version). Node.js, to build the viewer page with the `am-bim-viewer` skill script (see "Node.js without admin rights") |
 | Schedule viewer mod | `/plugin install am-schedule-view@archi-magic` | Claude Code 2.1.299 or later |
 | Rhino MCP (McNeel, official) | Run `am-rhino-setup` first; it tells you when to run `/plugin install rhino-mcp@archi-magic` | Rhino 8, Node.js |
+
+**Node.js without admin rights.** A fresh machine has no `node`. Do **not** run `winget install OpenJS.NodeJS.LTS`: its installer asks for administrator rights (a UAC prompt), and it fails with exit code 1602 when the user cancels. Use the portable zip instead: download `node-v<version>-win-x64.zip` from `https://nodejs.org/dist/v<version>/`, check its SHA-256 against `SHASUMS256.txt` in the same folder, and extract it to `%LOCALAPPDATA%\nodejs-portable`. Then call `%LOCALAPPDATA%\nodejs-portable\node-v<version>-win-x64\node.exe` by its full path. Do not change the system PATH. Ask the user before you download.
 
 ### Route the user's request to a skill
 
@@ -84,6 +86,7 @@ Optional add-ons, installed only when the user needs them:
 | ANY change to the Revit model (renumber, rename, set parameters, move elements, material colors, patterns, graphics overrides, view templates, filters) | `am-safe-change` | Read, then show the before/after preview, ask, dry run, then Keep/Discard |
 | Paste 3D-viewer changes, or move or rotate elements | `am-safe-change` (element-transforms recipe) | Check the JSON, show the before/after preview, dry run, then Keep/Discard |
 | Add a detail view to a sheet, match the existing viewports | `am-safe-change` (detail-views recipe) | Copy the reference viewport's label settings, center each box, propose numbers in the sheet's pattern, dry run, then Keep/Discard |
+| "import this floor type", "bring this material into the model", a manufacturer's product .rvt | `am-import-from-manufacturer-rvt` | Ask which file is the product and which model is the target; check name conflicts (read only); copy with one approved change |
 | "check my model", "model health", "dashboard" | `am-model-health` | Read-only query; offer the dashboard |
 | "are the parameters filled in", BEP checks | `am-param-qa` | Ask which categories and parameters |
 | "which materials are unused", "list materials", "material colors" | `am-material-audit` | Read-only query; lists materials by name prefix with colors and patterns, flags duplicates and low contrast |
@@ -91,6 +94,7 @@ Optional add-ons, installed only when the user needs them:
 | room or area report, program comparison | `am-area-report` | Read-only query |
 | "show me the ... schedule", compare schedules | `am-schedule-view` | List schedules, ask which one |
 | "show the model in 3D" | `am-bim-viewer` | Export the active 3D view (read-only), build the viewer |
+| "send feedback to archi-magic", "reflect on this session", "report this to the archi-magic team" | `am-feedback` | Reflect read-only, remove private data, check duplicates, show the draft, post only after the user says yes |
 | markups, redlines, review comments (PDF, photos) | `am-markup-intake` | Inventory the files; data warning; extract in parallel |
 | "set up Rhino", Rhino questions | `am-rhino-setup` | Run `-Verify`, then the setup |
 | "check my Rhino model", Rhino tolerance, bad objects | `am-rhino-model-health` | Read-only script via `run_python` |
@@ -127,6 +131,8 @@ API lookups: when connected to Revit, use the `pyrevit` MCP tools `lookup_revit_
 | Revit crashed | Anything | `am-revit-crash-doctor` |
 | `run_query` returns `invalid_params` | The call passed `code` instead of `script` | Pass the script text as `script`. See the sample query skeleton in `am-revit-api-docs`. |
 | `AttributeError` on `ElementId.IntegerValue` | The script uses a member removed in Revit 2026 | Use `ElementId.Value` (Revit 2024+). See "Revit 2026 differences" in `am-revit-api-docs`. |
+| "Multiple targets could match: ElementId(BuiltInParameter), ..." (IronPython) | `DB.ElementId(123456789)` is ambiguous | `import System`, then `DB.ElementId(System.Int64(123456789))` |
+| `claude plugin install am-bim-viewer@archi-magic` fails with `Failed to load marketplace configuration: JSON Parse error` | A damaged local marketplace cache, or the CLI could not read it | Refresh the marketplace (`/plugin` > Marketplaces > archi-magic > Update marketplace), retry, and check `%USERPROFILE%\.claude\plugins\known_marketplaces.json`. As a fallback, run the `am-bim-viewer` skill scripts directly (they need Node.js, see above). |
 
 Logs: archi-magic writes one JSON line per event to `%LOCALAPPDATA%\archi-magic\logs\<yyyy-MM>.jsonl`. The setup script also writes a transcript and backups under `%TEMP%\pyrevit7-setup\<timestamp>\`. Exit-code tables are in each skill's `kit-README.md` or `SKILL.md`.
 
@@ -141,6 +147,7 @@ Logs: archi-magic writes one JSON line per event to `%LOCALAPPDATA%\archi-magic\
 | `am-doctor` | Finds and fixes problems with pyRevit 7, the Revit connection and archi-magic. It checks your setup and recent logs, explains each problem, runs the fix you approve, and can draft a bug report. Ask Claude to "run the doctor". |
 | `am-revit-crash-doctor` | Finds out why Revit crashed or froze. It reads Revit journals, crash dumps, Autodesk crash reports and the Windows event log, then explains the likely cause and the next step. It only reads, and works with Revit closed. Ask "why did Revit crash?" |
 | `am-safe-change` | Shows a before/after preview of any Revit model change and asks you to confirm before Revit changes. It then does a dry run, shows the side-effect counts (edited vs regenerated), applies the change with your Keep/Discard in Revit, and checks the result. Recipes: sheet renumbering, moving or rotating elements (including changes copied from the 3D viewer), material colors with a live panel, and detail views on a sheet (copy the reference viewport's label settings, center each box, propose numbers in the sheet's pattern). Ask "shift all sheet numbers from A301 up by one", paste the viewer's "Copy changes for Revit" JSON, or ask "add two section details to A401 and match the existing viewports". |
+| `am-import-from-manufacturer-rvt` | Copies a type and its material (for example a floor type) from a manufacturer's product .rvt into your project model. It checks for name conflicts first, then makes one change that you approve with Keep or Discard, and reminds you to sync. Ask "import this floor type into the project". |
 | `am-model-health` | Checks the open Revit model without changing it: warnings, links, in-place families, rooms, duplicate Marks, CAD, views and file size. You get a short ranked report or an HTML dashboard with trends. Ask "check my model health". Adapted from [Utopia5327](https://github.com/Utopia5327/claude-plugin-for-revit-bim) (MIT). |
 | `am-param-qa` | Finds elements whose required parameters are missing or empty (for example door Fire Rating, Mark, or your BEP list). Ask "are my door parameters filled in?". Adapted from Utopia5327 (MIT). |
 | `am-material-audit` | Lists materials whose names start with a prefix you give, with Shading color, Transparency, Surface Pattern foreground and background, and Cut pattern, all in RGB. It flags duplicates and low pattern contrast, and finds unused materials with a scoped check. Ask "which Floor Finish materials are unused?". |
@@ -149,6 +156,7 @@ Logs: archi-magic writes one JSON line per event to `%LOCALAPPDATA%\archi-magic\
 | `am-markup-intake` | Reads all your review markups: PDF and Bluebeam comments, photos and scans. It makes one action list that removes duplicates, shows conflicts between reviewers, and marks text it cannot read well. It checks sheet, room and door numbers against your open model (read only). Changes to the model go to `am-safe-change`. Ask "go through these markups". |
 | `am-schedule-view` | Shows a Revit schedule as Revit displays it, in an interactive table: search, sort, filter, copy, export CSV, compare. It also shows the `am-safe-change` preview. Ask "show me the door schedule". |
 | `am-bim-viewer` | Shows the model in 3D with Rhino mouse controls, element data on click, category filters, and Top, Front, Right and Perspective views. Ask "show this model in 3D". |
+| `am-feedback` | Looks back over your session, finds what went wrong or cost time, removes private data, and posts it as a GitHub issue on archi-magic after you click Post. Ask "send feedback to archi-magic". |
 | `am-rhino-setup` | Connects Claude Code to Rhino 8 **without admin rights**, using McNeel's official `rhino-mcp` plugin. It checks Rhino and Node.js, installs the Rhino package, and makes Claude ask before any tool that changes a file or the model. It also documents the RhinoCode CLI fallback. Ask Claude to "set up Rhino". |
 | `am-rhino-model-health` | Read-only health check of the open Rhino document: units and tolerance, invalid geometry, small strays, open polysurfaces, objects on Default, empty layers, unused blocks. Ask Claude to "check my Rhino model". |
 | `am-rhino-area-report` | Read-only areas by layer (and by a user text key such as "Room") from closed planar curves, planar surfaces and hatches, in m2 and ft2, with a CSV option. Ask for "Rhino areas by layer". |

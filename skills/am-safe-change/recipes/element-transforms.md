@@ -32,6 +32,14 @@ Files (paths relative to the am-safe-change skill folder):
 
 If the user describes a move in words, write this JSON yourself. Use the element's location point from the read step as the pivot, unless the user names another point. Convert the user's units to feet (1 m = 3.28084 ft, 1 mm = 0.00328084 ft).
 
+## Before you start: say what to expect
+
+Tell the user these three facts first, in plain words:
+
+- You cannot press Revit's Undo. To undo a move, you apply the opposite move (see "Undo a move" below). Revit then shows two undo entries.
+- Revit does not move a pinned element. You will ask what to do with each pinned element.
+- The viewer's category label is a hint. Check the real element in the read step.
+
 ## Step 2: validate, then ask
 
 Save the pasted JSON as `transforms.json` in the work folder, then:
@@ -47,6 +55,24 @@ Ask only when the request leaves something open, for example a move written in w
 ## Step 3: read
 
 `run_query` with the content of `scripts/read_elements.py` and `inputs: {"ids": [...]}`, or `inputs: {"request_path": "<full path to transforms.json>"}`. Save the result as `read.json`. For each id it returns the name, category, location (point, or midpoint of the location line), rotation in degrees, pinned, group, host, the elements it hosts, and the project length display unit.
+
+### Check each element before you compute (read-only)
+
+Show a short table with one row for each element, built from `read.json`: category, level, pinned, current position (in feet), and the planned change (move and rotation). Add the element class when the category looks odd. `read_elements.py` does not return the class. To get it, run a small `run_query` with `type(doc.GetElement(DB.ElementId(System.Int64(n)))).__name__`.
+
+Three cases to watch:
+
+- **Category and class can differ.** The viewer shows the Revit category. For example, a curtain wall panel can be a `Wall` element with the category "Curtain Panels". Show both when they differ, so the user knows what will move.
+- **Pinned.** See "Pinned elements" below.
+- **No location.** A Ceiling (and some floors and roofs) has no point or line `Location`. The recipe reports it as `not_movable` and skips it. If the user still wants to move it, the move is possible with `ElementTransformUtils.MoveElement(doc, id, XYZ)`, but the bundled scripts do not do it. Write a one-off `run_modify` script, show the same before and after table, run a dry run first, and let the user click Keep or Discard as for any change. The sketch lines, dimensions and tags of the ceiling update with it.
+
+## Pinned elements
+
+The bundled scripts never unpin an element. For each pinned element, ask one question with buttons:
+
+- **Skip it (Recommended).** The element stays where it is and shows in the table without a change.
+- **Cancel, I will unpin it in Revit.** Then start again at step 3.
+- **Unpin, move, pin again.** Offer this only when the user asks for it. It needs a one-off `run_modify` script that unpins, moves and pins again in one transaction, so Revit shows one undo entry. Say in the preview that the pinned state changes for a moment and is restored.
 
 ## Step 4: compute
 
@@ -104,6 +130,20 @@ Run `read_elements.py` again with the same ids, save it as `verify.json`, then:
 `python "<skill dir>\scripts\transforms_preview.py" compare --preview preview.json --actual verify.json`
 
 A real example: [assets/fixtures/snowdon-element-transforms.request.json](../assets/fixtures/snowdon-element-transforms.request.json) and its preview [assets/fixtures/snowdon-element-transforms.preview.json](../assets/fixtures/snowdon-element-transforms.preview.json). The table rotates about a pivot 1 ft from its location point, so it orbits and turns.
+
+## Undo a move
+
+The agent cannot press Revit's Undo. When the user says "undo the move", apply the opposite move as a new change, with the same preview, dry run and Keep or Discard:
+
+1. Read the element again. Check that its position is where the earlier move left it (an assert in the script, within 1e-6 ft). If someone moved it since then, stop and tell the user.
+2. For a move without rotation, send a new request with the negative `move` (for example `[-2, 0, 0]`) and `rotateZ` 0. A move with a rotation was "rotate, then move", so the exact reverse is "move back, then rotate back by the negative angle about the same pivot". One request cannot do that order. Send two requests, one after the other (first the negative move, then the negative rotation about the original pivot), and show both in the preview.
+3. Verify as in step 8.
+
+Revit now shows two undo entries (the move and the move back). The net result is no change. Tell the user.
+
+## IronPython on Revit 2026
+
+In an IronPython script, `DB.ElementId(123456789)` is ambiguous on Revit 2026 (it matches the `Int64`, `BuiltInCategory` and `BuiltInParameter` overloads) and raises "Multiple targets could match". Write `DB.ElementId(System.Int64(n))`. The bundled scripts already do this (`make_id`). Also, `ElementId.IntegerValue` is gone in 2026: use `.Value`.
 
 ## Tests
 

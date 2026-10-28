@@ -76,3 +76,9 @@ test('Walk camera: perspective at the eye, Z up, looking along yaw; Esc restores
   assert.deepEqual(w.saved, keep, 'Esc returns to this camera');
   assert.deepEqual(before, keep, 'entering walk does not change the saved view');
 });
+
+test('Walk click: picks under the cursor, or under the screen center when the pointer is locked', () => {
+  const rect = { left: 10, top: 20, width: 800, height: 600 };
+  assert.deepEqual(core.walkPickPoint(false, 123, 456, rect), { x: 123, y: 456 }, 'unlocked: the cursor');
+  assert.deepEqual(core.walkPickPoint(true, 123, 456, rect), { x: 410, y: 320 }, 'locked: the center of the canvas');
+});

@@ -212,6 +212,10 @@
   #walkinfo { position: absolute; left: 14px; bottom: 14px; z-index: 4; display: none; padding: 4px 8px; background: var(--bg);
     border: var(--hair) solid var(--line-strong); font-size: var(--fs-micro); color: var(--ink-2); pointer-events: none; }
   #walkinfo.on { display: grid; gap: 2px; }
+  /* Crosshair: shows only while the pointer is locked, because a click then picks the screen center. */
+  #xhair { position: absolute; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; z-index: 4; display: none;
+    border: 1px solid var(--ink); border-radius: 50%; pointer-events: none; }
+  .walking.locked #xhair { display: block; }
   #walkread { color: var(--ink); font-variant-numeric: tabular-nums; }
   .walking #cubewrap { opacity: .45; pointer-events: none; }
   /* View cube (top right): hairline wireframe, no fill until hover, compass ring with N/E/S/W. */
@@ -363,7 +367,8 @@
       <button id="helpbtn" type="button" aria-expanded="false" aria-controls="helppanel" aria-label="Mouse and keyboard help">?</button>
       <div id="helppanel" role="region" aria-label="Mouse and keyboard" tabindex="-1"></div>
     </div>
-    <div id="walkinfo" aria-live="polite"><div id="walkhint">click to look around, esc to exit</div><div id="walkread"></div></div>
+    <div id="xhair" aria-hidden="true"></div>
+    <div id="walkinfo" aria-live="polite"><div id="walkhint">click an element to select it, click empty space to look around, esc to exit</div><div id="walkread"></div></div>
     <div id="cubewrap">
       <button id="cubehome" type="button" title="Home: the default perspective" aria-label="Home: the default perspective"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8.2 L8 3.2 L13.5 8.2 M4.6 6.6 V12.8 H11.4 V6.6"/></svg></button>
       <svg id="viewcube" viewBox="-42 -42 84 84" role="img" aria-label="View cube: click a face, edge or corner; drag to orbit; drag the ring to spin"></svg>
@@ -442,7 +447,7 @@ scene.add(sun);
 const cams = { persp: new THREE.PerspectiveCamera(40, 1, 0.1, 1e5), ortho: new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1e5) };
 const state = createViewState();
 let viewName = 'perspective';
-let walk = null, walkDrag = null; // first-person walk state (see the Walk section)
+let walk = null, walkDrag = null, walkClick = null; // first-person walk state (see the Walk section)
 const SELECTED = toColor(pal.selected, '#f4f4f1');
 const OUTLINE = toColor(pal.outline, '#0a0a0a');
 const EDGE = toColor(pal.edge, '#0a0a0a');
@@ -648,7 +653,7 @@ canvas.addEventListener('pointermove', e => {
   requestRender();
 });
 canvas.addEventListener('pointerup', e => {
-  if (walk) { walkDrag = null; return; }
+  if (walk) { walkPointerUp(e); return; }
   if (drag && drag.action === 'select' && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) select(pick(e.clientX, e.clientY));
   drag = null;
   setCursor(hovered ? 'hover' : 'idle');
@@ -754,7 +759,7 @@ function helpRows() {
     [['Click handle'], 'type a value: 2.5, 2\'6", 750mm, 15'], [['0-9'], 'while dragging: type the value'],
     [['Enter'], 'apply the typed value'], [['Tab'], 'apply, then the next axis'],
     [['G'], 'walk in first person (esc exits)'], [['W', 'A', 'S', 'D'], 'walk: move'], [['Q', 'E'], 'walk: lower / raise the eye'],
-    [['Shift'], 'walk: run'], [['C'], 'walk: collision on / off'], [['Click'], 'walk: look with the mouse (right drag if no lock)'],
+    [['Shift'], 'walk: run'], [['C'], 'walk: collision on / off'], [['Click'], 'walk: select an element; on empty space, look with the mouse (right drag if no lock)'],
   ]);
 }
 function updateHint() {
@@ -1107,7 +1112,10 @@ function walkApply() { Object.assign(state, walkView(walk, state)); }
 function updateWalkInfo() {
   const above = walkFloor === null ? null : walk.pos[2] - walkFloor;
   walkRead.textContent = 'eye ' + (above === null ? '--' : above.toFixed(2) + ' ft') + '   speed ' + Math.hypot(walk.vel[0], walk.vel[1]).toFixed(1) + ' ft/s   collision ' + (walk.isCollision ? 'on' : 'off');
-  walkHint.textContent = document.pointerLockElement === canvas ? 'mouse looks around, esc to exit' : walkNoLock ? 'right drag to look around, esc to exit' : 'click to look around, esc to exit';
+  vp.classList.toggle('locked', document.pointerLockElement === canvas);
+  walkHint.textContent = document.pointerLockElement === canvas ? 'mouse looks around, click selects, esc to exit'
+    : walkNoLock ? 'click an element to select it, right drag to look around, esc to exit'
+    : 'click an element to select it, click empty space to look around, esc to exit';
 }
 function walkTick(now) {
   if (!walk) return;
@@ -1144,15 +1152,28 @@ function exitWalkMode() {
   setViewName(walkPrevName);
   frameTo(saved); // animated back to the camera from before the walk
 }
+// A left click in walk mode selects the element under the cursor (under the crosshair when the
+// pointer is locked). A click on empty space clears the selection and, if the pointer is not
+// locked yet, asks for the lock to look around.
+function requestWalkLook() {
+  try {
+    const p = canvas.requestPointerLock();
+    if (p && p.catch) p.catch(() => { walkNoLock = true; updateWalkInfo(); });
+  } catch (err) { walkNoLock = true; updateWalkInfo(); }
+}
 function walkPointerDown(e) {
   e.preventDefault();
   if (e.button === 2) { walkDrag = { x: e.clientX, y: e.clientY }; return; }
-  if (e.button === 0 && document.pointerLockElement !== canvas) {
-    try {
-      const p = canvas.requestPointerLock();
-      if (p && p.catch) p.catch(() => { walkNoLock = true; updateWalkInfo(); });
-    } catch (err) { walkNoLock = true; updateWalkInfo(); }
-  }
+  if (e.button === 0) walkClick = { x: e.clientX, y: e.clientY, locked: document.pointerLockElement === canvas };
+}
+function walkPointerUp(e) {
+  walkDrag = null;
+  const c = walkClick; walkClick = null;
+  if (!c || e.button !== 0 || Math.hypot(e.clientX - c.x, e.clientY - c.y) >= 5) return;
+  const at = walkPickPoint(c.locked, e.clientX, e.clientY, canvas.getBoundingClientRect());
+  const m = pick(at.x, at.y);
+  select(m);
+  if (!m && !c.locked) requestWalkLook();
 }
 function walkPointerMove(e) {
   if (!walkDrag) return;

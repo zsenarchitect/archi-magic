@@ -605,6 +605,13 @@ export function walkView(w, state) {
   };
 }
 
+// Where a left click picks in walk mode. With the pointer locked the pointer is hidden and frozen,
+// so the click picks what is under the screen center (the crosshair). Otherwise it picks under the
+// cursor. rect is the canvas bounding box (left, top, width, height) in page pixels.
+export function walkPickPoint(isLocked, clientX, clientY, rect) {
+  return isLocked ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : { x: clientX, y: clientY };
+}
+
 // ---- View cube (Revit conventions, Z up, Y = north) ----
 // Each face's normal points from the model toward the camera that looks at that face:
 // FRONT = camera south looking north; BACK = camera north looking south; RIGHT = camera east
