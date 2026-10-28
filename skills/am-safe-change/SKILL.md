@@ -1,6 +1,6 @@
 ---
 name: am-safe-change
-description: "Use before ANY change to a Revit model (renumber, rename, set parameters, move to workset, shift sheet numbers, \"make room for a new sheet\", material colors, patterns, graphics overrides, view templates, filters). Enforces read, compute, preview, confirm, dry run, apply with Revit Keep/Discard, then verify, so the user sees a before/after table and approves it before Revit changes. Recipes: sheet renumbering (\"shift all sheet numbers from A301 up by one\"), move or rotate elements, including changes copied from the 3D viewer (element-transforms JSON from am-bim-viewer), and material colors (\"pick the colors for the floor materials by eye\"). NOT for read-only questions (answer directly) or schedule viewing (am-schedule-view)."
+description: "Use before ANY change to a Revit model (renumber, rename, set parameters, move to workset, shift sheet numbers, \"make room for a new sheet\", material colors, patterns, graphics overrides, view templates, filters). Enforces read, compute, preview, confirm, dry run, apply with Revit Keep/Discard, then verify, so the user sees a before/after table and approves it before Revit changes. Recipes: sheet renumbering (\"shift all sheet numbers from A301 up by one\"), move or rotate elements, including changes copied from the 3D viewer (element-transforms JSON from am-bim-viewer), material colors (\"pick the colors for the floor materials by eye\"), and detail views on a sheet (\"add two section details to A401 and match the existing viewports\"). NOT for read-only questions (answer directly) or schedule viewing (am-schedule-view)."
 ---
 
 # am-safe-change
@@ -12,6 +12,7 @@ Recipes (the task-specific parts):
 - Sheet renumbering: [recipes/sheet-renumber.md](recipes/sheet-renumber.md). Use it for "shift sheet numbers", "insert a sheet at A301", "renumber the A3xx sheets".
 - Element transforms: [recipes/element-transforms.md](recipes/element-transforms.md). Use it to move or rotate elements, including changes copied from the 3D viewer (JSON with `"kind": "element-transforms"`), or "move this column 2 ft east and turn it 15 degrees".
 - Material colors: [recipes/material-colors.md](recipes/material-colors.md). Use it to let the user tune Shading and Surface Pattern colors by eye in a panel, then write them to Revit ("pick the colors for the floor materials by eye").
+- Detail views: [recipes/detail-views.md](recipes/detail-views.md). Use it to add section detail views to a sheet and match the existing viewports: copy the reference viewport's label settings and type, center each box with `SetBoxCenter`, propose detail numbers in the sheet's pattern, and verify with a fresh read ("add two section details to A401 and match the existing viewports").
 
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
