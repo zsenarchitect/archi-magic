@@ -101,6 +101,23 @@ The viewer never changes the Revit model. When the user pastes "element-transfor
 
 The gumball, selection and view cube are off during a walk. A small label shows the eye height, the speed and the collision state.
 
+## Pet mode: a small cat that walks, runs and jumps where you click
+
+1. Click **pet** in the header, or press P. A short message says pet mode is on. Press P again to turn it off.
+2. Click a floor, a roof or any face that points up. The first click puts a small cartoon cat there (an orange tabby that walks on four legs). Each later click sends it to the new spot. A ring spreads out where you click. A small marker stays at the target while the cat goes there. A thin line shows the way it will take.
+3. If a wall, a gap or a step is in the way, the cat **finds a route around it**. It searches a grid of cells (a little more than half its size), keeps a distance from walls, and drops the points it does not need. If the straight line is clear, it does not search at all. While it searches (a fraction of a second), it turns toward the target. If a wall still blocks it, it searches again from where it stands (up to three times).
+4. The cat turns in arcs and moves with a four-beat cat gait. Walk or run is a mood: it **might walk, run or hop** each time. A far target makes a run more likely (about 85% above 6 ft), a near one a walk (about 10% run below 3 ft). On a long walk it may also hop forward a little, as if playing.
+5. It follows the ground height. It **jumps** up a ledge (up to 2.5 ft), down a drop (up to 8 ft), over a gap, or over a low obstacle, when it can land in reach. It prefers a way around, and jumps when there is none. It stops at a wall that is too high.
+6. When the cat has nothing to do, it stands. After about 1.5 s it sits. Then it licks a paw, grooms or yawns, one after another. After a long rest (about 14 s) it curls up and sleeps. A click wakes it.
+7. If the cat **cannot get where you sent it**, it walks as near as it can, sits up and **meows for attention**: a "meow!" bubble over the cat, a short synthesized meow, three calls about 5 s apart. Press M to mute or unmute the sound.
+8. **Click the cat to pet it** (in any mode). The cursor turns into an open hand over the cat, and tilts back and forth as you stroke it. The cat stops, shuts its eyes, leans into your hand and purrs. Hearts float up from its head and a short purr plays. Click again to keep petting. This wakes a sleeping cat and ends a stuck cat's calls.
+9. The cat has **thoughts**. Now and then a thought cloud shows over its head with a short, silly idea that fits what it is doing ("zoomies!" when it runs, "parkour!" when it jumps, "more please" when you pet it, "who put a wall here?" when it is stuck). While it sleeps, Z z z floats over it.
+10. A click on a wall shows "click a floor or a roof". A click on nothing shows "click a surface".
+11. The cat is not part of the model. You cannot select it, it is not in the element list, and it is not in the exported JSON. It grows with a large model (up to 6 times) so you can still see it.
+12. Pet mode turns off when you start a walk (G). Clicks select elements again when pet mode is off.
+
+The page redraws at full speed while the cat moves, at 30 frames a second for a lick, groom, yawn or meow, and at 8 frames a second while it sits or sleeps. The figure is built from simple shapes in `createPetModel` (no image file), and the meow is made with the browser audio API (no sound file). The behavior is in `viewer-core.mjs` (`petStep`, `createPlanner`, `petPose`, `petSurface`) and is tested in `tests/pet.test.mjs`.
+
 ## Theme and help
 
 - The page follows the time of day: paper (light) from 07:00 to 19:00, night (dark) at other hours. The "paper / night" link switches until the next 07:00 or 19:00.

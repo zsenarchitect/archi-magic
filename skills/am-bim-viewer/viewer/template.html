@@ -212,6 +212,27 @@
   #walkinfo { position: absolute; left: 14px; bottom: 14px; z-index: 4; display: none; padding: 4px 8px; background: var(--bg);
     border: var(--hair) solid var(--line-strong); font-size: var(--fs-micro); color: var(--ink-2); pointer-events: none; }
   #walkinfo.on { display: grid; gap: 2px; }
+  /* The cat's speech bubble: shows "meow!" over the cat when it is stuck and calls for attention. */
+  #bubble { position: absolute; z-index: 5; display: none; transform: translate(-50%, -100%); pointer-events: none; padding: 2px 9px;
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line-strong); font: inherit; font-size: 12px; white-space: nowrap; }
+  #bubble.on { display: block; }
+  /* The cat's thought cloud: a rounded cloud over the cat with two small dots trailing down to it. */
+  #thought { position: absolute; z-index: 5; display: none; transform: translate(-50%, -100%); pointer-events: none; max-width: 190px; margin-top: -16px; padding: 7px 14px;
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line-strong); border-radius: 22px 26px 20px 24px / 20px 22px 24px 18px;
+    font: inherit; font-size: 12px; line-height: 1.25; text-align: center; }
+  #thought.on { display: block; }
+  #thought::before, #thought::after { content: ''; position: absolute; border-radius: 50%; background: var(--bg); border: 1px solid var(--line-strong); }
+  #thought::before { width: 9px; height: 9px; left: 50%; bottom: -15px; margin-left: -4px; }
+  #thought::after { width: 5px; height: 5px; left: 50%; bottom: -24px; margin-left: 3px; }
+  /* Z z z over the sleeping cat, and hearts when it is petted. */
+  #zzz { position: absolute; z-index: 5; display: none; pointer-events: none; width: 56px; height: 64px; color: var(--ink); font: inherit; font-size: 17px; }
+  #zzz.on { display: block; }
+  #zzz span { position: absolute; left: 0; bottom: 0; opacity: 0; animation: zzz 2.4s ease-in infinite; }
+  #zzz span:nth-child(2) { animation-delay: .8s; font-size: 21px; }
+  #zzz span:nth-child(3) { animation-delay: 1.6s; font-size: 26px; }
+  @keyframes zzz { 0% { opacity: 0; transform: translate(0, 0); } 20% { opacity: 1; } 100% { opacity: 0; transform: translate(26px, -44px); } }
+  .heart { position: absolute; z-index: 5; pointer-events: none; font-size: 16px; animation: heartup 1.3s ease-out forwards; }
+  @keyframes heartup { 0% { opacity: 1; transform: translate(-50%, 0) scale(.8); } 100% { opacity: 0; transform: translate(-50%, -48px) scale(1.25); } }
   /* Crosshair: shows only while the pointer is locked, because a click then picks the screen center. */
   #xhair { position: absolute; left: 50%; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; z-index: 4; display: none;
     border: 1px solid var(--ink); border-radius: 50%; pointer-events: none; }
@@ -352,6 +373,7 @@
         <button data-proj="perspective">perspective</button>
         <button data-proj="parallel">parallel</button>
         <button id="walkbtn" aria-pressed="false" title="First-person walk (G)">walk</button>
+        <button id="petbtn" aria-pressed="false" title="Pet mode (P): click a floor to send the pet there">pet</button>
       </div>
       <button class="btn" id="fit" title="Zoom extents">zoom extents</button>
       <button class="link" id="theme" title="Switch day / night until the next 07:00 or 19:00">paper / night</button>
@@ -367,6 +389,10 @@
       <button id="helpbtn" type="button" aria-expanded="false" aria-controls="helppanel" aria-label="Mouse and keyboard help">?</button>
       <div id="helppanel" role="region" aria-label="Mouse and keyboard" tabindex="-1"></div>
     </div>
+    <div id="bubble" role="status"></div>
+    <div id="thought" aria-hidden="true"></div>
+    <div id="zzz" aria-hidden="true"><span>z</span><span>z</span><span>Z</span></div>
+    <div id="hearts" aria-hidden="true"></div>
     <div id="xhair" aria-hidden="true"></div>
     <div id="walkinfo" aria-live="polite"><div id="walkhint">click an element to select it, click empty space to look around, esc to exit</div><div id="walkread"></div></div>
     <div id="cubewrap">
@@ -448,6 +474,7 @@ const cams = { persp: new THREE.PerspectiveCamera(40, 1, 0.1, 1e5), ortho: new T
 const state = createViewState();
 let viewName = 'perspective';
 let walk = null, walkDrag = null, walkClick = null; // first-person walk state (see the Walk section)
+let petMode = false, pet = null, petModel = null, petRaf = 0, petLast = 0; // pet mode (see the Pet section)
 const SELECTED = toColor(pal.selected, '#f4f4f1');
 const OUTLINE = toColor(pal.outline, '#0a0a0a');
 const EDGE = toColor(pal.edge, '#0a0a0a');
@@ -635,6 +662,7 @@ const canvas = renderer.domElement;
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('pointerdown', e => {
   if (walk) { walkPointerDown(e); return; }
+  if (e.button === 0 && pet && catHit(e.clientX, e.clientY)) setCursor('hand2'); // a press on the cat: the hand closes a little
   const action = mapPointer({ button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, isParallel: state.projection === 'parallel' });
   drag = { action, x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY };
   try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events have no capture */ }
@@ -643,7 +671,7 @@ canvas.addEventListener('pointerdown', e => {
 });
 canvas.addEventListener('pointermove', e => {
   if (walk) { walkPointerMove(e); return; }
-  if (!drag) { setHover(pick(e.clientX, e.clientY)); return; }
+  if (!drag) { setHover(pick(e.clientX, e.clientY)); petCursor(e); return; }
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   drag.x = e.clientX; drag.y = e.clientY;
   if (drag.action === 'rotate') { orbit(state, dx, dy); if (viewName !== 'perspective') setViewName('rotated'); }
@@ -654,13 +682,15 @@ canvas.addEventListener('pointermove', e => {
 });
 canvas.addEventListener('pointerup', e => {
   if (walk) { walkPointerUp(e); return; }
-  if (drag && drag.action === 'select' && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) select(pick(e.clientX, e.clientY));
+  if (drag && drag.action === 'select' && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) {
+    if (catHit(e.clientX, e.clientY)) petThePet(); else if (petMode) petClick(e.clientX, e.clientY); else select(pick(e.clientX, e.clientY));
+  }
   drag = null;
-  setCursor(hovered ? 'hover' : 'idle');
+  setCursor(hovered ? 'hover' : 'idle'); petCursor(e);
 });
 // Double-click: Zoom Selected on an element, zoom extents on empty space.
 canvas.addEventListener('dblclick', e => {
-  if (e.button !== 0 || walk) return;
+  if (e.button !== 0 || walk || petMode) return;
   const m = pick(e.clientX, e.clientY);
   select(m);
   frameTo(dblClickView(state, m ? posedEl(m.userData.el) : null, bounds));
@@ -758,7 +788,7 @@ function helpRows() {
     [['Drag handle'], 'move / rotate the selected element'], [['Alt'], 'free, no snap'], [['Esc'], 'cancel the drag or the typed value'],
     [['Click handle'], 'type a value: 2.5, 2\'6", 750mm, 15'], [['0-9'], 'while dragging: type the value'],
     [['Enter'], 'apply the typed value'], [['Tab'], 'apply, then the next axis'],
-    [['G'], 'walk in first person (esc exits)'], [['W', 'A', 'S', 'D'], 'walk: move'], [['Q', 'E'], 'walk: lower / raise the eye'],
+    [['P'], 'pet mode: click a floor to send the pet there'], [['M'], 'mute or unmute the cat sound'], [['Click cat'], 'pet the cat'], [['G'], 'walk in first person (esc exits)'], [['W', 'A', 'S', 'D'], 'walk: move'], [['Q', 'E'], 'walk: lower / raise the eye'],
     [['Shift'], 'walk: run'], [['C'], 'walk: collision on / off'], [['Click'], 'walk: select an element; on empty space, look with the mouse (right drag if no lock)'],
   ]);
 }
@@ -1130,6 +1160,7 @@ function walkStepOnce(dt) {
 }
 function enterWalkMode() {
   if (walk) return;
+  if (petMode) setPetMode(false);
   if (anim) { cancelAnimationFrame(anim); anim = null; }
   select(null); setHover(null);
   if (typed) closeTyped();
@@ -1187,6 +1218,8 @@ window.addEventListener('keydown', e => {
   if (e.target && e.target.closest && e.target.closest('input')) return; // typing a value
   const k = e.key.toLowerCase();
   if (k === 'g' && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); if (walk) exitWalkMode(); else enterWalkMode(); return; }
+  if (k === 'p' && !e.ctrlKey && !e.metaKey && !e.altKey && !gdrag) { e.preventDefault(); setPetMode(!petMode); return; }
+  if (k === 'm' && !e.ctrlKey && !e.metaKey && !e.altKey && pet) { e.preventDefault(); petMuted = !petMuted; toast(petMuted ? 'cat sound off' : 'cat sound on'); return; }
   if (!walk) return;
   if (k === 'escape') { e.preventDefault(); exitWalkMode(); return; }
   if (k === 'c') { walk.isCollision = !walk.isCollision; updateWalkInfo(); return; }
@@ -1195,6 +1228,190 @@ window.addEventListener('keydown', e => {
 window.addEventListener('keyup', e => { delete walkKeys[e.key.toLowerCase()]; });
 window.addEventListener('blur', () => { for (const k of Object.keys(walkKeys)) delete walkKeys[k]; });
 walkBtn.addEventListener('click', () => { if (walk) exitWalkMode(); else enterWalkMode(); });
+
+// ---------- Pet mode: click a surface and a small figure walks there (P or the pet button) ----------
+// The pet is not a model element: it is not in `meshes`, so it is never picked, listed or exported.
+// The first click on a floor or roof (a face that points up) places it; later clicks send it there.
+// It follows the ground height; walks, or runs when the target is far; jumps up a ledge, down a drop or
+// over a small gap; and stops at a wall that is too high. When it has nothing to do it sits, licks a
+// paw, grooms, yawns, and in the end sleeps (a click wakes it).
+const petBtn = document.getElementById('petbtn');
+const castPetDown = new THREE.Raycaster(), castPetAcross = new THREE.Raycaster();
+const petEnv = {
+  ground(x, y, zFrom) {
+    castPetDown.set(new THREE.Vector3(x, y, zFrom), new THREE.Vector3(0, 0, -1)); castPetDown.far = 1e5;
+    for (const h of castPetDown.intersectObjects(meshes.filter(m => m.visible), false)) {
+      const s = petSurface(h, castPetDown.ray.direction);
+      if (s && s.isStandable) return h.point.z;
+    }
+    return null;
+  },
+  blocked(x, y, z, ux, uy, len, height) { // height: the probe height above the feet (default half the pet; a jump probes higher)
+    castPetAcross.set(new THREE.Vector3(x, y, z + (height === undefined ? 0.5 * PET.height * pet.scale : height)), new THREE.Vector3(ux, uy, 0)); castPetAcross.far = len;
+    return castPetAcross.intersectObjects(meshes.filter(m => m.visible), false)
+      .some(h => { const s = petSurface(h, castPetAcross.ray.direction); return s && !s.isStandable; });
+  },
+};
+// Click echo: a ring that expands and fades at the clicked point, and a small marker that stays at
+// the target (and pulses) until the pet arrives or stops. Both lie on the clicked face and show
+// through the model, so you see where the pet is going.
+const ECHO_COLOR = 0xf3a152, ECHO_MS = 600;
+const echoMaterial = opacity => new THREE.MeshBasicMaterial({ color: ECHO_COLOR, transparent: true, opacity, depthTest: false, side: THREE.DoubleSide });
+const echoRipple = new THREE.Mesh(new THREE.RingGeometry(0.85, 1, 48), echoMaterial(0));
+const echoMark = new THREE.Group();
+echoMark.add(new THREE.Mesh(new THREE.RingGeometry(0.72, 0.88, 32), echoMaterial(0.9)), new THREE.Mesh(new THREE.CircleGeometry(0.2, 20), echoMaterial(0.9)));
+for (const o of [echoRipple, echoMark]) { o.visible = false; o.renderOrder = 10; scene.add(o); }
+let echoT0 = 0, echoRaf = 0;
+// One unit of echo size: about 14 px on screen at any zoom, never smaller than half the pet.
+const echoUnit = () => Math.max(0.5 * pet.scale, 14 * worldPerPixel(state, canvas.clientHeight));
+function echoTick(now) {
+  const t = (now - echoT0) / ECHO_MS;
+  if (t >= 1) { echoRipple.visible = false; echoRaf = 0; requestRender(); return; }
+  echoRipple.scale.setScalar(echoUnit() * (0.3 + 1.7 * (1 - Math.pow(1 - t, 3))));
+  echoRipple.material.opacity = 0.9 * (1 - t);
+  requestRender(); echoRaf = requestAnimationFrame(echoTick);
+}
+function echoAt(point, normal) {
+  const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+
+  for (const o of [echoRipple, echoMark]) { o.position.set(point[0], point[1], point[2]).addScaledVector(n, 0.02 * pet.scale); o.quaternion.copy(q); }
+  echoMark.scale.setScalar(echoUnit() * 0.55); echoMark.visible = !!pet.goal;
+  echoRipple.visible = true; echoT0 = performance.now();
+  if (!echoRaf) echoRaf = requestAnimationFrame(echoTick);
+}
+// The pet loop runs as long as the pet exists, because its idle timer and actions (sit, lick, groom,
+// yawn, sleep) need it. The page is redrawn at petFps(): full speed while it moves, 30 fps for an idle
+// action, 8 fps while it sits or sleeps (a still scene costs almost nothing).
+let petRenderAt = 0;
+// The cursor over the cat is an open hand. While the cat purrs, the hand tilts back and forth as you move over it
+// (a new frame every 14 px), so it feels like stroking. Off the cat, the normal cursor comes back.
+let petStrokeD = 0, petStrokeFlip = false, petLastX = 0;
+function petCursor(e) {
+  if (!pet || !petModel) return;
+  if (catHit(e.clientX, e.clientY)) {
+    if (pet.act === 'purr') {
+      petStrokeD += Math.abs(e.clientX - petLastX);
+      if (petStrokeD > 14) { petStrokeD = 0; petStrokeFlip = !petStrokeFlip; }
+      setCursor(petStrokeFlip ? 'hand2' : 'handb');
+    } else setCursor('hand');
+    petLastX = e.clientX;
+  } else if (cursorName.startsWith('hand')) setCursor(hovered ? 'hover' : 'idle');
+}
+// Petting: a click on the cat (in any mode) pets it. It stops, shuts its eyes and purrs; hearts float up from
+// its head and a short purr plays (M mutes). The cat's thought cloud shows what it thinks (petThink in the core),
+// and Z z z floats over it while it sleeps.
+const thoughtEl = document.getElementById('thought'), zzzEl = document.getElementById('zzz'), heartsEl = document.getElementById('hearts');
+let petThoughtSeen = 0, petPetSeen = 0, purrAt = 0;
+const petScreen = dz => { const v = new THREE.Vector3(pet.pos[0], pet.pos[1], pet.pos[2] + dz * pet.scale).project(activeCam); return { x: ((v.x + 1) / 2) * vp.clientWidth, y: ((1 - v.y) / 2) * vp.clientHeight }; };
+function catHit(px, py) { // is the cat the first thing under this point?
+  if (!pet || !petModel) return false;
+  raycaster.setFromCamera(ndcAt(px, py), activeCam);
+  const hit = raycaster.intersectObject(petModel.group, true).find(h => h.object !== petModel.parts.shadow && h.object.visible);
+  if (!hit) return false;
+  const wall = raycaster.intersectObjects(meshes.filter(m => m.visible), false)[0];
+  return !wall || hit.distance <= wall.distance;
+}
+function petThePet() { petPetted(pet); echoAt(pet.pos, [0, 0, 1]); }
+function playPurr() {
+  if (petMuted) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    petAudioCtx = petAudioCtx || new AC(); const ctx = petAudioCtx; if (ctx.state === 'suspended') ctx.resume();
+    const t = ctx.currentTime, o = ctx.createOscillator(), lfo = ctx.createOscillator(), lg = ctx.createGain(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+    o.type = 'sawtooth'; o.frequency.value = 70; f.type = 'lowpass'; f.frequency.value = 260; lfo.frequency.value = 24; lg.gain.value = 0.06;
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.12, t + 0.15); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
+    lfo.connect(lg); lg.connect(g.gain); o.connect(f); f.connect(g); g.connect(ctx.destination);
+    o.start(t); lfo.start(t); o.stop(t + 1.6); lfo.stop(t + 1.6);
+  } catch (e) { /* no audio here: the hearts still show */ }
+}
+function spawnHearts() {
+  const q = petScreen(0.95);
+  for (let i = 0; i < 3; i++) {
+    const h = document.createElement('span'); h.className = 'heart'; h.textContent = '\u2665'; h.style.color = '#e8707a';
+    h.style.left = (q.x + (i - 1) * 14 + Math.random() * 6) + 'px'; h.style.top = (q.y - 4 - Math.random() * 8) + 'px'; h.style.animationDelay = (i * 0.12) + 's';
+    heartsEl.append(h); setTimeout(() => h.remove(), 1800);
+  }
+}
+function petFxCheck(now) {
+  if ((pet.petCount || 0) !== petPetSeen) { petPetSeen = pet.petCount; spawnHearts(); if (now - purrAt > 1200) { purrAt = now; playPurr(); } }
+  const t = pet.thought;
+  thoughtEl.classList.toggle('on', !!t);
+  if (t) {
+    if (pet.thoughtId !== petThoughtSeen) { petThoughtSeen = pet.thoughtId; thoughtEl.textContent = t.text; }
+    const q = petScreen(1.55); thoughtEl.style.left = q.x + 'px'; thoughtEl.style.top = q.y + 'px';
+  }
+  const sleeping = pet.act === 'sleep' && !pet.moving && !pet.jump;
+  zzzEl.classList.toggle('on', sleeping);
+  if (sleeping) { const q = petScreen(0.95); zzzEl.style.left = (q.x + 2) + 'px'; zzzEl.style.top = (q.y - 56) + 'px'; }
+}
+// The cat meows for attention when it cannot get where it was sent (p.meowCount goes up): a speech bubble over the
+// cat, and a short synthesized meow (no sound file). Press M to mute or unmute the sound.
+const bubbleEl = document.getElementById('bubble');
+let petMeowSeen = 0, bubbleUntil = 0, petAudioCtx = null, petMuted = false;
+function playMeow() {
+  if (petMuted) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    petAudioCtx = petAudioCtx || new AC(); const ctx = petAudioCtx; if (ctx.state === 'suspended') ctx.resume();
+    const t = ctx.currentTime, o = ctx.createOscillator(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+    o.type = 'sawtooth'; o.frequency.setValueAtTime(520, t); o.frequency.linearRampToValueAtTime(820, t + 0.22); o.frequency.linearRampToValueAtTime(480, t + 0.7);
+    f.type = 'bandpass'; f.Q.value = 3; f.frequency.setValueAtTime(900, t); f.frequency.linearRampToValueAtTime(1800, t + 0.25); f.frequency.linearRampToValueAtTime(900, t + 0.7);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.18, t + 0.08); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
+    o.connect(f); f.connect(g); g.connect(ctx.destination); o.start(t); o.stop(t + 0.8);
+  } catch (e) { /* no audio here: the bubble still shows */ }
+}
+function petMeowCheck(now) {
+  if ((pet.meowCount || 0) !== petMeowSeen) { petMeowSeen = pet.meowCount; bubbleEl.textContent = 'meow!'; bubbleUntil = now + 1500; playMeow(); }
+  const on = now < bubbleUntil;
+  bubbleEl.classList.toggle('on', on);
+  if (on) {
+    const v = new THREE.Vector3(pet.pos[0], pet.pos[1], pet.pos[2] + 1.3 * pet.scale).project(activeCam);
+    bubbleEl.style.left = ((v.x + 1) / 2) * vp.clientWidth + 'px'; bubbleEl.style.top = ((1 - v.y) / 2) * vp.clientHeight + 'px';
+    requestRender();
+  }
+}
+// Route line: a thin line from the pet through the next route points to the goal, drawn through the model.
+// While a route search runs it shows a straight hint to the goal.
+const routeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: ECHO_COLOR, transparent: true, opacity: 0.7, depthTest: false }));
+routeLine.visible = false; routeLine.frustumCulled = false; routeLine.renderOrder = 9; scene.add(routeLine);
+function updateRoute() {
+  if (!pet.goal) { routeLine.visible = false; return; }
+  const pts = [pet.pos];
+  if (pet.target) pts.push(pet.target);
+  for (const q of pet.path) pts.push(q);
+  if (pet.planning) pts.push(pet.goal);
+  routeLine.geometry.setFromPoints(pts.map(q => new THREE.Vector3(q[0], q[1], q[2] + 0.04 * pet.scale)));
+  routeLine.visible = pts.length > 1;
+}
+function petTick(now) {
+  const dt = Math.min(0.1, Math.max(0, (now - petLast) / 1000)); petLast = now;
+  petStep(pet, dt, petEnv);
+  echoMark.visible = !!pet.goal; // the goal marker pulses while the pet walks, and goes when it arrives or stops
+  if (pet.goal) echoMark.scale.setScalar(echoUnit() * (0.55 + 0.1 * Math.sin(now / 130)));
+  updateRoute(); petMeowCheck(now); petFxCheck(now);
+  if (now - petRenderAt >= 1000 / petFps(pet) - 2) { petRenderAt = now; petApply(petModel, pet); requestRender(); }
+  petRaf = requestAnimationFrame(petTick);
+}
+function startPetLoop() { if (!petRaf) { petLast = performance.now(); petRaf = requestAnimationFrame(petTick); } }
+function petClick(px, py) {
+  raycaster.setFromCamera(ndcAt(px, py), activeCam);
+  const hits = raycaster.intersectObjects(meshes.filter(m => m.visible), false);
+  const s = hits.length ? petSurface(hits[0], raycaster.ray.direction) : null;
+  if (!s) { toast('click a surface'); return; }
+  if (!s.isStandable) { toast('click a floor or a roof'); return; }
+  if (!pet) {
+    pet = createPet(s.point, petScale(bounds)); pet.playful = true; petModel = createPetModel(THREE);
+    scene.add(petModel.group); petApply(petModel, pet); requestRender(); startPetLoop();
+  } else petGo(pet, s.point, petEnv);
+  echoAt(s.point, s.normal);
+}
+function setPetMode(on) {
+  if (on && walk) return; // pet mode is for the orbit views; walk mode uses clicks to select
+  petMode = on; petBtn.setAttribute('aria-pressed', String(on));
+  if (on) { select(null); setHover(null); toast(pet ? 'pet mode: click a floor' : 'pet mode: click a floor to place the pet'); }
+}
+petBtn.addEventListener('click', () => setPetMode(!petMode));
 // ---------- Theme: follow am-theme (time of day, or a manual switch) ----------
 // On each am-theme-change, re-read the tokens and recolor the scene: category values,
 // selection, outline, edges, grid and gizmo. The flat backdrop is CSS (--bg).
@@ -1239,6 +1456,19 @@ window.__bim = {
     pause: on => { walkPaused = on; }, step: (dt, keys = {}) => { Object.assign(walkKeys, keys); walkStepOnce(dt); for (const k of Object.keys(keys)) delete walkKeys[k]; },
     get: () => walk && { pos: walk.pos.slice(), yaw: walk.yaw, pitch: walk.pitch, isCollision: walk.isCollision, eyeAboveFloor: walkFloor === null ? null : walk.pos[2] - walkFloor },
     look: (dx, dy) => walkLook(walk, dx, dy),
+  },
+  pet: {
+    mode: on => setPetMode(on), isOn: () => petMode, click: (x, y) => petClick(x, y),
+    get: () => pet && { pos: pet.pos.slice(), heading: pet.heading, moving: pet.moving, scale: pet.scale, target: pet.target && pet.target.slice(),
+      act: pet.act, run: pet.run, jumping: !!pet.jump, speed: pet.speed, idleT: pet.idleT, goal: pet.goal && pet.goal.slice(), planning: !!pet.planning, route: pet.path.length, meows: pet.meowCount || 0, pets: pet.petCount || 0, thought: pet.thought && pet.thought.text },
+    step: (dt, rand) => { if (pet) { petStep(pet, dt, rand ? { ...petEnv, rand } : petEnv); petApply(petModel, pet); render(); } },
+    setAct: name => { if (pet && !pet.target && !pet.jump) { pet.act = name; pet.actT = 0; pet.ib = petPose({ ...pet, ib: undefined, w: 0 }); petApply(petModel, pet); render(); } },
+    petIt: () => petThePet(), think: kind => petThink(pet, kind), hearts: () => document.querySelectorAll('.heart').length,
+    fx: () => ({ thought: thoughtEl.classList.contains('on') ? thoughtEl.textContent : null, zzz: zzzEl.classList.contains('on') }),
+    meowNow: () => { if (pet) { pet.act = 'meow'; pet.actT = 0; pet.meowCount = (pet.meowCount || 0) + 1; } },
+    freeze: on => { if (on) { cancelAnimationFrame(petRaf); petRaf = 0; } else startPetLoop(); },
+    inScene: () => !!petModel && petModel.group.parent === scene, inPickList: () => !!petModel && meshes.some(m => m === petModel.group),
+    echo: () => ({ rippleVisible: echoRipple.visible, rippleOpacity: echoRipple.material.opacity, markVisible: echoMark.visible, markAt: echoMark.position.toArray() }),
   },
   gumball: {
     layout: () => { const L = gumballLayout(), r = vp.getBoundingClientRect(); if (!L) return null;

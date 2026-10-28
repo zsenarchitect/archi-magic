@@ -139,7 +139,7 @@
     const on = await haloPixels(name, theme, scale, true), off = await haloPixels(name, theme, scale, false);
     cursorRows.push(on.shape > 0 && on.halo >= 8 * scale && off.halo === 0);
   }
-  results.cursorShadowRenders = cursorRows.length === 20 && cursorRows.every(Boolean);
+  results.cursorShadowRenders = cursorRows.length === __bim.cursor.names.length * 4 && cursorRows.every(Boolean);
   // Help: the pointer is simulated with real hit-testing (document.elementFromPoint) so the test
   // measures hit areas, not which element we chose to dispatch on. pointerenter/leave are sent
   // along the ancestor chains exactly as a browser does when the element under the pointer changes.
