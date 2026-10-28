@@ -14,6 +14,12 @@ The tokens live in `design/tokens.css`. That file is the only source. `scripts/s
 6. **Axis and air.** Compose along a centered vertical axis where the layout allows it. Leave generous empty space. Put fewer things on screen.
 7. **Slow and calm motion.** Use fades and eases of about 420 ms (`--slow`, `--ease`). Do not bounce.
 
+## Named exceptions
+
+- **Pet mode (am-bim-viewer).** The walking companion cat is drawn in color (orange body with green and cream marks), with pink hearts when petted and a rounded thought cloud. This is a deliberate exception to principle 1 and to the "rounded cards" don't, decided by the maintainer (PR #45, 2026-10-28).
+- The exception holds because the cat is a companion character, not data. Its color is its identity. It encodes no state, status, or category. Everything that carries meaning (status, categories, selection, changes) stays in monochrome value steps.
+- The exception covers only the pet and its effects (speech bubble, thought cloud, zzz, hearts) in the viewer. It does not extend to page chrome, tables, or model categories.
+
 ## Tokens (summary)
 
 | Token | Value | Use |
