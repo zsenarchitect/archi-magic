@@ -42,8 +42,22 @@ These changes broke real queries. Check them first when a query fails on Revit 2
       return int(element_id.IntegerValue)
   ```
   Use the same pattern in new scripts.
-- `ElementId(Int32)` (the constructor that takes a 32-bit integer) is gone in Revit 2026. Use `ElementId(Int64)` instead. It exists in Revit 2024, 2025 and 2026.
+- `ElementId(Int32)` (the constructor that takes a 32-bit integer) is gone in Revit 2026. Use `ElementId(Int64)` instead. It exists in Revit 2024, 2025 and 2026. In IronPython, a plain integer argument is ambiguous. Use `DB.ElementId(System.Int64(...))`:
+  ```python
+  DB.ElementId(System.Int64(19624851))
+  ```
+- `NewDimension` wants the dimension type element, not its id. Pass the element you got from the document, not the integer id.
+- `run_query` result dicts must have string keys. A dict with integer keys fails or drops the values.
 - `run_query` takes the script text in a parameter named `script`. A parameter named `code` returns `invalid_params`. See the sample below.
+
+### Material keynote tags on cut layers
+
+Revit cannot place a material keynote tag on a cut floor layer. This limit cost a full session in issue #50. State it before you promise keynote tags on a detail.
+
+- `IndependentTag.Create` with a face reference fails with "The reference can not be tagged".
+- An element reference creates the tag, but `TagText` reads empty for every keynote and material tag type tried.
+- The `TM_ADDBY_MATERIAL` mode creates a Material Tags tag that also reads empty.
+- The workaround from the field report is a text note. The note carries the keynote value from the floor type's `Keynote` parameter. Use text notes when the user asks for keynotes on cut layers.
 
 ### Sample query skeleton
 
