@@ -91,6 +91,7 @@ Optional add-ons, installed only when the user needs them:
 | "are the parameters filled in", BEP checks | `am-param-qa` | Ask which categories and parameters |
 | "which materials are unused", "list materials", "material colors" | `am-material-audit` | Read-only query; lists materials by name prefix with colors and patterns, flags duplicates and low contrast |
 | worksets | `am-workset-audit` | Read-only audit; any move goes through dry run + Keep/Discard |
+| "issue board", keep findings and to-dos in the model, add or close an issue in a text note | `am-issue-board` | Ask which view; read the note (read only); plan an in-place edit; dry run, then Keep/Discard |
 | room or area report, program comparison | `am-area-report` | Read-only query |
 | "show me the ... schedule", compare schedules | `am-schedule-view` | List schedules, ask which one |
 | "show the model in 3D" | `am-bim-viewer` | Export the active 3D view (read-only), build the viewer |
@@ -152,6 +153,7 @@ Logs: archi-magic writes one JSON line per event to `%LOCALAPPDATA%\archi-magic\
 | `am-param-qa` | Finds elements whose required parameters are missing or empty (for example door Fire Rating, Mark, or your BEP list). Ask "are my door parameters filled in?". Adapted from Utopia5327 (MIT). |
 | `am-material-audit` | Lists materials whose names start with a prefix you give, with Shading color, Transparency, Surface Pattern foreground and background, and Cut pattern, all in RGB. It flags duplicates and low pattern contrast, and finds unused materials with a scoped check. Ask "which Floor Finish materials are unused?". |
 | `am-workset-audit` | Checks the worksets of a team model and moves elements only after a dry run and your Keep/Discard. Ask "audit my worksets". Adapted from Utopia5327 (MIT). |
+| `am-issue-board` | Keeps a GitHub-style issue list in a text note in the model: fixed issue numbers, status, assignee from the element creator, severity, findings, to-dos, dated comments and related issues. It edits the note in place, so manual edits stay, and every change needs your Keep/Discard. Ask "put these findings on the issue board". |
 | `am-area-report` | Reports room areas by level and department, gross totals from area plans, and unplaced or unenclosed rooms; compares against a program you paste. Ask for "a room area report". Adapted from Utopia5327 (MIT). |
 | `am-markup-intake` | Reads all your review markups: PDF and Bluebeam comments, photos and scans. It makes one action list that removes duplicates, shows conflicts between reviewers, and marks text it cannot read well. It checks sheet, room and door numbers against your open model (read only). Changes to the model go to `am-safe-change`. Ask "go through these markups". |
 | `am-schedule-view` | Shows a Revit schedule as Revit displays it, in an interactive table: search, sort, filter, copy, export CSV, compare. It also shows the `am-safe-change` preview. Ask "show me the door schedule". |
