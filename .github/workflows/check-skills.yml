@@ -74,6 +74,8 @@ jobs:
           .\skills\am-doctor\tests\test-deps.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\skills\am-doctor\tests\test-mcp.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\skills\am-doctor\tests\test-policy.ps1
           exit $LASTEXITCODE
       # The setup tests use stub pyrevit/claude programs and temp roots. They need no real pyRevit or Claude.
       - name: am-pyrevit7-setup tests (hermetic stubs, temp roots)
