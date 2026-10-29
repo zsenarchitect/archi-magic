@@ -25,7 +25,7 @@ Diagnose archi-magic problems with the tested script `scripts/doctor.ps1` in thi
    - Exit 2: no problem found, but some part was not checked. Say which part, and say what the user can do so it can be checked.
    - If Revit answered earlier in this session and is gone now, run it again with `-RevitWasRunning`. The doctor then points to `am-revit-crash-doctor`.
 2. Explain each `error`, `warn` and `unchecked` line in plain words. Say what is wrong, why it matters, and what the fix does. Mention `info` lines only when they help.
-3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option.
+3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option. If the user set `auto` on purpose, report POLICY_AUTO only: do not offer its fix, and never mark it "(Recommended)".
 4. Run only the fix that the user picked:
    `powershell -NoProfile -ExecutionPolicy Bypass -File "<this skill dir>\scripts\doctor.ps1" -Fix <CODE>`
    - Exit 4 means there is no automatic fix. Give the user the manual step from the `fix` column.

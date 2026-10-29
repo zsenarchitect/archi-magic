@@ -168,6 +168,7 @@ try {
     Assert-True 'no installed skills: no list' ($x -and $x.systemMessage -match $New -and $x.systemMessage -notmatch 'Skills you do not have') $r.Out
 
     # 18. Skills call fails (closed port): the normal notice, exit 0, a warn line in the log.
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Root 'logs\*.jsonl')   # earlier cases also logged this line
     $r = Invoke-Hook $skRoot @('-LatestTag', "r2026.10.22-$New", '-SkillsApiUrl', $OfflineSkills)
     $x = Get-Msg $r
     Assert-True 'skills call offline: notice without list, exit 0' ($r.Code -eq 0 -and $x -and $x.systemMessage -match $New -and $x.systemMessage -notmatch 'Skills you do not have') "exit $($r.Code) $($r.Out)"

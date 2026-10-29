@@ -147,7 +147,7 @@ try {
             $newest = @(Get-SkillDirNames (Join-Path (Split-Path -Parent $PluginRoot.TrimEnd('\', '/')) $latest))
         }
         if ($newest.Count -eq 0 -and $c -and $c.latest_skills_tag -eq $tag) { $newest = @($c.latest_skills | Where-Object { $_ }) }
-        if ($newest.Count -eq 0 -and $skillsCallAllowed -and $SkillsApiUrl) {
+        if ($newest.Count -eq 0 -and $have.Count -gt 0 -and $skillsCallAllowed -and $SkillsApiUrl) {
             $left = 8 - $clock.Elapsed.TotalSeconds
             if ($clock.Elapsed.TotalSeconds -gt 5) {
                 Write-Log 'warn' 'Update check: skills list skipped (time budget used)' @{ latest = $latest }
