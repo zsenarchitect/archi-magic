@@ -2,6 +2,8 @@
 # is appended to calls.log. Used only by the tests in this folder. Never touches real pyRevit or Claude config.
 # Like the real claude.exe, 'mcp get' and 'mcp remove' on a missing server write to STDERR and exit 1.
 # AM_STUB_INSTALL_NOOP=1 makes 'pyrevit mcp install claude' register nothing (forces the direct-add path).
+# AM_STUB_PY7_STDERR=1 makes every pyrevit call also write one log line to STDERR (exit code unchanged),
+# like a real pyrevit.exe that logs a warning. The line holds no word the setup script parses.
 # The .cmd wrapper passes the raw argument line in AM_STUB_ARGS, because powershell.exe -File
 # rebinds a literal '--' in its own argument list. Test paths contain no spaces.
 param([string]$Kind)
@@ -14,6 +16,7 @@ Add-Content -LiteralPath (Join-Path $dir 'calls.log') -Value ("$Kind " + ($argv 
 function Save { [IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false)) }
 $line = $argv -join ' '
 if ($Kind -eq 'py7') {
+    if ($env:AM_STUB_PY7_STDERR -eq '1') { [Console]::Error.WriteLine('[stub log] pyrevit wrote a warning line') }
     switch -regex ($line) {
         '^--version$' { 'pyRevit CLI v7.0.0.26278'; exit 0 }
         '^configs agent$' { if ($state.enabled) { 'Agent host is Enabled' } else { 'Agent host is Disabled' }; exit 0 }
