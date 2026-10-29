@@ -25,7 +25,7 @@ Diagnose archi-magic problems with the tested script `scripts/doctor.ps1` in thi
    - Exit 2: no problem found, but some part was not checked. Say which part, and say what the user can do so it can be checked.
    - If Revit answered earlier in this session and is gone now, run it again with `-RevitWasRunning`. The doctor then points to `am-revit-crash-doctor`.
 2. Explain each `error`, `warn` and `unchecked` line in plain words. Say what is wrong, why it matters, and what the fix does. Mention `info` lines only when they help.
-3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option.
+3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option. If the user set `auto` on purpose, report POLICY_AUTO only: do not offer its fix, and never mark it "(Recommended)".
 4. Run only the fix that the user picked:
    `powershell -NoProfile -ExecutionPolicy Bypass -File "<this skill dir>\scripts\doctor.ps1" -Fix <CODE>`
    - Exit 4 means there is no automatic fix. Give the user the manual step from the `fix` column.
@@ -49,12 +49,29 @@ Diagnose archi-magic problems with the tested script `scripts/doctor.ps1` in thi
 | NO_MODEL_OPEN | The Revit window shows `[Home]`. The agent needs an open model. | Manual: open a model. An Autodesk sample such as Snowdon Towers is fine. |
 | MCP_MISSING | `claude mcp get pyrevit` finds no server. | am-pyrevit7-setup `-EnableAgent`, then a new Claude Code session. |
 | MCP_WRONG_PATH | The `pyrevit` MCP command is not the full pyRevit 7 path. | am-pyrevit7-setup `-EnableAgent`, then a new Claude Code session. |
-| POLICY_AUTO | The agent policy is `auto`, so model changes skip the Keep/Discard approval. | `pyrevit configs agent policy ask`. |
+| AGENT_POLICY (ok or info) | The current agent policy: `ask` (ok) or `readonly` (info). The fix column gives the command to change it. See "Agent policy". | None. Change the policy only when the user asks. |
+| POLICY_AUTO | The agent policy is `auto`, so model changes skip the Keep/Discard approval. If the user chose `auto` on purpose, report it only. | `pyrevit configs agent policy ask`, only when the user picks it. |
 | DOCS_OFFLINE | The pyRevit docs search could not refresh. It uses the cached copy. | None needed. |
 | HEADLESS_OLD_PYREVIT (info) | A machine-wide manifest (installed by IT) still loads an older pyRevit, for example 6.4 in `C:\Program Files\pyRevit-Master`. Revit opened by hand and the archi-magic skills are fine (per-user fix, `pyrevit agent run`), but `pyrevit run` batch or CI scripts load the old pyRevit. | No automatic fix. Tell the user only if they run `pyrevit run` scripts: IT must uninstall the machine-wide pyRevit (admin). |
 | DEPS_MISSING | archi-magic is installed, but `superpowers@archi-magic` or `frontend-design@archi-magic` is missing, or its install folder or `.claude-plugin\plugin.json` is gone ("failed to load"). This happened after `claude plugin update` from 0.1.0 to 0.4.1. The doctor only reads `%USERPROFILE%\.claude\plugins\installed_plugins.json` (no network). | `claude plugin install <name>@archi-magic` for each missing one. Then the user quits and restarts the Claude app. |
 
 If Revit stays busy, the agent check names the dialog when the busy line lists the open windows. The finding is `AGENT_BLOCKED_DIALOG | warn`. Ask the user to close the dialog, then run the doctor again. If the busy line names no windows, the finding stays `AGENT_STATUS | unchecked`.
+
+## Agent policy
+
+The agent policy tells pyRevit what an agent run may do. The doctor reports it as AGENT_POLICY or POLICY_AUTO.
+
+| Policy | What it does |
+|---|---|
+| `readonly` | Queries run. Model changes are refused. |
+| `ask` | The default. Each model change waits for Keep/Discard in Revit. |
+| `auto` | Model changes run without Keep/Discard. `am-safe-change` stops when the policy is `auto`. |
+
+- Read it: `pyrevit configs agent policy`, or call `get_context` (it shows `policy`).
+- Change it: `pyrevit configs agent policy readonly`, `ask` or `auto`. The full path is `%APPDATA%\pyRevit-Master\bin\pyrevit.exe`.
+- The change applies at once. Call `get_context` to confirm it. Revit does not need a restart.
+- Switch back: `pyrevit configs agent policy ask`.
+- Change the policy only when the user asks for it in chat (for example "we do not need to confirm in Revit"). Say the new policy back, and say how to switch back. Never change it on your own, and never to skip a Keep/Discard prompt.
 
 ## When archi-magic does not load
 

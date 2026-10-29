@@ -21,8 +21,9 @@
   Exit codes (-Fix): the fix command's exit code; 4 = no automatic fix (user action needed);
     2 = fix command not available.
 
-  Test parameters (-AddinsRoot, -UserAddinsRoot, -Py7Root, -LogDir, -SetupLogRoot, -McpName,
+  Test parameters (-AddinsRoot, -UserAddinsRoot, -Py7Root, -Py7Exe, -LogDir, -SetupLogRoot, -McpName,
   -InstalledPluginsJson, -ClaudeSettingsJson, -Only) point the checks at other folders or names.
+  -Py7Exe replaces <Py7Root>\bin\pyrevit.exe (for example with a test stub), as in pyrevit7-setup.ps1.
   Defaults are the real locations. The deps check only reads those two JSON files (no network).
 
 .EXAMPLE
@@ -44,8 +45,9 @@ param(
     [string]$LogDir = '',
     [string]$SetupLogRoot = (Join-Path $env:TEMP 'pyrevit7-setup'),
     [string]$McpName = 'pyrevit',
-    # Test parameters: another Claude Code CLI and another setup script. Defaults are the real ones.
+    # Test parameters: another Claude Code CLI, pyrevit.exe and setup script. Defaults are the real ones.
     [string]$ClaudeCli = '',
+    [string]$Py7Exe = '',
     [string]$SetupScript = '',
     # Claude Code's config folder: CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude.
     [string]$InstalledPluginsJson = (Join-Path $(if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }) 'plugins\installed_plugins.json'),
@@ -67,7 +69,8 @@ $ProgressPreference = 'SilentlyContinue'
 $IssuesUrl = 'https://github.com/zsenarchitect/archi-magic/issues'
 $PluginRoot = Join-Path $PSScriptRoot '..\..\..'
 if (-not $SetupScript) { $SetupScript = Join-Path $PSScriptRoot '..\..\am-pyrevit7-setup\scripts\pyrevit7-setup.ps1' }
-$Py7 = Join-Path $Py7Root 'bin\pyrevit.exe'
+$Py7 = if ($Py7Exe) { $Py7Exe } else { Join-Path $Py7Root 'bin\pyrevit.exe' }
+$PolicySwitch = 'Change it only when the user asks: pyrevit configs agent policy readonly|ask|auto (get_context shows the new policy at once, no Revit restart)'
 
 # One spelling per file: 'C:\x\Roaming/pyRevit-Master/bin/pyrevit.exe' equals the backslash form.
 # GetFullPath throws on an empty or odd string: keep it raw then.
@@ -365,8 +368,9 @@ if (Test-Want 'agent') {
             Add-Finding 'AGENT_CONFIG' 'ok' "pyrevit configs agent: $($cfg.Out)" '-'
             $pol = Invoke-Native $Py7 @('configs', 'agent', 'policy') 60
             if (-not $pol.Ok) { Add-Finding 'AGENT_POLICY' 'unchecked' "pyrevit configs agent policy failed: $($pol.Error)" 'Run: pyrevit configs agent policy' }
-            elseif ($pol.Out -match '\bauto\b') { Add-Finding 'POLICY_AUTO' 'warn' "$($pol.Out). Model changes run without Keep/Discard approval." $FixMap.POLICY_AUTO.Text }
-            elseif ($pol.Out -match '\bask\b') { Add-Finding 'AGENT_POLICY' 'ok' $pol.Out '-' }
+            elseif ($pol.Out -match '\bauto\b') { Add-Finding 'POLICY_AUTO' 'warn' "$($pol.Out). Model changes run without Keep/Discard approval. If the user chose auto on purpose, report it only" "$($FixMap.POLICY_AUTO.Text) (back to the default; only when the user asks)" }
+            elseif ($pol.Out -match '\bask\b') { Add-Finding 'AGENT_POLICY' 'ok' "$($pol.Out). Each model change waits for Keep/Discard in Revit" $PolicySwitch }
+            elseif ($pol.Out -match '\breadonly\b') { Add-Finding 'AGENT_POLICY' 'info' "$($pol.Out). Queries run; model changes are refused" $PolicySwitch }
             else { Add-Finding 'AGENT_POLICY' 'unchecked' "unknown policy output: $($pol.Out)" 'Run: pyrevit configs agent policy' }
 
             if ($revit.Count -eq 0) {

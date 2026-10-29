@@ -32,7 +32,7 @@ Sets up pyRevit 7 and the pyRevit Agent Runtime (https://docs.pyrevitlabs.io/age
 4. Tell the user to restart the Claude desktop app and open a new Code session; the `pyrevit` MCP tools load only in new sessions. After the restart, tell the user to paste exactly this line:
    "Setup is done. Run am-welcome and give me a first safe Revit question."
 5. Close with these points:
-   - Every model change needs their **Keep/Discard** approval in Revit.
+   - Every model change needs their **Keep/Discard** approval in Revit. The setup sets the agent policy to `ask`. To see or change the policy later, see "Agent policy" in `am-doctor`. Change it only when the user asks.
    - Anything the agent reads from the model is sent to the AI provider (see step 0), so only use it on projects where that's allowed.
    - Turn on auto-update for archi-magic, so the user always gets the newest version. Third-party marketplaces have it off by default. Offer the settings route: add this entry to `~/.claude/settings.json`. Merge it with the settings that are already there; do not replace the whole file.
      ```json
