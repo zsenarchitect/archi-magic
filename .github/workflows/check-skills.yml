@@ -72,7 +72,17 @@ jobs:
           .\skills\am-doctor\tests\test-headless.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\skills\am-doctor\tests\test-deps.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\skills\am-doctor\tests\test-mcp.ps1
           exit $LASTEXITCODE
+      # The setup tests use stub pyrevit/claude programs and temp roots. They need no real pyRevit or Claude.
+      - name: am-pyrevit7-setup tests (hermetic stubs, temp roots)
+        run: |
+          foreach ($t in 'test-undo.ps1', 'test-fresh-mcp.ps1', 'test-stderr-paths.ps1') {
+            "== $t"
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\skills\am-pyrevit7-setup\tests\$t"
+            if ($LASTEXITCODE -ne 0) { "FAIL: $t exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          }
       - name: Repo checks mutation table (every break red, simulated split green)
         run: |
           .\scripts\tests\test-checks.ps1

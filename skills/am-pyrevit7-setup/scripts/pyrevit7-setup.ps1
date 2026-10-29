@@ -135,7 +135,7 @@ function Fail($code, $msg) {
 
 function Get-Py7Version {
     if (-not (Test-Path $Py7)) { return $null }
-    $out = (& $Py7 --version 2>&1 | Out-String)
+    $out = (Invoke-Cli $Py7 @('--version') | Out-String)
     $m = [regex]::Match($out, 'v(\d+)\.(\d+)\.(\d+)')
     if ($m.Success) { return [version]("{0}.{1}.{2}" -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) }
     return $null
@@ -237,6 +237,22 @@ function Invoke-Cli([string]$exe, [string[]]$argv) {
     }
 }
 
+function Get-NormalPath([string]$path) {
+    # One spelling per file: 'C:\x\AppData\Roaming/pyRevit-Master/bin/pyrevit.exe' and the same path
+    # with backslashes must compare equal. GetFullPath throws on an empty or odd string: keep it raw then.
+    $p = ([string]$path).Trim().Trim('"')
+    try { return [IO.Path]::GetFullPath($p) } catch { return $p }
+}
+function Test-SamePath([string]$a, [string]$b) {
+    if (-not $a -or -not $b) { return $false }
+    return ((Get-NormalPath $a) -ieq (Get-NormalPath $b))
+}
+function Test-McpUsesPy7([string]$claude) {
+    # True when 'claude mcp get pyrevit' names the pyRevit 7 exe (any slash style).
+    $reg = Get-McpRegistration $claude
+    return [bool]($reg -and (Test-SamePath $reg.command $Py7))
+}
+
 function Get-McpRegistration([string]$claude) {
     # Parses 'claude mcp get pyrevit'. Returns $null when no server has that name.
     $out = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
@@ -307,7 +323,7 @@ function Test-InstallerTrust([string]$Path, $Digest) {
 function Get-AgentPolicy {
     # 'pyrevit configs agent policy' prints "Agent policy: ask". Returns ask|readonly|auto, or $null.
     if (-not (Test-Path $Py7)) { return $null }
-    $out = (& $Py7 configs agent policy 2>&1 | Out-String)
+    $out = (Invoke-Cli $Py7 @('configs', 'agent', 'policy') | Out-String)
     $m = [regex]::Match($out, 'Agent policy:\s*(\w+)')
     if ($m.Success) { return $m.Groups[1].Value.ToLowerInvariant() }
     return $null
@@ -316,7 +332,7 @@ function Get-AgentPolicy {
 function Get-AgentEnabled {
     # 'pyrevit configs agent' prints "Agent host is Enabled" or "... Disabled". Returns $true, $false or $null.
     if (-not (Test-Path $Py7)) { return $null }
-    $out = (& $Py7 configs agent 2>&1 | Out-String)
+    $out = (Invoke-Cli $Py7 @('configs', 'agent') | Out-String)
     if ($out -match '\bDisabled\b') { return $false }
     if ($out -match '\bEnabled\b') { return $true }
     return $null
@@ -434,7 +450,7 @@ if ($Undo) {
                     if ($prev.args) { $argv += @(([string]$prev.args) -split '\s+' | Where-Object { $_ }) }
                     Invoke-Cli $claude $argv | Out-Host
                     $now = Get-McpRegistration $claude
-                    if ($now -and $now.command -eq $prev.command) { Say "Restored the previous pyrevit MCP registration: $($prev.command) $($prev.args)" }
+                    if ($now -and (Test-SamePath $now.command $prev.command)) { Say "Restored the previous pyrevit MCP registration: $($prev.command) $($prev.args)" }
                     else { Warn "Could not restore the previous pyrevit MCP registration ($($prev.command) $($prev.args))." }
                 }
             }
@@ -446,7 +462,7 @@ if ($Undo) {
         if (-not (Test-Path $Py7)) { Warn "pyRevit not found at $Py7; the agent setting was not restored." }
         else {
             if ($j.agent.wasEnabled -eq $false -and (Get-AgentEnabled) -ne $false) {
-                & $Py7 configs agent disable | Out-Host
+                Invoke-Cli $Py7 @('configs', 'agent', 'disable') | Out-Host
                 if ((Get-AgentEnabled) -ne $false) { Warn 'Could not disable the agent host again.' } else { Say 'Agent host: disabled again (as before the setup run).' }
             }
             $prevPol = [string]$j.agent.policy
@@ -455,7 +471,7 @@ if ($Undo) {
                     Write-Host "[pyrevit7] WARNING: the previous agent policy was 'auto'. Model changes will run WITHOUT the Keep/Discard approval in Revit. To keep the approval, run: & `"$Py7`" configs agent policy ask" -ForegroundColor Yellow
                     AmLog 'warn' "Undo restored agent policy 'auto'." $null
                 }
-                & $Py7 configs agent policy $prevPol | Out-Host
+                Invoke-Cli $Py7 @('configs', 'agent', 'policy', $prevPol) | Out-Host
                 if ((Get-AgentPolicy) -ne $prevPol) { Warn "Could not restore the agent policy '$prevPol'." } else { Say "Agent policy restored to '$prevPol'." }
             }
         }
@@ -560,7 +576,7 @@ if ($Repoint) {
     $machine =@(Get-ChildItem (Join-Path $MachineAddins '*\pyRevit*.addin') -ErrorAction SilentlyContinue)
     if ($machine.Count -eq 0) {
         Say 'No machine-wide pyRevit manifests found. Using the normal attach.'
-        & $Py7 attach master default --installed
+        Invoke-Cli $Py7 @('attach', 'master', 'default', '--installed') | Out-Host
         if ($LASTEXITCODE -ne 0) { Warn "pyrevit attach exited $LASTEXITCODE." }
     } else {
         foreach ($src in $machine) {
@@ -604,8 +620,8 @@ if ($EnableAgent) {
         Save-Journal
     }
 
-    & $Py7 configs agent enable | Out-Host
-    & $Py7 configs agent policy $Policy | Out-Host
+    Invoke-Cli $Py7 @('configs', 'agent', 'enable') | Out-Host
+    Invoke-Cli $Py7 @('configs', 'agent', 'policy', $Policy) | Out-Host
     $policyNow = Get-AgentPolicy
     if ($policyNow -ne $Policy) {
         Warn "Agent policy is '$policyNow', not '$Policy'. Run: & `"$Py7`" configs agent policy $Policy"
@@ -623,7 +639,7 @@ if ($EnableAgent) {
         # 'pyrevit mcp install claude' shells out to 'claude', so make sure it is on PATH for this process.
         $env:PATH = (Split-Path $claude) + ';' + $env:PATH
         $prevReg = Get-McpRegistration $claude
-        if ($prevReg -and $prevReg.command -ieq $Py7) {
+        if ($prevReg -and (Test-SamePath $prevReg.command $Py7)) {
             Say 'pyrevit MCP server already registered with the full pyRevit 7 path.'
         } else {
             # Journal what is replaced (only a user-scope entry is removed) or that a new one is added.
@@ -636,14 +652,12 @@ if ($EnableAgent) {
             }
             # pyrevit shells out to claude, so its stderr can carry the same 'not found' lines.
             Invoke-Cli $Py7 @('mcp', 'install', 'claude') | Out-Host
-            $existing = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
-            if ($existing -notmatch [regex]::Escape($Py7)) {
+            if (-not (Test-McpUsesPy7 $claude)) {
                 Say 'pyrevit mcp install did not register the full path; adding it directly.'
                 Invoke-Cli $claude @('mcp', 'remove', 'pyrevit', '-s', 'user') | Out-Null
                 Invoke-Cli $claude @('mcp', 'add', 'pyrevit', '-s', 'user', '--', "$Py7", 'mcp') | Out-Host
-                $existing = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
             }
-            if ($existing -notmatch [regex]::Escape($Py7)) { Warn 'Could not register the pyrevit MCP server with Claude Code.' }
+            if (-not (Test-McpUsesPy7 $claude)) { Warn 'Could not register the pyrevit MCP server with Claude Code.' }
             else { Say 'pyrevit MCP server registered with Claude Code (user scope).' }
         }
     }
@@ -675,7 +689,7 @@ if ($Verify) {
     }
 
     if (Test-Path $Py7) {
-        $agent = (& $Py7 agent status 2>&1 | Out-String).Trim()
+        $agent = (Invoke-Cli $Py7 @('agent', 'status') | Out-String).Trim()
         $agent -split "`r?`n" | ForEach-Object { Say "agent: $_" }
         if ($agent -notmatch 'Agent host: enabled') { Warn 'Agent host is not enabled. Run -EnableAgent.' }
         $pol = Get-AgentPolicy
@@ -688,8 +702,7 @@ if ($Verify) {
 
     $claude = Find-ClaudeCli
     if ($claude) {
-        $reg = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
-        if ($reg -match [regex]::Escape($Py7)) { Say 'Claude Code MCP: pyrevit registered with the pyRevit 7 path.' }
+        if (Test-McpUsesPy7 $claude) { Say 'Claude Code MCP: pyrevit registered with the pyRevit 7 path.' }
         else { Warn 'Claude Code MCP: pyrevit is not registered with the pyRevit 7 path. Run -EnableAgent.' }
     } else { Warn 'Claude Code CLI not found; cannot check the MCP registration.' }
     AmLog 'info' 'Verify step finished.' $null
