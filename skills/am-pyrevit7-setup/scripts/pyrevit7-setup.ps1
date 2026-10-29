@@ -226,9 +226,20 @@ function Complete-RepointJournal {
     }
 }
 
+function Invoke-Cli([string]$exe, [string[]]$argv) {
+    # Runs a native CLI (claude, pyrevit) and emits its stdout and stderr as plain text lines.
+    # 'claude mcp get/remove' on a missing server writes to stderr and exits 1. With the script-wide
+    # EAP 'Stop', Windows PowerShell 5.1 turns a redirected stderr line into a terminating error,
+    # so the preference is 'Continue' here only. $LASTEXITCODE keeps the exit code for the caller.
+    $ErrorActionPreference = 'Continue'
+    & $exe @argv 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ }
+    }
+}
+
 function Get-McpRegistration([string]$claude) {
     # Parses 'claude mcp get pyrevit'. Returns $null when no server has that name.
-    $out = (& $claude mcp get pyrevit 2>&1 | Out-String)
+    $out = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
     if ($out -notmatch '(?m)^\s*Scope:') { return $null }
     $scopeText = [regex]::Match($out, '(?m)^\s*Scope:\s*(.+?)\s*$').Groups[1].Value
     $scope = if ($scopeText -match '^User') { 'user' } elseif ($scopeText -match '^Project') { 'project' } elseif ($scopeText -match '^Local') { 'local' } else { $scopeText }
@@ -406,7 +417,7 @@ if ($Undo) {
         else {
             $env:PATH = (Split-Path $claude) + ';' + $env:PATH
             if ($j.mcp.action -eq 'added') {
-                & $claude mcp remove pyrevit -s user 2>&1 | Out-Host
+                Invoke-Cli $claude @('mcp', 'remove', 'pyrevit', '-s', 'user') | Out-Host
                 $left = Get-McpRegistration $claude
                 if ($left -and $left.scope -eq 'user') { Warn 'Could not remove the pyrevit MCP server that the setup run added.' }
                 else { Say 'Removed the pyrevit MCP registration that the setup run added.' }
@@ -415,13 +426,13 @@ if ($Undo) {
                 if ($prev.type -and $prev.type -ne 'stdio') {
                     Warn "The previous pyrevit MCP server was type '$($prev.type)'. Restore it by hand: claude mcp add --transport $($prev.type) pyrevit $($prev.command)"
                 } else {
-                    & $claude mcp remove pyrevit -s user 2>&1 | Out-Host
+                    Invoke-Cli $claude @('mcp', 'remove', 'pyrevit', '-s', 'user') | Out-Host
                     $argv = @('mcp', 'add', 'pyrevit', '-s', [string]$prev.scope)
                     foreach ($e in @($prev.env)) { if ($e) { $argv += @('-e', [string]$e) } }
                     $argv += '--'
                     $argv += [string]$prev.command
                     if ($prev.args) { $argv += @(([string]$prev.args) -split '\s+' | Where-Object { $_ }) }
-                    & $claude @argv 2>&1 | Out-Host
+                    Invoke-Cli $claude $argv | Out-Host
                     $now = Get-McpRegistration $claude
                     if ($now -and $now.command -eq $prev.command) { Say "Restored the previous pyrevit MCP registration: $($prev.command) $($prev.args)" }
                     else { Warn "Could not restore the previous pyrevit MCP registration ($($prev.command) $($prev.args))." }
@@ -621,15 +632,16 @@ if ($EnableAgent) {
             Save-Journal
             if ($prevReg) {
                 Say 'Replacing an existing pyrevit MCP registration that does not use the pyRevit 7 path.'
-                & $claude mcp remove pyrevit -s user 2>&1 | Out-Host
+                Invoke-Cli $claude @('mcp', 'remove', 'pyrevit', '-s', 'user') | Out-Host
             }
-            & $Py7 mcp install claude 2>&1 | Out-Host
-            $existing = (& $claude mcp get pyrevit 2>&1 | Out-String)
+            # pyrevit shells out to claude, so its stderr can carry the same 'not found' lines.
+            Invoke-Cli $Py7 @('mcp', 'install', 'claude') | Out-Host
+            $existing = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
             if ($existing -notmatch [regex]::Escape($Py7)) {
                 Say 'pyrevit mcp install did not register the full path; adding it directly.'
-                & $claude mcp remove pyrevit -s user 2>&1 | Out-Null
-                & $claude mcp add pyrevit -s user -- "$Py7" mcp 2>&1 | Out-Host
-                $existing = (& $claude mcp get pyrevit 2>&1 | Out-String)
+                Invoke-Cli $claude @('mcp', 'remove', 'pyrevit', '-s', 'user') | Out-Null
+                Invoke-Cli $claude @('mcp', 'add', 'pyrevit', '-s', 'user', '--', "$Py7", 'mcp') | Out-Host
+                $existing = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
             }
             if ($existing -notmatch [regex]::Escape($Py7)) { Warn 'Could not register the pyrevit MCP server with Claude Code.' }
             else { Say 'pyrevit MCP server registered with Claude Code (user scope).' }
@@ -676,7 +688,7 @@ if ($Verify) {
 
     $claude = Find-ClaudeCli
     if ($claude) {
-        $reg = (& $claude mcp get pyrevit 2>&1 | Out-String)
+        $reg = (Invoke-Cli $claude @('mcp', 'get', 'pyrevit') | Out-String)
         if ($reg -match [regex]::Escape($Py7)) { Say 'Claude Code MCP: pyrevit registered with the pyRevit 7 path.' }
         else { Warn 'Claude Code MCP: pyrevit is not registered with the pyRevit 7 path. Run -EnableAgent.' }
     } else { Warn 'Claude Code CLI not found; cannot check the MCP registration.' }
