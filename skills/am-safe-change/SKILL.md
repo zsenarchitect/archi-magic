@@ -34,7 +34,27 @@ For a change with no recipe yet, follow the same 8 steps. Write the read query, 
    - Then run the same script with `run_modify` (not dry run). Revit shows the user a Keep/Discard prompt. Tell the user to check the isolated elements and click Keep or Discard. The change is one undo entry named "Agent: <title>".
    - The dry run is mandatory for every model write. A preview shown in chat, or the user saying "apply" after a preview, does not skip it. When the user asks for a second group after the first (for example a second material group), run the full flow again from step 3, with its own dry run. A dry run from an earlier group never covers a later group.
    - Status `rejected` means the user clicked Discard. The model did not change. Stop there.
-8. **Verify.** Run the read script again with `run_query`. Compare the new values with the preview's "after" rows. Report "Matches preview" or list each difference.
+8. **Verify.** Run the read script again with `run_query`. Compare the new values with the preview's "after" rows. Report "Matches preview" or list each difference. Then end with the "Sync to Central hand-off" below. Do this after every kept change.
+
+## Sync to Central hand-off
+
+An agent run cannot synchronize with central. Revit blocks Synchronize with Central while a script runs, so the user must do it. "Central" is the shared model file that the team saves to.
+
+1. Check `doc.IsWorkshared` (in the read result, or with one `run_query`). If it is false, there is no central model. Tell the user to save the model, and stop here.
+2. Give the user these exact steps:
+   1. In Revit, click **Collaborate > Synchronize with Central > Synchronize and Modify Settings**.
+   2. Tick **Borrowed Elements**. This gives back the elements that the change borrowed.
+   3. Type a comment, for example "Agent: <title>".
+   4. Click **OK**.
+3. Offer a read-only check after the sync. Use AskUserQuestion: **Check the sync (Recommended)** / **Skip**.
+4. For the check, run one `run_query` on the changed element ids from the preview. For each id, read `WorksharingUtils.GetModelUpdatesStatus(doc, id)` and `WorksharingUtils.GetCheckoutStatus(doc, id)`. Report the counts. Then act on each result:
+   - `CurrentWithCentral` and `NotOwned`: the sync is complete. Say so.
+   - `OwnedByCurrentUser`: the elements are still borrowed. Tell the user to click **Collaborate > Relinquish All Mine**. Then offer the check again.
+   - `NotYetInCentral`: the change is not in central yet. Tell the user to do the sync steps again.
+   - `UpdatedInCentral`: central has a newer version. Tell the user to click **Collaborate > Reload Latest**, or to sync again.
+   - `OwnedByOtherUser`: another user owns the element. Report it only. Do not ask the user to take it.
+   - `DeletedInCentral`: report it, and ask the user what they expect.
+5. Never synchronize, relinquish or reload from a script. These are the user's actions.
 
 ## Rules
 
