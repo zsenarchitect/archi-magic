@@ -53,9 +53,10 @@ def main(argv):
             text, formats = read_note(argv[1])
             if cmd == "parse":
                 board = ib.parse_board(text, formats)
+                counts = ib.summary(board)
                 for i in board["issues"]:
                     del i["lines"]
-                out = {"summary": ib.summary(board), "header": board["header"],
+                out = {"summary": counts, "header": board["header"],
                        "issues": board["issues"], "warnings": board["warnings"]}
             elif cmd == "add":
                 out = ib.plan_add_issue(text, load(argv[2]), formats)
