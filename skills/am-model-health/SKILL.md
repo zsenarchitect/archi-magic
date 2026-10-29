@@ -1,6 +1,6 @@
 ---
 name: am-model-health
-description: Read-only health check of the open Revit model through the pyRevit Agent Runtime, as a short ranked report in plain words or as an interactive HTML dashboard with trends across saved snapshots. Checks Revit warnings by type, linked models (loaded, pinned, shared-coordinates hints), in-place families, unplaced, not-enclosed and redundant rooms, duplicate Marks, imported CAD, views not on sheets and file size. Use when the user asks "check my model", "model health", "is my model clean", "how many warnings", "BIM QC", "link status", "model dashboard", before a submission or when the model is slow. NOT for checking that required parameter values are filled in (use am-param-qa), NOT for worksets (use am-workset-audit), NOT for a Revit crash (use am-revit-crash-doctor), and NOT for setting up the Revit connection (use am-pyrevit7-setup).
+description: Read-only health check of the open Revit model through the pyRevit Agent Runtime, as a short ranked report in plain words or as an interactive HTML dashboard with trends across saved snapshots. Checks Revit warnings by type, linked models (loaded, pinned, shared-coordinates hints), in-place families, unplaced, not-enclosed and redundant rooms, duplicate Marks, a CAD link audit (path, status, personal sync folders, placement, views that show it), views not on sheets and file size. Use when the user asks "check my model", "model health", "is my model clean", "how many warnings", "BIM QC", "link status", "where are the DWG files", "CAD link audit", "model dashboard", before a submission or when the model is slow. NOT for checking that required parameter values are filled in (use am-param-qa), NOT for worksets (use am-workset-audit), NOT for a Revit crash (use am-revit-crash-doctor), and NOT for setting up the Revit connection (use am-pyrevit7-setup).
 ---
 
 # am-model-health
@@ -13,7 +13,7 @@ It drives the `pyrevit` MCP tools (the pyRevit Agent Runtime). If those tools ar
 
 - Call `get_context` first. Then call `get_skill("revit-scripting")` before you submit any script. The pyRevit server asks for both.
 - Use only `run_query` here (read-only, rolled back). Never use `run_modify` in this skill. If the user wants a fix, hand over to the matching pyRevit skill (`modeling`, `views`, `scheduling`, ...) as a separate task, with Keep/Discard approval in Revit.
-- Do not rewrite the check script. Read `scripts/model_health.py` in this skill's folder and pass its full text as the `script` argument of `run_query`. Optional `inputs`: `{"max_ids": 300, "top_warnings": 15}`.
+- Do not rewrite the check script. Read `scripts/model_health.py` in this skill's folder and pass its full text as the `script` argument of `run_query`. Optional `inputs`: `{"max_ids": 300, "top_warnings": 15, "cad_outlier_ft": 1000, "cad_many_views": 25, "cad_view_budget_s": 30}`.
 - The script runs on IronPython 2.7 (no f-strings). It reads ElementIds with `.Value` (Revit 2024+) and falls back to `.IntegerValue`.
 - If Revit answers `revit_busy`, read the open windows in the error first. If it names a dialog, stop. Tell the user which dialog blocks Revit, in plain words. Do not try again. Do not close windows. If it names another agent run or another client instead, wait 20 to 30 seconds and try again. Try at most 8 times, then stop and report. If the error names no windows, call `get_context` once, then stop and ask the user what is open in Revit.
 - If `list_revit_instances` returns an empty list after a pipe or connection error, Revit closed. Tell the user unsaved work may be lost. Offer to run `am-revit-crash-doctor` once Revit is closed. If `get_context` fails because no Revit answers, treat it the same way.
@@ -41,11 +41,33 @@ It drives the `pyrevit` MCP tools (the pyRevit Agent Runtime). If those tools ar
 | `rooms_redundant` | Rooms in "Multiple Rooms are in the same enclosed region" warnings (English Revit only) | 0 / 10 |
 | `duplicate_marks` | Model elements that share a Mark in the same category | 0 / 50 |
 | `cad_imported` | Imported (not linked) CAD | 0 / 5 |
-| `cad_linked` | Linked CAD | information |
+| `cad_links` | CAD instances (linked or imported) with at least one CAD flag (see "CAD link audit") | 0 / 3 |
 | `views_not_on_sheets` | Printable views and schedules that are not on a sheet | 150 / 400 |
 | `file_size` | Size of the local .rvt file, in MB | 300 / 600 |
 
 The two link hints are not proof. The Revit API has no simple "uses shared coordinates" flag. Say "hint" when you report them.
+
+### CAD link audit
+
+`result.cad_links[]` has one row for each CAD instance (`ImportInstance`): `name` (file name), `kind` (`linked` or `imported`), `path`, `path_kind`, `status`, `workset`, `pinned`, `view_specific`, `owner_view`, `origin_ft` and `rotation_deg` (insertion point and angle from `GetTotalTransform()`), `extent_ft` (bounding box width and depth), `views`, `creator` and `flags[]`.
+
+- `status` is `Loaded`, `NotFound`, another Revit link status (for example `Unloaded`), `unreadable` (the path could not be read, or Revit returned no path) or `Imported` (no file reference).
+- `views` is the number of model views (plans, sections, elevations, 3D) that show a model-level instance. A view-specific instance counts its owner view only. `result.cad_view_count` tells how many views were checked. If `partial` is true, the time limit (`cad_view_budget_s`) stopped the count: say that the counts are lower bounds.
+
+| Flag | Meaning | Suggested fix (never done by this skill) |
+|---|---|---|
+| `personal OneDrive/SharePoint path` | The path is in `C:\Users\<name>\OneDrive...` | Move the file to the shared document store (for example ACC), then link it again. Do this by hand. |
+| `personal folder path` | The path is in another folder of one person's profile (`C:\Users\<name>\<company>\...`, Desktop, Downloads) | Same as above. Use `creator` to find the person. |
+| `file not found` | Revit cannot find the file | Repath by hand, or remove the link. |
+| `path unreadable` | Revit gave no readable path | Open Manage Links and check the link by hand. |
+| `not loaded (...)` | Another link status, for example Unloaded | Reload or remove the link. |
+| `not pinned` | Anybody can move it by accident | Pin it (`am-safe-change`). |
+| `not on a CAD workset` | Model-level instance on a workset without "CAD" in its name (workshared models only) | Move it to the CAD links workset (`am-safe-change`). |
+| `far from the other CAD links` | Insertion point more than `cad_outlier_ft` (default 1,000 ft) from the median of the other model-level CAD instances, and from each of them (3 or more instances needed) | Check the placement with the file owner. |
+| `same file placed more than once` | Same file name twice at model level, or twice in one view | Delete the extra copy. A full and a reduced copy of one file have different names; the check does not find them. |
+| `shows in N views` | A model-level instance shows in `cad_many_views` (default 25) views or more | Hide it in the views that do not need it (`am-safe-change`, view graphics). |
+
+The audit is read only. Give the fixes as suggestions only. Each model change goes through `am-safe-change` with Keep/Discard in Revit.
 
 ## Step 1: Ask which output (only if the user did not say)
 
