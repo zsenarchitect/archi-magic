@@ -1,6 +1,6 @@
 ---
 name: am-model-health
-description: Read-only health check of the open Revit model through the pyRevit Agent Runtime, as a short ranked report in plain words or as an interactive HTML dashboard with trends across saved snapshots. Checks Revit warnings by type, linked models (loaded, pinned, shared-coordinates hints), in-place families, unplaced, not-enclosed and redundant rooms, duplicate Marks, a CAD link audit (path, status, personal sync folders, placement, views that show it), views not on sheets and file size. Use when the user asks "check my model", "model health", "is my model clean", "how many warnings", "BIM QC", "link status", "where are the DWG files", "CAD link audit", "model dashboard", before a submission or when the model is slow. NOT for checking that required parameter values are filled in (use am-param-qa), NOT for worksets (use am-workset-audit), NOT for a Revit crash (use am-revit-crash-doctor), and NOT for setting up the Revit connection (use am-pyrevit7-setup).
+description: Read-only health check of the open Revit model through the pyRevit Agent Runtime, as a short ranked report in plain words or as an interactive HTML dashboard with trends across saved snapshots. Checks Revit warnings by type, linked models (loaded, pinned, shared-coordinates hints), in-place families, unplaced, not-enclosed and redundant rooms, duplicate Marks, a CAD link audit (path, status, personal sync folders, placement, views that show it), views with heavy 2D content ranked by severity, views not on sheets and file size. Use when the user asks "check my model", "model health", "is my model clean", "how many warnings", "BIM QC", "link status", "where are the DWG files", "CAD link audit", "heavy 2D views", "model dashboard", before a submission or when the model is slow. NOT for checking that required parameter values are filled in (use am-param-qa), NOT for worksets (use am-workset-audit), NOT for a Revit crash (use am-revit-crash-doctor), and NOT for setting up the Revit connection (use am-pyrevit7-setup).
 ---
 
 # am-model-health
@@ -17,6 +17,8 @@ It drives the `pyrevit` MCP tools (the pyRevit Agent Runtime). If those tools ar
 - The script runs on IronPython 2.7 (no f-strings). It reads ElementIds with `.Value` (Revit 2024+) and falls back to `.IntegerValue`.
 - If Revit answers `revit_busy`, read the open windows in the error first. If it names a dialog, stop. Tell the user which dialog blocks Revit, in plain words. Do not try again. Do not close windows. If it names another agent run or another client instead, wait 20 to 30 seconds and try again. Try at most 8 times, then stop and report. If the error names no windows, call `get_context` once, then stop and ask the user what is open in Revit.
 - If `list_revit_instances` returns an empty list after a pipe or connection error, Revit closed. Tell the user unsaved work may be lost. Offer to run `am-revit-crash-doctor` once Revit is closed. If `get_context` fails because no Revit answers, treat it the same way.
+- Never report `<Sketch>` lines, "Automatic Sketch Dimensions" or elements with no category as bloat or as a finding. They are normal, passive elements. The script does not count them; do not add them from another query.
+- Do not say "exploded CAD" from 2D counts alone. Say it only as a possibility, and only when a view row has `cad_layer_styles` above 0 (its top line styles look like CAD layer names).
 - This check reads the whole model by design. The query-budget rule in `am-revit-api-docs` does not apply to it. Its `check_duplicate_marks` step reads every element once, but it reads only one parameter per element.
 - Tell the user to save or sync before you run the check.
 - If `result.error` is `no_project_document`, ask the user to open a project model (not a family) and run again.
@@ -42,10 +44,21 @@ It drives the `pyrevit` MCP tools (the pyRevit Agent Runtime). If those tools ar
 | `duplicate_marks` | Model elements that share a Mark in the same category | 0 / 50 |
 | `cad_imported` | Imported (not linked) CAD | 0 / 5 |
 | `cad_links` | CAD instances (linked or imported) with at least one CAD flag (see "CAD link audit") | 0 / 3 |
+| `heavy_2d_views` | Views with 250 or more 2D elements (see "Heavy 2D views") | 0 / 10 |
 | `views_not_on_sheets` | Printable views and schedules that are not on a sheet | 150 / 400 |
 | `file_size` | Size of the local .rvt file, in MB | 300 / 600 |
 
 The two link hints are not proof. The Revit API has no simple "uses shared coordinates" flag. Say "hint" when you report them.
+
+### Heavy 2D views
+
+`result.heavy_2d_views[]` lists the ranked views, worst first. `result.heavy_2d_summary` has the totals (`critical`, `high`, `medium`, `views_with_2d`, `on_sheet`, `archive`, `near_duplicate`, `line_heavy`, `by_creator`, `seconds`).
+
+- The script counts view-specific elements per view (`OwnerViewId`) with one collector per category: lines (`OST_Lines`), detail items (`OST_DetailComponents`, filled regions included and also counted separately), text notes and dimensions. It skips `<Sketch>` lines, sketch dimensions and elements with no category.
+- Severity: **Critical** 1,000 or more 2D elements in one view, **High** 500 to 999, **Medium** 250 to 499.
+- Signals in each row: `line_share` (`line_heavy` at 85% lines or more), `filled_regions`, `sheet` (sheet number when the view is on a sheet), `archive` (name starts with `ARCHIVE_`), `same_counts_as` (other views with exactly the same counts, likely copies), `creator`, `top_line_styles` (3) and `cad_layer_styles`.
+- Report them grouped: by pattern (ARCHIVE views, copies with the same counts) and by `creator`.
+- A view on a sheet is part of a printed drawing. Tell the user before they delete or clean it. Fixes go through `am-safe-change`.
 
 ### CAD link audit
 

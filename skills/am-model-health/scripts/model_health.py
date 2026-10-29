@@ -521,6 +521,211 @@ def count_cad_views(model_level):
     return counts, stats
 
 
+# ---------------------------------------------------------------------------
+# Heavy 2D views (issue #61). Pure functions first (unit tested in tests/), then the Revit reader.
+# Never count <Sketch> lines, Automatic Sketch Dimensions or elements with no category:
+# they are normal, passive elements, not bloat.
+# ---------------------------------------------------------------------------
+SEVERITY_2D = (("Critical", 1000), ("High", 500), ("Medium", 250))
+LINE_HEAVY_SHARE = 0.85
+_NOT_BLOAT_CATEGORIES = ("<sketch>", "sketch lines", "automatic sketch dimensions")
+_NOT_BLOAT_STYLES = ("<sketch>",)
+_CAD_LAYER = re.compile(r"(\$0\$|\||^[A-Z]{1,2}-[A-Z0-9]{2,6}(-[A-Z0-9]{2,6})*$)")
+
+
+def severity_2d(total):
+    """Critical 1,000+, High 500-999, Medium 250-499, else None."""
+    for label, floor in SEVERITY_2D:
+        if total >= floor:
+            return label
+    return None
+
+
+def counts_as_2d(category_name, style_name=""):
+    """False for elements that must never be reported as 2D bloat."""
+    if not category_name:
+        return False  # no category
+    if category_name.strip().lower() in _NOT_BLOAT_CATEGORIES:
+        return False
+    if (style_name or "").strip().lower() in _NOT_BLOAT_STYLES:
+        return False
+    return True
+
+
+def is_archive_name(name):
+    return (name or "").strip().upper().startswith("ARCHIVE_")
+
+
+def cad_layer_like(style_name):
+    """True when a line style name looks like a CAD layer (A-WALL, X-REF$0$LAYER, xref|layer).
+    Only then may a report say the lines may come from exploded CAD."""
+    return bool(_CAD_LAYER.search((style_name or "").strip()))
+
+
+def top_items(counter, n=3):
+    """[(name, count)] of the n biggest counts, ties by name."""
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def view_2d_row(view_id, name, counts, styles=None, sheet=None, creator=""):
+    """One view row. counts: lines, detail_items (filled regions included), filled_regions,
+    text_notes, dimensions."""
+    lines = counts.get("lines", 0)
+    total = lines + counts.get("detail_items", 0) + counts.get("text_notes", 0) + counts.get("dimensions", 0)
+    share = (float(lines) / total) if total else 0.0
+    top = top_items(styles or {}, 3)
+    return {
+        "id": view_id, "name": name, "total": total,
+        "lines": lines, "detail_items": counts.get("detail_items", 0),
+        "filled_regions": counts.get("filled_regions", 0),
+        "text_notes": counts.get("text_notes", 0), "dimensions": counts.get("dimensions", 0),
+        "line_share": round(share, 3), "line_heavy": total > 0 and share >= LINE_HEAVY_SHARE,
+        "severity": severity_2d(total), "sheet": sheet or "", "archive": is_archive_name(name),
+        "creator": creator or "",
+        "top_line_styles": [{"name": k, "count": v} for k, v in top],
+        "cad_layer_styles": len([k for k, _ in top if cad_layer_like(k)]),
+        "same_counts_as": 0,
+    }
+
+
+def _count_key(r):
+    return (r["lines"], r["detail_items"], r["filled_regions"], r["text_notes"], r["dimensions"])
+
+
+def mark_near_duplicates(rows):
+    """Set same_counts_as = number of OTHER views with exactly the same counts."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(_count_key(r), []).append(r)
+    for g in groups.values():
+        for r in g:
+            r["same_counts_as"] = len(g) - 1 if r["total"] else 0
+    return rows
+
+
+def rank_heavy_views(rows):
+    """Views with a severity, worst first."""
+    order = dict((label, i) for i, (label, _) in enumerate(SEVERITY_2D))
+    ranked = [r for r in rows if r["severity"]]
+    ranked.sort(key=lambda r: (order[r["severity"]], -r["total"], r["name"]))
+    return ranked
+
+
+def heavy_view_label(r):
+    """Plain-words label for one ranked view. Never says "exploded CAD"."""
+    bits = ["lines %d%%" % int(round(r["line_share"] * 100))]
+    if r["line_heavy"]:
+        bits.append("line-heavy")
+    if r["filled_regions"]:
+        bits.append("%d filled regions" % r["filled_regions"])
+    bits.append("on sheet %s" % r["sheet"] if r["sheet"] else "not on a sheet")
+    if r["archive"]:
+        bits.append("ARCHIVE view")
+    if r["same_counts_as"]:
+        bits.append("same counts as %d other view(s)" % r["same_counts_as"])
+    if r["cad_layer_styles"]:
+        bits.append("line styles look like CAD layers")
+    if r["creator"]:
+        bits.append("by " + r["creator"])
+    styles = ", ".join([s["name"] for s in r["top_line_styles"]])
+    if styles:
+        bits.append("top styles: " + styles)
+    return "%s: %s - %d 2D elements (%s)" % (r["severity"], r["name"], r["total"], "; ".join(bits))
+
+
+def summarize_heavy(rows, ranked):
+    by_sev = dict((label, 0) for label, _ in SEVERITY_2D)
+    by_creator = {}
+    for r in ranked:
+        by_sev[r["severity"]] += 1
+        k = r["creator"] or "(unknown)"
+        by_creator[k] = by_creator.get(k, 0) + 1
+    return {
+        "views_with_2d": len([r for r in rows if r["total"]]),
+        "critical": by_sev["Critical"], "high": by_sev["High"], "medium": by_sev["Medium"],
+        "on_sheet": len([r for r in ranked if r["sheet"]]),
+        "archive": len([r for r in ranked if r["archive"]]),
+        "near_duplicate": len([r for r in ranked if r["same_counts_as"]]),
+        "line_heavy": len([r for r in ranked if r["line_heavy"]]),
+        "by_creator": by_creator,
+    }
+
+
+def _style_name(e, cache):
+    try:
+        p = e.get_Parameter(DB.BuiltInParameter.BUILDING_CURVE_GSTYLE)
+        sid = p.AsElementId() if p is not None else None
+        if sid is None:
+            return ""
+        k = eid(sid)
+        if k not in cache:
+            gs = doc.GetElement(sid)  # noqa: F821
+            cache[k] = safe_name(gs) if gs is not None else ""
+        return cache[k]
+    except Exception:
+        return ""
+
+
+def read_heavy_2d():
+    """Per-view 2D counts from four per-category collectors, grouped by OwnerViewId."""
+    t0 = time.time()
+    invalid = DB.ElementId.InvalidElementId
+    per = {}
+    view_ids = {}
+    styles = {}
+    style_cache = {}
+    sketch_cat = int(DB.BuiltInCategory.OST_SketchLines)
+
+    def bump(vid, key):
+        c = per.setdefault(vid, {})
+        c[key] = c.get(key, 0) + 1
+
+    cats = (("lines", DB.BuiltInCategory.OST_Lines), ("detail_items", DB.BuiltInCategory.OST_DetailComponents),
+            ("text_notes", DB.BuiltInCategory.OST_TextNotes), ("dimensions", DB.BuiltInCategory.OST_Dimensions))
+    for key, bic in cats:
+        for e in DB.FilteredElementCollector(doc).OfCategory(bic).WhereElementIsNotElementType():  # noqa: F821
+            ov = e.OwnerViewId
+            if ov is None or ov == invalid:
+                continue  # model element, not 2D
+            cat = e.Category
+            if cat is None or eid(cat.Id) == sketch_cat:
+                continue
+            style = _style_name(e, style_cache) if key == "lines" else ""
+            if not counts_as_2d(cat.Name, style):
+                continue
+            vid = eid(ov)
+            view_ids[vid] = ov
+            bump(vid, key)
+            if key == "lines":
+                s = styles.setdefault(vid, {})
+                s[style or "(none)"] = s.get(style or "(none)", 0) + 1
+            elif key == "detail_items" and isinstance(e, DB.FilledRegion):
+                bump(vid, "filled_regions")
+    sheet_of = {}
+    for vp in collect(cls=DB.Viewport):
+        try:
+            sh = doc.GetElement(vp.SheetId)  # noqa: F821
+            sheet_of[eid(vp.ViewId)] = sh.SheetNumber if sh is not None else ""
+        except Exception:
+            pass
+    rows = []
+    for vid, counts in per.items():
+        v = doc.GetElement(view_ids[vid])  # noqa: F821
+        name = safe_name(v) if v is not None else "(view %d)" % vid
+        sheet = sheet_of.get(vid)
+        if isinstance(v, DB.ViewSheet):
+            sheet = v.SheetNumber  # 2D drawn on the sheet itself is part of the printed drawing too
+        rows.append(view_2d_row(vid, name, counts, styles.get(vid), sheet))
+    mark_near_duplicates(rows)
+    ranked = rank_heavy_views(rows)
+    if doc.IsWorkshared:  # noqa: F821
+        for r in ranked:
+            r["creator"] = _creator(view_ids[r["id"]])
+    summary = summarize_heavy(rows, ranked)
+    summary["seconds"] = round(time.time() - t0, 1)
+    return ranked, summary
+
+
 def check_views():
     views = [v for v in collect(cls=DB.View) if not v.IsTemplate]
     sheets = [v for v in views if isinstance(v, DB.ViewSheet)]
@@ -619,6 +824,15 @@ else:
                           % (len(cad_rows), " View counts are partial (time limit)." if cad_view_stats["partial"] else ""),
                           cad_link_details(cad_rows)))
 
+    h_ranked, h_summary = read_heavy_2d()
+    metrics.append(metric("heavy_2d_views", "Views with heavy 2D content", len(h_ranked), 0, 10,
+                          "%d Critical (1,000+), %d High (500-999), %d Medium (250-499) of %d views with 2D. "
+                          "%d of them are on sheets: a cleanup there changes a printed drawing. Ask before you delete."
+                          % (h_summary["critical"], h_summary["high"], h_summary["medium"],
+                             h_summary["views_with_2d"], h_summary["on_sheet"]),
+                          [{"label": heavy_view_label(r), "count": r["total"], "ids": [r["id"]]}
+                           for r in h_ranked[:MAX_ROWS]]))
+
     v_all, v_sheets, v_loose = check_views()
     metrics.append(metric("views_not_on_sheets", "Views not on sheets", len(v_loose), 150, 400,
                           "%d views and %d sheets in total. Delete views you do not need." % (len(v_all), len(v_sheets)),
@@ -640,6 +854,8 @@ else:
         "metrics": metrics,
         "cad_links": cad_rows[:MAX_ROWS],
         "cad_view_count": cad_view_stats,
+        "heavy_2d_views": h_ranked[:MAX_ROWS],
+        "heavy_2d_summary": h_summary,
     }
     result = jsonable(result)
     bad = len([m for m in metrics if m["status"] == "bad"])
