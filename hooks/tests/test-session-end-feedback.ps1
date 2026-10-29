@@ -16,7 +16,10 @@ function Invoke-Hook([string]$transcript, [string]$feedback, [string[]]$extra = 
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 function Invoke-HookJson([string]$json, [string]$feedback) {
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Hook -HookInputJson $json -FeedbackFile $feedback 2>&1 | Out-String
+    # Call the hook the way hooks/hooks.json does: hook JSON on stdin, script called in-process.
+    # Passing the JSON as a native argument loses its double quotes under Windows PowerShell 5.1 (#67).
+    $cmd = "`$in = [Console]::In.ReadToEnd(); & '$Hook' -HookInputJson `$in -FeedbackFile '$feedback'; exit `$LASTEXITCODE"
+    $out = $json | & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 function Assert-True([string]$name, [bool]$ok, [string]$detail) {
