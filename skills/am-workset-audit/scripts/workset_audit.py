@@ -6,13 +6,19 @@ Adapted from Utopia5327/claude-plugin-for-revit-bim skills/workset-manager (MIT)
 rewritten for pyRevit (no Dynamo DocumentManager / IN / OUT).
 
 inputs (all optional):
-  rules                 list of rule ids to apply. Default: ["links", "levels_grids", "workset1"]
+  rules                 list of rule ids to apply.
+                          Default: ["links", "cad_links", "levels_grids", "workset1"]
                           "links"         Revit link instances not on the links workset
+                          "cad_links"     CAD links and imports (ImportInstance) not on the CAD
+                                          links workset. View-specific CAD is skipped: its
+                                          workset is the view workset and cannot be changed.
                           "levels_grids"  levels and grids not on the levels-and-grids workset
                           "workset1"      model elements left on the default workset (report only)
                           "categories"    elements whose category is in category_map but sit
                                           on another workset
   links_workset         target workset for links: workset id (int, preferred) or exact name
+  cad_links_workset     target workset for CAD links: workset id or exact name. Default: the one
+                          user workset whose name has the word "CAD" (not "Facade")
   levels_grids_workset  target workset for levels and grids: workset id or exact name
   default_workset       default workset: id or name. Default: "Workset1"
   category_map          {"OST_Walls": 1234 or "Exterior", ...}: BuiltInCategory name -> workset
@@ -21,9 +27,18 @@ inputs (all optional):
   max_items             cap on listed findings. Default: 500
 
 result: worksets with element counts, findings, and "moves" (only movable elements) in the
-exact shape that workset_fix.py takes as its "moves" input.
+exact shape that workset_fix.py takes as its "moves" input. "cad_links_skipped" lists the
+view-specific CAD elements that the cad_links rule does not move.
+
+The pure functions (name_has, match_workset, split_cad) use no Revit API, so the tests in
+../tests can import this file outside Revit.
 """
-from pyrevit.api import DB
+import re
+
+try:
+    from pyrevit.api import DB
+except ImportError:  # outside Revit (tests). The audit itself runs only when DB exists.
+    DB = None
 
 try:
     inputs
@@ -40,29 +55,65 @@ def eid_int(element_id):
         return int(element_id.IntegerValue)
 
 
-def find_workset(worksets, wanted, hints, prefer=None):
-    """wanted may be a workset id (int) or an exact, case-insensitive name; with no wanted,
-    guess by hint substrings. When several match, a single one that also matches a `prefer`
-    substring wins (for example "2_RVT Links" over "3_CAD Links" for Revit links).
-    Returns (workset or None, list of candidate names)."""
+def name_has(name, hint, word=False):
+    """Case-insensitive test. word=True needs the hint as a whole word, so "cad" matches
+    "3_CAD Links" and "Links-CAD" but not "Facade" or "Arcade"."""
+    name = name.lower()
+    if not word:
+        return hint in name
+    return re.search(r"(?<![a-z])" + re.escape(hint) + r"(?![a-z])", name) is not None
+
+
+def match_workset(pairs, wanted, hints, prefer=None, word=False):
+    """Pure target matching. pairs: list of (workset id int, name).
+    wanted may be a workset id (int) or an exact, case-insensitive name; with no wanted,
+    guess by hints (substrings, or whole words when word=True). When several match, a
+    single one that also matches a `prefer` substring wins (for example "2_RVT Links" over
+    "3_CAD Links" for Revit links). When none or several match, the target is None so the
+    skill asks the user. Returns (workset id or None, list of candidate names)."""
     if isinstance(wanted, int) and not isinstance(wanted, bool):
-        for ws in worksets:
-            if eid_int(ws.Id) == wanted:
-                return ws, [ws.Name]
+        for wid, name in pairs:
+            if wid == wanted:
+                return wid, [name]
         return None, []
     if wanted:
-        for ws in worksets:
-            if ws.Name.lower() == wanted.lower():
-                return ws, [ws.Name]
+        for wid, name in pairs:
+            if name.lower() == wanted.lower():
+                return wid, [name]
         return None, []
-    cands = [ws for ws in worksets if any(h in ws.Name.lower() for h in hints)]
+    cands = [(wid, name) for wid, name in pairs if any(name_has(name, h, word) for h in hints)]
     if len(cands) == 1:
-        return cands[0], [cands[0].Name]
+        return cands[0][0], [cands[0][1]]
     if len(cands) > 1 and prefer:
-        best = [ws for ws in cands if any(p in ws.Name.lower() for p in prefer)]
+        best = [c for c in cands if any(name_has(c[1], p) for p in prefer)]
         if len(best) == 1:
-            return best[0], [c.Name for c in cands]
-    return None, [c.Name for c in cands]
+            return best[0][0], [c[1] for c in cands]
+    return None, [c[1] for c in cands]
+
+
+def split_cad(items, target_id):
+    """Pure decision for the cad_links rule. items: list of (element id, workset id,
+    view_specific). Returns (off_target ids, skipped list). A view-specific element is
+    always skipped with the reason "view workset", because its workset follows its view.
+    With no target (target_id None), every other element is off target, so the audit
+    lists it with "no target workset chosen"."""
+    off, skipped = [], []
+    for eid, ws_id, view_specific in items:
+        if view_specific:
+            skipped.append({"element_id": eid, "reason": "view workset"})
+        elif target_id is None or ws_id != target_id:
+            off.append(eid)
+    return off, skipped
+
+
+def find_workset(worksets, wanted, hints, prefer=None, word=False):
+    """match_workset on Workset objects. Returns (workset or None, list of candidate names)."""
+    pairs = [(eid_int(ws.Id), ws.Name) for ws in worksets]
+    wid, cands = match_workset(pairs, wanted, hints, prefer, word)
+    for ws in worksets:
+        if wid is not None and eid_int(ws.Id) == wid:
+            return ws, cands
+    return None, cands
 
 
 def movable(el):
@@ -89,7 +140,7 @@ def main():
         return {"status": "not_workshared", "document": doc.Title,
                 "message": "This model is not workshared. It has no worksets to audit."}
 
-    rules = inputs.get("rules") or ["links", "levels_grids", "workset1"]
+    rules = inputs.get("rules") or ["links", "cad_links", "levels_grids", "workset1"]
     max_items = int(inputs.get("max_items") or 500)
     default_name = inputs.get("default_workset") or "Workset1"
 
@@ -141,13 +192,19 @@ def main():
             "reason": why if not ok else ("" if target else "no target workset chosen"),
         }
 
-    def rule_by_class(rule, cls_list, wanted, hints, prefer=None):
-        target, cands = find_workset(worksets, wanted, hints, prefer)
-        targets[rule] = {"target": target.Name if target else None, "candidates": cands}
+    def pick_target(rule, wanted, hints, prefer=None, word=False):
+        target, cands = find_workset(worksets, wanted, hints, prefer, word)
+        targets[rule] = {"target": target.Name if target else None,
+                         "target_id": eid_int(target.Id) if target else None,
+                         "candidates": cands}
         if target is None:
             notes.append("%s: no single target workset found. Candidates: %s. Pass the exact name."
                          % (rule, ", ".join(cands) if cands else "none"))
         warn_closed(rule, target)
+        return target
+
+    def rule_by_class(rule, cls_list, wanted, hints, prefer=None):
+        target = pick_target(rule, wanted, hints, prefer)
         for cls in cls_list:
             for el in DB.FilteredElementCollector(doc).OfClass(cls):
                 if target is None or el.WorksetId != target.Id:
@@ -155,6 +212,27 @@ def main():
 
     if "links" in rules:
         rule_by_class("links", [DB.RevitLinkInstance], inputs.get("links_workset"), ["link"], ["rvt", "revit"])
+    cad_skipped = None
+    if "cad_links" in rules:
+        target = pick_target("cad_links", inputs.get("cad_links_workset"), ["cad"], ["link"], word=True)
+        cad_els = {}
+        rows = []
+        for el in DB.FilteredElementCollector(doc).OfClass(DB.ImportInstance):
+            key = eid_int(el.Id)
+            cad_els[key] = el
+            rows.append((key, eid_int(el.WorksetId), bool(el.ViewSpecific)))
+        off, cad_skipped = split_cad(rows, eid_int(target.Id) if target else None)
+        for key in off:
+            add(cad_els[key], "cad_links", target)
+        for item in cad_skipped:
+            el = cad_els[item["element_id"]]
+            cur = ws_by_int.get(eid_int(el.WorksetId))
+            item["name"] = el.Name or ""
+            item["linked"] = bool(el.IsLinked)
+            item["workset"] = cur.Name if cur else "(view workset)"
+            view = doc.GetElement(el.OwnerViewId)
+            item["view"] = view.Name if view is not None else ""
+
     if "levels_grids" in rules:
         rule_by_class("levels_grids", [DB.Level, DB.Grid],
                       inputs.get("levels_grids_workset"), ["level", "grid"])
@@ -207,6 +285,8 @@ def main():
         "not_movable_count": len(items) - len(moves),
         "findings": items[:max_items], "findings_truncated": len(items) > max_items,
         "moves": moves, "workset1": workset1, "notes": notes,
+        "cad_links_skipped": cad_skipped,
+        "cad_links_skipped_count": len(cad_skipped) if cad_skipped is not None else None,
     }
 
 def ascii_safe(obj):
@@ -226,5 +306,6 @@ def ascii_safe(obj):
     return obj
 
 
-result = ascii_safe(main())
-print("am-workset-audit: %s" % result.get("status"))
+if DB is not None:
+    result = ascii_safe(main())
+    print("am-workset-audit: %s" % result.get("status"))
