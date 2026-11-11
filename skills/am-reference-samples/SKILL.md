@@ -96,6 +96,27 @@ Open `legend.html`. The sketch and table use the layer order in Revit. A vertica
 
 Check the width result for each type. Review any missing width, unresolved material, or mismatch. Exit 1 means the preview contains blocking warnings. Exit 2 means the snapshot could not be read. The HTML is a local snapshot of the selected scope.
 
+### Create the reviewed drafting view
+
+1. Follow am-safe-change. Choose a new view name, a drafting view type, and a text note type. Use a drafting type without a view template. Read the same scope again. Add `view_name`, `drafting_type_id`, and `text_type_id` to the request. Use decimal strings for the IDs.
+2. Compute the preview again. Show the layer legend and the standard change preview. Stop if a warning blocks creation. The recipe creates one drafting view and its annotations. There are zero existing write targets.
+3. Run `scripts/create_compound_legend.py` with `run_modify` in dry-run mode. Set the scripts directory as the workspace. Pass `mode` as `"apply"`. Pass `plan` from `legend.json` and the contents of `preview.json` as `preview`.
+4. Save the full dry-run result as `dry-run.json`. Repeat the original read and save it as `fresh-read.json`. Run both checks.
+
+   ```sh
+   python3 compound_legend_preview.py dry-run.json legend.json --check side-effects
+   python3 compound_legend_preview.py fresh-read.json legend.json --check baseline
+   ```
+
+5. Check the current document and policy. Follow am-safe-change approval rules. Run the same approved input with `run_modify`. Use Keep or Discard in Revit.
+6. After Keep, run `scripts/create_compound_legend.py` with `run_query`. Pass `mode` as `"verify"` and the kept `view_id` and `view_uid` from `legend_json`. Save the new result as `verify.json`. Compare it with the kept run.
+
+   ```sh
+   python3 compound_legend_preview.py verify.json legend.json --check compare --kept-receipt kept.json
+   ```
+
+7. After Discard, repeat the original read and run the baseline check. The view name must still be available.
+
 ## Not verified
 
 - No live Revit run. The tests use fixture data only.

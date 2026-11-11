@@ -22,6 +22,10 @@ MAX_TYPES = 100
 MAX_LAYERS = 1000
 MAX_BYTES = 1024 * 1024
 MAX_SELECTED = 500
+MAX_DETAILS = 2000
+VIEW_SCALE = 10
+SKETCH_LENGTH_FT = 2.0
+MEMBRANE_MARK_FT = 0.25
 CATEGORIES = ("Wall", "Floor")
 
 
@@ -147,7 +151,113 @@ def compute(snapshot):
     }
     return {"preview": shown, "plan": {"recipe": "compound_type_legend", "basis": basis,
                                      "request": request, "types": checks, "target": snapshot.get("target"),
-                                     "excluded": snapshot.get("excluded", [])}}
+                                     "excluded": snapshot.get("excluded", []),
+                                     "project": snapshot.get("project")}}
+
+
+def section_size(item):
+    thickness = item["section_sum_ft"]
+    return (thickness, SKETCH_LENGTH_FT) if item["category"] == "Wall" else (SKETCH_LENGTH_FT, thickness)
+
+
+def section_lines(item, top=0.0):
+    layers = item.get("slice", item)["layers"]
+    across, down = section_size(item)
+    bottom = top - down
+    lines = [
+        ((0.0, top), (across, top)), ((0.0, bottom), (across, bottom)),
+        ((0.0, bottom), (0.0, top)), ((across, bottom), (across, top)),
+    ]
+    widths = []
+    for layer in layers:
+        offset = math.fsum(widths)
+        if layer["width_ft"] == 0:
+            if item["category"] == "Wall":
+                lines.append(((offset, top), (offset, top + MEMBRANE_MARK_FT)))
+            else:
+                lines.append(((-MEMBRANE_MARK_FT, top - offset), (0.0, top - offset)))
+        elif 0 < offset < item["section_sum_ft"]:
+            if item["category"] == "Wall":
+                lines.append(((offset, bottom), (offset, top)))
+            else:
+                lines.append(((0.0, top - offset), (across, top - offset)))
+        widths.append(layer["width_ft"])
+    return sorted({tuple(sorted(segment)) for segment in lines})
+
+
+def note_text(item):
+    def clean(value):
+        return u" ".join(value.split()).replace(u"|", u"/")
+
+    def table_rows(layers):
+        rows = [u"Layer | Material | Function | Thickness"]
+        for index, layer in enumerate(layers, 1):
+            flag = u" (variable nominal)" if layer["variable"] else u""
+            if layer["width_ft"] == 0:
+                flag += u" (zero width)"
+            rows.append(u"%d | %s | %s | %s%s" %
+                        (index, clean(layer["material"]), clean(layer["function"]),
+                         dimension(layer["width_ft"]), flag))
+        return rows
+
+    sample = item.get("slice")
+    lines = [
+        u"%s | %s | Type ID %s | %d instances" %
+        (item["category"], clean(item["name"]), item["id"], item["instances"]),
+        u"Nominal type width %s | Section layer sum %s | Reference %s" %
+        (dimension(item["width_ft"]), dimension(item["section_sum_ft"]),
+         dimension(item["section_reference_ft"])),
+        u"Exterior to interior" if item["category"] == "Wall" else u"Top to bottom",
+    ]
+    if sample:
+        lines.append(u"Sample at %s above base | Nominal grid width %s | Nominal layer sum %s" %
+                     (dimension(sample["height_ft"]), dimension(item["grid_width_ft"]),
+                      dimension(item["nominal_sum_ft"])))
+    lines.extend(table_rows(sample["layers"] if sample else item["layers"]))
+    if sample:
+        lines.extend([u"Nominal layers"] + table_rows(item["layers"]))
+    return u"\r".join(lines)
+
+
+def receipt_from(record):
+    result = record.get("result", record)
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        raise ValueError("Read the complete successful legend creation or verification result.")
+    return json.loads(result["legend_json"])
+
+
+def verify_contents(plan, receipt):
+    request = plan["request"]
+    if (receipt["project"] != plan["project"] or receipt["name"] != request["view_name"]
+            or receipt["drafting_type_id"] != request["drafting_type_id"] or receipt["scale"] != VIEW_SCALE):
+        raise ValueError("The verified drafting view does not match the approved plan.")
+    positive_id(receipt["view_id"])
+    if not receipt["view_uid"]:
+        raise ValueError("The drafting view has no verified identity.")
+    contents = receipt["contents"]
+    ids = {positive_id(item["id"]) for item in contents}
+    if len(ids) != len(contents) or receipt["view_id"] in ids:
+        raise ValueError("The drafting view element inventory is ambiguous.")
+    notes = sorted(item["text"] for item in contents if item["kind"] == "note")
+    lines = [item for item in contents if item["kind"] == "line"]
+    planned_notes = sorted(note_text(item).replace(u"\r", u"\n") for item in plan["types"])
+    planned_lines = sum(len(section_lines(item)) for item in plan["types"])
+    if (len(contents) != len(notes) + len(lines) or notes != planned_notes or len(lines) != planned_lines
+            or any(item["type_id"] != request["text_type_id"] for item in contents if item["kind"] == "note")):
+        raise ValueError("The drafting view does not contain the reviewed layer tables and section line counts.")
+    return ids | {receipt["view_id"]}
+
+
+def verify_dry_run(plan, record):
+    ids = verify_contents(plan, receipt_from(record))
+    changes = record.get("changes") or {}
+    added = changes.get("added_ids")
+    if added is None:
+        added = [item["id"] for item in changes.get("added", [])]
+    if (changes.get("added_count") != len(ids) or {str(item) for item in added} != ids
+            or changes.get("modified_count") != 0 or changes.get("deleted_count") != 0
+            or changes.get("other_documents")):
+        raise ValueError("Dry-run telemetry does not establish creation of only the reviewed view and its contents.")
 
 
 def render_html(artifact):
@@ -228,7 +338,7 @@ th,td{text-align:left;padding:.4rem;border-bottom:1px solid GrayText;overflow-wr
 @media print{.layer{print-color-adjust:exact}}
 </style><h1>Compound wall and floor legend</h1>
 <p>Type sections share a scale within each orientation. Width checks use unrounded source values.</p>
-""" + "<p>Scope: " + scope + "</p>" + "\n".join(sections) + omitted + "</html>\n"
+""" + "<p>Scope includes " + scope + "</p>" + "\n".join(sections) + omitted + "</html>\n"
 
 
 def load(path):
@@ -254,9 +364,26 @@ def main():
     parser.add_argument("artifact")
     parser.add_argument("--html")
     parser.add_argument("--preview")
+    parser.add_argument("--check", choices=("baseline", "side-effects", "compare"))
+    parser.add_argument("--kept-receipt", help="Successful kept run record for the compare check.")
     args = parser.parse_args()
     try:
-        artifact = compute(snapshot_from(load(args.record)))
+        record = load(args.record)
+        if args.check:
+            plan = load(args.artifact)["plan"]
+            if args.check == "baseline":
+                if fingerprint(snapshot_from(record)) != plan["basis"]:
+                    raise ValueError("The model or target view name changed after preview.")
+            elif args.check == "side-effects":
+                verify_dry_run(plan, record)
+            else:
+                receipt = receipt_from(record)
+                verify_contents(plan, receipt)
+                if not args.kept_receipt or receipt != receipt_from(load(args.kept_receipt)):
+                    raise ValueError("The kept view or its contents differ from the saved kept-run receipt.")
+            print("Compound legend %s check passed." % args.check)
+            return 0
+        artifact = compute(snapshot_from(record))
         write(args.artifact, canonical(artifact) + u"\n")
         if args.html:
             write(args.html, render_html(artifact))
