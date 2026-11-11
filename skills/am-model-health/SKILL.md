@@ -53,6 +53,16 @@ For hidden elements in one view, use the [visibility recipe](../am-safe-change/r
 
 The two link hints are not proof. The Revit API has no simple "uses shared coordinates" flag. Say "hint" when you report them.
 
+### Warning triage by type and creator
+
+Call `run_query` with `scripts/model_health.py` and inputs `{"warning_triage": true}`. Use the same document check as the standard audit.
+
+- Read `groups` in count order. Use the failure ID to distinguish warning types with the same displayed text.
+- Count one warning per creator of a failing element. A warning can count for more than one creator.
+- Report warnings with unknown creators. Revit provides worksharing creator data only in a workshared model.
+- Use the selected instance's `failing_ids` to locate its elements. Use `additional_ids` for related references.
+- Keep the creator names and model references in the local review. The query returns a stopped result if it cannot read the complete inventory.
+
 ### Heavy 2D views
 
 `result.heavy_2d_views[]` lists the ranked views, worst first. `result.heavy_2d_summary` has the totals (`critical`, `high`, `medium`, `views_with_2d`, `on_sheet`, `archive`, `near_duplicate`, `line_heavy`, `by_creator`, `seconds`).
