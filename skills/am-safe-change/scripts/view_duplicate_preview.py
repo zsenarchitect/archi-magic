@@ -16,7 +16,7 @@ MAX_FAMILY = 100
 MODES = ("plain", "detailing", "dependent")
 TEXT = (type(u""), str)
 ID = re.compile(r"^[1-9][0-9]{0,18}\Z")
-TOKEN = re.compile(r"\{(name|index)\}|[{}]")
+TOKEN = re.compile(r"\{(name|index|id)\}|[{}]")
 
 
 def element_id(value):
@@ -25,15 +25,15 @@ def element_id(value):
     return value
 
 
-def duplicate_name(pattern, name, index):
+def duplicate_name(pattern, name, index, source_id):
     if not isinstance(pattern, TEXT) or not 1 <= len(pattern) <= 200:
         raise ValueError("Use a name pattern of one to 200 characters.")
-    values = {"name": name, "index": str(index)}
+    values = {"name": name, "index": str(index), "id": element_id(source_id)}
 
     def substitute(match):
         token = match.group(1)
         if token is None:
-            raise ValueError("The only supported placeholders are {name} and {index}.")
+            raise ValueError("The only supported placeholders are {name}, {index}, and {id}.")
         return values[token]
 
     result = TOKEN.sub(substitute, pattern)
@@ -83,7 +83,7 @@ def compute(snapshot):
         if not view["uid"] or view["name"].upper() not in existing_names:
             raise ValueError("A source view is missing from the current view inventory.")
         row = "view:%d" % index
-        name = duplicate_name(request["pattern"], view["name"], index)
+        name = duplicate_name(request["pattern"], view["name"], index, source_id)
         name_key = name.upper()
         if name_key in used_names:
             block(row, "The proposed name is already in use.")
@@ -112,8 +112,12 @@ def compute(snapshot):
                         block(row, "Changing the existing dependent family requires explicit approval.")
                     changes[primary_id] = sorted(members, key=int)
                     owners.update(members)
-            if source_id not in families[primary_id]["members"]:
+            members = families[primary_id]["members"]
+            if source_id not in members:
                 raise ValueError("The source view is missing from its dependent family.")
+            for target_id in changes.get(primary_id, [primary_id]):
+                if members[target_id]["writable"] is not True:
+                    block(row, "Worksharing status blocks view %s." % target_id)
 
         before.append([row, view["name"], mode, None, None, None, None])
         after.append([row, view["name"], mode, name, template_name, None, None])

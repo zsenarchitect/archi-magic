@@ -16,7 +16,7 @@ def snapshot():
     primary = {
         "name": "Étage {index}", "uid": "primary", "primary_id": "-1",
         "allowed_modes": ["plain", "detailing", "dependent"], "template_allowed": True,
-        "details_complete": True, "details": [{"id": "31", "position": [1, 2, 3]}],
+        "details_complete": True, "writable": True, "details": [{"id": "31", "position": [1, 2, 3]}],
         "template_id": "7", "template_name": "Existing", "sheets": [], "controlled_settings": ["Scale"],
     }
     dependent = dict(primary, name="Étage nord", uid="dependent", primary_id="10", sheets=["A101"])
@@ -96,4 +96,10 @@ def test_unsaved_detail_change_changes_plan_basis(snapshot):
 @pytest.mark.parametrize("pattern", ["{name:}", "{unknown}", "{{name}}", "{name", "{name} "])
 def test_malformed_name_patterns_are_rejected(pattern):
     with pytest.raises(ValueError):
-        preview.duplicate_name(pattern, "Source", 1)
+        preview.duplicate_name(pattern, "Source", 1, "10")
+
+
+def test_id_placeholder_preserves_full_int64():
+    assert preview.duplicate_name("{name} - {id}", "North", 1, "9223372036854775807") == (
+        "North - 9223372036854775807"
+    )
