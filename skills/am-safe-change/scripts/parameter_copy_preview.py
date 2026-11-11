@@ -141,7 +141,7 @@ def display_value(field, value):
     if value is None:
         return "(unset)"
     if field["storage"] == "String":
-        return value if value else "(empty text)"
+        return u'"%s"' % value if value else "(empty text)"
     if field["storage"] == "ElementId":
         return u"%s [ID %s]" % (value.get("label") or "Element", value["id"])
     return repr(value)

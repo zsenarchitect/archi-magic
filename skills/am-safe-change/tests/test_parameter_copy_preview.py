@@ -43,7 +43,7 @@ def test_copy_combine_and_type_mismatch_through_cli(tmp_path):
 
     copy = preview({"source": "Source"})
     assert copy["preview"]["before"] == [[eid, "(empty text)"]]
-    assert copy["preview"]["after"] == [[eid, "Door"]]
+    assert copy["preview"]["after"] == [[eid, '"Door"']]
     assert copy["preview"]["ownership_ids"] == [eid]
     assert copy["preview"]["steps"] == []
     assert copy["plan"]["steps"] == [
@@ -52,10 +52,16 @@ def test_copy_combine_and_type_mismatch_through_cli(tmp_path):
     ]
 
     combined = preview({"parts": [{"parameter": "Level"}, {"literal": " / "}, {"parameter": "Number"}]})
-    assert combined["preview"]["after"] == [[eid, "Level 1 / 03"]]
+    assert combined["preview"]["after"] == [[eid, '"Level 1 / 03"']]
     assert combined["plan"]["steps"][0]["value"] == "Level 1 / 03"
     good = [sys.executable, SCRIPT, "baseline", artifact, snapshot]
     subprocess.run(good, check=True, capture_output=True)
+
+    row["fields"]["Source"]["value"] = "(empty text)"
+    literal = preview({"source": "Source"})
+    assert literal["preview"]["before"] == [[eid, "(empty text)"]]
+    assert literal["preview"]["after"] == [[eid, '"(empty text)"']]
+    row["fields"]["Source"]["value"] = "Door"
 
     request["destination"] = "Number"
     blocked = preview({"source": "Source"})
