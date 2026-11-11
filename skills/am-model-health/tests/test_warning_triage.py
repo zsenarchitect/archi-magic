@@ -26,7 +26,8 @@ def run_query(monkeypatch, warnings, names, workshared=True):
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=NS(
         WorksharingUtils=NS(GetWorksharingTooltipInfo=tooltip)
     )))
-    document = NS(IsFamilyDocument=False, IsWorkshared=workshared, GetWarnings=lambda: warnings)
+    document = NS(IsFamilyDocument=False, IsWorkshared=workshared, GetWarnings=lambda: warnings,
+                  PathName="Fixture.rvt", ProjectInformation=NS(UniqueId="fixture-uid"))
     result = runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": {"warning_triage": True}})
     return result["result"], queries
 

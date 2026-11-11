@@ -60,7 +60,9 @@ Call `run_query` with `scripts/model_health.py` and inputs `{"warning_triage": t
 - Read `groups` in count order. Use the failure ID to distinguish warning types with the same displayed text.
 - Count one warning per creator of a failing element. A warning can count for more than one creator.
 - Report warnings with unknown creators. Revit provides worksharing creator data only in a workshared model.
-- Use the selected instance's `failing_ids` to locate its elements. Use `additional_ids` for related references.
+- Use the selected instances' `failing_ids` to locate their elements. Use `additional_ids` for related references.
+- With user approval, select the failing elements with `show_elements` in the verified active project. Choose **Temporary Hide/Isolate → Isolate Element** on the Revit View Control Bar. Reset Temporary Hide/Isolate after review.
+- Use [the issue-board warning handoff](../am-issue-board/SKILL.md#hand-off-revit-warnings-issue-139) for types that need follow-up.
 - Keep the creator names and model references in the local review. The query returns a stopped result if it cannot read the complete inventory.
 
 ### Heavy 2D views

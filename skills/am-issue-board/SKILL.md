@@ -213,6 +213,14 @@ Use a local Navisworks XML report. Include the Item ID, Revit Element ID Quick P
 - Add `--board board.json` to prepare a board plan. Add `--archive archive.json` to check archived clashes. Review all proposed additions. The offline report contains section bounds, and it creates no views or model changes.
 - Use the existing board preview, dry run, Keep or Discard, and readback before applying any board plan. Live creation and activation of Revit section views still need qualification.
 
+## Hand off Revit warnings (issue #139)
+
+1. Run the warning triage query in `am-model-health` and save the full result as `warnings.json`.
+2. Read the active board and any archive with `read_board.py` and `"include_identity": true`.
+3. Run `python scripts/warning_board_cli.py warnings.json --board board.json --type <failure-id>`. Repeat `--type` for each reviewed type. Add `--archive archive.json` when the model has an archive board.
+4. Review the proposed issues. Each new issue records the warning count and up to 100 failing element links. The plan checks the saved project, board note and archive note before applying.
+5. Use the existing board preview, dry run, Keep or Discard, and readback. Pass only the returned `plan` and `note_id` to the board apply script.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.

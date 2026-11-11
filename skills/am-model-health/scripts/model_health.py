@@ -13,6 +13,7 @@ Optional inputs (dict): {"max_ids": 300, "top_warnings": 15}.
 Use {"warning_triage": true} for the separate read-only warning inventory.
 """
 import datetime
+import hashlib
 import json
 import math
 import re
@@ -213,6 +214,11 @@ def read_warning_triage(document):
     payload = {"kind": "revit-warning-triage", "status": "ok", "warning_count": total,
                "workshared": bool(document.IsWorkshared), "groups": rows,
                "unavailable_creator_count": sum(name is None for name in creators.values())}
+    path = document.PathName
+    project = document.ProjectInformation
+    if path and project is not None and project.UniqueId:
+        payload["host_identity"] = {"project_uid": str(project.UniqueId),
+                                    "path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest()}
     if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > 1024 * 1024:
         raise ValueError("The complete warning inventory exceeds 1 MiB.")
     if time.time() >= deadline:
