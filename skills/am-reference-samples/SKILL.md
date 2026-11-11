@@ -82,6 +82,20 @@ A parameter table is a dated snapshot, not live data. Put the snapshot date in t
 - `scripts/check_samples.py`: offline check. It prints the coverage report and the fix plan.
 - `tests/test_reference_samples.py`: fixture tests for the coverage check, the fix plan, the layout guard and the run-twice rule.
 
+## Preview compound wall and floor types
+
+Run `scripts/read_compound_legend.py` with `run_query`. Use the scripts directory as the workspace. Pass an empty `request` to read all wall and floor types in use. Add `"category":"Wall"` or `"category":"Floor"` to narrow the read. Add `element_ids` as decimal strings to use only selected host instances.
+
+Save the full query result. Run the commands from the scripts directory.
+
+```sh
+python3 compound_legend_preview.py read.json legend.json --html legend.html --preview preview.json
+```
+
+Open `legend.html`. The sketch and table use the layer order in Revit. A vertically compound wall shows a sample at mid-height and a separate nominal table. A variable layer shows its nominal thickness. A membrane has zero thickness and a dashed marker. The preview reports types without compound layers.
+
+Check the width result for each type. Review any missing width, unresolved material, or mismatch. Exit 1 means the preview contains blocking warnings. Exit 2 means the snapshot could not be read. The HTML is a local snapshot of the selected scope.
+
 ## Not verified
 
 - No live Revit run. The tests use fixture data only.
