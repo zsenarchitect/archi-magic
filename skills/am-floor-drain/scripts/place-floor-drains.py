@@ -11,10 +11,16 @@
 #                      X lines at x = ox + n*gx and Y lines at y = oy + m*gy (internal feet).
 #                      Measure them with the procedure in SKILL.md. A floor with a tile pattern but
 #                      no entry is placed at the exact target and listed in NEEDS_GRID_MEASURE.
-#   target_past  float optional, ft past the bowl front (default 1.5 = 18")
+#   single_mode  str   optional, single-user rooms: "corner" (default) = between the WC and the nearer
+#                      side wall, back_clear ft from the wall behind the WC, no tile snap;
+#                      "front" = in front of the bowl, snapped to the tile grid.
+#                      Resnap always uses the "front" rules.
+#   back_clear   float optional, corner mode: ft from the wall behind the WC (default 0.5 = 6")
+#   target_past  float optional, front mode: ft past the bowl front (default 1.5 = 18")
 #   min_past     float optional, ft past the bowl front, minimum after snap (default 1.0 = 12")
 #   wall_clear   float optional, ft from the room boundary (default 1.0)
-#   points       dict  optional, {"<room id>": [x, y]}: approved aisle points in selected rooms
+#   points       dict  optional, {"<room id>": [x, y]}: approved points in selected rooms (multi-stall
+#                      rooms, and rooms with a shower, which the rules never place)
 #   resnap       bool  optional, true = move only approved drains onto measured grids
 #   resnap_drain_ids list required with resnap, drain ids from the approved placement's "created" map
 # Python 2.7 syntax (IronPython).
@@ -42,6 +48,12 @@ else:
     MINP = float(inputs.get("min_past", 1.0))
     CLR = float(inputs.get("wall_clear", 1.0))
     RESNAP = bool(inputs.get("resnap", False))
+    MODE = inputs.get("single_mode", "corner")
+    if MODE not in ("corner", "front"):
+        raise ValueError("single_mode must be 'corner' or 'front'.")
+    BACK = float(inputs.get("back_clear", 0.5))
+    if MODE == "corner" and not RESNAP and (not BACK > 0 or math.isinf(BACK)):
+        raise ValueError("back_clear must be a finite positive distance.")
     RESNAP_IDS = set(int(x) for x in inputs.get("resnap_drain_ids", []))
     POINTS = dict((int(k), v) for k, v in (inputs.get("points") or {}).items())
     if RESNAP and not RESNAP_IDS:
@@ -137,13 +149,14 @@ else:
             rep["drain_id"] = selected[0].Id.Value
         elif inroom:
             rep["skip"] = "already has a drain"; report.append(rep); continue
-        if any(is_shower(f) and near(f, bb, 0.3) for f in fixtures):
-            rep["skip"] = "ASK: room has a shower; drain goes in the shower (not automated)"; report.append(rep); continue
+        # A room with a shower is never placed by rule. An approved point is the user's decision.
+        if room_id not in POINTS and any(is_shower(f) and near(f, bb, 0.3) for f in fixtures):
+            rep["skip"] = "ASK: room has a shower; pass an approved point in `points`, or skip the room"; report.append(rep); continue
         curves = [segment.GetCurve() for loop in (r.GetBoundarySegments(boundary_options) or []) for segment in loop]
         boundaries = [(curve, curve.GetEndPoint(0).Z) for curve in curves]
-        def clear_room(x, y):
+        def clear_room(x, y, clearance=CLR):
             return (r.IsPointInRoom(DB.XYZ(x, y, z)) and bool(boundaries)
-                    and all(curve.Distance(DB.XYZ(x, y, height)) >= CLR for curve, height in boundaries))
+                    and all(curve.Distance(DB.XYZ(x, y, height)) >= clearance for curve, height in boundaries))
         if room_id in POINTS:
             x, y = (float(v) for v in point)
             if any(math.isnan(v) or math.isinf(v) for v in (x, y)) or not clear_room(x, y):
@@ -161,6 +174,8 @@ else:
         dx, dy = {"W": (1, 0), "E": (-1, 0), "S": (0, 1), "N": (0, -1)}[side]
         wall = {"W": x0, "E": x1, "S": y0, "N": y1}[side]
         wbb = wc.get_BoundingBox(None)          # bowl length = how far the WC sticks out of the wall
+        if wbb is None:
+            rep["skip"] = "ASK: no bounds for the selected WC"; report.append(rep); continue
         if dx: bowl = (wbb.Max.X - wall) if dx > 0 else (wall - wbb.Min.X)
         else:  bowl = (wbb.Max.Y - wall) if dy > 0 else (wall - wbb.Min.Y)
         bowl = bowl if 1.0 < bowl < 3.5 else 2.1
@@ -180,11 +195,50 @@ else:
                 boxes.append((dp.X - w / 2 - 0.25, dp.Y - w - 0.5, dp.X + w / 2 + 0.25, dp.Y + w + 0.5))
             else:
                 boxes.append((dp.X - w - 0.5, dp.Y - w / 2 - 0.25, dp.X + w + 0.5, dp.Y + w / 2 + 0.25))
+        def outside_door_swing(x, y):
+            return not any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in boxes)
+
+        if MODE == "corner" and not RESNAP:
+            # Measure from the WC insertion axis to the selected side of its actual bounds.
+            lx, ly = (0, 1) if dx else (1, 0)
+            bx = wall + dx * BACK if dx else p.X
+            by = wall + dy * BACK if dy else p.Y
+
+            def reach(sign):
+                distance = 0.0
+                while distance < 12:
+                    sample = distance + 0.05
+                    if not r.IsPointInRoom(DB.XYZ(bx + sign * lx * sample, by + sign * ly * sample, z)):
+                        break
+                    distance = sample
+                return distance
+
+            if not r.IsPointInRoom(DB.XYZ(bx, by, z)):
+                rep["skip"] = "ASK: corner axis is outside the room"; report.append(rep); continue
+            positive, negative = reach(1), reach(-1)
+            sign = 1 if positive <= negative else -1
+            edge = wbb.Max if sign > 0 else wbb.Min
+            fixture_reach = sign * ((edge.Y - p.Y) if dx else (edge.X - p.X))
+            gap = min(positive, negative) - fixture_reach
+            rep.update({"wc_id": wc.Id.Value, "wc_wall": side, "mode": "corner",
+                        "gap_in": round(gap * 12, 1)})
+            if not (fixture_reach > 0 and 4.0 / 12.0 <= gap <= 3.0):
+                rep["skip"] = "ASK: gap between WC and side wall is %.1f in" % (gap * 12); report.append(rep); continue
+            distance = fixture_reach + gap / 2.0
+            nx, ny = bx + sign * lx * distance, by + sign * ly * distance
+            # The corner has its own offsets. Check the actual boundary for tighter obstructions.
+            if not clear_room(nx, ny, min(BACK, gap / 2.0) - 1e-6):
+                rep["skip"] = "ASK: corner point fails room boundary clearance"; report.append(rep); continue
+            if not outside_door_swing(nx, ny):
+                rep["skip"] = "ASK: corner point overlaps the door swing"; report.append(rep); continue
+            rep["xy"] = [round(nx, 3), round(ny, 3)]
+            report.append(rep); plan.append((str(room_id), nx, ny, None)); continue
+
         def ok(cx, cy):
             if not clear_room(cx, cy): return None
             past = dx * (cx - wall) + dy * (cy - wall) - bowl
             if past < MINP - 1e-6: return None
-            if any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes): return None
+            if not outside_door_swing(cx, cy): return None
             return past
         g = tile_grid(tx, ty, bb.Min.Z)
         rep.update({"wc_id": wc.Id.Value, "wc_wall": side, "bowl_in": round(bowl * 12, 1), "doors": len(boxes),
