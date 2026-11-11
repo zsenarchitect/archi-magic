@@ -389,3 +389,83 @@ def test_dry_run_verifies_independent_runtime_telemetry(write_runtime):
     record["changes"]["added_ids"] = [101]
     with pytest.raises(ValueError, match="runtime change record"):
         preview.verify_dry_run(plan, record)
+
+
+def test_independent_verification_detects_a_rename_after_keep(write_runtime, tmp_path):
+    main, document = write_runtime
+    plan, display = preview.compute(read(write_runtime, mode="plain"))
+    kept = apply_request(write_runtime, plan, display)
+    inputs = {"mode": "verify", "plan": plan, "receipt": json.loads(kept["receipt_json"])}
+    readback = main(document, inputs)
+    plan_path = tmp_path / "plan.json"
+    record = tmp_path / "verified.json"
+    plan_path.write_text(json.dumps(plan))
+    record.write_text(json.dumps({"result": readback}))
+    dry_receipt = json.loads(kept["receipt_json"])
+    dry_receipt["views"][0].update(id="110", uid="provisional")
+    dry_receipt["changes"]["added"] = ["110"]
+    dry = tmp_path / "dry.json"
+    dry.write_text(json.dumps({
+        "result": {"status": "ok", "receipt_json": json.dumps(dry_receipt)},
+        "changes": {"added_count": 1, "added_ids": [110], "modified_count": 0,
+                    "deleted_count": 0, "by_category": {"Views": 1}, "other_documents": []},
+    }))
+    preview.run_verification("compare", str(plan_path), str(record), str(dry))
+    dry_receipt["views"][0]["view_type"] = "Section"
+    dry_record = json.loads(dry.read_text())
+    dry_record["result"]["receipt_json"] = json.dumps(dry_receipt)
+    dry.write_text(json.dumps(dry_record))
+    with pytest.raises(ValueError, match="differs from the approved dry run"):
+        preview.run_verification("compare", str(plan_path), str(record), str(dry))
+    document.elements[100].Name = "Changed after Keep"
+    with pytest.raises(ValueError, match="approved name"):
+        main(document, inputs)
+
+
+@pytest.mark.parametrize("marker_case", ["approved", "wrong_target", "unreviewed_host"])
+def test_dependent_marker_must_point_to_new_view_in_reviewed_host(write_runtime, monkeypatch, marker_case):
+    main, document = write_runtime
+    db = main.__globals__["DB"]
+    db.ElevationMarker = type("ElevationMarker", (), {})
+    db.ReferenceableViewUtils = NS(GetReferencedViewId=lambda doc, identifier: doc.elements[identifier.Value].target)
+    primary = document.elements[9]
+    primary.ViewTemplateId = Id(8)
+    document.elements[12] = View(12, "Marker host")
+    duplicate = primary.Duplicate
+
+    def add_dependent(mode):
+        new_id = duplicate(mode)
+        view = document.elements[new_id.Value]
+        view.parent = Id(9)
+        view.ViewTemplateId = Id(8)
+        primary.children.append(new_id)
+        document.elements[101] = NS(Id=Id(101), UniqueId="marker-101", ViewSpecific=True, OwnerViewId=Id(12),
+                                    Category=NS(Id=Id(-200)), target=Id(9) if marker_case == "wrong_target" else new_id)
+        document.added.append(101)
+        return new_id
+
+    monkeypatch.setattr(primary, "Duplicate", add_dependent)
+    source = {"id": "9", "mode": "dependent"}
+    if marker_case != "unreviewed_host":
+        source["marker_host_id"] = "12"
+    request = {"template_id": "8", "pattern": "{name} Copy", "sources": [source]}
+    snapshot = json.loads(main(document, {"request": request})["snapshot_json"])
+    plan, display = preview.compute(snapshot)
+    if marker_case != "unreviewed_host":
+        assert plan["ownership_ids"] == ["9", "12"]
+        assert display["notes"] == ["Review marker host Marker host (view 12) for North Copy."]
+        display["notes"].append("Ownership: The model is not workshared.")
+    result = apply_request(write_runtime, plan, display)
+    if marker_case != "approved":
+        assert result["status"] == "stopped"
+        assert result["message"].startswith("Unverified addition 101 has owner view 12.")
+        assert set(document.elements) == {8, 9, 12}
+        return
+    assert result["status"] == "ok"
+    receipt = json.loads(result["receipt_json"])
+    assert receipt["markers"] == [{"id": "101", "uid": "marker-101", "host_id": "12", "view_id": "100",
+                                    "category_id": "-200"}]
+    assert main(document, {"mode": "verify", "plan": plan, "receipt": receipt})["status"] == "ok"
+    document.elements[101].target = Id(9)
+    with pytest.raises(ValueError, match="marker differs from the receipt"):
+        main(document, {"mode": "verify", "plan": plan, "receipt": receipt})

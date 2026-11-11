@@ -208,7 +208,18 @@ def read_snapshot(document, request):
             raise ValueError("Choose plain, detailing, or dependent duplication.")
         requested_modes.setdefault(source_id, set()).add(mode)
 
+    marker_hosts = {}
     for index, row in enumerate(requested, 1):
+        if "marker_host_id" in row:
+            if row["mode"] != "dependent":
+                raise ValueError("A marker host is only valid for a dependent duplicate.")
+            host_id = preview.element_id(row["marker_host_id"])
+            if host_id not in marker_hosts:
+                host = read_view(document, host_id)
+                state = view_identity(host)
+                ownership = owner_state(document, host)
+                state.update(ownership=ownership, writable=can_edit(ownership))
+                marker_hosts[host_id] = state
         view = read_view(document, row["id"])
         name = preview.duplicate_name(request["pattern"], view.Name, index, row["id"])
         if not DB.NamingUtils.IsValidName(name):
@@ -266,7 +277,7 @@ def read_snapshot(document, request):
         raise ValueError("The view snapshot exceeded ten seconds. Narrow the batch.")
     snapshot = {"kind": "view-duplicate-snapshot", "complete": True, "document": identity,
                 "request": request, "names": names, "template": states[key(template.Id)], "sources": sources,
-                "families": families, "template_states": states}
+                "families": families, "template_states": states, "marker_hosts": marker_hosts}
     preview.snapshot_digest(snapshot)
     return snapshot
 
@@ -282,8 +293,11 @@ def approved_snapshot(document, plan, display):
     if any(warning.get("blocking") for warning in display["warnings"]):
         raise ValueError("The displayed preview has a blocking warning.")
     for field in actual_display:
-        if field != "warnings" and display.get(field) != actual_display[field]:
+        if field not in ("warnings", "notes") and display.get(field) != actual_display[field]:
             raise ValueError("The displayed preview differs from the approved plan.")
+    notes = [note for note in display.get("notes", []) if not note.startswith("Ownership: ")]
+    if notes != actual_display.get("notes", []):
+        raise ValueError("The displayed marker scope differs from the approved plan.")
     ownership = display.get("ownership")
     if ownership and (ownership["owned_by_others"] or ownership["updated_in_central"]):
         raise ValueError("The displayed preview has a worksharing conflict.")
@@ -311,6 +325,10 @@ def create_duplicates(document, plan, snapshot):
         primary_id = step["primary_id"]
         if primary_id != "-1" and not can_edit(owner_state(document, read_view(document, primary_id))):
             raise ValueError("Worksharing status blocks the primary view.")
+        if "marker_host_id" in step:
+            host = read_view(document, step["marker_host_id"])
+            if not can_edit(owner_state(document, host)):
+                raise ValueError("Worksharing status blocks the dependent-view marker host.")
         new_view = document.GetElement(source.Duplicate(options[step["mode"]]))
         if not isinstance(new_view, DB.View) or not new_view.IsValidViewTemplate(template):
             raise ValueError("A duplicated view is incompatible with the template.")
@@ -363,23 +381,54 @@ def capture_changes(events):
             "deleted": sorted(deleted, key=int)}
 
 
+def identify_marker(document, element, expected_host, expected_views):
+    if (element is None or not element.ViewSpecific or key(element.OwnerViewId) != expected_host
+            or element.Category is None):
+        return None
+    if isinstance(element, DB.ElevationMarker):
+        targets = {key(element.GetViewId(index)) for index in range(element.MaximumViewCount)} - {"-1"}
+    else:
+        try:
+            target = DB.ReferenceableViewUtils.GetReferencedViewId(document, element.Id)
+        except Exception:
+            return None
+        targets = {key(target)}
+    if len(targets) != 1 or not targets.issubset(expected_views):
+        return None
+    return {"id": key(element.Id), "uid": str(element.UniqueId), "host_id": expected_host,
+            "view_id": next(iter(targets)), "category_id": key(element.Category.Id)}
+
+
 def classify_changes(document, plan, snapshot, new_views, changes):
     if changes["deleted"] or not set(changes["modified"]).issubset(plan["ownership_ids"]):
         raise ValueError("Revit deleted or modified an element outside the approved scope.")
     new_by_id = {row["id"]: row for row in new_views}
     if not set(new_by_id).issubset(changes["added"]):
         raise ValueError("Revit change tracking did not identify every new view.")
-    details = []
+    details, markers = [], []
+    marker_targets = {}
+    for row, step in zip(new_views, plan["steps"]):
+        if "marker_host_id" in step:
+            marker_targets.setdefault(step["marker_host_id"], set()).add(row["id"])
     for item in set(changes["added"]) - set(new_by_id):
         element = document.GetElement(identifier(item))
         owner = new_by_id.get(key(element.OwnerViewId)) if element is not None else None
         if owner and owner["mode"] == "detailing":
             detail = detail_line(document, element)
             if detail is not None:
-                details.append({"id": item, "view_id": owner["id"], "points": detail["points"],
-                                "style": detail["style"]})
+                details.append({"id": item, "uid": detail["uid"], "view_id": owner["id"],
+                                "points": detail["points"], "style": detail["style"]})
                 continue
-        raise ValueError("Revit added an element outside the verified view and detail scope (%s)." % item)
+        if element is not None:
+            host_id = key(element.OwnerViewId)
+            if host_id in marker_targets:
+                marker = identify_marker(document, element, host_id, marker_targets[host_id])
+                if marker is not None:
+                    markers.append(marker)
+                    continue
+            raise ValueError("Unverified addition %s has owner view %s. Review its scope and repeat the dry run."
+                             % (item, host_id))
+        raise ValueError("Revit added an unavailable element (%s)." % item)
     for view, step in zip(new_views, plan["steps"]):
         if step["mode"] != "detailing":
             continue
@@ -388,7 +437,8 @@ def classify_changes(document, plan, snapshot, new_views, changes):
         signature = lambda row: json.dumps([row["points"], row["style"]], ensure_ascii=True)
         if Counter(map(signature, original)) != Counter(map(signature, copied)):
             raise ValueError("The copied detail geometry or style differs from the source.")
-    return sorted(details, key=lambda row: int(row["id"]))
+    return (sorted(details, key=lambda row: int(row["id"])),
+            sorted(markers, key=lambda row: int(row["id"])))
 
 
 def rollback(transaction, group):
@@ -441,15 +491,16 @@ def apply(document, plan, display):
         if state != DB.TransactionStatus.Committed:
             raise ValueError("Revit did not commit the duplication transaction.")
         changes = capture_changes(events)
-        details = classify_changes(document, plan, snapshot, views, changes)
+        details, markers = classify_changes(document, plan, snapshot, views, changes)
         families = verify_families(document, snapshot, views)
         for row, step in zip(views, plan["steps"]):
             current = verify_view(read_view(document, row["id"]), step, row["template_id"], row["view_type"])
             if current != row:
                 raise ValueError("Revit changed a duplicated view while committing it.")
         receipt = {"document": snapshot["document"], "basis_sha256": plan["basis_sha256"],
-                   "views": views, "families": families, "details": details, "changes": changes}
+                   "views": views, "families": families, "details": details, "markers": markers, "changes": changes}
         payload = json.dumps(receipt, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        preview.check_receipt(plan, receipt)
         if len(payload) > preview.MAX_BYTES:
             raise ValueError("The duplication receipt exceeds 2 MiB.")
         if group.Assimilate() != DB.TransactionStatus.Committed:
@@ -461,12 +512,71 @@ def apply(document, plan, display):
         return {"status": "transaction_unresolved", "message": "Check the Revit transaction before continuing."}
 
 
+def verify_kept(document, plan, receipt):
+    preview.check_receipt(plan, receipt)
+    if document_identity(document) != plan["document"]:
+        raise ValueError("Open the saved project that contains the kept batch.")
+    created = []
+    for step, expected in zip(plan["steps"], receipt["views"]):
+        view = read_view(document, expected["id"])
+        row = verify_view(view, step, plan["request"]["template_id"], expected["view_type"])
+        if row != expected:
+            raise ValueError("The kept view identity differs from the transaction receipt.")
+        created.append(row)
+
+    families = {}
+    for view_id, expected in receipt["families"].items():
+        current = view_identity(read_view(document, view_id))
+        families[view_id] = {field: current[field] for field in
+                             ("uid", "name", "template_id", "primary_id", "view_type")}
+    placements = viewports(document, families, Stopwatch.StartNew())
+    for item, row in families.items():
+        row["placement_ids"] = placements[item]
+    if families != receipt["families"]:
+        raise ValueError("An existing family view changed after Keep.")
+    for primary_id in {row["primary_id"] for row in created} - {"-1"}:
+        expected = {item for item, row in families.items() if row["primary_id"] == primary_id}
+        expected.update(row["id"] for row in created if row["primary_id"] == primary_id)
+        primary = read_view(document, primary_id)
+        actual = primary.GetDependentViewIds()
+        if actual.Count != len(expected) or {key(item) for item in actual} != expected:
+            raise ValueError("The kept dependent family membership differs from the receipt.")
+
+    details = []
+    for expected in receipt["details"]:
+        element = document.GetElement(identifier(expected["id"]))
+        detail = detail_line(document, element)
+        if detail is None:
+            raise ValueError("A kept detail line could not be verified.")
+        row = {"id": detail["id"], "uid": detail["uid"], "points": detail["points"],
+               "style": detail["style"], "view_id": key(element.OwnerViewId)}
+        if row != expected:
+            raise ValueError("A kept detail line differs from the receipt.")
+        details.append(row)
+    markers = []
+    for expected in receipt["markers"]:
+        element = document.GetElement(identifier(expected["id"]))
+        row = identify_marker(document, element, expected["host_id"], {expected["view_id"]})
+        if row != expected:
+            raise ValueError("A kept dependent-view marker differs from the receipt.")
+        markers.append(row)
+    result = {"document": document_identity(document), "basis_sha256": plan["basis_sha256"],
+              "views": created, "families": families, "details": details, "markers": markers,
+              "changes": receipt["changes"]}
+    payload = json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    if len(payload) > preview.MAX_BYTES:
+        raise ValueError("The independent verification exceeds 2 MiB.")
+    return {"status": "ok", "verification_json": payload}
+
+
 def main(document, args):
     mode = args.get("mode", "read")
     if mode == "apply":
         return apply(document, args["plan"], args["preview"])
+    if mode == "verify":
+        return verify_kept(document, args["plan"], args["receipt"])
     if mode != "read":
-        raise ValueError("Choose read or apply.")
+        raise ValueError("Choose read, apply, or verify.")
     snapshot = read_snapshot(document, args["request"])
     return {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, sort_keys=True,
                                                         separators=(",", ":"), allow_nan=False)}

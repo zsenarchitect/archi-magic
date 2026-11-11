@@ -70,6 +70,7 @@ def compute(snapshot):
     before, after, warnings, steps = [], [], [], []
     families, changes, owners = {}, {}, set()
     template_name = template["name"]
+    marker_notes = []
 
     def block(row, message):
         warnings.append({"row": row, "text": message, "blocking": True})
@@ -121,8 +122,19 @@ def compute(snapshot):
 
         before.append([row, view["name"], mode, None, None, None, None])
         after.append([row, view["name"], mode, name, template_name, None, None])
-        steps.append({"source_id": source_id, "source_uid": view["uid"], "mode": mode,
-                      "name": name, "primary_id": primary_id})
+        step = {"source_id": source_id, "source_uid": view["uid"], "mode": mode,
+                "name": name, "primary_id": primary_id}
+        if "marker_host_id" in source:
+            if mode != "dependent":
+                raise ValueError("A marker host is only valid for a dependent duplicate.")
+            host_id = element_id(source["marker_host_id"])
+            host = snapshot["marker_hosts"][host_id]
+            if host["writable"] is not True:
+                block(row, "Worksharing status blocks the marker host %s." % host_id)
+            owners.add(host_id)
+            step["marker_host_id"] = host_id
+            marker_notes.append(u"Review marker host %s (view %s) for %s." % (host["name"], host_id, name))
+        steps.append(step)
 
     if sum(len(family["members"]) for family in families.values()) > MAX_FAMILY:
         raise ValueError("The batch exceeds 100 existing dependent family views.")
@@ -147,6 +159,8 @@ def compute(snapshot):
                "changedColumns": ["Result name", "Template", "Controlled settings"],
                "before": before, "after": after, "warnings": warnings, "blocked": blocked,
                "ownership_ids": ownership_ids, "steps": [], "review_only": True}
+    if marker_notes:
+        display["notes"] = marker_notes
     return plan, display
 
 
@@ -172,8 +186,7 @@ def read_snapshot(path):
     return read_payload(read_record(path), "snapshot_json")
 
 
-def verify_dry_run(plan, record):
-    receipt = read_payload(record, "receipt_json")
+def check_receipt(plan, receipt):
     if (receipt["basis_sha256"] != plan["basis_sha256"] or receipt["document"] != plan["document"]
             or plan["blocked"] or len(receipt["views"]) != len(plan["steps"])):
         raise ValueError("The dry run did not execute the approved batch.")
@@ -181,6 +194,27 @@ def verify_dry_run(plan, record):
         if (any(row[field] != step[field] for field in ("name", "mode", "primary_id"))
                 or row["template_id"] != plan["request"]["template_id"] or not row["uid"]):
             raise ValueError("A dry-run view differs from the approved batch.")
+    views = {row["id"]: (row, step) for row, step in zip(receipt["views"], plan["steps"])}
+    if len(views) != len(plan["steps"]):
+        raise ValueError("The receipt repeats a created view ID.")
+    for detail in receipt["details"]:
+        if views[detail["view_id"]][1]["mode"] != "detailing" or not detail["uid"]:
+            raise ValueError("A copied detail does not belong to a reviewed detailing duplicate.")
+    for marker in receipt["markers"]:
+        step = views[marker["view_id"]][1]
+        if step["mode"] != "dependent" or marker["host_id"] != step.get("marker_host_id") or not marker["uid"]:
+            raise ValueError("A marker does not belong to a reviewed host and dependent view.")
+    for primary_id, ids in plan["family_changes"].items():
+        for item in ids:
+            family = receipt["families"][item]
+            expected_primary = "-1" if item == primary_id else primary_id
+            if family["template_id"] != plan["request"]["template_id"] or family["primary_id"] != expected_primary:
+                raise ValueError("An existing dependent family view differs from the approved batch.")
+
+
+def verify_dry_run(plan, record):
+    receipt = read_payload(record, "receipt_json")
+    check_receipt(plan, receipt)
     changes = record["changes"]
     added = changes.get("added_ids")
     if added is None:
@@ -197,33 +231,59 @@ def verify_dry_run(plan, record):
         raise ValueError("The complete runtime change record disagrees with the duplication receipt.")
     created = [row["id"] for row in receipt["views"]]
     details = [row["id"] for row in receipt["details"]]
-    if sorted(created + details, key=int) != added:
+    markers = [row["id"] for row in receipt["markers"]]
+    if sorted(created + details + markers, key=int) != added:
         raise ValueError("The dry run reported an unexplained addition.")
     return receipt
 
 
-def run_verification(command, plan_path, record_path):
+def repeatable_state(receipt):
+    index = {row["id"]: position for position, row in enumerate(receipt["views"])}
+    views = [[row[field] for field in ("name", "mode", "primary_id", "view_type", "template_id")]
+             for row in receipt["views"]]
+    details = [[index[row["view_id"]], row["points"], row["style"]] for row in receipt["details"]]
+    markers = [[index[row["view_id"]], row["host_id"], row["category_id"]] for row in receipt["markers"]]
+    return {"views": views, "families": receipt["families"],
+            "details": sorted(json.dumps(row, ensure_ascii=True) for row in details),
+            "markers": sorted(markers), "modified": receipt["changes"]["modified"]}
+
+
+def run_verification(command, plan_path, record_path, dry_run_path=None):
     plan = read_record(plan_path)
     if command == "baseline":
         snapshot = read_snapshot(record_path)
         if snapshot_digest(snapshot) != plan["basis_sha256"]:
             raise ValueError("The original Revit model state differs from the approved baseline.")
         print("The original Revit model matches the approved baseline.")
+    elif command == "compare":
+        receipt = read_payload(read_record(record_path), "verification_json")
+        check_receipt(plan, receipt)
+        if not dry_run_path:
+            raise ValueError("Supply the full dry-run record for comparison.")
+        dry = verify_dry_run(plan, read_record(dry_run_path))
+        if repeatable_state(receipt) != repeatable_state(dry):
+            raise ValueError("The independently verified kept batch differs from the approved dry run.")
+        print("The independently verified kept batch matches the approved dry run.")
     else:
         receipt = verify_dry_run(plan, read_record(record_path))
-        print("Created %d views and %d detail lines. Changed %d reviewed existing elements."
-              % (len(receipt["views"]), len(receipt["details"]), len(receipt["changes"]["modified"])))
+        print("Created %d views, %d detail lines and %d dependent-view markers. Changed %d reviewed existing elements."
+              % (len(receipt["views"]), len(receipt["details"]), len(receipt["markers"]),
+                 len(receipt["changes"]["modified"])))
+        for marker in receipt["markers"]:
+            print("Marker %s appears in host view %s and points to new view %s."
+                  % (marker["id"], marker["host_id"], marker["view_id"]))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("first", help="Runtime read record, baseline, or side-effects")
+    parser.add_argument("first", help="Runtime read record, baseline, compare, or side-effects")
     parser.add_argument("second", help="Plan output or approved plan")
     parser.add_argument("third", help="Preview output or runtime record")
+    parser.add_argument("--dry-run", help="Full runtime dry-run record for compare")
     args = parser.parse_args()
     try:
-        if args.first in ("baseline", "side-effects"):
-            run_verification(args.first, args.second, args.third)
+        if args.first in ("baseline", "compare", "side-effects"):
+            run_verification(args.first, args.second, args.third, args.dry_run)
             return 0
         plan, display = compute(read_snapshot(args.first))
         for path, data in [(args.second, plan), (args.third, display)]:
