@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Read the inputs to a batch view duplication preview through Revit."""
+"""Read and apply a reviewed batch view duplication through Revit."""
+from collections import Counter
 import hashlib
 import json
 
@@ -270,9 +271,202 @@ def read_snapshot(document, request):
     return snapshot
 
 
+TRANSACTION_NAME = "Duplicate Revit views"
+
+
+def approved_snapshot(document, plan, display):
+    snapshot = read_snapshot(document, plan["request"])
+    actual_plan, actual_display = preview.compute(snapshot)
+    if actual_plan["blocked"] or plan != actual_plan or display.get("blocked") is not False:
+        raise ValueError("The approved plan is blocked or its model inputs changed.")
+    if any(warning.get("blocking") for warning in display["warnings"]):
+        raise ValueError("The displayed preview has a blocking warning.")
+    for field in actual_display:
+        if field != "warnings" and display.get(field) != actual_display[field]:
+            raise ValueError("The displayed preview differs from the approved plan.")
+    ownership = display.get("ownership")
+    if ownership and (ownership["owned_by_others"] or ownership["updated_in_central"]):
+        raise ValueError("The displayed preview has a worksharing conflict.")
+    return snapshot
+
+
+def verify_view(view, step, template_id, view_type):
+    row = view_identity(view)
+    if (row["name"] != step["name"] or row["view_type"] != view_type
+            or row["primary_id"] != step["primary_id"] or row["template_id"] != template_id):
+        raise ValueError("A duplicated view differs from its approved name, type, template or primary.")
+    return {"id": key(view.Id), "uid": row["uid"], "name": row["name"],
+            "view_type": row["view_type"], "primary_id": row["primary_id"],
+            "template_id": row["template_id"], "mode": step["mode"]}
+
+
+def create_duplicates(document, plan, snapshot):
+    template = identifier(plan["request"]["template_id"])
+    options = modes()
+    created = []
+    for step in plan["steps"]:
+        source = read_view(document, step["source_id"])
+        if str(source.UniqueId) != step["source_uid"] or not source.CanViewBeDuplicated(options[step["mode"]]):
+            raise ValueError("A source view changed or can no longer be duplicated.")
+        primary_id = step["primary_id"]
+        if primary_id != "-1" and not can_edit(owner_state(document, read_view(document, primary_id))):
+            raise ValueError("Worksharing status blocks the primary view.")
+        new_view = document.GetElement(source.Duplicate(options[step["mode"]]))
+        if not isinstance(new_view, DB.View) or not new_view.IsValidViewTemplate(template):
+            raise ValueError("A duplicated view is incompatible with the template.")
+        new_view.Name = step["name"]
+        if primary_id == "-1":
+            new_view.ViewTemplateId = template
+        created.append((new_view, step))
+    for primary_id, members in plan["family_changes"].items():
+        if any(not can_edit(owner_state(document, read_view(document, item))) for item in members):
+            raise ValueError("Worksharing status blocks an affected dependent family member.")
+        primary = read_view(document, primary_id)
+        if not primary.IsValidViewTemplate(template):
+            raise ValueError("The template is incompatible with the primary view.")
+        primary.ViewTemplateId = template
+    document.Regenerate()
+    return [verify_view(view, step, key(template), snapshot["sources"][step["source_id"]]["view_type"])
+            for view, step in created]
+
+
+def verify_families(document, snapshot, new_views):
+    states = {}
+    for primary_id, family in snapshot["families"].items():
+        old = family["members"]
+        primary = read_view(document, primary_id)
+        expected = set(old) - {primary_id}
+        expected.update(row["id"] for row in new_views if row["primary_id"] == primary_id)
+        current = primary.GetDependentViewIds()
+        if current.Count != len(expected) or {key(item) for item in current} != expected:
+            raise ValueError("The primary view's dependent membership differs from the approved batch.")
+        for view_id, prior in old.items():
+            row = view_identity(read_view(document, view_id))
+            if (row["template_id"] != snapshot["template"]["id"]
+                    or any(row[field] != prior[field] for field in ("name", "uid", "primary_id", "view_type"))):
+                raise ValueError("An existing dependent family view differs from its approved state.")
+            states[view_id] = {field: row[field] for field in ("uid", "name", "template_id", "primary_id", "view_type")}
+    placements = viewports(document, states, Stopwatch.StartNew())
+    for family in snapshot["families"].values():
+        for view_id, prior in family["members"].items():
+            if placements[view_id] != prior["placement_ids"]:
+                raise ValueError("A reviewed view changed its sheet placement.")
+            states[view_id]["placement_ids"] = placements[view_id]
+    return states
+
+
+def capture_changes(events):
+    if len(events) != 1 or events[0] is None:
+        raise ValueError("Revit did not provide one complete transaction change record.")
+    added, modified, deleted = events[0]
+    return {"added": sorted(added, key=int), "modified": sorted(modified, key=int),
+            "deleted": sorted(deleted, key=int)}
+
+
+def classify_changes(document, plan, snapshot, new_views, changes):
+    if changes["deleted"] or not set(changes["modified"]).issubset(plan["ownership_ids"]):
+        raise ValueError("Revit deleted or modified an element outside the approved scope.")
+    new_by_id = {row["id"]: row for row in new_views}
+    if not set(new_by_id).issubset(changes["added"]):
+        raise ValueError("Revit change tracking did not identify every new view.")
+    details = []
+    for item in set(changes["added"]) - set(new_by_id):
+        element = document.GetElement(identifier(item))
+        owner = new_by_id.get(key(element.OwnerViewId)) if element is not None else None
+        if owner and owner["mode"] == "detailing":
+            detail = detail_line(document, element)
+            if detail is not None:
+                details.append({"id": item, "view_id": owner["id"], "points": detail["points"],
+                                "style": detail["style"]})
+                continue
+        raise ValueError("Revit added an element outside the verified view and detail scope (%s)." % item)
+    for view, step in zip(new_views, plan["steps"]):
+        if step["mode"] != "detailing":
+            continue
+        original = snapshot["sources"][step["source_id"]]["details"]
+        copied = [row for row in details if row["view_id"] == view["id"]]
+        signature = lambda row: json.dumps([row["points"], row["style"]], ensure_ascii=True)
+        if Counter(map(signature, original)) != Counter(map(signature, copied)):
+            raise ValueError("The copied detail geometry or style differs from the source.")
+    return sorted(details, key=lambda row: int(row["id"]))
+
+
+def rollback(transaction, group):
+    try:
+        state = transaction.GetStatus()
+        if state == DB.TransactionStatus.Started:
+            state = transaction.RollBack()
+        if state == DB.TransactionStatus.Pending:
+            return False
+        return (group.GetStatus() == DB.TransactionStatus.Started
+                and group.RollBack() == DB.TransactionStatus.RolledBack)
+    except Exception:
+        return False
+
+
+def apply(document, plan, display):
+    snapshot = approved_snapshot(document, plan, display)
+    application = document.Application
+    events = []
+
+    def record_change(_sender, event):
+        try:
+            if (len(events) or not event.GetDocument().Equals(document)
+                    or list(event.GetTransactionNames()) != [TRANSACTION_NAME]):
+                events.append(None)
+                return
+            added = event.GetAddedElementIds()
+            modified = event.GetModifiedElementIds()
+            deleted = event.GetDeletedElementIds()
+            if added.Count > MAX_DETAILS or modified.Count > len(plan["ownership_ids"]) or deleted.Count:
+                events.append(None)
+                return
+            events.append(tuple({key(item) for item in items} for items in (added, modified, deleted)))
+        except Exception:
+            events.append(None)
+
+    group = DB.TransactionGroup(document, TRANSACTION_NAME)
+    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    if group.Start() != DB.TransactionStatus.Started:
+        return {"status": "transaction_unresolved", "message": "Revit did not start the change group."}
+    try:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise ValueError("Revit did not start the duplication transaction.")
+        application.DocumentChanged += record_change
+        try:
+            views = create_duplicates(document, plan, snapshot)
+            state = transaction.Commit()
+        finally:
+            application.DocumentChanged -= record_change
+        if state != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not commit the duplication transaction.")
+        changes = capture_changes(events)
+        details = classify_changes(document, plan, snapshot, views, changes)
+        families = verify_families(document, snapshot, views)
+        for row, step in zip(views, plan["steps"]):
+            current = verify_view(read_view(document, row["id"]), step, row["template_id"], row["view_type"])
+            if current != row:
+                raise ValueError("Revit changed a duplicated view while committing it.")
+        receipt = {"document": snapshot["document"], "basis_sha256": plan["basis_sha256"],
+                   "views": views, "families": families, "details": details, "changes": changes}
+        payload = json.dumps(receipt, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        if len(payload) > preview.MAX_BYTES:
+            raise ValueError("The duplication receipt exceeds 2 MiB.")
+        if group.Assimilate() != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not finish the duplication group.")
+        return {"status": "ok", "receipt_json": payload}
+    except Exception as error:
+        if rollback(transaction, group):
+            return {"status": "stopped", "message": str(error)}
+        return {"status": "transaction_unresolved", "message": "Check the Revit transaction before continuing."}
+
+
 def main(document, args):
-    if args.get("mode", "read") != "read":
-        raise ValueError("Choose read to inspect the view duplication inputs.")
+    mode = args.get("mode", "read")
+    if mode == "apply":
+        return apply(document, args["plan"], args["preview"])
+    if mode != "read":
+        raise ValueError("Choose read or apply.")
     snapshot = read_snapshot(document, args["request"])
     return {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, sort_keys=True,
                                                         separators=(",", ":"), allow_nan=False)}

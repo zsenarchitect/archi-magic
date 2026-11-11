@@ -40,7 +40,7 @@ class View:
         return self.parent
 
     def GetDependentViewIds(self):
-        return self.children
+        return Items(self.children)
 
     def GetPlacementOnSheetStatus(self):
         return "NotPlaced"
@@ -195,3 +195,197 @@ def test_dependent_template_change_checks_all_existing_family_members(runtime):
     document.owners[10] = "NotOwned"
     snapshot = json.loads(main(document, {"request": request})["snapshot_json"])
     assert preview.compute(snapshot)[0]["family_changes"] == {"9": ["9", "10"]}
+
+
+class Items(list):
+    @property
+    def Count(self):
+        return len(self)
+
+
+class Event:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+
+class Transaction:
+    def __init__(self, document, name):
+        self.document, self.name = document, name
+        self.status = "uninitialized"
+
+    def Start(self):
+        self.status = "started"
+        return self.status
+
+    def GetStatus(self):
+        return self.status
+
+    def RollBack(self):
+        self.status = "rolled_back"
+        return self.status
+
+    def Commit(self):
+        self.status = "committed"
+        doc = self.document
+        if doc.emit_changes:
+            args = NS(GetDocument=lambda: doc, GetTransactionNames=lambda: [self.name],
+                      GetAddedElementIds=lambda: Items(Id(item) for item in doc.added),
+                      GetModifiedElementIds=lambda: Items(Id(item) for item in doc.modified),
+                      GetDeletedElementIds=lambda: Items(Id(item) for item in doc.deleted))
+            for handler in doc.Application.DocumentChanged.handlers:
+                handler(doc.Application, args)
+        return self.status
+
+
+class TransactionGroup(Transaction):
+    def Start(self):
+        self.original_ids = set(self.document.elements)
+        self.original_families = {
+            item: (element.ViewTemplateId, list(element.children))
+            for item, element in self.document.elements.items() if isinstance(element, View)
+        }
+        return super().Start()
+
+    def RollBack(self):
+        for item in set(self.document.elements) - self.original_ids:
+            del self.document.elements[item]
+        for item, (template, children) in self.original_families.items():
+            view = self.document.elements[item]
+            view.ViewTemplateId = template
+            view.children = children
+        return super().RollBack()
+
+    def Assimilate(self):
+        self.status = "committed"
+        return self.status
+
+
+@pytest.fixture
+def write_runtime(runtime, monkeypatch):
+    main, document = runtime
+    db = main.__globals__["DB"]
+    db.Transaction = Transaction
+    db.TransactionGroup = TransactionGroup
+    db.TransactionStatus = NS(Started="started", Pending="pending", Committed="committed", RolledBack="rolled_back")
+    document.Application = NS(DocumentChanged=Event())
+    document.Equals = lambda other: other is document
+    document.Regenerate = lambda: None
+    document.added, document.modified, document.deleted = [], [], []
+    document.emit_changes = True
+
+    def duplicate(_mode):
+        identifier = 100 + len(document.added)
+        document.elements[identifier] = View(identifier, "Native fallback")
+        document.added.append(identifier)
+        return Id(identifier)
+
+    monkeypatch.setattr(document.elements[9], "Duplicate", duplicate, raising=False)
+    return main, document
+
+
+def apply_request(runtime, plan=None, display=None):
+    if plan is None:
+        plan, display = preview.compute(read(runtime, mode="plain"))
+    main, document = runtime
+    return main(document, {"mode": "apply", "plan": plan, "preview": display})
+
+
+def test_transaction_uses_exact_name_and_reports_created_identity(write_runtime):
+    result = apply_request(write_runtime)
+    assert result["status"] == "ok"
+    receipt = json.loads(result["receipt_json"])
+    assert receipt["views"] == [{"id": "100", "uid": "view-100", "name": "North - 9",
+                                 "view_type": "FloorPlan", "primary_id": "-1", "template_id": "8",
+                                 "mode": "plain"}]
+    assert receipt["changes"] == {"added": ["100"], "modified": [], "deleted": []}
+    assert write_runtime[1].Application.DocumentChanged.handlers == []
+
+
+@pytest.mark.parametrize("failure", ["unapproved_modification", "deleted", "overflow", "missing_event"])
+def test_change_group_rolls_back_after_unexpected_transaction_effects(write_runtime, failure):
+    _, document = write_runtime
+    if failure == "missing_event":
+        document.emit_changes = False
+    elif failure == "unapproved_modification":
+        document.modified = [9]
+    elif failure == "deleted":
+        document.deleted = [200]
+    else:
+        document.added = list(range(1000, 3001))
+    assert apply_request(write_runtime)["status"] == "stopped"
+    assert set(document.elements) == {8, 9}
+    assert document.Application.DocumentChanged.handlers == []
+
+
+def test_apply_requires_unchanged_basis_and_unblocked_linked_preview(write_runtime):
+    _, document = write_runtime
+    plan, display = preview.compute(read(write_runtime, mode="plain"))
+    display["warnings"] = [{"blocking": True}]
+    with pytest.raises(ValueError, match="blocking warning"):
+        apply_request(write_runtime, plan, display)
+    display["warnings"] = []
+    document.elements[8].Scale = 50
+    with pytest.raises(ValueError, match="model inputs changed"):
+        apply_request(write_runtime, plan, display)
+    assert set(document.elements) == {8, 9}
+
+
+
+def test_dependent_copy_verifies_primary_and_existing_sibling(write_runtime, monkeypatch):
+    _, document = write_runtime
+    primary = document.elements[9]
+    sibling = View(10, "North-east")
+    sibling.parent = Id(9)
+    primary.children = [Id(10)]
+    document.elements[10] = sibling
+    duplicate = primary.Duplicate
+
+    def add_dependent(mode):
+        assert mode == "dependent"
+        new_id = duplicate(mode)
+        document.elements[new_id.Value].parent = Id(9)
+        primary.children.append(new_id)
+        return new_id
+
+    def propagate_template():
+        for view_id in primary.children:
+            document.elements[view_id.Value].ViewTemplateId = primary.ViewTemplateId
+        document.modified = [9, 10]
+
+    monkeypatch.setattr(primary, "Duplicate", add_dependent)
+    document.Regenerate = propagate_template
+    snapshot = read(write_runtime, mode="dependent")
+    snapshot["request"]["allow_family_template_change"] = True
+    plan, display = preview.compute(snapshot)
+    result = apply_request(write_runtime, plan, display)
+    assert result["status"] == "ok"
+    receipt = json.loads(result["receipt_json"])
+    assert receipt["views"][0]["primary_id"] == "9"
+    assert receipt["families"]["10"]["template_id"] == "8"
+    assert receipt["changes"]["modified"] == ["9", "10"]
+
+
+def test_dry_run_verifies_independent_runtime_telemetry(write_runtime):
+    plan, display = preview.compute(read(write_runtime, mode="plain"))
+    result = apply_request(write_runtime, plan, display)
+    record = {"result": result, "changes": {
+        "added_count": 1, "added_ids": [100], "modified_count": 0, "deleted_count": 0,
+        "by_category": {"Views": 1}, "other_documents": [],
+    }}
+    receipt = preview.verify_dry_run(plan, record)
+    assert receipt["views"][0]["id"] == "100"
+    record["changes"]["other_documents"] = [{"title": "Other"}]
+    with pytest.raises(ValueError, match="runtime change record"):
+        preview.verify_dry_run(plan, record)
+    record["changes"]["other_documents"] = []
+    record["changes"]["added_ids"] = [101]
+    with pytest.raises(ValueError, match="runtime change record"):
+        preview.verify_dry_run(plan, record)

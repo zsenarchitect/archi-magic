@@ -150,30 +150,83 @@ def compute(snapshot):
     return plan, display
 
 
-def read_snapshot(path):
+def read_record(path):
     with io.open(path, "r", encoding="utf-8-sig") as stream:
         raw = stream.read(MAX_BYTES + 65537)
     if len(raw) > MAX_BYTES + 65536:
         raise ValueError("The runtime record is too large.")
-    record = json.loads(raw)
+    return json.loads(raw)
+
+
+def read_payload(record, field):
     result = record["result"]
     if result["status"] != "ok":
         raise ValueError("Revit did not return a successful view snapshot.")
-    payload = result["snapshot_json"]
+    payload = result[field]
     if len(payload) > MAX_BYTES or any(ord(char) > 127 for char in payload):
-        raise ValueError("Expected an ASCII Revit snapshot of at most 2 MiB.")
+        raise ValueError("Expected an ASCII Revit payload of at most 2 MiB.")
     return json.loads(payload)
+
+
+def read_snapshot(path):
+    return read_payload(read_record(path), "snapshot_json")
+
+
+def verify_dry_run(plan, record):
+    receipt = read_payload(record, "receipt_json")
+    if (receipt["basis_sha256"] != plan["basis_sha256"] or receipt["document"] != plan["document"]
+            or plan["blocked"] or len(receipt["views"]) != len(plan["steps"])):
+        raise ValueError("The dry run did not execute the approved batch.")
+    for row, step in zip(receipt["views"], plan["steps"]):
+        if (any(row[field] != step[field] for field in ("name", "mode", "primary_id"))
+                or row["template_id"] != plan["request"]["template_id"] or not row["uid"]):
+            raise ValueError("A dry-run view differs from the approved batch.")
+    changes = record["changes"]
+    added = changes.get("added_ids")
+    if added is None:
+        added = [row["id"] for row in changes.get("added", [])]
+    added = sorted((element_id(str(item)) for item in added), key=int)
+    modified = sorted((element_id(str(row["id"])) for row in changes.get("modified", [])), key=int)
+    reported = receipt["changes"]
+    categories = changes["by_category"]
+    if (changes["added_count"] != len(added) or changes["modified_count"] != len(modified)
+            or changes["deleted_count"] != 0 or changes.get("other_documents")
+            or sum(categories.values()) != len(added) + len(modified)
+            or added != reported["added"] or modified != reported["modified"] or reported["deleted"]
+            or not set(modified).issubset(plan["ownership_ids"])):
+        raise ValueError("The complete runtime change record disagrees with the duplication receipt.")
+    created = [row["id"] for row in receipt["views"]]
+    details = [row["id"] for row in receipt["details"]]
+    if sorted(created + details, key=int) != added:
+        raise ValueError("The dry run reported an unexplained addition.")
+    return receipt
+
+
+def run_verification(command, plan_path, record_path):
+    plan = read_record(plan_path)
+    if command == "baseline":
+        snapshot = read_snapshot(record_path)
+        if snapshot_digest(snapshot) != plan["basis_sha256"]:
+            raise ValueError("The original Revit model state differs from the approved baseline.")
+        print("The original Revit model matches the approved baseline.")
+    else:
+        receipt = verify_dry_run(plan, read_record(record_path))
+        print("Created %d views and %d detail lines. Changed %d reviewed existing elements."
+              % (len(receipt["views"]), len(receipt["details"]), len(receipt["changes"]["modified"])))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("record")
-    parser.add_argument("plan")
-    parser.add_argument("preview")
+    parser.add_argument("first", help="Runtime read record, baseline, or side-effects")
+    parser.add_argument("second", help="Plan output or approved plan")
+    parser.add_argument("third", help="Preview output or runtime record")
     args = parser.parse_args()
     try:
-        plan, display = compute(read_snapshot(args.record))
-        for path, data in [(args.plan, plan), (args.preview, display)]:
+        if args.first in ("baseline", "side-effects"):
+            run_verification(args.first, args.second, args.third)
+            return 0
+        plan, display = compute(read_snapshot(args.first))
+        for path, data in [(args.second, plan), (args.third, display)]:
             with io.open(path, "w", encoding="utf-8") as stream:
                 stream.write(u"%s\n" % json.dumps(data, ensure_ascii=True, indent=2))
         return 1 if plan["blocked"] else 0
