@@ -12,6 +12,7 @@ import sys
 from time import monotonic
 
 from cad_file_inventory import link_or_reparse, local_path
+import family_library_windows as windows
 
 MAX_ENTRIES = 10_000
 MAX_DEPTH = 12
@@ -21,6 +22,12 @@ MAX_CATALOG_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_SECONDS = 120
 CHUNK_BYTES = 1024 * 1024
+
+
+class WindowsDirectory:
+    def __init__(self, path, handle):
+        self.path = path
+        self.handle = handle
 
 
 class ScanLimit(ValueError):
@@ -50,8 +57,30 @@ def directory_flags():
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
+def child_info(parent, name):
+    if isinstance(parent, WindowsDirectory):
+        return windows.path_info(parent.path / name)
+    return os.stat(name, dir_fd=parent, follow_symlinks=False)
+
+
+def directory_info(parent):
+    if isinstance(parent, WindowsDirectory):
+        return windows.handle_info(parent.handle)
+    return os.fstat(parent)
+
+
 @contextmanager
 def pinned_directory(parent, name, expected=None):
+    if os.name == "nt":
+        path = Path(name) if parent is None else parent.path / name
+        with windows.open_handle(path, directory=True) as (handle, info):
+            if expected is not None and identity(info) != identity(expected):
+                raise ValueError("A Windows directory changed after enumeration.")
+            yield WindowsDirectory(path, handle)
+            if identity(windows.path_info(path)) != identity(info):
+                raise ValueError("A Windows directory changed during discovery.")
+        return
+
     before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if not stat.S_ISDIR(before.st_mode) or link_or_reparse(before):
         raise ValueError("The path is not an ordinary directory.")
@@ -72,6 +101,8 @@ def pinned_directory(parent, name, expected=None):
 
 @contextmanager
 def pinned_root(path):
+    if os.name == "nt":
+        windows.require_local_volume(path.anchor)
     with ExitStack() as opened:
         parent = opened.enter_context(pinned_directory(None, path.anchor))
         for name in path.parts[1:]:
@@ -84,15 +115,25 @@ def ordinary_file(info, cap):
             and info.st_nlink == 1 and 0 < info.st_size <= cap)
 
 
+@contextmanager
+def open_file(parent, name):
+    if isinstance(parent, WindowsDirectory):
+        with windows.file_stream(parent.path / name) as stream:
+            yield stream, windows.stream_info
+        return
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(name, flags, dir_fd=parent), "rb") as stream:
+        yield stream, lambda opened: os.fstat(opened.fileno())
+
+
 def checked_file(parent, name, enumerated, cap, budget):
     if not ordinary_file(enumerated, cap):
         raise ValueError("Expected a bounded regular file without links.")
     budget["bytes"] += enumerated.st_size
     if budget["bytes"] > MAX_TOTAL_BYTES:
         raise ScanLimit("The discovery byte budget was exceeded.")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
-    with os.fdopen(os.open(name, flags, dir_fd=parent), "rb") as stream:
-        opened = os.fstat(stream.fileno())
+    with open_file(parent, name) as (stream, info):
+        opened = info(stream)
         if file_stamp(opened) != file_stamp(enumerated) or not ordinary_file(opened, cap):
             raise ValueError("A source file changed before it was opened.")
         size = 0
@@ -107,8 +148,8 @@ def checked_file(parent, name, enumerated, cap, budget):
             if size > opened.st_size:
                 raise ValueError("A source file grew while it was being read.")
             digest.update(data)
-        final = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        if size != opened.st_size or file_stamp(opened) != file_stamp(os.fstat(stream.fileno())) or (
+        final = child_info(parent, name)
+        if size != opened.st_size or file_stamp(opened) != file_stamp(info(stream)) or (
                 file_stamp(opened) != file_stamp(final)):
             raise ValueError("A source file changed while it was being read.")
     return file_record(name, size, digest.hexdigest())
@@ -116,14 +157,16 @@ def checked_file(parent, name, enumerated, cap, budget):
 
 def classify_entries(parent, budget):
     by_name = defaultdict(list)
-    with os.scandir(parent) as entries:
+    scan_root = parent.path if isinstance(parent, WindowsDirectory) else parent
+    with os.scandir(scan_root) as entries:
         for entry in entries:
             budget["entries"] += 1
             if budget["entries"] > MAX_ENTRIES:
                 raise ScanLimit("The directory entry limit was exceeded.")
             if monotonic() > budget["deadline"]:
                 raise ScanLimit("The discovery time budget was exceeded.")
-            by_name[entry.name.casefold()].append((entry.name, entry.inode()))
+            inode = None if isinstance(parent, WindowsDirectory) else entry.inode()
+            by_name[entry.name.casefold()].append((entry.name, inode))
     return by_name
 
 
@@ -133,13 +176,13 @@ def record_pair(parent, name, info, catalog_names, budget):
     catalog = None
     if catalog_names:
         companion, inode = catalog_names[0]
-        catalog_info = os.stat(companion, dir_fd=parent, follow_symlinks=False)
-        if catalog_info.st_ino != inode:
+        catalog_info = child_info(parent, companion)
+        if inode is not None and catalog_info.st_ino != inode:
             raise ValueError("The companion catalog changed after enumeration.")
         catalog = checked_file(parent, companion, catalog_info, MAX_CATALOG_BYTES, budget)
     rfa = checked_file(parent, name, info, MAX_FAMILY_BYTES, budget)
     if catalog is not None and file_stamp(catalog_info) != file_stamp(
-            os.stat(companion, dir_fd=parent, follow_symlinks=False)):
+            child_info(parent, companion)):
         raise ValueError("The companion catalog changed during the paired read.")
     return rfa, catalog
 
@@ -149,7 +192,7 @@ def report_skip(skipped, relative, reason):
 
 
 def walk(parent, relative, ancestors, budget, files, skipped):
-    start = os.fstat(parent)
+    start = directory_info(parent)
     checkpoint = len(files)
     by_name = classify_entries(parent, budget)
     for names in sorted(by_name.values(), key=lambda group: group[0][0].casefold()):
@@ -166,8 +209,8 @@ def walk(parent, relative, ancestors, budget, files, skipped):
         try:
             if monotonic() > budget["deadline"]:
                 raise ScanLimit("The discovery time budget was exceeded.")
-            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            if info.st_ino != inode:
+            info = child_info(parent, name)
+            if inode is not None and info.st_ino != inode:
                 raise ValueError("The path changed after enumeration.")
             if link_or_reparse(info):
                 report_skip(skipped, path, "Links and reparse paths are outside discovery.")
@@ -176,7 +219,7 @@ def walk(parent, relative, ancestors, budget, files, skipped):
                     report_skip(skipped, path, "The directory exceeds the depth limit.")
                     continue
                 with pinned_directory(parent, name, expected=info) as child:
-                    walk(child, path, [*ancestors, identity(os.fstat(child))], budget, files, skipped)
+                    walk(child, path, [*ancestors, identity(directory_info(child))], budget, files, skipped)
             elif Path(name).suffix.casefold() == ".rfa":
                 budget["families"] += 1
                 if budget["families"] > MAX_FAMILIES:
@@ -193,7 +236,7 @@ def walk(parent, relative, ancestors, budget, files, skipped):
         if budget["limited"]:
             break
 
-    if directory_stamp(os.fstat(parent)) != directory_stamp(start):
+    if directory_stamp(directory_info(parent)) != directory_stamp(start):
         del files[checkpoint:]
         report_skip(skipped, relative, "Directory contents changed during discovery.")
 
@@ -205,7 +248,7 @@ def discover(raw_root):
     budget = {"entries": 0, "families": 0, "bytes": 0, "deadline": monotonic() + MAX_SECONDS, "limited": False}
     files, skipped = [], []
     with pinned_root(root) as parent:
-        root_identity = identity(os.fstat(parent))
+        root_identity = identity(directory_info(parent))
         try:
             walk(parent, (), [root_identity], budget, files, skipped)
         except ScanLimit as error:
