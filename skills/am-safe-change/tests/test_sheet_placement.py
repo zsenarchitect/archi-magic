@@ -213,7 +213,9 @@ def placement_host(monkeypatch):
 
         def get_BoundingBox(self, sheet):
             # The local box is not in sheet coordinates. Transform every corner.
-            right = 1.2 if document.overflow and sheet.Id.Value == 11 else 0.5
+            right = 0.6 if document.geometry_drift else 0.5
+            if document.overflow and sheet.Id.Value == 11:
+                right = 1.2
             transform = Record(OfPoint=lambda point: xyz(self.Point.X + point.X, self.Point.Y + point.Y))
             return Record(Min=xyz(0, -0.2), Max=xyz(right, 0.1), Transform=transform, Dispose=lambda: None)
 
@@ -297,7 +299,7 @@ def placement_host(monkeypatch):
             self.state = status.Committed
             return self.state
 
-    document = Record(items={}, next_id=100, groups=0, overflow=False, modified=False, late_anchor=False,
+    document = Record(items={}, next_id=100, groups=0, overflow=False, modified=False, late_anchor=False, geometry_drift=False,
                       IsFamilyDocument=False, IsReadOnly=False, IsWorkshared=False, PathName="/tmp/placement.rvt",
                       ProjectInformation=Record(UniqueId="ab-01"), Application=Record(DocumentChanged=Event()))
     document.GetElement = lambda key: document.items.get(key.Value)
@@ -347,7 +349,7 @@ def test_native_read_apply_verify_and_noop_uses_one_group(placement_host):
     doc, main, request = placement_host
     baseline = json.loads(main(doc, {"request": request})["snapshot_json"])
     plan = preview.compute(baseline)
-    outcome = main(doc, {"mode": "apply", "plan": plan})
+    outcome = main(doc, {"mode": "dry-run", "plan": plan})
     assert outcome["status"] == "ok", outcome
     receipt = json.loads(outcome["receipt_json"])
     assert [item["point_ft"] for item in receipt["placements"]] == [[1, 1], [1, 1], [2, 1], [2, 1]]
@@ -356,7 +358,7 @@ def test_native_read_apply_verify_and_noop_uses_one_group(placement_host):
     assert json.loads(result["verification_json"]) == receipt
     replay = preview.compute(json.loads(main(doc, {"request": request})["snapshot_json"]))
     assert all(item[-1] == "Already placed" for item in replay["after"])
-    assert main(doc, {"mode": "apply", "plan": replay})["status"] == "no_changes"
+    assert main(doc, {"mode": "dry-run", "plan": replay})["status"] == "no_changes"
     assert doc.groups == 1
 
 
@@ -366,7 +368,7 @@ def test_native_placement_rolls_back_the_whole_batch(placement_host, failure):
     baseline = json.loads(main(doc, {"request": request})["snapshot_json"])
     original = set(doc.items)
     setattr(doc, failure, True)
-    outcome = main(doc, {"mode": "apply", "plan": preview.compute(baseline)})
+    outcome = main(doc, {"mode": "dry-run", "plan": preview.compute(baseline)})
     assert outcome["status"] == "stopped", outcome
     assert doc.groups == 1 and set(doc.items) == original
     assert json.loads(main(doc, {"request": request})["snapshot_json"]) == baseline
@@ -379,7 +381,7 @@ def test_title_block_type_change_invalidates_measured_usable_area(placement_host
     plan = preview.compute(baseline)
     doc.items[60].VersionGuid = "sheet-type-changed"
     with pytest.raises(ValueError, match="title block or revision state"):
-        main(doc, {"mode": "apply", "plan": plan})
+        main(doc, {"mode": "dry-run", "plan": plan})
     assert doc.groups == 0
 
 
@@ -387,7 +389,7 @@ def test_runtime_receipts_allow_new_ids_but_reject_duplicate_runs_and_changed_ge
     doc, main, request = placement_host
     baseline = json.loads(main(doc, {"request": request})["snapshot_json"])
     plan = preview.compute(baseline)
-    receipt = json.loads(main(doc, {"mode": "apply", "plan": plan})["receipt_json"])
+    receipt = json.loads(main(doc, {"mode": "dry-run", "plan": plan})["receipt_json"])
     dry_receipt = {**receipt, "placements": [
         {**item, "id": str(200 + index), "uid": f"ae-{200 + index}"}
         for index, item in enumerate(receipt["placements"])
@@ -409,3 +411,33 @@ def test_runtime_receipts_allow_new_ids_but_reject_duplicate_runs_and_changed_ge
     changed = record("dry", "rolled_back", "receipt_json", dry_receipt, preview.receipt_ids(plan, dry_receipt))
     with pytest.raises(ValueError, match="differs from the dry run"):
         preview.verify_outcome(plan, kept, fresh, "committed", changed)
+
+
+def test_real_placement_rolls_back_if_geometry_differs_from_approved_dry_run(placement_host):
+    doc, main, request = placement_host
+    original = dict(doc.items)
+    baseline = json.loads(main(doc, {"request": request})["snapshot_json"])
+    plan = preview.compute(baseline)
+    dry_result = main(doc, {"mode": "dry-run", "plan": plan})
+    assert dry_result["status"] == "ok"
+    receipt = json.loads(dry_result["receipt_json"])
+    ids = preview.receipt_ids(plan, receipt)
+    dry = {"status": "ok", "run_id": "dry-1", "decision": "rolled_back", "result": dry_result,
+           "changes": {"added_ids": ids, "added_count": len(ids), "modified_count": 0,
+                       "deleted_count": 0, "by_category": {"Placements": len(ids)}}}
+    # Simulate the host rolling back its outer dry-run transaction.
+    doc.items = dict(original)
+    with pytest.raises(ValueError, match="approved dry-run"):
+        main(doc, {"mode": "apply", "plan": plan})
+    assert doc.groups == 1
+    doc.geometry_drift = True
+    real = main(doc, {"mode": "apply", "plan": plan, "approved_dry_run": dry})
+    assert real["status"] == "stopped" and "approved dry run" in real["message"]
+    assert doc.items == original
+
+    doc.geometry_drift = False
+    real = main(doc, {"mode": "apply", "plan": plan, "approved_dry_run": dry})
+    kept = json.loads(real["receipt_json"])
+    assert real["status"] == "ok"
+    assert preview.receipt_ids(plan, kept) != ids
+    assert preview.same_placement_batch(kept["placements"], receipt["placements"])

@@ -255,7 +255,7 @@ def baseline_without_created(document, plan, ids):
     return read_snapshot(document, plan["request"], excluded=set(ids), placed_pairs=pairs)
 
 
-def apply(document, plan):
+def apply(document, plan, *, dry_run=False, approved_dry_run=None):
     if document is None or document.IsReadOnly:
         raise ValueError("Open the writable project used for the sheet placement preview.")
     baseline = read_snapshot(document, plan["request"])
@@ -264,6 +264,14 @@ def apply(document, plan):
     steps = plan["steps"]
     if not steps:
         return {"status": "no_changes", "message": "The reviewed placements already exist."}
+    expected = None
+    if not dry_run:
+        if not isinstance(approved_dry_run, dict):
+            raise ValueError("Supply the full approved dry-run record before real placement.")
+        record = approved_dry_run.get("response", approved_dry_run)
+        if not isinstance(record, dict) or not isinstance(record.get("run_id"), str) or not record["run_id"]:
+            raise ValueError("The approved dry-run record has no Revit run identity.")
+        expected = preview.check_receipt_record(plan, record, "rolled_back")["placements"]
     application = document.Application
     events = []
 
@@ -321,6 +329,8 @@ def apply(document, plan):
 
         current = baseline_without_created(document, plan, ids)
         measured = preview.verify_layout(plan, current, measured_batch(document, steps, ids))
+        if expected is not None and not preview.same_placement_batch(expected, measured):
+            raise ValueError("The measured placements differ from the approved dry run.")
         receipt = {"document": plan["document"], "basis_sha256": plan["basis_sha256"], "placements": measured}
         payload = preview.encode(receipt)
         if group.Assimilate() != DB.TransactionStatus.Committed:
@@ -356,12 +366,13 @@ def main(document, args):
             sheet = destination(document, identifier)
             rows.append(paper_state(document, sheet, owned_title_block(document, sheet), deadline))
         return {"status": "ok", "catalog_json": preview.encode({"document": identity, "sheets": rows})}
-    if mode == "apply":
-        return apply(document, args["plan"])
+    if mode in ("dry-run", "apply"):
+        return apply(document, args["plan"], dry_run=mode == "dry-run",
+                     approved_dry_run=args.get("approved_dry_run"))
     if mode == "verify":
         return verify_kept(document, args["plan"], args["receipt"])
     if mode != "read":
-        raise ValueError("Choose sheet-catalog, read, apply, or verify.")
+        raise ValueError("Choose sheet-catalog, read, dry-run, apply, or verify.")
     return {"status": "ok", "snapshot_json": preview.encode(read_snapshot(document, args["request"]))}
 
 

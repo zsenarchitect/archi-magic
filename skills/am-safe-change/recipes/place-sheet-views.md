@@ -31,19 +31,19 @@ Use Revit 2026 with CPython and a saved project. Qualify the native placement an
    ```
 
 3. Run the same script with `run_query` and the request. Save the full record as `read.json`. Run `python sheet_placement_preview.py read.json > plan.json`. Render the plan with am-schedule-view. Stop on blocked rows. Exact repeats need no transaction. The native dry run measures the actual body, label and schedule bounds.
-4. Check destination sheet ownership and the current project and policy. Run the script with `run_modify`, `dry_run:true`, `mode:"apply"` and the exact reviewed `plan`. Save the full record as `dry.json`. Run a fresh original query and save it as `fresh.json`.
+4. Check destination sheet ownership and the current project and policy. Run the script with `run_modify`, `dry_run:true`, `mode:"dry-run"` and the exact reviewed `plan`. Save the full record as `dry.json`. Run a fresh original query and save it as `fresh.json`.
 
    ```sh
    python sheet_placement_preview.py plan.json --run dry.json --fresh fresh.json --decision rolled_back
    ```
 
-5. Use the same approved plan for the real run. Follow am-safe-change and use Keep or Discard. Under auto policy, get the required second approval. Save the full run as `real.json`.
+5. Use the same approved plan with `mode:"apply"` for the real run. Pass the full `dry.json` record as `approved_dry_run`. The script rolls back if the measured geometry differs from that run. Follow am-safe-change and use Keep or Discard. Under auto policy, get the required second approval. Save the full run as `real.json`.
 6. After Keep, query the script with `mode:"verify"`, the approved plan, and the decoded kept `receipt_json` as `receipt`. Save the full query as `verified.json`. Check exact placements and the native bounds.
 
    ```sh
    python sheet_placement_preview.py plan.json --run real.json --fresh verified.json --decision committed --dry-run dry.json
    ```
 
-7. After Discard, repeat the original query and use `--decision discarded` with its full record. Check for borrowing after dry run or Discard. Report kept placement IDs and complete the am-safe-change worksharing hand-off.
+7. After Discard, repeat the original query and use `--decision discarded --dry-run dry.json` with the full Discard record. Check for borrowing after dry run or Discard. Report kept placement IDs and complete the am-safe-change worksharing hand-off.
 
 The workflow preserves existing placements. It supports one placement per ordinary view and repeats legends and whole schedules on different sheets. Views with a Saved Position, split schedules and schedules filtered by sheet require a separate workflow.
