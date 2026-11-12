@@ -185,6 +185,10 @@ Send `POST /session` with the token in a JSON body to start a browser session. R
 
 Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Read the current state after connecting and after each revision notice. The notice carries the revision. Read review details through the authenticated HTTP route.
 
+To publish a completed audit, preview, or board locally, configure an `artifacts` entry under the project. Each slot has a `kind` and a relative JSON `path`. Board slots also have a `board` identity with `lineage`, `host_identity`, and `note_uid`. Read the original Revit note with `include_identity` before publishing a board.
+
+Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot> <generation> <saved-result.json>`. Use the source run's increasing generation. An exact repeat keeps the current file. An older run or conflicting repeat stops with an error.
+
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)
 
 - **Rhino navigation in custom three.js viewers**: `am-bim-viewer` uses Rhino mouse controls by default. When configuring a custom three.js `OrbitControls` viewer, set `controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }` (right-drag orbits, `Shift` + right-drag pans automatically, left-click selects, wheel zooms).
