@@ -358,7 +358,15 @@ def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=(), *, expected_
         finding_id += 1
         all_findings.append(f)
 
-    for f in check_xrefs(xrefs):
+    graph = drawing_data.get("xref_graph")
+    if graph is None:
+        xref_findings = check_xrefs(xrefs)
+    else:
+        xref_findings = [
+            {**finding, "host": edge["host"], "message": f"{edge['host']}: {finding['message']}"}
+            for edge in graph if edge["status"] != "overlay_excluded" for finding in check_xrefs([edge])
+        ]
+    for f in xref_findings:
         f["id"] = f"CAD-{finding_id:04d}"
         finding_id += 1
         all_findings.append(f)
@@ -380,7 +388,7 @@ def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=(), *, expected_
     return {
         "drawing_name": drawing_data.get("filename", "unknown.dwg"),
         "total_layers": len(layers),
-        "total_xrefs": len(xrefs),
+        "total_xrefs": drawing_data.get("direct_xref_count", len(xrefs)),
         "total_findings": len(all_findings),
         "units": unit_settings(header, expected_units or {}),
         "summary": {
@@ -397,7 +405,12 @@ def audit_file(args):
     from cad_file_inventory import FILE_LIMIT, inspect_drawing, local_path
 
     try:
-        drawing = inspect_drawing(args.input, args.dwgread)
+        root = getattr(args, "xref_root", None)
+        if root:
+            from cad_xref_graph import inspect_nested_drawing
+            drawing = inspect_nested_drawing(args.input, root, args.dwgread)
+        else:
+            drawing = inspect_drawing(args.input, args.dwgread)
         policy_findings = []
         for option, coverage, reader, check, label in (
                 ("layer_policy", "layer_style_policy", read_layer_policy, check_layer_policy, "layer style"),
@@ -447,6 +460,7 @@ def main() -> int:
     parser.add_argument("--summary", action="store_true", help="Print summary only")
 
     parser.add_argument("--dwgread", help="Absolute path to trusted LibreDWG 0.14 dwgread")
+    parser.add_argument("--xref-root", help="Approved local directory for an opt-in nested Xref scan on POSIX")
     parser.add_argument("--layer-policy", help="Local JSON layer color and linetype standard")
     parser.add_argument("--attribute-policy", help="Local JSON standard for required block attribute tags")
     parser.add_argument("--expected-insunits", type=int, choices=range(1, len(INSERTION_UNITS)), metavar="CODE",
@@ -457,8 +471,8 @@ def main() -> int:
 
     if Path(args.input).suffix.lower() in {".dxf", ".dwg"}:
         return audit_file(args)
-    if args.layer_policy or args.attribute_policy:
-        parser.error("Policy options require a direct DWG or DXF drawing.")
+    if args.layer_policy or args.attribute_policy or args.xref_root:
+        parser.error("Policy and nested Xref options require a direct DWG or DXF drawing.")
 
     if not os.path.isfile(args.input):
         print(f"Error: input file '{args.input}' not found.", file=sys.stderr)
