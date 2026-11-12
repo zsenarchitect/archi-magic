@@ -81,6 +81,10 @@ def dependency_rows(document, identifiers, budget):
     return sorted(rows.values(), key=lambda row: int(row["id"]))
 
 
+def parameter_identity(parameter):
+    return "shared:" + str(parameter.GUID) if parameter.IsShared else "parameter:" + str(parameter.Id.Value)
+
+
 def read_parameters(element, budget):
     reads = {DB.StorageType.String: ("string", "AsString"),
              DB.StorageType.Integer: ("integer", "AsInteger"),
@@ -93,7 +97,7 @@ def read_parameters(element, budget):
         if storage is None or parameter.Definition is None:
             raise ValueError("An instance parameter has no readable definition or storage type.")
         kind, getter = storage
-        key = "shared:" + str(parameter.GUID) if parameter.IsShared else "parameter:" + str(parameter.Id.Value)
+        key = parameter_identity(parameter)
         if key in entries:
             raise ValueError("The instance has a duplicate parameter identity.")
         has_value = bool(parameter.HasValue)
@@ -246,6 +250,11 @@ def read_cut(document, row, floor, budget):
     return dict(identity(element), kind="grid" if grid else "line", start_xy_ft=start[:2], end_xy_ft=end[:2])
 
 
+def wall_axis(element):
+    return {"line_xy_ft": [p[:2] for p in line_points(element.Location.Curve)],
+            "orientation": xyz(element.Orientation), "flipped": bool(element.Flipped)}
+
+
 def read_source(document, row, budget, require_split_eligible=True):
     fields(row, {"source", "cuts"})
     element = selected(document, row["source"])
@@ -282,7 +291,8 @@ def read_source(document, row, budget, require_split_eligible=True):
         geometry, footprint = vertical_geometry(document, element, wall, budget, require_split_eligible)
     return dict(source, type_id=type_info["id"], type_uid=type_info["uid"], category=category, geometry=geometry,
                 cuts=cuts), dict(source, parameters=read_parameters(element, budget), dependencies=dependencies,
-                                 geometry_joins=joins, wall_end_joins=wall_ends, footprint_xy_ft=footprint)
+                                 geometry_joins=joins, wall_end_joins=wall_ends, footprint_xy_ft=footprint,
+                                 wall_axis=wall_axis(element) if wall else None)
 
 
 def readback(document, args, project, version):

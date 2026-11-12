@@ -233,11 +233,11 @@ Run `python scripts/verify_element_split.py snapshot.json inventory.json approva
 
 A matched comparison covers piece extents or floor boundaries, vertical footprints, original type, and typed instance parameters. Verify the complete transaction effects, solid geometry, dependent elements, and native approval separately before accepting the split.
 
-### Disposable column split trial
+### Disposable wall and column split trial
 
-Qualify the installed Revit 2026 bridge's transaction nesting on a disposable control first. Use `scripts/probe_column_split.py` with `run_modify` in dry-run mode for an approved disposable fixture. Pass `mode: rollback_trial`, `disposable_fixture: true`, the original query arguments in `source_request`, and the exact approved file contents and digest as `approval_json` and `approval_sha256`. The trial requires a straight vertical column with a native defining curve and complete source evidence. Point-located columns require separate qualification.
+Qualify the installed Revit 2026 bridge's transaction nesting on a disposable control first. Use `scripts/probe_element_split.py` with `run_modify` in dry-run mode for an approved disposable fixture. Pass `mode: rollback_trial`, `disposable_fixture: true`, the original query arguments in `source_request`, and the exact approved file contents and digest as `approval_json` and `approval_sha256`. The trial accepts straight vertical columns with a native defining curve and basic unconnected centerline walls without inserts, attachments, stacked hosts, dependencies, or joins. Point-located columns, top-constrained walls, and floors require separate qualification.
 
-The probe measures the resulting pieces and checks their types and typed parameters before rolling back the full transaction group. Save `trial_json` privately. Its inner effects and rollback events are separate. Independently retrieve the complete bridge run and reread the original fixture and unrelated controls before accepting rollback. Stop on an unresolved outcome. Native trial and Keep/Discard verification remain required before release.
+The probe measures the resulting pieces and checks their types and typed parameters before rolling back the full transaction group. New wall pieces use their reviewed level, retain the source type and orientation, and restore writable instance values. The probe checks wall axes, footprints, and end-join permissions. Verify exact wall faces and solids in the disposable model as part of native qualification. Save `trial_json` privately. Its inner effects and rollback events are separate. Independently retrieve the complete bridge run and reread the original fixture and unrelated controls before accepting rollback. Stop on an unresolved outcome. Native trial and Keep/Discard verification remain required before release.
 
 ## House rules (all am-* skills)
 

@@ -124,6 +124,7 @@ def model(monkeypatch):
         "WALL_TOP_IS_ATTACHED": parameter(-14, "i", 0), "WALL_BOTTOM_IS_ATTACHED": parameter(-15, "i", 0),
     }
     wall = native(Wall, 10, WallType=NS(Kind="basic"), CrossSection="vertical", SketchId=Id(-1),
+                  Orientation=point(0, -1, 0), Flipped=False, IsStackedWallMember=False,
                   Location=LocationCurve(Curve=Line((0, 0, 0), (4, 0, 0)), neighbors=[[], []]),
                   FindInserts=lambda *_: [], get_Parameter=wall_values.get, get_BoundingBox=get_bounds, **source_fields)
     column_values = {name: parameter(-20 - i, kind, value) for i, (name, kind, value) in enumerate((
@@ -353,6 +354,48 @@ class Changed:
             handler(None, event)
 
 
+def install_trial_transactions(db, document, elements, created, changes, status, fault, original):
+    started = []
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            started.append(type(self).__name__)
+            self.state = status.Started
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def Commit(self):
+            self.state = status.Committed
+            changes.emit(document, self.name, "TransactionCommitted", added=created,
+                         modified=[original.Id, 100] if fault == "extra_edit" else [original.Id])
+            return self.state
+
+        def RollBack(self):
+            self.state = status.RolledBack
+            return self.state
+
+    class Group(Transaction):
+        def RollBack(self):
+            self.state = status.RolledBack
+            elements[original.Id] = original
+            if fault != "residual":
+                for identifier in created:
+                    del elements[identifier]
+            document.IsModified = False
+            if fault != "no_rollback_event":
+                changes.emit(document, self.name, "TransactionGroupRolledBack", modified=[original.Id], deleted=created)
+            return self.state
+
+    db.Transaction = Transaction
+    db.TransactionGroup = Group
+    return started
+
+
 @pytest.mark.parametrize("fault, expected", [
     ("none", "trial_rolled_back"),
     ("digest", "stopped"),
@@ -364,7 +407,7 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
     document, elements, _ = model
     db = sys.modules["pyrevit.api"].DB
     monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
-    started, ratios, created = [], [], []
+    ratios, created = [], []
     changes = Changed()
     document.Application.DocumentChanged = changes
     document.Equals = lambda other: document is other
@@ -407,43 +450,7 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
 
     elements[12] = original = column(12, 0, 20)
 
-    class Transaction:
-        def __init__(self, _document, name):
-            self.name = name
-            self.state = status.Uninitialized
-
-        def Start(self):
-            started.append(type(self).__name__)
-            self.state = status.Started
-            return self.state
-
-        def GetStatus(self):
-            return self.state
-
-        def Commit(self):
-            self.state = status.Committed
-            changes.emit(document, self.name, "TransactionCommitted", added=created,
-                         modified=[12, 100] if fault == "extra_edit" else [12])
-            return self.state
-
-        def RollBack(self):
-            self.state = status.RolledBack
-            return self.state
-
-    class Group(Transaction):
-        def RollBack(self):
-            self.state = status.RolledBack
-            elements[12] = original
-            if fault != "residual":
-                for identifier in created:
-                    del elements[identifier]
-            document.IsModified = False
-            if fault != "no_rollback_event":
-                changes.emit(document, self.name, "TransactionGroupRolledBack", modified=[12], deleted=created)
-            return self.state
-
-    db.Transaction = Transaction
-    db.TransactionGroup = Group
+    started = install_trial_transactions(db, document, elements, created, changes, status, fault, original)
     before_request = request(document)
     before_request["scope"] = [before_request["scope"][2]]
     before = invoke(document, before_request)
@@ -456,7 +463,7 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
                                    "parameter:-1001357": low, "parameter:-1001358": high - 20}}
                                for index, (low, high) in enumerate(((0, 8), (8, 15), (15, 20)), 1)]})
     approval_sha = sha256(approval.encode()).hexdigest()
-    result = runpy.run_path(str(SCRIPTS / "probe_column_split.py"), init_globals={"doc": document, "inputs": {
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
         "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
         "approval_json": approval, "approval_sha256": "f" * 64 if fault == "digest" else approval_sha,
     }})["result"]
@@ -474,3 +481,116 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
         assert receipt["rollback_events"][0]["deleted"] == ["200", "201"]
         assert receipt["comparison"]["status"] == "matched"
         assert invoke(document, before_request) == before
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "trial_rolled_back"),
+    ("offset_location", "stopped"),
+    ("joined_wall", "stopped_and_rolled_back"),
+    ("cannot_copy", "stopped_and_rolled_back"),
+])
+def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monkeypatch, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
+                                       RolledBack="rolled_back")
+    db.WallLocationLine = NS(WallCenterline=0)
+    db.WallUtils.IsWallJoinAllowedAtEnd = lambda wall, end: wall.join_allowed[end]
+    db.WallUtils.DisallowWallJoinAtEnd = lambda wall, end: wall.join_allowed.__setitem__(end, False)
+    db.XYZ = point
+    db.BuiltInParameter.WALL_KEY_REF_PARAM = "WALL_KEY_REF_PARAM"
+    db.BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT = "WALL_STRUCTURAL_SIGNIFICANT"
+    monkeypatch.setattr(Line, "CreateBound", staticmethod(
+        lambda a, b: Line((a.X, a.Y, a.Z), (b.X, b.Y, b.Z))), raising=False)
+    changes = Changed()
+    document.Application.DocumentChanged = changes
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    created, constructor_calls = [], []
+    template = elements[10]
+
+    def mutable(identifier, storage, initial, reject=False, **details):
+        item = parameter(identifier, storage, initial, **details)
+        item.current = initial
+        item.AsDouble = item.AsString = lambda: item.current
+
+        def set_value(value):
+            if reject:
+                return False
+            item.current = value
+            document.IsModified = True
+            return True
+
+        item.Set = set_value
+        return item
+
+    def wall(identifier, native_line, base_level, height, finish, flipped=True, structural=True):
+        height_parameter = mutable(-1001105, "d", height)
+        base_parameter = parameter(-1001107, "e", base_level)
+        finish_parameter = mutable(50, "s", finish, reject=fault == "cannot_copy" and identifier != 10,
+                                   GUID="wall-finish")
+        values = {
+            "WALL_BASE_CONSTRAINT": base_parameter,
+            "WALL_BASE_OFFSET": parameter(-1001108, "d", 0),
+            "WALL_HEIGHT_TYPE": parameter(-1001103, "e", Id(-1)),
+            "WALL_USER_HEIGHT_PARAM": height_parameter,
+            "WALL_TOP_IS_ATTACHED": parameter(-14, "i", 0),
+            "WALL_BOTTOM_IS_ATTACHED": parameter(-15, "i", 0),
+            "WALL_KEY_REF_PARAM": parameter(-1001122, "i", int(fault == "offset_location")),
+            "WALL_STRUCTURAL_SIGNIFICANT": parameter(-1001596, "i", int(structural)),
+        }
+        base = elements[base_level].ProjectElevation
+        location = LocationCurve(Curve=native_line, neighbors=[[elements[100]] if fault == "joined_wall"
+                                                                and identifier != 10 else [], []])
+        common = {key: value for key, value in vars(template).items()
+                  if key not in ("Id", "UniqueId", "get_Parameter", "get_BoundingBox", "Location",
+                                 "Parameters", "Orientation", "Flipped")}
+        return native(Wall, identifier, **common, Location=location, join_allowed=[True, identifier != 10],
+                      Orientation=point(0, 1 if flipped else -1, 0), Flipped=flipped,
+                      Parameters=[*values.values(), finish_parameter], get_Parameter=values.get,
+                      get_BoundingBox=lambda _: NS(
+                          Min=point(0, 0, base), Max=point(4, 0.5, base + height_parameter.current),
+                          Transform=NS(OfPoint=lambda value: value, IsIdentity=True)))
+
+    def create(_, line, type_id, level_id, height, offset, flipped, structural):
+        identifier = 300 + len(created)
+        created.append(identifier)
+        constructor_calls.append((type_id.Value, level_id.Value, height, offset, flipped, structural,
+                                  line.GetEndPoint(0).Z))
+        elements[identifier] = wall(identifier, line, level_id, height, "Default", flipped, structural)
+        document.IsModified = True
+        return elements[identifier]
+
+    monkeypatch.setattr(Wall, "Create", staticmethod(create), raising=False)
+    original_line = Line((0, 0, 0), (4, 0, 0))
+    elements[10] = wall(10, original_line, Id(1), 20, "Reviewed")
+    original = wall(10, original_line, Id(1), 20, "Reviewed")
+    started = install_trial_transactions(db, document, elements, created, changes, status, fault, original)
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][0]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    approval = json.dumps({"kind": "element-split-readback-approval",
+                           "snapshot_sha256": sha256(before["snapshot_json"].encode()).hexdigest(),
+                           "inventory_sha256": sha256(before["inventory_json"].encode()).hexdigest(),
+                           "piece_adjustments": [
+                               {"source_id": "10", "piece": index, "values": {
+                                   "parameter:-1001107": str(level_id), "parameter:-1001105": height}}
+                               for index, (level_id, height) in enumerate(((1, 8), (2, 7), (3, 5)), 1)]})
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
+        "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
+        "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
+    }})["result"]
+    assert result["status"] == expected, result
+    assert invoke(document, before_request) == before
+    assert not any(identifier in elements for identifier in created)
+    if fault == "offset_location":
+        assert started == []
+    elif fault == "none":
+        assert constructor_calls == [(100, 2, 7, 0, True, True, 8), (100, 3, 5, 0, True, True, 15)]
+        receipt = json.loads(result["trial_json"])
+        assert receipt["inner_effects"] == {"added": ["300", "301"], "modified": ["10"], "deleted": []}
+        measured = json.loads(receipt["readback_json"])
+        assert all(any(row["identity"] == "shared:wall-finish" and row["value"] == "Reviewed"
+                       for row in item["parameters"]) for item in measured["pieces"])

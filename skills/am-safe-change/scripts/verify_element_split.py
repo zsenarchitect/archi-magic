@@ -20,7 +20,7 @@ HOST_GEOMETRY = {"parameter:-1012805", "parameter:-1012806"}
 COLUMN_GEOMETRY = {"parameter:-1001350", "parameter:-1001351", "parameter:-1001357", "parameter:-1001358"}
 ADJUSTABLE = {
     "wall": HOST_GEOMETRY | {"parameter:-1001103", "parameter:-1001105", "parameter:-1001107",
-                             "parameter:-1001108", "parameter:-1001109", "parameter:-1004005"},
+                             "parameter:-1001108", "parameter:-1001109"},
     "architectural_column": HOST_GEOMETRY | COLUMN_GEOMETRY,
     "structural_column": HOST_GEOMETRY | COLUMN_GEOMETRY,
     "floor": HOST_GEOMETRY,
