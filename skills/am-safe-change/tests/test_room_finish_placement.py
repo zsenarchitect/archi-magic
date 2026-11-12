@@ -42,7 +42,7 @@ class Entity:
 @pytest.mark.parametrize("outcome", [
     "committed", "offset_mismatch", "provenance_missing", "unqualified_schema", "stale_profile",
     "modified_existing", "unrelated_add", "missing_root", "commit_changed",
-    "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned", "workflow_mapping_changed",
+    "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned", "workflow_mapping_changed", "workflow_wall_incomplete",
 ])
 def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(monkeypatch, outcome):
     def xyz(x, y, z):
@@ -281,6 +281,12 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
             return runpy.run_path(script, init_globals={"doc": document, "inputs": inputs})["result"]
 
         request = {"room_ids": ["1"], "horizontal_finishes": {"floor": {"type_id": "30", "offset_ft": 0.125}}}
+        if outcome == "workflow_wall_incomplete":
+            request.update(wall_type_id="40", wall_dimensions={"height_ft": 9, "base_offset_ft": 0})
+            row["wall_finish"] = {"status": "incomplete", "height_ft": 9}
+            edges[0]["wall_finish"] = {"status": "incomplete", "finish_footprints": [
+                {"status": "excluded", "reason": "ambiguous_room_side"},
+            ]}
         if outcome == "workflow_mapping_changed":
             choice = {"horizontal_finishes": request.pop("horizontal_finishes")}
             request["finish_rules"] = {"parameter": "Finish Code", "by_value": {"A": choice, "B": choice}}
@@ -320,6 +326,13 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
             assert preview["columns"][-1] == "Room finish code" and preview["after"][0][-1] == "A"
             row["finish_rule"]["value"] = "B"
         receipt = execute(mode="apply", plan=preview)
+        if outcome == "workflow_wall_incomplete":
+            assert [warning["text"] for warning in preview["warnings"]] == [
+                "Wall finishes were skipped because the wall preview is incomplete.",
+            ]
+            assert receipt["status"] == "ok"
+            assert len(created) == 1 and isinstance(created[0], db.Floor)
+            return
         if outcome == "workflow_commit":
             assert events == ["started", "committed"] and receipt["status"] == "ok"
             assert group_events == ["started", "committed"] and receipt["added_sketch_element_ids"] == ["210", "300"]

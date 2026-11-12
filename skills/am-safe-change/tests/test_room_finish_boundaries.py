@@ -495,6 +495,16 @@ def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monke
         floor.offset = 0.5
     tagged.extend([] if state == "empty" else [floor] if state == "partial" else [floor, ceiling])
     report = run(models, ["1"], horizontal_finishes=horizontal, audit_existing_finishes=True)
+    if state == "empty":
+        # The fixture's room boundary has no resolvable host walls.
+        models[105] = WallType()
+        mixed = run(models, ["1"], horizontal_finishes=horizontal, audit_existing_finishes=True,
+                    wall_type_id="105", wall_dimensions={"height_ft": 9, "base_offset_ft": 0})
+        row, = mixed["rooms"]
+        assert mixed["status"] == "incomplete" and row["wall_finish"]["status"] == "incomplete"
+        assert row["existing_finishes"]["status"] == "no_tagged_pieces"
+        assert row["existing_finishes"]["expected_piece_keys"] == sorted(expected)
+        assert row["existing_finishes"]["nearby"] == {"status": "none_in_scope", "candidates": []}
     audit = report["rooms"][0]["existing_finishes"]
     assert audit["expected_piece_keys"] == sorted(expected)
     if state in ("empty", "match"):

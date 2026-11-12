@@ -251,7 +251,8 @@ def audit_existing_finishes(document, rows):
         existing = records.get(row["room_uid"], [])
         audit = {"status": "conflict", "tagged_pieces": len(existing)}
         row["existing_finishes"] = audit
-        if row.get("wall_finish", {}).get("status", "reported") != "reported":
+        if (row.get("wall_finish", {}).get("status", "reported") != "reported"
+                and not row["horizontal_finishes"]):
             audit["reason"] = "wall_preview_incomplete"
             continue
         try:

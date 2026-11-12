@@ -285,13 +285,16 @@ def compute_preview(request, basis):
             warnings.append({"row": room_id, "text": row["reason"], "blocking": False})
         elif row["phase"]["id"] != basis["phase_id"]:
             warnings.append({"row": room_id, "text": "Room phase differs from the active view.", "blocking": False})
-        elif "wall_finish" in row and "height_ft" not in row["wall_finish"]:
+        elif row.get("wall_finish", {}).get("status") == "reported" and "height_ft" not in row["wall_finish"]:
             warnings.append({"row": room_id, "text": "Resolve the wall scope and include wall dimensions.", "blocking": False})
         elif nearby != "none_in_scope" or audit.get("status") not in ("no_tagged_pieces", "tagged_set_matches"):
             warnings.append({"row": room_id, "text": "Resolve existing or incomplete finish evidence.", "blocking": False})
         elif audit["status"] == "tagged_set_matches":
             warnings.append({"row": room_id, "text": "The reviewed finish set already exists.", "blocking": False})
         else:
+            if row.get("wall_finish", {}).get("status", "reported") != "reported":
+                warnings.append({"row": room_id, "text": "Wall finishes were skipped because the wall preview is incomplete.",
+                                 "blocking": False})
             pieces = expected_pieces(row)
             if pieces:
                 ownership_ids.add(room_id)
@@ -353,12 +356,13 @@ def placement_entries(document, preview, held):
         shapes = expected_pieces(row)
         profiles = room_profiles(room, held) if row["horizontal_finishes"] else None
         centerlines = {}
-        for loop in row["boundary_loops"]:
-            for segment in loop:
-                wall = segment.get("wall_finish", {})
-                for footprint in wall.get("finish_footprints", []):
-                    points = footprint["centerline_ft"]
-                    centerlines[wall["wall_uid"], digest(edge_key("Line", *points))] = points
+        if row.get("wall_finish", {}).get("status") == "reported":
+            for loop in row["boundary_loops"]:
+                for segment in loop:
+                    wall = segment["wall_finish"]
+                    for footprint in wall["finish_footprints"]:
+                        points = footprint["centerline_ft"]
+                        centerlines[wall["wall_uid"], digest(edge_key("Line", *points))] = points
         for step in steps:
             intended = shapes[step["piece_key"]]
             entry = dict(step, intended=intended, room_uid=row["room_uid"], level_id=row["level"]["id"])
