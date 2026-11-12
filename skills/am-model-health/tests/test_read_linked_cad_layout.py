@@ -3,6 +3,7 @@
 from hashlib import sha256
 from importlib import import_module
 from itertools import product
+from copy import deepcopy
 import json
 from pathlib import Path
 import runpy
@@ -686,6 +687,59 @@ def test_probe_requires_a_physical_door_cut_at_three_wall_depths(linked_dwg):
     cut = False
     with pytest.raises(ValueError, match="does not have the reviewed door cut"):
         measure.door_cut(wall, [solid], door, [door], 4000, 1, None, monotonic() + 5, [10])
+
+
+def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg, tmp_path):
+    document = linked_dwg[0]
+    response = native_preview(document, placement_request(linked_dwg))
+    preview = json.loads(response["preview_json"])
+    room, = preview["proposal"]["rooms"]
+    lateral = 200.25 * 0.375
+    door, = preview["proposal"]["doors"]
+    start, end = door["span_mm"]
+
+    def run(run_id, mode, result):
+        return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "no_changes",
+                "exit_code": 0, "result_truncated": False, "error": None, "warnings": [], "dialogs": [],
+                "failures": [], "blocked": [], "engine": {"requested": "cpython"},
+                "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
+                "result": result}
+
+    measurements = {"wall_face_offsets_mm": {"wall-1": [[-100.125], [100.125]]},
+                    "door_cuts": {door["source_ids"][0]: {"elevation_mm": 4000, "samples": [
+                        {"lateral_mm": offset, "span_mm": [start, end]} for offset in (-lateral, 0, lateral)
+                    ]}},
+                    "rooms": {room["source_ids"][0]: {"finish_area_mm2": 9200000, "segment_count": 4}}}
+    before = run("preview-run", "query", response)
+    dry = run("dry-run", "dry_run", {"status": "probe_rolled_back", "rollback_verified": True,
+                                     "preview_sha256": response["preview_sha256"], "transient_element_count": 7,
+                                     "measurements": measurements})
+    fresh = run("fresh-run", "query", response)
+    paths = [tmp_path / f"{name}.json" for name in ("before", "dry", "fresh")]
+    for path, record in zip(paths, (before, dry, fresh)):
+        path.write_text(json.dumps(record))
+    completed = subprocess.run([sys.executable, SCRIPTS / "verify_cad_layout_probe.py", *paths],
+                               capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["status"] == "rollback_probe_verified"
+    verify = import_module("verify_cad_layout_probe").verify
+
+    repeated = {**fresh, "run_id": before["run_id"]}
+    with pytest.raises(ValueError, match="separate Revit runs"):
+        verify(before, dry, repeated)
+    with pytest.raises(ValueError, match="complete successful Revit record"):
+        verify(before, {**dry, "result_truncated": True}, fresh)
+    with pytest.raises(ValueError, match="unexpected model changes"):
+        verify(before, {**dry, "changes": {**dry["changes"], "deleted_count": 1}}, fresh)
+    drifted = deepcopy(fresh)
+    drifted["result"]["preview_json"] += " "
+    drifted["result"]["preview_sha256"] = sha256(drifted["result"]["preview_json"].encode()).hexdigest()
+    with pytest.raises(ValueError, match="differs after rollback"):
+        verify(before, dry, drifted)
+    wrong_cut = deepcopy(dry)
+    wrong_cut["result"]["measurements"]["door_cuts"][door["source_ids"][0]]["samples"][2]["span_mm"][1] += 10
+    with pytest.raises(ValueError, match="differs from the reviewed cut span"):
+        verify(before, wrong_cut, fresh)
 
 
 @pytest.mark.parametrize("change,reason", [

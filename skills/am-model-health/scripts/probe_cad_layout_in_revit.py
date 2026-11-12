@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from pyrevit.api import DB
 
-from cad_layout_preview import edges, fields, inside, point_distance
+from cad_layout_preview import contour_area, contour_area_tolerance, edges, fields, inside, point_distance
 from measure_cad_wall_openings import measure_walls_and_doors
 from preview_cad_layout_in_revit import read_preview
 from read_cad_room_boundaries import read_room, xyz_mm
@@ -187,6 +187,7 @@ def room_probe(document, proposal, walls, level, phase, created, deadline):
     options.SpatialElementBoundaryLocation = DB.SpatialElementBoundaryLocation.Finish
     circuits_seen = 0
     remaining_segments = [5000]
+    measurements = {}
     try:
         for row, allowed in zip(proposal["rooms"], room_edges):
             check_time(deadline)
@@ -219,18 +220,25 @@ def room_probe(document, proposal, walls, level, phase, created, deadline):
                     or len(loops) != 1 or len(loops[0]) != len(contour)):
                 raise ValueError("The placed room does not match the reviewed phase, seed, or contour.")
             actual = []
+            outline = []
             for source, points in loops[0]:
                 if int(source[0]) not in allowed or source[2] or len(points) != 2:
                     raise ValueError("The new room has an unreviewed finish boundary source.")
                 actual.append(sorted(point[:2] for point in points))
+                outline.append(tuple(point[:2] for point in points))
             expected = [sorted(edge) for edge in contour]
             for edge in expected:
                 matches = [line for line in actual if all(math.dist(a, b) <= tolerance for a, b in zip(line, edge))]
                 if len(matches) != 1:
                     raise ValueError("The new room finish edges do not match the reviewed outline.")
                 actual.remove(matches[0])
+            area = contour_area(outline)
+            if abs(area - contour_area(contour)) > contour_area_tolerance(contour, tolerance):
+                raise ValueError("The new room finish area differs from the reviewed outline.")
+            measurements[row["source_ids"][0]] = {"finish_area_mm2": area, "segment_count": len(outline)}
     finally:
         options.Dispose()
+    return measurements
 
 
 def create_probe_geometry(document, preview, created):
@@ -240,11 +248,10 @@ def create_probe_geometry(document, preview, created):
     if not isinstance(level, DB.Level) or not isinstance(phase, DB.Phase):
         raise ValueError("The reviewed level or phase is unavailable.")
     walls = wall_and_door_probe(document, preview, level, phase, created, deadline)
-    if preview["proposal"]["rooms"]:
-        room_probe(document, preview["proposal"], walls, level, phase, created, deadline)
+    rooms = room_probe(document, preview["proposal"], walls, level, phase, created, deadline) if preview["proposal"]["rooms"] else {}
     measurements = measure_walls_and_doors(preview, walls, deadline)
     check_time(deadline)
-    return measurements
+    return {**measurements, "rooms": rooms}
 
 
 def probe(document, request):

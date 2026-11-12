@@ -16,7 +16,7 @@ INPUT_LIMIT = 1024 * 1024
 FRAME = "revit_internal_axes_mm"
 
 
-def read_input(path):
+def read_input(path, limit=INPUT_LIMIT):
     source = local_path(path)
     original = source.lstat()
     if link_or_reparse(original) or not stat.S_ISREG(original.st_mode):
@@ -25,9 +25,9 @@ def read_input(path):
              | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(os.open(source, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > INPUT_LIMIT:
-            raise ValueError("Use a regular JSON file up to 1 MiB.")
-        raw = stream.read(INPUT_LIMIT + 1)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"Use a regular JSON file up to {limit // (1024 * 1024)} MiB.")
+        raw = stream.read(limit + 1)
         after = os.fstat(stream.fileno())
         current = source.lstat()
         if not (
@@ -199,6 +199,15 @@ def edges(loop):
     return list(zip(loop, loop[1:] + loop[:1]))
 
 
+def contour_area(sides):
+    origin = sides[0][0]
+    return abs(sum(cross(sub(a, origin), sub(b, origin)) for a, b in sides)) / 2
+
+
+def contour_area_tolerance(sides, tolerance):
+    return sum(math.dist(a, b) for a, b in sides) * tolerance + math.pi * tolerance ** 2
+
+
 def inside(p, sides):
     x, y = p
     return sum(
@@ -211,9 +220,7 @@ def valid_room(loop, seed, tolerance):
     sides = edges(loop)
     if len(set(loop)) != len(loop) or min(math.dist(*edge) for edge in sides) <= tolerance:
         return False
-    base = loop[0]
-    area = abs(sum(cross(sub(a, base), sub(b, base)) for a, b in sides)) / 2
-    if area < 10000:
+    if contour_area(sides) < 10000:
         return False
     for i, (a, b) in enumerate(sides):
         c = sides[(i + 1) % len(sides)][1]

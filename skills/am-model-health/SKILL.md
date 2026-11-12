@@ -217,6 +217,8 @@ For native qualification, use a disposable, non-workshared Revit 2026 project wi
 
 Check `measurements` for the wall finish plane offsets and the door cut span at three positions across each wall. The cut span must agree with the DWG marker at the reviewed height.
 
+After the rollback probe, run the original preview query again. Save the complete pyRevit records for the first preview, the probe, and the fresh query. Run `python scripts/verify_cad_layout_probe.py before.json dry-run.json fresh.json`. The command checks distinct run IDs, the unchanged preview, and the measured walls, door openings and room areas. It requires complete records with zero reported model changes.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).
