@@ -83,6 +83,7 @@ def transfer_state(document, DB):
             associations = []
             record = dict(state["parameters"][key], group=bounded_text(definition.GetGroupTypeId().TypeId),
                           built_in=built_in(DB, definition), can_assign_formula=bool(parameter.CanAssignFormula),
+                          yes_no=definition.GetDataType() == DB.SpecTypeId.Boolean.YesNo,
                           associations=associations)
             definitions[key] = record
             try:

@@ -283,6 +283,16 @@ Run `scripts/read_family_parameter_transfer.py` with the Revit CPython bridge. R
 
 The reader closes the inspection document without saving. Verify this workflow in Revit 2026 before use on project data.
 
+### Review the transfer
+
+Run `python scripts/family_parameter_transfer_preview.py --source source.json --target target.json --request request.json`. Supply the two complete Revit snapshots as files.
+
+Set `source_sha256` and `target_sha256` to the reviewed read digests. List the exact parameter names in `selected`. Map every target type name to a source type name in `type_map`.
+
+Review each proposed addition and the expected values for each target type. Equivalent target definitions are retained. The preview stops on incomplete reference evidence, incompatible retained values, or missing formula dependencies. Use a separate preview for each target.
+
+The preview makes no model changes. The private family trial and guarded project reload require native verification.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

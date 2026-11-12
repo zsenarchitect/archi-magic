@@ -58,6 +58,7 @@ def case():
     dimension.References = [SimpleNamespace(ElementId=key(12), ConvertToStableRepresentation=lambda doc: "fixture:ref")]
     db = SimpleNamespace(InternalDefinition=Definition, BuiltInParameter=SimpleNamespace(INVALID="INVALID"),
                          Family=Family, Dimension=Dimension, ElementId=int,
+                         SpecTypeId=SimpleNamespace(Boolean=SimpleNamespace(YesNo=SimpleNamespace(TypeId="yesno"))),
                          FilteredElementCollector=lambda doc: SimpleNamespace(OfClass=lambda cls: [dimension]))
     return app, model, db, dimension, parameter
 
