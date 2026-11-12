@@ -47,7 +47,10 @@ def block_reasons(row):
         reasons.append("The element is pinned or its pin state is unknown.")
     references = row.get("references")
     if references != []:
-        if isinstance(references, list) and any(edge.get("kind") in PLACEMENT_KINDS for edge in references):
+        kinds = {edge.get("kind") for edge in references} if isinstance(references, list) else set()
+        if "sheet_owned_import" in kinds:
+            reasons.append("The CAD import is owned by a sheet.")
+        elif kinds & PLACEMENT_KINDS:
             reasons.append("A sheet placement or view reference protects this item.")
         else:
             reasons.append("The item has references or the reference data is unavailable.")

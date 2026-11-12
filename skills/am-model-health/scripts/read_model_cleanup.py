@@ -252,7 +252,8 @@ def read_inventory(document, selected_ids=None):
             candidates.extend(("filter", item) for item in collect(document, clock, cls=cls))
         candidates.extend(("scope_box", item) for item in collect(
             document, clock, category=DB.BuiltInCategory.OST_VolumeOfInterest))
-        candidates.extend(("cad", item) for item in collect(document, clock, cls=DB.ImportInstance))
+        imports = collect(document, clock, cls=DB.ImportInstance)
+        candidates.extend(("cad", item) for item in imports)
         candidates.extend(("view", view) for view in views if not view.IsTemplate)
 
         stage = "references"
@@ -260,6 +261,10 @@ def read_inventory(document, selected_ids=None):
             add_reference(references, active_view.Id, active_view.Id, "active_view")
         read_placement_references(document, clock, references)
         read_view_references(document, views, clock, references)
+        sheets = {element_id(view.Id) for view in bounded(views, clock) if str(view.ViewType) == "DrawingSheet"}
+        for item in bounded(imports, clock):
+            if element_id(item.OwnerViewId) in sheets:
+                add_reference(references, item.Id, item.OwnerViewId, "sheet_owned_import")
     except ScanLimit as error:
         incomplete.append({"group": stage, "reason": str(error)})
     except Exception as error:

@@ -166,6 +166,22 @@ def test_query_reports_exact_native_ids_and_sheet_template_references(monkeypatc
         with pytest.raises(ValueError, match="unique positive decimal-string"):
             read_inventory(document, ["5", "5"])
 
+        owner = view(8)
+        groups["views"].append(owner)
+        imported.OwnerViewId = owner.Id
+        imported.VersionGuid = "12345678-1234-1234-1234-123456789abc"
+        imported.GetDependentElements = lambda _: []
+        document.GetUnusedElements = lambda _: [Id(6)]
+        build = runpy.run_path(str(PREVIEW))["build_preview"]
+        control = read_inventory(document, ["6"])
+        assert build(control, ["6"])["cleanup_selection"]["probe_candidate_ids"] == ["6"]
+        owner.ViewType = "DrawingSheet"
+        sheet_inventory = read_inventory(document, ["6"])
+        assert sheet_inventory["rows"][0]["references"] == [{"source_id": "8", "kind": "sheet_owned_import"}]
+        preview = build(sheet_inventory, ["6"])
+        assert preview["cleanup_selection"]["probe_candidate_ids"] == []
+        assert any("owned by a sheet" in warning["text"] for warning in preview["warnings"])
+
 
 def cleanup_preview_fixture():
     row = {"id": "9007199254740993", "uid": "filter-uid", "kind": "filter",
