@@ -244,7 +244,7 @@ Use the disposable model and acceptance cases in the [room-finish plan](../../do
 1. Use the scripts directory as the workspace. Run `room_finish_placement.py` with `run_query` and `mode: "schema-check"`. This checks a detached entity and registers the schema in Revit memory if needed.
 2. Run the same script with `run_query`, `mode: "preview"`, and the room and finish inputs under `request`. Decode `preview_json`. Review the proposed pieces, excluded rooms, and ownership. Verify the active view phase.
 3. Follow the safe-change steps with the exact preview as `plan` and `mode: "apply"`. Use the host's Dry Run and Keep or Discard. Compare the created piece keys and side effects with the preview. The placement receipt lists the created finishes and the added sketch element IDs.
-4. After Dry Run or Discard, repeat the preview and check that it matches the baseline. After Keep, audit the same rooms and finish types. Verify the tagged sets and the placement geometry independently.
+4. After Dry Run or Discard, make a separate query to `room_finish_placement.py` with `mode: "verify-rollback"`, the exact preview as `plan`, and the placement result as `receipt`. Require `rollback_verified`. This checks the original room scope and the absence of every provisional finish and sketch ID and UID. After Keep, audit the same rooms and finish types. Verify the tagged sets and the placement geometry independently.
 
 ## House rules (all am-* skills)
 

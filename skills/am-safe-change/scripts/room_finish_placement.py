@@ -12,6 +12,7 @@ from room_finish_provenance import SCHEMA_GUID, SCHEMA_NAME, digest, edge_key, e
 
 
 MAX_PIECES = 200
+MAX_SKETCH_ELEMENTS = 5000
 TRANSACTION_NAME = "Place reviewed room finishes"
 HEIGHT_PARAMETERS = {"floor": "FLOOR_HEIGHTABOVELEVEL_PARAM", "ceiling": "CEILING_HEIGHTABOVELEVEL_PARAM"}
 
@@ -132,9 +133,15 @@ def checked_commit(document, pieces, receipts, changes, schema, field):
             raise ValueError("Revit changed finish provenance during commit.")
         if kind != "wall":
             dependencies.update(finish_sketch_dependencies(document, element))
-    if not (added - roots) <= dependencies:
+    if len(added - roots) > MAX_SKETCH_ELEMENTS or not (added - roots) <= dependencies:
         raise ValueError("The finish transaction created an element outside the reviewed pieces and their sketches.")
-    return sorted(added - roots, key=int)
+    evidence = []
+    for identifier in sorted(added - roots, key=int):
+        element = document.GetElement(native_id(identifier))
+        if element is None or not element.UniqueId:
+            raise ValueError("A new sketch element has no verifiable native identity.")
+        evidence.append({"id": identifier, "uid": str(element.UniqueId)})
+    return evidence
 
 
 def rollback_group(transaction, group):
@@ -195,11 +202,12 @@ def place_room_finishes(document, pieces):
             application.DocumentChanged -= changed
         if state != DB.TransactionStatus.Committed:
             raise ValueError("Revit did not commit the finish transaction.")
-        dependent_ids = checked_commit(document, pieces, receipts, changes, schema, field)
+        dependents = checked_commit(document, pieces, receipts, changes, schema, field)
         if group.Assimilate() != DB.TransactionStatus.Committed:
             raise ValueError("Revit did not finish the placement transaction group.")
         return {"status": "ok", "created": [receipt for receipt, _ in receipts],
-                "added_sketch_element_ids": dependent_ids}
+                "added_sketch_element_ids": [item["id"] for item in dependents],
+                "added_sketch_elements": dependents}
     except Exception as error:
         if rollback_group(transaction, group):
             result = {"status": "stopped", "target_rollback_verified": True, "error_type": type(error).__name__}
@@ -377,10 +385,45 @@ def apply_preview(document, approved):
                 raise ValueError("A room finish source changed in central or is owned by another user.")
     held = []
     try:
-        return place_room_finishes(document, placement_entries(document, current, held))
+        receipt = place_room_finishes(document, placement_entries(document, current, held))
+        if receipt["status"] == "ok":
+            receipt["basis_sha256"] = current["basis_sha256"]
+        return receipt
     finally:
         for profile in held:
             profile.Dispose()
+
+
+def verify_rollback(document, approved, receipt):
+    if (document is None or document.IsModifiable or approved.get("recipe") != "room-finishes"
+            or approved.get("blocked") is not False or receipt.get("status") != "ok"
+            or digest(approved["basis"]) != approved["basis_sha256"]
+            or receipt.get("basis_sha256") != approved["basis_sha256"]):
+        raise ValueError("Use the exact reviewed room finish preview and its provisional receipt.")
+    created = receipt["created"]
+    expected_keys = [step["piece_key"] for step in approved["steps"]]
+    if (not isinstance(created, list) or not 1 <= len(created) <= MAX_PIECES
+            or [item["piece_key"] for item in created] != expected_keys):
+        raise ValueError("The provisional receipt does not cover the exact reviewed finish pieces.")
+    sketches = receipt["added_sketch_elements"]
+    if (not isinstance(sketches, list) or len(sketches) > MAX_SKETCH_ELEMENTS
+            or [item["id"] for item in sketches] != receipt["added_sketch_element_ids"]):
+        raise ValueError("The provisional receipt does not cover the exact sketch elements.")
+    identifiers, uids, absent = set(), set(), []
+    for item in created + sketches:
+        identifier, uid = item["id"], item["uid"]
+        if not hasattr(uid, "strip") or not uid.strip() or identifier in identifiers or uid in uids:
+            raise ValueError("The provisional receipt repeats or omits a native identity.")
+        if document.GetElement(native_id(identifier)) is not None or document.GetElement(uid) is not None:
+            raise ValueError("A provisional finish or sketch element still resolves by ID or UID.")
+        identifiers.add(identifier)
+        uids.add(uid)
+        absent.append({"id": identifier, "uid": uid})
+    current = finish_preview(document, approved["request"])
+    if current["basis"] != approved["basis"] or current["steps"] != approved["steps"]:
+        raise ValueError("The original room finish scope changed after rollback.")
+    return {"status": "rollback_verified", "basis_sha256": approved["basis_sha256"],
+            "confirmed_absent": sorted(absent, key=lambda item: int(item["id"]))}
 
 
 if "inputs" in globals():
@@ -393,8 +436,10 @@ if "inputs" in globals():
             result = {"status": "ok", "preview_json": json.dumps(plan, ensure_ascii=True, allow_nan=False)}
         elif mode == "apply":
             result = apply_preview(doc, inputs["plan"])
+        elif mode == "verify-rollback":
+            result = verify_rollback(doc, inputs["plan"], inputs["receipt"])
         else:
-            raise ValueError("Choose schema-check, preview, or apply.")
+            raise ValueError("Choose schema-check, preview, apply, or verify-rollback.")
     except (ValueError, KeyError, TypeError) as error:
         result = {"status": "stopped", "message": str(error)}
     except Exception as error:

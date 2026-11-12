@@ -157,11 +157,14 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
                 item.SketchId = ElementId(item.Id.Value + 10)
                 sketch = sketch_class()
                 sketch.Id, sketch.OwnerId, sketch.Profile = item.SketchId, item.Id, geometry
+                sketch.UniqueId = "sketch-" + str(sketch.Id.Value)
                 sketch.SketchPlane = None
                 curve_id = ElementId(item.Id.Value + 100)
                 sketch.GetAllElements = lambda: [curve_id]
                 document.elements[item.SketchId.Value] = sketch
-                document.elements[curve_id.Value] = model_curve()
+                curve = model_curve()
+                curve.Id, curve.UniqueId = curve_id, "curve-" + str(curve_id.Value)
+                document.elements[curve_id.Value] = curve
             document.elements[item.Id.Value] = item
             created.append(item)
             return item
@@ -208,7 +211,10 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
     document = NS(IsFamilyDocument=False, IsReadOnly=False, IsModifiable=False,
                   Application=NS(ShortCurveTolerance=0.01, DocumentChanged=ChangeEvent()), Regenerate=lambda: None,
                   elements={10: level(), 20: NS(UniqueId="phase"), 30: floor_type(), 40: ceiling_type(), 50: wall_type()})
-    document.GetElement = lambda element_id: document.elements.get(element_id.Value)
+    document.GetElement = lambda element_id: (
+        next((item for item in document.elements.values() if getattr(item, "UniqueId", None) == element_id), None)
+        if isinstance(element_id, str) else document.elements.get(element_id.Value)
+    )
     document.Equals = lambda other: other is document
     points = [xyz(0, 0, 25), xyz(4, 0, 25), xyz(4, 4, 25), xyz(0, 4, 25)]
     profile = [Line(a, b) for a, b in zip(points, points[1:] + points[:1])]
@@ -318,6 +324,28 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
             assert events == ["started", "committed"] and receipt["status"] == "ok"
             assert group_events == ["started", "committed"] and receipt["added_sketch_element_ids"] == ["210", "300"]
             assert receipt["created"][0]["piece_key"] == preview["steps"][0]["piece_key"]
+            assert receipt["basis_sha256"] == preview["basis_sha256"]
+            assert receipt["added_sketch_elements"] == [
+                {"id": "210", "uid": "sketch-210"}, {"id": "300", "uid": "curve-300"},
+            ]
+            rollback = {"mode": "verify-rollback", "plan": preview, "receipt": receipt}
+            assert "still resolves" in execute(**rollback)["message"]
+            for identifier in (200, 210, 300):
+                document.elements.pop(identifier)
+            assert execute(**rollback) == {
+                "status": "rollback_verified", "basis_sha256": preview["basis_sha256"],
+                "confirmed_absent": [
+                    {"id": "200", "uid": "finish-200"},
+                    {"id": "210", "uid": "sketch-210"},
+                    {"id": "300", "uid": "curve-300"},
+                ],
+            }
+            document.elements[999] = NS(UniqueId="curve-300")
+            assert "still resolves by ID or UID" in execute(**rollback)["message"]
+            document.elements.pop(999)
+            report["host_identity"] = {"project_uid": "changed", "path_sha256": "a" * 64}
+            assert "scope changed after rollback" in execute(**rollback)["message"]
+            assert events == ["started", "committed"]
         else:
             assert receipt["status"] == "stopped" and not events and not created
         return
