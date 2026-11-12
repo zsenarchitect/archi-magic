@@ -120,3 +120,39 @@ def test_stale_support_stops_before_any_transaction(monkeypatch):
     with pytest.raises(ValueError, match="changed since preview"):
         probe(document, args)
     assert operations == []
+
+
+def test_saved_alignment_requires_independent_restoration(monkeypatch, tmp_path):
+    import subprocess
+
+    probe, document, args, _, _ = setup(monkeypatch)
+    baseline = args["baseline"]
+    query = {"status": "ok", "snapshot_json": json.dumps(baseline)}
+
+    def run_record(run_id, mode, result):
+        changes = {key: [] for key in ("added", "modified", "deleted", "transactions")}
+        changes.update(added_count=0, modified_count=0, deleted_count=0, by_category={})
+        return {"run_id": run_id, "mode": mode, "status": "ok", "exit_code": 0,
+                "decision": "no_changes" if mode == "dry_run" else "rolled_back",
+                "result_truncated": False, "changes": changes, "result": result}
+
+    before = run_record("before", "query", query)
+    dry = run_record("trial", "dry_run", probe(document, args))
+    fresh = run_record("after", "query", dict(query))
+    paths = [tmp_path / (name + ".json") for name in ("before", "trial", "fresh")]
+
+    def verify(after):
+        for path, row in zip(paths, (before, dry, after)):
+            path.write_text(json.dumps({"response": row}))
+        return subprocess.run([sys.executable, str(SCRIPT.with_name("verify_toposolid_alignment.py")),
+                               *map(str, paths)], capture_output=True, text=True)
+
+    accepted = verify(fresh)
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["status"] == "toposolid_alignment_rollback_verified"
+    assert verify(dict(fresh, run_id="before")).returncode == 2
+    drifted = json.loads(query["snapshot_json"])
+    drifted["vertices_ft"][0][2] += 1
+    assert verify(dict(fresh, result=dict(query, snapshot_json=json.dumps(drifted)))).returncode == 2
+    dry["result"]["baseline_sha256"] = "0" * 64
+    assert verify(fresh).returncode == 2

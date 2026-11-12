@@ -9,6 +9,7 @@ from pyrevit.api import DB
 
 from probe_toposolid_vertex_offset import TOLERANCE_FT, locate, rollback
 from read_toposolid_vertices import element_id, project_identity, read_vertices, shape_vertices
+from verify_toposolid_alignment import TRANSACTION, digest
 
 
 def measure_alignment(document, terrain_id, rows, baseline_vertices, tolerance):
@@ -66,7 +67,7 @@ def probe(document, args):
     if json.loads(read_vertices(document, read_args)["snapshot_json"]) != baseline:
         raise ValueError("The terrain, selected support or targets changed since preview.")
     terrain_id = element_id(read_args["toposolid_id"], "Toposolid")
-    transaction = DB.Transaction(document, "Try reviewed Toposolid alignment and roll back")
+    transaction = DB.Transaction(document, TRANSACTION)
     observed, failure, rolled_back = None, None, False
     try:
         if transaction.Start() != DB.TransactionStatus.Started:
@@ -106,6 +107,7 @@ def probe(document, args):
         return dict(failure, status="stopped", rollback_verified=True)
     return {"status": "measured", "rollback_verified": True, "document": project,
             "toposolid": baseline["toposolid"], "support": alignment["support"], "vertices": observed,
+            "baseline_sha256": digest(baseline),
             "revit_build": str(document.Application.VersionBuild), "python_engine": platform.python_implementation()}
 
 
