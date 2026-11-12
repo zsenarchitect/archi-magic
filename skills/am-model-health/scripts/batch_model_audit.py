@@ -41,7 +41,7 @@ def regular_file(path):
     return info
 
 
-def digest(path, destination=None):
+def digest(path, destination=None, *, max_file=MAX_FILE):
     initial = regular_file(path)
     flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
@@ -49,13 +49,15 @@ def digest(path, destination=None):
     total = 0
     with os.fdopen(os.open(path, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not (stat.S_ISREG(before.st_mode) and 0 < before.st_size <= MAX_FILE
+        if not (stat.S_ISREG(before.st_mode) and 0 < before.st_size <= max_file
                 and os.path.samestat(initial, before)):
-            raise ValueError("Audit inputs must be regular, nonempty files up to 1 GiB.")
+            limit = "1 GiB" if max_file == MAX_FILE else f"{max_file // (1024 * 1024)} MiB"
+            raise ValueError(f"Audit inputs must be regular, nonempty files up to {limit}.")
         while chunk := stream.read(1024 * 1024):
             total += len(chunk)
-            if total > MAX_FILE:
-                raise ValueError("Input exceeds 1 GiB.")
+            if total > max_file:
+                limit = "1 GiB" if max_file == MAX_FILE else f"{max_file // (1024 * 1024)} MiB"
+                raise ValueError(f"Input exceeds {limit}.")
             value.update(chunk)
             if destination is not None:
                 destination.write(chunk)
