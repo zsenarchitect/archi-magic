@@ -167,7 +167,7 @@ Audit a local drawing before linking it. This workflow reads the drawing without
 - DXF. Use local Python with ezdxf 1.4.5. Run `python scripts/dwg_cad_audit.py drawing.dxf`.
 - DWG. Use a trusted local LibreDWG 0.14 `dwgread` executable. Run `python scripts/dwg_cad_audit.py drawing.dwg --dwgread "/absolute/path/to/dwgread"`. The qualified DWG versions are AC1015 and AC1032.
 - Add `--output findings.json` to save the report at a new path. Without it, the command prints JSON. Existing inventory JSON inputs still work.
-- Check the inventory for layers, external references, block definitions and attributes, and unit settings. The report gives layer colors and linetypes, attribute definitions and stored values. It does not assess office policies or determine purge safety.
+- Check the inventory for layers, external references, block definitions and attributes, and unit settings. The report gives layer colors and linetypes, attribute definitions and stored values. In DXF reports, `purge_candidates` lists named block definitions with no known references. Use AutoCAD to confirm purge eligibility before proposing an edit.
 - An external reference is an Xref. The audit checks regular files under the drawing directory. It identifies a direct self-reference. Nested Xrefs and unsafe paths remain unchecked.
 - Exit 0 means the supported checks ran with no errors. Exit 1 means they ran and found an error. Exit 2 means the audit failed. Exit 3 means the report has incomplete coverage. Read its notes and findings.
 

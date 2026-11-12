@@ -249,6 +249,7 @@ def dwg_inventory(doc, version):
 
 def dxf_worker(snapshot):
     import ezdxf
+    from ezdxf.blkrefs import find_unreferenced_blocks
     if ezdxf.__version__ != "1.4.5":
         raise ValueError("Install the qualified ezdxf 1.4.5 reader.")
     doc = ezdxf.readfile(snapshot)
@@ -256,7 +257,8 @@ def dxf_worker(snapshot):
     inserts = defaultdict(list)
     if len(doc.entitydb) > RECORD_LIMIT:
         raise ValueError("Drawing exceeds the supported object limits.")
-    layers, xrefs, blocks = [], [], []
+    layers, xrefs, blocks, purge_candidates = [], [], [], []
+    unreferenced = find_unreferenced_blocks(doc)
     for layout in doc.blocks:
         for entity in layout:
             if entity.dxf.hasattr("layer"):
@@ -275,6 +277,9 @@ def dxf_worker(snapshot):
         if flagged or path:
             xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
         elif not entity.is_layout_block:
+            if (layout.name in unreferenced and not name.startswith(("*", "_")) and "|" not in name
+                    and not entity.is_anonymous and not entity.dxf.flags & (entity.EXTERNAL | entity.RESOLVED)):
+                purge_candidates.append({"kind": "block", "name": name})
             instances = inserts.get(name.casefold(), [])
             attributes = [
                 {"tag": text_value(attribute.dxf.tag), "value": text_value(attribute.dxf.text),
@@ -288,6 +293,7 @@ def dxf_worker(snapshot):
             blocks.append({"name": name, "count": len(instances), "attributes": attributes,
                            "definitions": definitions})
     return {"layers": layers, "xrefs": xrefs, "blocks": blocks,
+            "purge_candidates": sorted(purge_candidates, key=lambda row: row["name"].casefold()),
             "header": {key: doc.header.get(key) for key in ("$INSUNITS", "$MEASUREMENT")},
             "unassociated_attributes": [], "unassociated_definitions": [], "notes": []}
 
@@ -340,6 +346,7 @@ def inspect_drawing(raw_source, decoder):
         "layer_style_policy": "not_assessed",
         "required_attribute_policy": "not_assessed",
         "purge_eligibility": "not_assessed",
+        "block_purge_review": "known_dxf_references" if suffix == ".dxf" else "not_assessed",
     })
     return result
 
