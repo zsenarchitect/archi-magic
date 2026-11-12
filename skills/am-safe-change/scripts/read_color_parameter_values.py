@@ -211,20 +211,15 @@ def qualify_rules(document, parameter_id, category_ids, rows, types, missing, ep
             "mismatch_count": mismatch_count, "mismatches": mismatches}
 
 
-def normalized_rule(expression):
-    # A non-inverted one-child logical node does not change the predicate.
-    while (expression and expression["type"] in ("LogicalAndFilter", "LogicalOrFilter")
-           and not expression["inverted"] and len(expression["children"]) == 1):
-        expression = expression["children"][0]
-    return expression
-
-
 def existing_filter_matches(document, view, inventory, clock):
+    from view_color_preview import normalized_rule
+
     groups = inventory["native_rules"]["groups"]
     categories = set(inventory["category_ids"])
     signatures = {snapshot_digest(normalized_rule(group["expression"])): group["key"] for group in groups}
     groups_by_members = {frozenset(group["member_ids"]): group["key"] for group in groups}
-    applied = {key(item) for item in bounded(view.GetOrderedFilters(), 100, "applied filter", clock)}
+    ordered = [key(item) for item in bounded(view.GetOrderedFilters(), 100, "applied filter", clock)]
+    applied = set(ordered)
     solid = key(DB.LinePatternElement.GetSolidPatternId())
     rows = inventory["rows"]
     observed = []
@@ -299,7 +294,8 @@ def existing_filter_matches(document, view, inventory, clock):
         results[group_id] = {"status": status, "reason": reason, "exact": exact_rows,
                              "uncertain_filter_ids": uncertain,
                              "selected_id": selected["id"] if status == "reuse" else None}
-    return {"groups": results, "existing_parameter_filter_names": sorted(names, key=lambda row: int(row["id"]))}
+    return {"groups": results, "ordered_applied_ids": ordered,
+            "existing_parameter_filter_names": sorted(names, key=lambda row: int(row["id"]))}
 
 
 def main(document, args):

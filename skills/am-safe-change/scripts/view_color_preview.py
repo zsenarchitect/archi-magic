@@ -9,13 +9,14 @@ import json
 import re
 import sys
 
-from view_duplicate_preview import element_id, read_payload, read_record, snapshot_digest
-from view_filter_transfer_preview import MAX_SAVED_RECORD, complete_record
+from view_duplicate_preview import TEXT, element_id, read_payload, read_record, snapshot_digest
+from view_filter_transfer_preview import MAX_SAVED_RECORD, checked_changes, checked_record, complete_record
 
 COLOR_FIELDS = ("ProjectionLineColor", "CutLineColor", "SurfaceForegroundPatternColor", "CutForegroundPatternColor")
 COLUMNS = ["Row", "Value", "Elements", "Filter", "Action", "Color"]
 MAX_VALUES = 24
 POSITION_TOLERANCE = 1e-7
+COLOR_TRIAL_TRANSACTION = "Test parameter color drafting legend"
 
 
 def color_text(rgb):
@@ -163,6 +164,14 @@ def existing_legend_matches(preflight, rows):
             "placements": existing["placements"]}
 
 
+def normalized_rule(expression):
+    # A non-inverted one-child logical node does not change the predicate.
+    while (expression and expression["type"] in ("LogicalAndFilter", "LogicalOrFilter")
+           and not expression["inverted"] and len(expression["children"]) == 1):
+        expression = expression["children"][0]
+    return expression
+
+
 def matching_applied_filter(row, candidate, solid_id):
     if (not candidate or not candidate["applied"] or not candidate["visible"] or not candidate["enabled"]
             or applied_color(candidate) != tuple(row["rgb"])):
@@ -273,13 +282,113 @@ def build(inventory):
     return proposal, display
 
 
+def trial_changes(baseline, proposal, receipt, combined):
+    rows = proposal["legend_rows"]
+    observed = receipt["rows"]
+    if [row["value_key"] for row in observed] != [row["value_key"] for row in rows]:
+        raise ValueError("The trial did not verify every reviewed legend row.")
+    identities = [(receipt["legend_id"], receipt["legend_uid"])]
+    for row, measured in zip(rows, observed):
+        if measured["rgb"] != row["rgb"]:
+            raise ValueError("A trial swatch differs from its reviewed color.")
+        identities.extend((measured[role + "_id"], measured[role + "_uid"]) for role in ("region", "note"))
+    added = [element_id(item) for item, _ in identities]
+    modified = []
+    if combined:
+        filters = receipt["filters"]
+        if [item["value_key"] for item in filters] != [row["value_key"] for row in rows]:
+            raise ValueError("The trial did not verify every reviewed filter.")
+        rules = {group["key"]: group["expression"] for group in baseline["native_rules"]["groups"]}
+        groups = baseline["existing_filters"]["groups"]
+        solid = proposal["legend_preflight"]["resources"]["solid"]["id"]
+        for row, item in zip(rows, filters):
+            value = row["value_key"]
+            created = row["filter_id"] is None
+            current = next((candidate for candidate in groups[value]["exact"]
+                            if candidate["id"] == row["filter_id"]), None)
+            if (item["created"] is not created or item["name"] != row["filter_name"]
+                    or item["expression"] != normalized_rule(rules[value])
+                    or (not created and (item["filter_id"] != row["filter_id"]
+                                         or item["filter_uid"] != current["uid"]))
+                    or not matching_applied_filter(
+                        row, dict(item, applied=True, visible=True, enabled=True), solid)):
+                raise ValueError("A trial filter differs from its reviewed identity, rule or graphics.")
+            identities.append((item["filter_id"], item["filter_uid"]))
+            if created:
+                added.append(element_id(item["filter_id"]))
+            if not matching_applied_filter(row, current, solid):
+                modified = [proposal["view"]["id"]]
+    elif "filters" in receipt:
+        raise ValueError("A legend-only trial reported filter changes.")
+
+    ids = [element_id(item) for item, _ in identities]
+    uids = [uid for _, uid in identities]
+    existing_ids = {proposal["view"]["id"]} | {row["id"] for row in baseline["rows"]}
+    existing_ids.update(row["id"] for row in baseline["existing_filters"]["existing_parameter_filter_names"])
+    existing_ids.update(resource["id"] for resource in proposal["legend_preflight"]["resources"].values())
+    if (len(set(ids)) != len(ids) or len(set(uids)) != len(uids) or set(added) & existing_ids
+            or any(not isinstance(uid, TEXT) or not uid for uid in uids)):
+        raise ValueError("The trial has repeated, missing or already existing identities.")
+    changes = {"added": sorted(added, key=int), "modified": modified, "deleted": []}
+    if receipt["changes"] != changes:
+        raise ValueError("The trial change list disagrees with the reviewed additions and model view.")
+    return changes
+
+
+def verify_fixture(review, original_record, probe_record, fresh_record):
+    original = checked_record(original_record, "query")
+    probe = checked_record(probe_record, "dry_run")
+    fresh = checked_record(fresh_record, "query")
+    if len({record["run_id"] for record in (original, probe, fresh)}) != 3:
+        raise ValueError("Supply three distinct pyRevit run records.")
+    checked_changes(original, [])
+    checked_changes(fresh, [])
+    baseline = read_payload(original, "inventory_json")
+    proposal, preview = build(baseline)
+    if review != {"proposal": proposal, "preview": preview} or proposal["blocked"] or not proposal["legend_preflight"]:
+        raise ValueError("The original query does not reproduce the reviewed color proposal and preview.")
+    if read_payload(fresh, "inventory_json") != baseline:
+        raise ValueError("The independent Revit query differs from the original color inventory.")
+    result = probe["result"]
+    receipt = result["receipt"]
+    if receipt["basis_sha256"] != proposal["basis_sha256"]:
+        raise ValueError("The probe receipt does not match the reviewed color inventory.")
+    status = result["status"]
+    if status == "color_fixture_unchanged" and proposal["no_change_candidate"]:
+        filter_ids = [row["filter_id"] for row in proposal["legend_rows"]]
+        order = receipt["ordered_filter_ids"]
+        if (receipt["legend_reuse"] != proposal["legend_reuse"]
+                or order != baseline["existing_filters"]["ordered_applied_ids"]
+                or Counter(order) != Counter(filter_ids)):
+            raise ValueError("The repeat receipt differs from the reviewed filter or legend identities.")
+        changes = {"added": [], "modified": [], "deleted": []}
+        verified = "verified_unchanged_color_fixture"
+    elif (status in ("color_trial_rolled_back", "legend_trial_rolled_back")
+          and proposal["legend_preflight"]["state"] == "available"):
+        changes = trial_changes(baseline, proposal, receipt, status == "color_trial_rolled_back")
+        verified = "verified_color_fixture_rollback" if status == "color_trial_rolled_back" else "verified_legend_rollback"
+    else:
+        raise ValueError("The probe outcome does not match the reviewed fixture.")
+    checked_changes(probe, changes["modified"], changes["added"], COLOR_TRIAL_TRANSACTION)
+    return {"status": verified, "basis_sha256": proposal["basis_sha256"], "document": proposal["document"],
+            "original_run_id": original["run_id"], "probe_run_id": probe["run_id"],
+            "fresh_run_id": fresh["run_id"], "changes": changes}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runtime_record", help="Full pyRevit color and reuse inventory")
+    parser.add_argument("--verify-fixture", nargs=3, metavar=("REVIEW", "PROBE", "FRESH"),
+                        help="Verify the saved review, full dry-run response, and independent fresh query")
     args = parser.parse_args()
     try:
-        record = complete_record(read_record(args.runtime_record, MAX_SAVED_RECORD))
-        inventory = read_payload(record, "inventory_json")
+        record = read_record(args.runtime_record, MAX_SAVED_RECORD)
+        if args.verify_fixture:
+            review, probe, fresh = [read_record(path, MAX_SAVED_RECORD) for path in args.verify_fixture]
+            report = verify_fixture(review, record, probe, fresh)
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            return 0
+        inventory = read_payload(complete_record(record), "inventory_json")
         proposal, preview = build(inventory)
         print(json.dumps({"proposal": proposal, "preview": preview}, ensure_ascii=True, indent=2))
         return 1 if proposal["blocked"] else 0

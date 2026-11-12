@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import runpy
@@ -576,6 +577,31 @@ def test_native_legend_preserves_collisions_and_records_existing_contents(reader
     assert proposal["blocked"] and any(expected in item["text"] for item in display["warnings"])
 
 
+def fixture_record(run_id, mode, result, changes=None):
+    from view_color_preview import COLOR_TRIAL_TRANSACTION
+
+    changes = changes or {"added": [], "modified": [], "deleted": []}
+    added, modified = changes["added"], changes["modified"]
+    touched = len(added) + len(modified)
+    return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "rolled_back",
+            "exit_code": 0, "result_truncated": False, "error": None, "result": result,
+            "failures": [], "dialogs": [], "blocked": [], "warnings": [],
+            "changes": {"added_count": len(added), "deleted_count": 0, "modified_count": len(modified),
+                        "added": [{"id": int(item)} for item in added], "deleted": [],
+                        "modified": [{"id": int(item)} for item in modified],
+                        "transactions": [COLOR_TRIAL_TRANSACTION] if touched else [],
+                        "by_category": {"Fixture elements": touched} if touched else {}}}
+
+
+def fixture_verification_records(inventory, probe):
+    snapshot = {"status": "ok", "inventory_json": json.dumps(inventory)}
+    return (
+        fixture_record("a00000000001", "query", snapshot),
+        fixture_record("b00000000002", "dry_run", probe, probe["receipt"].get("changes")),
+        fixture_record("c00000000003", "query", dict(snapshot)),
+    )
+
+
 @pytest.mark.parametrize("difference", [
     None, "note_format", "swatch_color", "extra_element", "filter_pattern",
     "competing_filter", "element_override", "legend_temporary_mode", "changed_readback", "changed_order",
@@ -692,10 +718,19 @@ def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reade
         with pytest.raises(ValueError, match=messages[difference]):
             trial["probe"](document, arguments)
     else:
-        assert trial["probe"](document, arguments) == {
+        result = trial["probe"](document, arguments)
+        assert result == {
             "status": "color_fixture_unchanged", "receipt": {"basis_sha256": proposal["basis_sha256"],
                 "ordered_filter_ids": ["201"], "legend_reuse": proposal["legend_reuse"]},
         }
+        from view_color_preview import verify_fixture
+
+        review = {"proposal": proposal, "preview": preview}
+        original, dry_run, fresh = fixture_verification_records(inventory, result)
+        assert verify_fixture(review, original, dry_run, fresh)["status"] == "verified_unchanged_color_fixture"
+        dry_run["result"]["receipt"]["ordered_filter_ids"] = []
+        with pytest.raises(ValueError, match="repeat receipt differs"):
+            verify_fixture(review, original, dry_run, fresh)
 
 
 def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(reader, monkeypatch):
@@ -711,8 +746,9 @@ def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(re
 
 
 @pytest.mark.parametrize("fault", [None, "swatch", "extra_element", "combined", "competing_filter"])
-def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, fault):
-    from view_color_preview import build
+def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, fault, tmp_path):
+    import subprocess
+    from view_color_preview import build, verify_fixture
 
     mock_rules(reader)
     document, request, _, _ = native_legend_fixture(reader, monkeypatch)
@@ -992,6 +1028,35 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
         assert result["receipt"]["filters"][0]["filter_uid"] == "filter-601"
         assert result["receipt"]["filters"][0]["graphics"]["CutLineColor"] == proposal["legend_rows"][0]["rgb"]
         assert not model.applied
+        review = {"proposal": proposal, "preview": display}
+        original, dry_run, fresh = fixture_verification_records(baseline, result)
+        paths = [tmp_path / (name + ".json") for name in ("original", "review", "dry-run", "fresh")]
+        for path, value in zip(paths, (original, review, dry_run, fresh)):
+            path.write_text(json.dumps(value))
+        check = subprocess.run(
+            [sys.executable, str(SCRIPTS / "view_color_preview.py"), str(paths[0]), "--verify-fixture",
+             *map(str, paths[1:])], capture_output=True, text=True,
+        )
+        assert check.returncode == 0, check.stderr
+        report = json.loads(check.stdout)
+        assert report["status"] == "verified_color_fixture_rollback"
+        assert report["changes"] == result["receipt"]["changes"]
+
+        short_samples = deepcopy(dry_run)
+        short_samples["changes"]["added"].pop()
+        with pytest.raises(ValueError, match="complete recipe telemetry"):
+            verify_fixture(review, original, short_samples, fresh)
+        wrong_filter = deepcopy(dry_run)
+        wrong_filter["result"]["receipt"]["filters"][0]["graphics"]["CutForegroundPatternId"] = None
+        with pytest.raises(ValueError, match="reviewed identity, rule or graphics"):
+            verify_fixture(review, original, wrong_filter, fresh)
+        replayed = dict(fresh, run_id=original["run_id"])
+        with pytest.raises(ValueError, match="distinct"):
+            verify_fixture(review, original, dry_run, replayed)
+        changed_inventory = dict(baseline, link_candidate_ids=["99"])
+        changed_fresh = dict(fresh, result=dict(fresh["result"], inventory_json=json.dumps(changed_inventory)))
+        with pytest.raises(ValueError, match="independent Revit query differs"):
+            verify_fixture(review, original, dry_run, changed_fresh)
     elif fault:
         assert result["status"] == "stopped_and_rolled_back", result
         expected = "reviewed color" if fault == "swatch" else "complete transaction change record"
@@ -1001,4 +1066,7 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
         assert result["receipt"]["changes"] == {"added": ["41", "501", "502"], "modified": [], "deleted": []}
         assert result["receipt"]["rows"][0]["rgb"] == proposal["legend_rows"][0]["rgb"]
         assert result["receipt"]["rows"][0]["region_uid"] == "region-501"
+        review = {"proposal": proposal, "preview": display}
+        records = fixture_verification_records(baseline, result)
+        assert verify_fixture(review, *records)["status"] == "verified_legend_rollback"
     assert not created and not document.legend_contents

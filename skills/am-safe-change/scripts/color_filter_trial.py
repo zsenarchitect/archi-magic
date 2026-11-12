@@ -6,8 +6,9 @@ from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 from duplicate_views import bounded, identifier, key
-from read_color_parameter_values import attachable_expression, normalized_rule, signed_identifier
+from read_color_parameter_values import attachable_expression, signed_identifier
 from read_view_filter_graphics import filter_definition, graphics
+from view_color_preview import normalized_rule
 
 GRAPHIC_SETTERS = {
     "ProjectionLineColor": "SetProjectionLineColor",

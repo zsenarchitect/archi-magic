@@ -10,9 +10,8 @@ from pyrevit.api import DB
 from duplicate_views import bounded, capture_changes, identifier, key, rollback
 from read_color_legend import name_of, point, read_contents
 from read_color_parameter_values import main as read_inventory
+from view_color_preview import COLOR_TRIAL_TRANSACTION as TRANSACTION_NAME
 from view_color_preview import build, close_points, note_fits_row
-
-TRANSACTION_NAME = "Test parameter color drafting legend"
 
 
 def world(view, x, y):

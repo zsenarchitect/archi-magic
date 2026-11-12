@@ -164,18 +164,19 @@ def checked_record(record, mode):
     return record
 
 
-def checked_changes(record, expected):
+def checked_changes(record, expected, added=(), transaction_name=TRANSACTION_NAME):
     changes = record["changes"]
     if (any(type(changes[field]) is not int or changes[field] != count for field, count in (
-            ("added_count", 0), ("deleted_count", 0), ("modified_count", len(expected))))
-            or changes["added"] != [] or changes["deleted"] != [] or changes.get("other_documents")):
+            ("added_count", len(added)), ("deleted_count", 0), ("modified_count", len(expected))))
+            or (not added and changes["added"] != []) or changes["deleted"] != [] or changes.get("other_documents")):
         raise ValueError("The bridge reported unreviewed additions, deletions or document changes.")
     modified = sorted((element_id(str(row["id"])) for row in changes["modified"]), key=int)
     category_counts = changes["by_category"].values()
-    transactions = [TRANSACTION_NAME] if expected else []
-    if (modified != expected or changes["transactions"] != transactions
+    reported_added = sorted((element_id(str(row["id"])) for row in changes["added"]), key=int)
+    transactions = [transaction_name] if expected or added else []
+    if (modified != expected or reported_added != list(added) or changes["transactions"] != transactions
             or any(type(count) is not int or count <= 0 for count in category_counts)
-            or sum(category_counts) != len(expected)):
+            or sum(category_counts) != len(expected) + len(added)):
         raise ValueError("The bridge change record disagrees with the complete recipe telemetry.")
 
 
