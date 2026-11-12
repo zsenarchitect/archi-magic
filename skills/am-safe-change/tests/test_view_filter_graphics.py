@@ -553,7 +553,7 @@ def test_verify_fixture_rollback_through_cli(verified_fixture, tmp_path):
 
 
 @pytest.mark.parametrize("fault,error", [
-    ("replayed", "distinct"), ("auto", "clean dry_run rollback"), ("truncated", "clean query rollback"),
+    ("replayed", "distinct"), ("auto", "clean dry_run rollback"), ("truncated", "missing or invalid metadata"),
     ("wrong_id", "disagrees"), ("short_samples", "disagrees"), ("foreign", "unreviewed additions"),
     ("model_drift", "differs from the original"), ("foreign_borrowing", "unreviewed ownership"),
 ])
@@ -598,3 +598,75 @@ def test_verify_fixture_reports_remaining_borrowing(verified_fixture):
     report = verify_rollback(plan, original, probe, fresh)
     assert report["status"] == "ownership_reconciliation_required"
     assert report["remaining_ownership_changes"] == delta
+
+
+def result_pages(record, cuts):
+    payload = json.dumps(record["result"], ensure_ascii=False).encode("utf-16-le")
+    total = len(payload) // 2
+    metadata = dict(record, result=None, result_truncated=True)
+    boundaries = [0] + cuts + [total]
+    return [
+        dict(metadata, result_page={"offset": start, "length": end - start, "total_length": total,
+                                    "text": payload[start * 2:end * 2].decode("utf-16-le", "surrogatepass")})
+        for start, end in zip(boundaries, boundaries[1:])
+    ]
+
+
+def test_paged_inventory_and_rollback_through_cli(verified_fixture, tmp_path):
+    import subprocess
+
+    plan, original, probe, fresh = verified_fixture
+    original_pages = list(reversed(result_pages(original, [11, 103])))
+    fresh_pages = [{"response": page} for page in result_pages(fresh, [23, 97])]
+    paths = [tmp_path / (name + ".json") for name in ("original", "plan", "probe", "fresh")]
+    for path, record in zip(paths, (original_pages, plan, result_pages(probe, [32]), fresh_pages)):
+        path.write_text(json.dumps(record))
+    script = str(SCRIPTS / "view_filter_transfer_preview.py")
+    preview = subprocess.run([sys.executable, script, str(paths[0])], capture_output=True, text=True)
+    assert preview.returncode == 0, preview.stderr
+    assert json.loads(preview.stdout)["plan"] == plan
+    verify = subprocess.run(
+        [sys.executable, script, str(paths[0]), "--verify-rollback", *map(str, paths[1:])],
+        capture_output=True, text=True,
+    )
+    assert verify.returncode == 0, verify.stderr
+    assert json.loads(verify.stdout)["status"] == "verified_fixture_rollback"
+
+
+def test_paged_result_joins_surrogate_pair_split_by_bridge():
+    from view_filter_transfer_preview import complete_record
+
+    result = {"status": "ok", "fixture": "Sheet \U0001f4d0"}
+    raw = json.dumps(result, ensure_ascii=False).encode("utf-16-le")
+    surrogate_split = raw.index("\U0001f4d0".encode("utf-16-le")) // 2 + 1
+    original = runtime_record("d00000000004", "query", result)
+    first, second = result_pages(original, [surrogate_split])
+    assert complete_record([second, first]) == original
+
+
+@pytest.mark.parametrize("fault,error", [
+    ("missing", "gap"), ("overlap", "overlap"), ("duplicate", "disagree"),
+    ("mixed_run", "disagree"), ("modified_metadata", "disagree"),
+    ("wrong_page_length", "disagree"), ("oversize", "size"),
+])
+def test_incomplete_or_mixed_pyrevit_pages_are_rejected(verified_fixture, fault, error):
+    from view_filter_transfer_preview import MAX_RESULT_TEXT, complete_record
+
+    _, original, _, _ = verified_fixture
+    pages = result_pages(original, [11, 103])
+    if fault == "missing":
+        pages.pop(1)
+    elif fault == "overlap":
+        pages[1]["result_page"]["offset"] = 10
+    elif fault == "duplicate":
+        pages.append(pages[0])
+    elif fault == "mixed_run":
+        pages[1]["run_id"] = "d00000000004"
+    elif fault == "modified_metadata":
+        pages[1]["changes"] = dict(pages[1]["changes"], modified_count=1)
+    elif fault == "wrong_page_length":
+        pages[0]["result_page"]["length"] = 10
+    elif fault == "oversize":
+        pages[0]["result_page"]["total_length"] = MAX_RESULT_TEXT + 1
+    with pytest.raises(ValueError, match=error):
+        complete_record(pages)

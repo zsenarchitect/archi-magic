@@ -7,10 +7,12 @@ import json
 import re
 import sys
 
-from view_duplicate_preview import element_id, read_payload, read_record, snapshot_digest
+from view_duplicate_preview import MAX_BYTES, TEXT, element_id, read_payload, read_record, snapshot_digest
 
 TRANSACTION_NAME = "Test reviewed view filter transfer"
 RUN_ID = re.compile(r"^[0-9a-f]{12}\Z")
+MAX_RESULT_TEXT = 2 * MAX_BYTES + 65536
+MAX_SAVED_RECORD = 4 * MAX_BYTES + 65536
 COLUMNS = ["Row", "View", "Sheet", "Filter", "Action", "Priority", "Visible", "Enabled", "Graphics"]
 
 
@@ -106,8 +108,51 @@ def compute(snapshot):
     return plan, display
 
 
+def complete_record(value):
+    if isinstance(value, dict):
+        record = value.get("response", value)
+        if record.get("result_truncated") is not True:
+            return record
+        value = [record]
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        raise ValueError("Supply a complete pyRevit response or up to 64 pages from one run.")
+
+    baseline, total, chunks = None, None, {}
+    for entry in value:
+        record = dict(entry.get("response", entry))
+        page = record.pop("result_page", None)
+        if (record.get("result_truncated") is not True or record.get("result") is not None
+                or not RUN_ID.match(record["run_id"]) or not isinstance(page, dict)
+                or any(type(page.get(field)) is not int for field in ("offset", "length", "total_length"))
+                or not isinstance(page.get("text"), TEXT)):
+            raise ValueError("A paged pyRevit result has missing or invalid metadata.")
+        start, length, reported = (page[field] for field in ("offset", "length", "total_length"))
+        # get_run counts UTF-16 code units, even if a page splits a surrogate pair.
+        chunk = page["text"].encode("utf-16-le", "surrogatepass")
+        if baseline is None:
+            baseline, total = record, reported
+        if (record != baseline or reported != total or start < 0 or start in chunks
+                or not 0 < length <= 200 * 1024 or start + length > total or len(chunk) != length * 2
+                or not 0 < total <= MAX_RESULT_TEXT):
+            raise ValueError("The pyRevit result pages disagree or exceed the supported result size.")
+        chunks[start] = chunk
+
+    cursor, payload = 0, bytearray()
+    for start, chunk in sorted(chunks.items()):
+        if start != cursor:
+            raise ValueError("The pyRevit result pages overlap or leave a gap.")
+        payload.extend(chunk)
+        cursor += len(chunk) // 2
+    if cursor != total:
+        raise ValueError("The pyRevit result is incomplete.")
+    result = json.loads(payload.decode("utf-16-le"))
+    if not isinstance(result, dict):
+        raise ValueError("The complete pyRevit result must be an object.")
+    return dict(baseline, result=result, result_truncated=False)
+
+
 def checked_record(record, mode):
-    record = record.get("response", record)
+    record = complete_record(record)
     run_id = record["run_id"]
     if (not RUN_ID.match(run_id) or record["mode"] != mode or record["status"] != "ok"
             or record["decision"] != "rolled_back" or record.get("approval") is not None
@@ -201,14 +246,15 @@ def main():
                         help="Verify the plan, full dry-run record, and independent post-rollback query")
     args = parser.parse_args()
     try:
-        record = read_record(args.runtime_record)
+        record = read_record(args.runtime_record, MAX_SAVED_RECORD)
         if args.verify_rollback:
             plan_file, probe_file, fresh_file = args.verify_rollback
-            plan = read_record(plan_file)
-            report = verify_rollback(plan.get("plan", plan), record, read_record(probe_file), read_record(fresh_file))
+            plan = read_record(plan_file, MAX_SAVED_RECORD)
+            report = verify_rollback(plan.get("plan", plan), record, read_record(probe_file, MAX_SAVED_RECORD),
+                                     read_record(fresh_file, MAX_SAVED_RECORD))
             print(json.dumps(report, ensure_ascii=True, indent=2))
             return 1 if report["remaining_ownership_changes"] else 0
-        snapshot = read_payload(record.get("response", record), "inventory_json")
+        snapshot = read_payload(complete_record(record), "inventory_json")
         plan, display = compute(snapshot)
         print(json.dumps({"plan": plan, "preview": display}, ensure_ascii=True, indent=2))
         return 1 if plan["blocked"] else 0

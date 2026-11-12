@@ -164,10 +164,10 @@ def compute(snapshot):
     return plan, display
 
 
-def read_record(path):
+def read_record(path, max_chars=MAX_BYTES + 65536):
     with io.open(path, "r", encoding="utf-8-sig") as stream:
-        raw = stream.read(MAX_BYTES + 65537)
-    if len(raw) > MAX_BYTES + 65536:
+        raw = stream.read(max_chars + 1)
+    if len(raw) > max_chars:
         raise ValueError("The runtime record is too large.")
     return json.loads(raw)
 
