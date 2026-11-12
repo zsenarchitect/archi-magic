@@ -7,7 +7,7 @@ from System.Collections.Generic import List
 from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
-from duplicate_views import capture_changes, identifier, key, rollback
+from duplicate_views import bounded, capture_changes, identifier, key, rollback
 from read_color_legend import name_of, point, read_contents
 from read_color_parameter_values import main as read_inventory
 from view_color_preview import build, close_points, note_fits_row
@@ -100,6 +100,28 @@ def read_snapshot(document, request):
     return json.loads(read_inventory(document, request)["inventory_json"])
 
 
+def verify_unchanged(document, request, baseline, proposal):
+    from color_filter_trial import fixture_view, require_normal_display
+
+    model_view, order = fixture_view(document, baseline, proposal)
+    if set(order) != {row["filter_id"] for row in proposal["legend_rows"]}:
+        raise ValueError("The applied filters changed during repeat verification.")
+    reuse = proposal["legend_reuse"]
+    legend = document.GetElement(identifier(reuse["view_id"]))
+    if not isinstance(legend, DB.ViewDrafting) or str(legend.UniqueId) != reuse["view_uid"]:
+        raise ValueError("The existing legend identity changed during repeat verification.")
+    require_normal_display(legend)
+    if read_snapshot(document, request) != baseline:
+        raise ValueError("The color or legend inventory changed during repeat verification.")
+    current_order = [key(item) for item in bounded(
+        model_view.GetOrderedFilters(), 100, "repeat fixture filter", Stopwatch.StartNew())]
+    if current_order != order:
+        raise ValueError("The filter order changed during repeat verification.")
+    return {"status": "color_fixture_unchanged", "receipt": {
+        "basis_sha256": proposal["basis_sha256"], "ordered_filter_ids": order, "legend_reuse": reuse,
+    }}
+
+
 def probe(document, args):
     if args.get("disposable_fixture") is not True or document.IsWorkshared:
         raise ValueError("Use an explicitly confirmed standalone disposable fixture.")
@@ -110,8 +132,12 @@ def probe(document, args):
     baseline = read_snapshot(document, request)
     proposal, display = build(baseline)
     if (proposal != args["proposal"] or display != args["preview"] or proposal["blocked"]
-            or not proposal["legend_preflight"] or proposal["legend_preflight"]["state"] != "available"):
+            or not proposal["legend_preflight"]):
         raise ValueError("The reviewed proposal, preview or drafting resources do not match the live fixture.")
+    if exercise_filters and proposal["no_change_candidate"]:
+        return verify_unchanged(document, request, baseline, proposal)
+    if proposal["legend_preflight"]["state"] != "available":
+        raise ValueError("The existing legend requires an exact, unchanged combined fixture.")
 
     model_view, order, filter_trial = None, [], None
     if exercise_filters:

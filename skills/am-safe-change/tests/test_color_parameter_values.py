@@ -576,7 +576,10 @@ def test_native_legend_preserves_collisions_and_records_existing_contents(reader
     assert proposal["blocked"] and any(expected in item["text"] for item in display["warnings"])
 
 
-@pytest.mark.parametrize("difference", [None, "note_format", "swatch_color", "extra_element", "filter_pattern"])
+@pytest.mark.parametrize("difference", [
+    None, "note_format", "swatch_color", "extra_element", "filter_pattern",
+    "competing_filter", "element_override", "legend_temporary_mode", "changed_readback", "changed_order",
+])
 def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reader, monkeypatch, difference):
     from view_color_preview import build
 
@@ -622,17 +625,77 @@ def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reade
         graphics["graphics"]["CutForegroundPatternId"] = {"kind": "element", "id": "75"}
 
     proposal, preview = build(inventory)
-    if difference in (None, "filter_pattern"):
+    if difference not in ("note_format", "swatch_color", "extra_element"):
         assert proposal["legend_reuse"] == {"view_id": "41", "view_uid": "legend-41", "placements": placements,
                                             "pairs": [{"value_key": row["value_key"], "region_id": "501",
                                                        "region_uid": "region-501", "note_id": "502",
                                                        "note_uid": "note-502"}]}
         assert proposal["blocked"] is False
-        assert proposal["no_change_candidate"] is (difference is None)
-        assert (preview["after"][0][4] == "Filter and legend match") is (difference is None)
+        assert proposal["no_change_candidate"] is (difference != "filter_pattern")
+        assert (preview["after"][0][4] == "Filter and legend match") is (difference != "filter_pattern")
     else:
         assert proposal["blocked"] and not proposal["no_change_candidate"] and proposal["legend_reuse"] is None
     assert preview["review_only"] and preview["steps"] == []
+
+    if not proposal["no_change_candidate"]:
+        return
+
+    db = reader["DB"]
+    model = document.GetElement(ElementId(31))
+    model.applied[201] = (True, True)
+    model.ViewTemplateId = ElementId(-1)
+    model.TemporaryViewModes = None
+    model.GetPrimaryViewId = lambda: ElementId(-1)
+    model.GetDependentViewIds = lambda: []
+    model.GetPlacementOnSheetStatus = lambda: "NotPlaced"
+    document.GetElement(ElementId(101)).IsHidden = lambda _view: False
+    model.GetElementOverrides = lambda _id: NS(
+        values={"ProjectionLineColor": [0, 0, 0]} if difference == "element_override" else {},
+        Dispose=lambda: None,
+    )
+    if difference == "competing_filter":
+        model.applied[999] = (True, True)
+    if difference == "changed_order":
+        ordered = iter([[ElementId(201)], []])
+        model.GetOrderedFilters = lambda: next(ordered)
+    db.OverrideGraphicSettings = lambda: NS(values={}, Dispose=lambda: None)
+    db.TemporaryViewMode = NS(RevealHiddenElements=1, TemporaryHideIsolate=2, TemporaryViewProperties=3)
+    legend = db.ViewDrafting()
+    legend.TemporaryViewModes = NS(IsModeAvailable=lambda _mode: True,
+                                  IsModeEnabled=lambda _mode: difference == "legend_temporary_mode")
+    get_element = document.GetElement
+    document.GetElement = lambda item: legend if item.Value == 41 else get_element(item)
+    document.IsWorkshared = False
+
+    def unexpected_transaction(*_):
+        pytest.fail("An unchanged fixture must open no transaction.")
+
+    db.TransactionGroup = db.Transaction = unexpected_transaction
+    reads = iter([inventory, dict(inventory, link_candidate_ids=["99"]) if difference == "changed_readback"
+                  else inventory])
+    reader_module = NS(**reader)
+    reader_module.main = lambda *_: {"inventory_json": json.dumps(next(reads))}
+    monkeypatch.setitem(sys.modules, "read_color_parameter_values", reader_module)
+    monkeypatch.setitem(sys.modules, "color_filter_trial",
+                        NS(**runpy.run_path(str(SCRIPTS / "color_filter_trial.py"))))
+    helpers = sys.modules["duplicate_views"]
+    helpers.capture_changes = helpers.rollback = unexpected_transaction
+    trial = runpy.run_path(str(SCRIPTS / "probe_color_legend.py"))
+    arguments = {"disposable_fixture": True, "exercise_filters": True, "request": args,
+                 "proposal": proposal, "preview": preview}
+    messages = {
+        "competing_filter": "other applied filters", "element_override": "individual graphic overrides",
+        "legend_temporary_mode": "temporary display modes", "changed_readback": "inventory changed",
+        "changed_order": "filter order changed",
+    }
+    if difference in messages:
+        with pytest.raises(ValueError, match=messages[difference]):
+            trial["probe"](document, arguments)
+    else:
+        assert trial["probe"](document, arguments) == {
+            "status": "color_fixture_unchanged", "receipt": {"basis_sha256": proposal["basis_sha256"],
+                "ordered_filter_ids": ["201"], "legend_reuse": proposal["legend_reuse"]},
+        }
 
 
 def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(reader, monkeypatch):

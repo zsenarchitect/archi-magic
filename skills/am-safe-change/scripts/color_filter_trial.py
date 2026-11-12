@@ -24,17 +24,21 @@ def native_graphics(settings, solid):
         settings.Dispose()
 
 
+def require_normal_display(view):
+    manager = view.TemporaryViewModes
+    for name in ("RevealHiddenElements", "TemporaryHideIsolate", "TemporaryViewProperties"):
+        mode = getattr(DB.TemporaryViewMode, name)
+        if manager is not None and manager.IsModeAvailable(mode) and manager.IsModeEnabled(mode):
+            raise ValueError("Turn off temporary display modes before the color trial.")
+
+
 def fixture_view(document, baseline, proposal):
     view = document.GetElement(identifier(baseline["view"]["id"]))
     if (not isinstance(view, DB.View) or str(view.UniqueId) != baseline["view"]["uid"] or view.IsTemplate
             or key(view.ViewTemplateId) != "-1" or key(view.GetPrimaryViewId()) != "-1"
             or list(view.GetDependentViewIds()) or str(view.GetPlacementOnSheetStatus()) != "NotPlaced"):
         raise ValueError("Use an independent, unplaced, untemplated fixture view.")
-    manager = view.TemporaryViewModes
-    for name in ("RevealHiddenElements", "TemporaryHideIsolate", "TemporaryViewProperties"):
-        mode = getattr(DB.TemporaryViewMode, name)
-        if manager is not None and manager.IsModeAvailable(mode) and manager.IsModeEnabled(mode):
-            raise ValueError("Turn off temporary display modes before the color trial.")
+    require_normal_display(view)
 
     ordered = [key(item) for item in bounded(view.GetOrderedFilters(), 100, "fixture filter", Stopwatch.StartNew())]
     reviewed = {row["filter_id"] for row in proposal["legend_rows"] if row["filter_id"] is not None}
