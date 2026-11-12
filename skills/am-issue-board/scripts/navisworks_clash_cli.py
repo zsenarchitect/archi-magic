@@ -365,6 +365,69 @@ def board_preview(path, archive, clashes):
     return plan, skipped
 
 
+def runtime_record(path):
+    data = json_input(local_bytes(path))
+    return data.get("response", data)
+
+
+def runtime_changes(record, mode, status, decision, approval=None):
+    if (record["mode"] != mode or record["status"] != status or record["decision"] != decision
+            or record.get("approval") != approval or not text(record["run_id"])
+            or record.get("reckless") or any(record.get(key) for key in (
+                "error", "failures", "dialogs", "blocked", "warnings", "closed_documents", "unclosed_documents"))):
+        raise ValueError("The guarded pyRevit record does not establish the requested outcome.")
+    changes = record["changes"]
+    if (changes.get("other_documents") or changes["modified"] or changes["deleted"]
+            or any(type(changes[key]) is not int or changes[key] != 0
+                   for key in ("modified_count", "deleted_count"))):
+        raise ValueError("The run reports unexpected model changes.")
+    return changes
+
+
+def runtime_payload(record, field):
+    result = record["result"]
+    if result["status"] != "ok":
+        raise ValueError("The clash script stopped before producing evidence.")
+    return json_input(result[field].encode("ascii"))
+
+
+def verify_view_run(plan, outcome, run, readback):
+    decisions = {"dry-run": ("dry_run", "ok", "rolled_back", None),
+                 "keep": ("modify", "ok", "committed", "user"),
+                 "discard": ("modify", "rejected", "discarded", "user")}
+    if plan["blocked"] or run["run_id"] == readback["run_id"]:
+        raise ValueError("Use an unblocked plan and an independent readback.")
+    changes = runtime_changes(run, *decisions[outcome])
+    fresh_changes = runtime_changes(readback, "query", "ok", "rolled_back")
+    if type(fresh_changes["added_count"]) is not int or fresh_changes["added_count"] != 0 or fresh_changes["added"]:
+        raise ValueError("The readback must leave the model unchanged.")
+    receipt = runtime_payload(run, "receipt_json")
+    view_id = receipt["view_id"]
+    if (not re.fullmatch(r"[1-9][0-9]{0,18}", view_id) or int(view_id) >= 2**63
+            or type(changes["added_count"]) is not int or changes["added_count"] != 1
+            or len(changes["added"]) != 1 or str(changes["added"][0]["id"]) != view_id
+            or changes["added"][0]["class"] != "View3D"):
+        raise ValueError("The guarded run must report only the exact added 3D view.")
+    expected = {"clash_guid": plan["view"]["clash_guid"], "view_name": plan["view"]["name"],
+                "view_type_id": plan["view"]["view_type_id"], "basis_sha256": plan["basis_sha256"],
+                "host_identity": plan["host_identity"]}
+    if (not text(receipt["view_uid"]) or any(receipt[key] != value for key, value in expected.items())
+            or any(not abs(actual - approved) <= 1e-7
+                   for field, bound in (("box_min", "min"), ("box_max", "max"))
+                   for actual, approved in zip(point(receipt[field]), plan["box"][bound]))):
+        raise ValueError("The created view differs from the reviewed plan.")
+    if outcome == "keep":
+        observed = runtime_payload(readback, "verification_json")
+        if observed != {"view": receipt, "potentially_visible": plan["targets"]}:
+            raise ValueError("The independent query did not verify the kept view and both mapped targets.")
+        return {"status": "verified_keep", "view": receipt, "visual_inspection_required": True}
+    snapshot = runtime_payload(readback, "snapshot_json")
+    basis = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    if hashlib.sha256(basis.encode("ascii")).hexdigest() != plan["basis_sha256"]:
+        raise ValueError("The original model readback changed after rollback.")
+    return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
@@ -373,6 +436,9 @@ def main(argv=None):
     parser.add_argument("--board")
     parser.add_argument("--archive")
     parser.add_argument("--view-clash", help="Preview one section view for an XML clash GUID")
+    parser.add_argument("--verify-view", choices=("dry-run", "keep", "discard"))
+    parser.add_argument("--view-run", help="Complete guarded pyRevit run record")
+    parser.add_argument("--view-readback", help="Complete independent pyRevit query record")
     args = parser.parse_args(argv)
     suffix = Path(args.report).suffix.lower()
     is_html = suffix in (".html", ".htm")
@@ -385,6 +451,9 @@ def main(argv=None):
             raise ValueError("Supply an active board with the archive.")
         if args.view_clash and (is_html or not args.snapshot or args.board):
             raise ValueError("Use XML and a Revit snapshot in a separate section-view preview.")
+        if any((args.verify_view, args.view_run, args.view_readback)) and not all(
+                (args.verify_view, args.view_run, args.view_readback, args.view_clash)):
+            raise ValueError("Supply the view GUID, outcome, full run record and independent readback together.")
         raw = local_bytes(args.report)
         units, clashes = parse_tabular_report(raw) if is_html else parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
@@ -412,6 +481,10 @@ def main(argv=None):
         if args.view_clash:
             report["view_plan"], report["view_preview"] = section_view_preview(
                 args.view_clash, clashes, snapshot_data, args.padding_ft, report["report_sha256"]
+            )
+        if args.verify_view:
+            report["view_verification"] = verify_view_run(
+                report["view_plan"], args.verify_view, runtime_record(args.view_run), runtime_record(args.view_readback)
             )
         if is_html:
             report["warnings"].append("Tabular rows lack clash GUIDs and selection-tree paths. Export XML for model mapping and board import.")

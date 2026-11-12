@@ -160,11 +160,9 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
                    f'<clashresult guid="{guid}" name="Fixture clash" status="new">'
                    f'<clashobjects>{objects}</clashobjects></clashresult>'
                    '</clashresults></clashtest></clashtests></batchtest></exchange>')
-    output = subprocess.run(
-        [sys.executable, str(SCRIPTS / "navisworks_clash_cli.py"), str(xml),
-         "--snapshot", str(record), "--view-clash", guid],
-        check=True, text=True, capture_output=True,
-    )
+    command = [sys.executable, str(SCRIPTS / "navisworks_clash_cli.py"), str(xml),
+               "--snapshot", str(record), "--view-clash", guid]
+    output = subprocess.run(command, check=True, text=True, capture_output=True)
     result = json.loads(output.stdout)
     plan, display = result["view_plan"], result["view_preview"]
     assert plan["view"]["name"] == view_name
@@ -176,6 +174,22 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
         assert [target["element_id"] for target in plan["targets"]] == ["42", "42"]
         assert display["after"][-1][-1] == [21, 4, 4]
         assert plan["steps"] == [{"action": "create_view"}]
+        receipt = {"clash_guid": guid, "view_name": view_name, "view_id": "100", "view_uid": "fixture-view",
+                   "view_type_id": plan["view"]["view_type_id"], "basis_sha256": plan["basis_sha256"],
+                   "host_identity": plan["host_identity"], "box_min": plan["box"]["min"], "box_max": plan["box"]["max"]}
+        unchanged = {"added_count": 0, "modified_count": 0, "deleted_count": 0,
+                     "added": [], "modified": [], "deleted": []}
+        dry_run = tmp_path / "dry-run.json"
+        dry_run.write_text(json.dumps({"mode": "dry_run", "status": "ok", "decision": "rolled_back",
+                                      "run_id": "dry-run", "result": {"status": "ok", "receipt_json": json.dumps(receipt)},
+                                      "changes": dict(unchanged, added_count=1, added=[{"id": 100, "class": "View3D"}])}))
+        fresh = tmp_path / "fresh.json"
+        fresh.write_text(json.dumps({"response": {"mode": "query", "status": "ok", "decision": "rolled_back",
+                                                 "run_id": "readback", "result": native, "changes": unchanged}}))
+        verified = subprocess.run(command + ["--verify-view", "dry-run", "--view-run", str(dry_run),
+                                             "--view-readback", str(fresh)],
+                                  check=True, text=True, capture_output=True)
+        assert json.loads(verified.stdout)["view_verification"] == {"status": "verified_dry_run"}
     else:
         assert plan["blocked"] and display["blocked"] and plan["steps"] == []
         assert display["warnings"][0]["blocking"]
@@ -345,3 +359,43 @@ def test_verify_kept_view_checks_both_link_instances(view_writer, state):
             run(host, args)
     assert opened == disposed == ([6, 7] if state in ("ready", "missing_link_target") else [])
     assert host.views == [view]
+
+
+@pytest.mark.parametrize("outcome,mode,status,decision,approval", [
+    ("dry-run", "dry_run", "ok", "rolled_back", None),
+    ("discard", "modify", "rejected", "discarded", "user"),
+    ("keep", "modify", "ok", "committed", "user"),
+])
+def test_verify_view_run_requires_matching_runtime_and_readback(view_writer, outcome, mode, status, decision, approval):
+    from navisworks_clash_cli import verify_view_run
+
+    run, host, plan, display = view_writer
+    baseline = run(host, plan["request"])
+    applied = run(host, {"mode": "apply", "plan": plan, "preview": display})
+    receipt = json.loads(applied["receipt_json"])
+    unchanged = {"added_count": 0, "modified_count": 0, "deleted_count": 0,
+                 "added": [], "modified": [], "deleted": []}
+    created = dict(unchanged, added_count=1, added=[{"id": 100, "class": "View3D"}])
+    record = {"mode": mode, "status": status, "decision": decision, "approval": approval,
+              "run_id": "create-run", "changes": created, "result": applied}
+    evidence = ({"status": "ok", "verification_json": json.dumps({
+        "view": receipt, "potentially_visible": plan["targets"],
+    })} if outcome == "keep" else baseline)
+    readback = {"mode": "query", "status": "ok", "decision": "rolled_back", "run_id": "readback-run",
+                "changes": unchanged, "result": evidence}
+    result = verify_view_run(plan, outcome, record, readback)
+    assert result["status"] == "verified_" + outcome.replace("-", "_")
+    if outcome == "keep":
+        assert result["view"] == receipt and result["visual_inspection_required"] is True
+        evidence = dict(evidence, verification_json=json.dumps({"view": receipt, "potentially_visible": []}))
+    else:
+        snapshot = json.loads(baseline["snapshot_json"])
+        snapshot["active_view_uid"] = "different"
+        evidence = dict(evidence, snapshot_json=json.dumps(snapshot))
+    with pytest.raises(ValueError, match="readback changed|both mapped targets"):
+        verify_view_run(plan, outcome, record, dict(readback, result=evidence))
+    with pytest.raises(ValueError, match="only the exact added"):
+        verify_view_run(plan, outcome, dict(record, changes=dict(created, added=[{"id": 101, "class": "View3D"}])),
+                        readback)
+    with pytest.raises(ValueError, match="independent readback"):
+        verify_view_run(plan, outcome, record, dict(readback, run_id=record["run_id"]))
