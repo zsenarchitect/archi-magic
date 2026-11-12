@@ -262,6 +262,52 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 5. Save the full fresh query record. Run `python scripts/verify_family_placement_decision.py preview.json before.json trial.json after.json modify.json fresh.json`. Check the result for the exact retained instance or the restored project.
 6. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
 
+## Validate a batch family type table (issue #165)
+
+Use `python scripts/batch_family_type_table.py --table types.csv --manifest discovery.json` to validate the input. Start the CSV with `source_path,seed_type,type`. Add size columns with explicit units, such as `Width[mm]` or `Ratio[1]`. Use exact library paths and type names. This step binds the table to the reviewed source files.
+
+1. Prepare one family worker for each source. Pass every size parameter name from the table to the worker. Save the full receipts.
+2. Run `python scripts/batch_family_type_preview.py prepare --request request.json --worker <worker-directory>`. Repeat `--worker` for each source. Save the lookup.
+3. Call `get_context`. Run `read_batch_family_types.py` in CPython query mode in the saved project. Pass the lookup object as `lookup`. Save the full project read.
+4. Run `python scripts/batch_family_type_preview.py preview --lookup lookup.json --project-read project.json`. Review the skipped, blocked, and ready rows. A ready row still needs a derivation preview and native qualification.
+
+### Prepare a writable family copy for derivation
+
+1. Save the reviewed batch preview as `preview.json`. Use `prepare_batch_family_derivation.py` with the lookup, project read, preview, staging receipt, exact source path, and destination parent. Use a private local destination outside the library and protected staging.
+2. Prepare one source at a time. The script returns no working file when every type for that source already exists. Save the derivation receipt when it creates a copy.
+3. Open only the working RFA named in the receipt. Call `get_context`. Run `read_batch_family_derivation.py` in CPython query mode with the receipt as `derivation`. Use the skill's scripts folder as the query workspace.
+4. Check the exact embedded seeds, type names, and writable size definitions. Save the family read for the derivation preview. Native type edits still require a separate reviewed dry run and Keep/Discard.
+
+### Review and test family type derivation
+
+1. Run `python scripts/batch_family_derivation_preview.py --derivation derivation.json --family-read family-read.json`. Review the exact seeds, target names, size changes, and calculated parameters.
+2. Call `get_context` and confirm the exact disposable family. Obtain approval for the rollback-only trial. Run `probe_batch_family_derivation.py` in guarded CPython dry-run mode.
+3. Pass `disposable_fixture: true`, the receipt as `derivation`, the saved query as `working_read`, and the reviewed `preview`. Pass its `preview_sha256` from `family_library_discovery.manifest_digest(preview)`.
+4. Save the full trial record. Run the family query again with the same derivation. Pass the trial's `transaction` as `trial_transaction`. Save the full fresh query.
+5. Run `python scripts/verify_batch_family_derivation.py derivation.json preview.json before.json trial.json after.json`. Check the measured values, effects, and restored family state.
+6. Recheck the active family and ask policy. Obtain approval to replay. Run `apply_batch_family_derivation.py` in guarded CPython modify mode. Pass the same trial inputs as `derivation_run` and the full records as `before`, `trial`, and `after`.
+7. Use Revit's Keep or Discard prompt. Save the full modify record. Run the family query again with the same derivation and the modify transaction. Set `kept: true` only after Keep.
+8. Run the same verifier with `--modify modify.json --fresh fresh.json`. Save its decision receipt.
+
+### Verify the privately exported family
+
+1. Use `batch_family_export.py reserve --derivation derivation.json --decision decision.json --destination <private-parent>`. Save the returned workspace and exact Save As path.
+2. After all transactions and groups close, use Revit Save As outside the guarded script. Save only to the reserved path. Close the exported file.
+3. Set `ARCHI_MAGIC_FAMILY_EXPORT_DIR` to the reserved workspace. Run `pyrevit run scripts/batch_family_export.py --revit=2026` in the qualified disposable CPython worker with no model arguments. Wait for the host to exit.
+4. Run `batch_family_export.py collect --workspace <workspace> --staging staging.json`. The receipt verifies the reopened types, exact RFA bytes, and companion absence.
+
+### Review and trial the project batch load
+
+1. Run the batch project query with `audit_inventory: true`. Save the full result as `before.json`.
+2. Run `batch_family_load_preview.py --lookup lookup.json --project-read before.json --staging staging.json`. Pass each verified workspace with `--export`. Review the exact export hashes, requested types, and skipped types.
+3. Call `get_context` and obtain approval for the rollback-only trial. Run `probe_batch_family_load.py` in guarded CPython dry-run mode. Pass `disposable_fixture: true`, `lookup`, `staging`, `preview`, `preview_sha256`, and the before query's `audit_token` as `baseline_audit_token`.
+4. Save the full trial record. Run the project query again with `audit_inventory: true`. Pass the trial's `transaction` and `effects.added` as `effect_ids`. Save it as `after.json`.
+5. Run `verify_batch_family_load.py lookup.json staging.json preview.json before.json trial.json after.json`. Review the exact effects and confirmed project restoration.
+6. Recheck the project and ask policy. Obtain approval for the real load. Run `apply_batch_family_load.py` in guarded CPython modify mode. Pass the same trial inputs as `load_run` and the full records as `before`, `trial`, and `after`.
+7. Use Revit's Keep or Discard prompt. Save the full modify record. Run the project query again with its transaction and effect IDs. Set `kept: true` only after Keep. Run the verifier with `--modify modify.json --fresh fresh.json`.
+8. Save the project after a verified Keep. Run a fresh project audit and rebuild the preview for the same lookup with no exports. Run the rollback probe with that preview and the fresh audit token. Save the no-op record and another independent project audit.
+9. Pass `--rerun-preview`, `--rerun-before`, `--rerun`, and `--rerun-after` to the verifier with the Keep records. Check that every row skipped and the project inventory stayed unchanged. This workflow still requires native qualification with the loaded Revit bridge.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

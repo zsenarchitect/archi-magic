@@ -144,10 +144,16 @@ def parameter_state(symbol, field):
     return {"state": "value", "value": value}
 
 
-def read_snapshot(document, DB, request, require_unmodified=True):
+def saved_project_identity(document, require_unmodified=True):
     if (document is None or not document.PathName or document.IsFamilyDocument or document.IsReadOnly
             or document.IsWorkshared or document.IsModelInCloud or (require_unmodified and document.IsModified)):
         raise ValueError("Open a saved, unmodified, local standalone Revit project.")
+    return {"project_uid": str(document.ProjectInformation.UniqueId),
+            "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+
+
+def read_snapshot(document, DB, request, require_unmodified=True):
+    project = saved_project_identity(document, require_unmodified)
     selection = request["selection"]
     level_key = request["level_id"]
     import System
@@ -185,8 +191,7 @@ def read_snapshot(document, DB, request, require_unmodified=True):
     return {
         "kind": "family-placement-project-snapshot", "version": 1,
         "selection_sha256": selection["selection_sha256"],
-        "project": {"project_uid": str(document.ProjectInformation.UniqueId),
-                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()},
+        "project": project,
         "revit_year": str(document.Application.VersionNumber),
         "revit_build": str(document.Application.VersionBuild),
         "level": {"id": eid(level), "uid": str(level.UniqueId), "name": level.Name,
