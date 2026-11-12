@@ -212,6 +212,17 @@ def horizontal_loop(loops, budget):
     return starts
 
 
+def same_floor_boundary(measured, expected):
+    if len(measured) != len(expected):
+        return False
+    tolerance = TOLERANCE_FT
+    origins = [index for index, point in enumerate(measured)
+               if math.dist(point[:2], expected[0]) <= tolerance]
+    return len(origins) == 1 and any(
+        all(math.dist(measured[(origins[0] + direction * index) % len(measured)][:2], vertex) <= tolerance
+            for index, vertex in enumerate(expected)) for direction in (-1, 1))
+
+
 def floor_geometry(document, floor, budget):
     editor = floor.GetSlabShapeEditor()
     if editor is None or editor.IsEnabled:
@@ -228,10 +239,7 @@ def floor_geometry(document, floor, budget):
     if not isinstance(face, DB.PlanarFace) or abs(face.FaceNormal.Z - 1) > TOLERANCE_FT:
         raise ValueError("The floor top face is not horizontal.")
     actual = horizontal_loop(face.GetEdgesAsCurveLoops(), budget)
-    matches = [index for index, point in enumerate(actual) if math.dist(point[:2], original[0][:2]) <= TOLERANCE_FT]
-    if len(actual) != len(original) or len(matches) != 1 or not any(
-            all(math.dist(actual[(matches[0] + direction * index) % len(actual)][:2], point[:2]) <= TOLERANCE_FT
-                for index, point in enumerate(original)) for direction in (-1, 1)):
+    if not same_floor_boundary(actual, [point[:2] for point in original]):
         raise ValueError("The native top face does not match the source sketch boundary.")
     return {"elevation_ft": actual[0][2], "boundary_xy_ft": [point[:2] for point in actual]}
 

@@ -1,4 +1,4 @@
-"""Run a rollback-only wall or column split trial in a disposable Revit fixture."""
+"""Run a rollback-only element split trial in a disposable Revit fixture."""
 
 from decimal import Decimal
 from hashlib import sha256
@@ -10,6 +10,7 @@ from pyrevit.api import DB
 from System import Int64
 
 import element_split_preview as planner
+import floor_split_replacement as floor_trial
 import read_element_split_evidence as reader
 import verify_element_split as verifier
 
@@ -26,7 +27,11 @@ def parse(value):
 
 
 def preflight(document, args):
-    planner.fields(args, {"mode", "disposable_fixture", "source_request", "approval_json", "approval_sha256"})
+    floor_input = isinstance(args, dict) and bool({"floor_cascade_json", "floor_cascade_sha256"} & args.keys())
+    required = {"mode", "disposable_fixture", "source_request", "approval_json", "approval_sha256"}
+    if floor_input:
+        required.update(("floor_cascade_json", "floor_cascade_sha256"))
+    planner.fields(args, required)
     if args["mode"] != "rollback_trial" or args["disposable_fixture"] is not True:
         raise ValueError("Use the rollback trial on an approved disposable fixture.")
     approval_text = args["approval_json"]
@@ -38,14 +43,27 @@ def preflight(document, args):
     inventory = parse(source["inventory_json"])
     approved = parse(approval_text)
     plan = planner.preview(snapshot)
-    if plan["blocked"] or any(item["category"] == "floor" for item in plan["findings"]):
-        raise ValueError("This trial requires unblocked walls or columns.")
+    if plan["blocked"]:
+        raise ValueError("This trial requires an unblocked split preview.")
+    floors = [item for item in plan["findings"] if item["category"] == "floor"]
+    if (floors and (not floor_input or len(plan["findings"]) != 1)) or (floor_input and not floors):
+        raise ValueError("A replacement trial needs one floor and its separately reviewed cascade.")
     expected = {item["id"]: item for item in plan["findings"]}
     baseline = {row["id"]: verifier.parameters(row["parameters"]) for row in inventory["elements"]}
     verifier.reviewed_adjustments(approved, digest(source["snapshot_json"]), digest(source["inventory_json"]),
                                   expected, baseline)
-    if any(row["dependencies"] or row["geometry_joins"] for row in inventory["elements"]):
+    if any(row["geometry_joins"] or (row["dependencies"] and not floors) for row in inventory["elements"]):
         raise ValueError("A source has dependencies or geometry joins outside this trial.")
+    floor_basis = None
+    if floors:
+        text = args["floor_cascade_json"]
+        if (not isinstance(text, str) or len(text.encode("utf-8")) > planner.MAX_BYTES
+                or digest(text) != args["floor_cascade_sha256"]):
+            raise ValueError("The separately reviewed floor cascade digest does not match.")
+        item = floors[0]
+        element = reader.selected(document, {"id": item["id"], "uid": item["uid"]})
+        floor_basis = floor_trial.prepare(document, parse(text), snapshot, digest(source["inventory_json"]),
+                                          digest(source["snapshot_json"]), element)
     facts = {row["id"]: dict(row) for row in inventory["elements"]}
     budget = reader.ReadBudget()
     for row in snapshot["elements"]:
@@ -55,9 +73,9 @@ def preflight(document, args):
                 raise ValueError("Wall end joins require separate native qualification.")
             facts[row["id"]]["wall_top"] = wall_constraints(document, element, expected[row["id"]])
             facts[row["id"]]["wall_faces"] = wall_face_evidence(element, row["geometry"], budget)
-        elif not isinstance(element.Location, DB.LocationCurve):
+        elif row["category"] != "floor" and not isinstance(element.Location, DB.LocationCurve):
             raise ValueError("Point-located columns require a separately qualified normalized split direction.")
-    return source, snapshot, inventory, approved, expected, facts
+    return source, snapshot, inventory, approved, expected, facts, floor_basis
 
 
 def ordered_axis(element):
@@ -202,18 +220,18 @@ def wall_face_evidence(wall, geometry, budget):
     return {"side_offsets_ft": offsets, "solid_volume_cuft": solids[0]}
 
 
-def preserve_wall_parameters(document, piece, source, budget):
+def preserve_parameters(document, piece, source, category, budget):
     expected = verifier.parameters(source["parameters"])
     actual = verifier.parameters(parse(json.dumps(reader.read_parameters(piece, budget), allow_nan=False)))
     for parameter in piece.Parameters:
         budget.visit("parameters")
         key = reader.parameter_identity(parameter)
         wanted = expected.get(key)
-        if (wanted is None or key in verifier.ADJUSTABLE["wall"] or parameter.IsReadOnly
+        if (wanted is None or key in verifier.ADJUSTABLE[category] or parameter.IsReadOnly
                 or actual[key] == wanted):
             continue
         if actual[key]["storage"] != wanted["storage"]:
-            raise ValueError("A new wall parameter has different storage.")
+            raise ValueError("A new piece parameter has different storage.")
         if wanted["has_value"]:
             value = wanted["value"]
             if wanted["storage"] == "element_id":
@@ -221,12 +239,12 @@ def preserve_wall_parameters(document, piece, source, budget):
             elif wanted["storage"] == "double":
                 value = float(value)
             if not parameter.Set(value):
-                raise ValueError("A preserved wall parameter could not be restored.")
+                raise ValueError("A preserved parameter could not be restored.")
         else:
             definition = document.GetElement(parameter.Id) if parameter.IsShared else None
             if (not isinstance(definition, DB.SharedParameterElement) or not definition.ShouldHideWhenNoValue()
                     or not parameter.ClearValue()):
-                raise ValueError("A new wall parameter cannot be restored to its original unset state.")
+                raise ValueError("A new piece parameter cannot be restored to its original unset state.")
 
 
 def split_wall(document, source, row, facts, expected, created, budget):
@@ -261,7 +279,7 @@ def split_wall(document, source, row, facts, expected, created, budget):
             if not end["join_allowed"]:
                 DB.WallUtils.DisallowWallJoinAtEnd(piece, end["end"])
         document.Regenerate()
-        preserve_wall_parameters(document, piece, facts, budget)
+        preserve_parameters(document, piece, facts, "wall", budget)
     return ids
 
 
@@ -301,13 +319,14 @@ def verify_wall_pieces(document, requests, facts, readback):
 
 
 def run(document, args):
-    source, snapshot, inventory, approval, expected, facts = preflight(document, args)
+    source, snapshot, inventory, approval, expected, facts, floor_basis = preflight(document, args)
     transaction_name = "Archi Magic element split trial " + uuid4().hex
     status = DB.TransactionStatus
     group = DB.TransactionGroup(document, transaction_name)
     transaction = DB.Transaction(document, transaction_name)
     created, observed = set(), set()
     source_ids = set(expected)
+    approved_deletions = set(floor_basis["approved"]) if floor_basis is not None else set()
     commit_events, rollback_events = [], []
     closing = invalid_event = False
 
@@ -323,15 +342,17 @@ def run(document, args):
                                ("deleted", event.GetDeletedElementIds())):
                 effects[key] = set()
                 for item in items:
-                    if len(effects[key]) >= planner.MAX_PIECES:
+                    if len(effects[key]) >= reader.MAX_DEPENDENCIES + 2:
                         raise ValueError("The transaction changed too many elements.")
                     effects[key].add(planner.identifier(str(item.Value)))
-            observed.update(effects["added"])
+            if not closing:
+                observed.update(effects["added"])
             names = list(event.GetTransactionNames())
             if closing and op in ("TransactionRolledBack", "TransactionGroupRolledBack"):
                 if (len(rollback_events) >= MAX_EVENTS or (names and names != [transaction_name])
-                        or effects["added"] or effects["modified"] - source_ids
-                        or effects["deleted"] - created):
+                        or effects["added"] - approved_deletions
+                        or effects["modified"] - (source_ids | approved_deletions)
+                        or effects["deleted"] - (created | observed)):
                     invalid_event = True
                 else:
                     rollback_events.append({"operation": op, "transactions": names, **effects})
@@ -344,7 +365,7 @@ def run(document, args):
 
     application = document.Application
     failure = readback_text = comparison = None
-    wall_measurements = {}
+    wall_measurements, floor_measurements = {}, {}
     rolled_back = regeneration_failed = False
     application.DocumentChanged += record
     try:
@@ -357,6 +378,12 @@ def run(document, args):
             if row["category"] == "wall":
                 element = reader.selected(document, {"id": source_id, "uid": row["uid"]})
                 ids = split_wall(document, element, row, facts[source_id], expected[source_id], created, budget)
+            elif row["category"] == "floor":
+                element = reader.selected(document, {"id": source_id, "uid": row["uid"]})
+                pieces = floor_trial.replace(document, element, floor_basis, expected[source_id], created, budget)
+                for piece in pieces:
+                    preserve_parameters(document, piece, facts[source_id], "floor", budget)
+                ids = [piece.Id for piece in pieces]
             else:
                 ids = [DB.ElementId(Int64(int(source_id)))]
                 for cut in sorted(row["cuts"], key=lambda item: item["elevation_ft"]):
@@ -366,7 +393,14 @@ def run(document, args):
                 requests.append({"source_id": source_id, "result": reader.identity(element)})
         if transaction.Commit() != status.Committed or transaction.GetStatus() != status.Committed:
             raise ValueError("The provisional column transaction did not finish.")
-        if invalid_event or commit_events != [{"added": created, "modified": source_ids, "deleted": set()}]:
+        if floor_basis is not None:
+            try:
+                created.update(floor_trial.effects(document, requests, floor_basis))
+            except Exception:
+                invalid_event = True
+                raise
+        exact_effects = {"added": created, "modified": source_ids - approved_deletions, "deleted": approved_deletions}
+        if invalid_event or commit_events != [exact_effects]:
             invalid_event = True
             raise ValueError("Revit reported effects outside the reviewed split.")
         data = reader.main(document, {"host_identity": snapshot["host_identity"], "readback": requests})
@@ -376,8 +410,13 @@ def run(document, args):
                                      digest(source["inventory_json"]), approval, measured)
         if comparison["status"] != "matched":
             raise ValueError("Trial geometry, types, or instance parameters differ from the reviewed basis.")
-        wall_measurements = verify_wall_pieces(document, requests, facts, measured)
+        if floor_basis is not None:
+            floor_measurements = floor_trial.verify_solids(document, requests, measured, floor_basis)
+        else:
+            wall_measurements = verify_wall_pieces(document, requests, facts, measured)
     except Exception as error:
+        if isinstance(error, floor_trial.UnexpectedFloorDeletion):
+            invalid_event = True
         regeneration_failed = type(error).__name__ == "RegenerationFailedException"
         failure = str(error) if isinstance(error, ValueError) else type(error).__name__
     finally:
@@ -403,6 +442,8 @@ def run(document, args):
             raise ValueError("A trial piece still resolves after rollback.")
         if reader.main(document, args["source_request"]) != source:
             raise ValueError("The original source evidence differs after rollback.")
+        if floor_basis is not None:
+            floor_trial.verify_restored(document, floor_basis, snapshot["elements"][0]["geometry"])
         budget = reader.ReadBudget()
         for row in snapshot["elements"]:
             if row["category"] == "wall":
@@ -424,6 +465,8 @@ def run(document, args):
     report = {"status": "trial_rolled_back", "transaction": transaction_name, "approval_sha256": args["approval_sha256"],
               "inner_effects": serializable(commit_events[0]), "rollback_events": list(map(serializable, rollback_events)),
               "comparison": comparison, "readback_json": readback_text, "wall_measurements": wall_measurements}
+    if floor_basis is not None:
+        report.update(floor_measurements=floor_measurements, floor_cascade_sha256=args["floor_cascade_sha256"])
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False)
     if len(encoded) > planner.MAX_BYTES:
         return {"status": "stopped_and_rolled_back", "reason": "The native trial receipt exceeds 2 MiB.",

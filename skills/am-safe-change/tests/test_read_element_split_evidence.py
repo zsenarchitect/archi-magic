@@ -721,3 +721,197 @@ def test_floor_cascade_discovery_reconciles_exact_owned_ids_after_rollback(model
         assert invoke(document, before_request) == before
     else:
         assert "cascade_json" not in response
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "trial_rolled_back"),
+    ("wrong_cascade_sha", "stopped"),
+    ("unexpected_deletion", "transaction_unresolved"),
+    ("extra_creation", "transaction_unresolved"),
+    ("wrong_thickness", "stopped_and_rolled_back"),
+])
+def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, monkeypatch, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    for name in ("read_element_split_evidence", "probe_floor_split_cascade", "floor_split_replacement"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
+                                       RolledBack="rolled_back")
+    changes = Changed()
+    document.Application.DocumentChanged = changes
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    db.XYZ = point
+    db.Options = lambda: NS(Dispose=lambda: None)
+    db.Solid = type("Solid", (NS,), {})
+    db.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM = "offset"
+    db.BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL = "structural"
+    db.HostObjectUtils.GetBottomFaces = lambda floor: ["bottom"]
+    monkeypatch.setattr(Line, "CreateBound", staticmethod(
+        lambda a, b: Line((a.X, a.Y, a.Z), (b.X, b.Y, b.Z))), raising=False)
+
+    class Collection(list):
+        Add = list.append
+        Append = list.append
+
+    class GenericList:
+        def __class_getitem__(cls, item):
+            return Collection
+
+    monkeypatch.setitem(sys.modules, "System.Collections", NS())
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=GenericList))
+    db.CurveLoop = Collection
+    db.BoundaryValidation = NS(IsValidHorizontalBoundary=lambda profiles: len(profiles) == 1 and len(profiles[0]) == 4)
+
+    class IdIterator:
+        def __init__(self):
+            self._items = iter(sorted(elements))
+
+        def MoveNext(self):
+            value = next(self._items, None)
+            if value is None:
+                return False
+            self.Current = Id(value)
+            return True
+
+        def Dispose(self):
+            pass
+
+    def collector(_):
+        return NS(WhereElementIsNotElementType=lambda: NS(GetElementIdIterator=IdIterator), Dispose=lambda: None)
+
+    db.FilteredElementCollector = collector
+    template = elements[13]
+    original_vertices = [(0, 0), (8, 0), (8, 4), (0, 4)]
+
+    def make_floor(identifier, sketch_id, member_id, vertices, height, finish):
+        offset = parameter(-1001951, "d", height)
+        offset.current = height
+        offset.AsDouble = lambda: offset.current
+        finish_parameter = parameter(50, "s", finish, GUID="floor-finish")
+        finish_parameter.current = finish
+        finish_parameter.AsString = lambda: finish_parameter.current
+
+        def change(item, value):
+            item.current = value
+            document.IsModified = True
+            return True
+
+        offset.Set = lambda value: change(offset, value)
+        finish_parameter.Set = lambda value: change(finish_parameter, value)
+        structural = parameter(-1001906, "i", 1)
+        params = {"offset": offset, "structural": structural}
+        area = abs(sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(vertices, vertices[1:] + vertices[:1]))) / 2
+        thickness = 0.4 if fault == "wrong_thickness" and identifier != 13 else 0.5
+
+        def face(ref):
+            bottom = ref == "bottom"
+            return PlanarFace(FaceNormal=point(0, 0, -1 if bottom else 1),
+                              GetEdgesAsCurveLoops=lambda: [loop(vertices, offset.current - thickness if bottom else offset.current)])
+
+        common = {key: value for key, value in vars(template).items()
+                  if key not in ("Id", "UniqueId", "Parameters", "SketchId", "GetDependentElements",
+                                 "GetGeometryObjectFromReference")}
+        floor = native(Floor, identifier, **common, LevelId=Id(1), SketchId=Id(sketch_id),
+                       Parameters=[offset, structural, finish_parameter], GetGeometryObjectFromReference=face,
+                       GetDependentElements=lambda _: [Id(sketch_id), Id(member_id)],
+                       get_Parameter=params.get, get_Geometry=lambda _: [db.Solid(Volume=area * thickness)])
+        elements[identifier] = floor
+        elements[sketch_id] = native(Sketch, sketch_id, OwnerId=Id(identifier), Profile=[loop(vertices, 0)],
+                                     GetAllElements=lambda: [Id(member_id)],
+                                     GetDependentElements=lambda _: [Id(member_id)])
+        elements[member_id] = native(ModelLine, member_id)
+        return floor
+
+    make_floor(13, 20, 23, original_vertices, -0.5, "Reviewed")
+    initial = dict(elements)
+    created, deleted, starts = [], [], []
+
+    def create(_, profiles, type_id, level_id, structural, slope_arrow, slope):
+        assert (type_id, level_id, structural, slope_arrow, slope) == (100, 1, True, None, 0)
+        points = [curve.GetEndPoint(0) for curve in profiles[0]]
+        identifier = 400 + len(created)
+        created.extend([identifier, identifier + 1, identifier + 2])
+        floor = make_floor(identifier, identifier + 1, identifier + 2, [(p.X, p.Y) for p in points], 0, "Default")
+        if fault == "extra_creation" and identifier == 400:
+            elements[600] = native(NS, 600)
+            created.append(600)
+        return floor
+
+    def delete(identifier):
+        assert identifier == 13
+        deleted.extend([13, 20, 23] + ([100] if fault == "unexpected_deletion" else []))
+        for value in deleted:
+            del elements[value]
+        document.IsModified = True
+        return list(map(Id, deleted))
+
+    monkeypatch.setattr(Floor, "Create", staticmethod(create), raising=False)
+    document.Delete = delete
+
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            self.state = status.Started
+            starts.append(type(self).__name__)
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def Commit(self):
+            self.state = status.Committed
+            changes.emit(document, self.name, "TransactionCommitted", added=created, deleted=deleted)
+            return self.state
+
+        def RollBack(self):
+            self.state = status.RolledBack
+            return self.state
+
+    class Group(Transaction):
+        def RollBack(self):
+            elements.clear()
+            elements.update(initial)
+            document.IsModified = False
+            self.state = status.RolledBack
+            changes.emit(document, self.name, "TransactionGroupRolledBack", added=deleted, deleted=created)
+            return self.state
+
+    db.Transaction, db.TransactionGroup = Transaction, Group
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][-1]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    snapshot_sha = sha256(before["snapshot_json"].encode()).hexdigest()
+    inventory_sha = sha256(before["inventory_json"].encode()).hexdigest()
+    approval = json.dumps({"kind": "element-split-readback-approval", "snapshot_sha256": snapshot_sha,
+                           "inventory_sha256": inventory_sha, "piece_adjustments": []})
+    cascade = json.dumps({"kind": "element-split-floor-cascade", "host_identity": before_request["host_identity"],
+                          "snapshot_sha256": snapshot_sha, "inventory_sha256": inventory_sha,
+                          "source": {"id": "13", "uid": "uid-13"}, "sketch": {"id": "20", "uid": "uid-20"},
+                          "deleted": [{"id": str(i), "uid": f"uid-{i}"} for i in (13, 20, 23)]})
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
+        "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
+        "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
+        "floor_cascade_json": cascade,
+        "floor_cascade_sha256": "f" * 64 if fault == "wrong_cascade_sha" else sha256(cascade.encode()).hexdigest(),
+    }})["result"]
+    assert result["status"] == expected, result
+    assert elements == initial and invoke(document, before_request) == before
+    if fault == "wrong_cascade_sha":
+        assert starts == []
+    if fault == "unexpected_deletion":
+        assert created == []
+    if fault == "none":
+        receipt = json.loads(result["trial_json"])
+        assert receipt["inner_effects"] == {
+            "added": list(map(str, range(400, 409))), "modified": [], "deleted": ["13", "20", "23"],
+        }
+        assert sum(piece["solid_volume_cuft"] for piece in receipt["floor_measurements"].values()) == 16
+        assert all(piece["thickness_ft"] == 0.5 for piece in receipt["floor_measurements"].values())
+        readback = json.loads(receipt["readback_json"])
+        assert all(any(row["identity"] == "shared:floor-finish" and row["value"] == "Reviewed"
+                       for row in piece["parameters"]) for piece in readback["pieces"])
