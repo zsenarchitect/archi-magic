@@ -213,6 +213,8 @@ The query checks actual boundary loops on the finish face. It keeps separate loo
 
 Add `horizontal_finishes` to preview selected floor and ceiling types and their heights in a saved project. For example, pass `{"floor":{"type_id":"123","offset_ft":0},"ceiling":{"type_id":"456","offset_ft":9}}`. Set each offset relative to the room level, in Revit internal feet. Check the room level, phase, boundary loops, and proposed project elevation. Resolve rooms excluded for missing scope or design options before placement. This query is read-only.
 
+Pass `wall_type_id` to review a basic wall finish type and its width. Review each straight host-wall boundary for projected door envelopes and the remaining spans. The span distances start at the boundary segment's first endpoint. Segments with unclassified inserts, door envelopes that reach a boundary end, or unsupported wall geometry are excluded with reasons. The spans need an interior-side and finish-width check before placement.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.

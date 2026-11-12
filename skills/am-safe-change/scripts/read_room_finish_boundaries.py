@@ -11,6 +11,8 @@ from System.Collections.Generic import List
 
 MAX_ROOMS = 20
 MAX_SEGMENTS = 2000
+MAX_WALL_SEGMENTS = 200
+MAX_INSERTS_PER_WALL = 100
 TOLERANCE_FT = 1e-6
 
 
@@ -64,7 +66,69 @@ def finite(value):
         return False
 
 
-def room_finish_preview(document, room, row, types):
+def visible_in_phase(element, phase_id):
+    return (element.DesignOption is None and element.GetPhaseStatus(phase_id) in
+            (DB.ElementOnPhaseStatus.New, DB.ElementOnPhaseStatus.Existing))
+
+
+def door_interval(door, start, axis):
+    box = door.get_BoundingBox(None)
+    if box is None or not box.Enabled or not box.Transform.IsIdentity:
+        return None
+    low, high = xyz(box.Min), xyz(box.Max)
+    if any(not (finite(a) and finite(b) and a <= b) for a, b in zip(low, high)):
+        return None
+    stations = [(x - start[0]) * axis[0] + (y - start[1]) * axis[1]
+                for x in (low[0], high[0]) for y in (low[1], high[1])]
+    return (min(stations), max(stations)) if all(finite(value) for value in stations) else None
+
+
+def wall_segment_preview(document, segment, phase_id, short_curve):
+    if segment["linked_source_id"] > 0 or segment["curve_type"] != "Line" or segment["source_id"] <= 0:
+        return {"status": "excluded", "reason": "boundary_not_a_straight_host_wall"}
+    wall = document.GetElement(DB.ElementId(Int64(segment["source_id"])))
+    if (not isinstance(wall, DB.Wall) or not wall.UniqueId or wall.IsStackedWallMember
+            or wall.WallType.Kind != DB.WallKind.Basic or wall.CrossSection != DB.WallCrossSection.Vertical
+            or not visible_in_phase(wall, phase_id)):
+        return {"status": "excluded", "reason": "wall_geometry_or_phase_requires_review"}
+    start, end = segment["start_ft"], segment["end_ft"]
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if not finite(length) or length <= short_curve:
+        return {"status": "excluded", "reason": "wall_boundary_too_short"}
+    axis = (dx / length, dy / length)
+    insert_ids = wall.FindInserts(True, True, True, True)
+    if len(insert_ids) > MAX_INSERTS_PER_WALL:
+        return {"status": "excluded", "reason": "wall_insert_limit"}
+    doors = []
+    for identifier in insert_ids:
+        door = document.GetElement(identifier)
+        if (not isinstance(door, DB.FamilyInstance) or not door.UniqueId or door.Category is None
+                or door.Category.Id.Value != int(DB.BuiltInCategory.OST_Doors)
+                or door.Host is None or door.Host.Id.Value != wall.Id.Value or not visible_in_phase(door, phase_id)):
+            return {"status": "excluded", "reason": "wall_insert_requires_review"}
+        interval = door_interval(door, start, axis)
+        if interval is None or interval[1] - interval[0] <= TOLERANCE_FT:
+            return {"status": "excluded", "reason": "door_bounds_unavailable"}
+        low, high = interval
+        if high < -TOLERANCE_FT or low > length + TOLERANCE_FT:
+            continue
+        if low <= TOLERANCE_FT or high >= length - TOLERANCE_FT:
+            return {"status": "excluded", "reason": "door_crosses_or_touches_boundary_end"}
+        doors.append({"id": str(identifier.Value), "uid": str(door.UniqueId), "start_ft": low, "end_ft": high})
+    doors.sort(key=lambda item: (item["start_ft"], item["end_ft"], item["id"]))
+    spans, cursor = [], 0.0
+    for door in doors:
+        if door["start_ft"] - cursor > short_curve:
+            spans.append([cursor, door["start_ft"]])
+        cursor = max(cursor, door["end_ft"])
+    if length - cursor > short_curve:
+        spans.append([cursor, length])
+    return {"status": "spans_previewed", "wall_uid": str(wall.UniqueId), "door_envelopes": doors,
+            "boundary_spans_ft": spans}
+
+
+def room_finish_preview(document, room, row, types, wall_type):
     if room.DesignOption is not None:
         return excluded(row["room_id"], "room_design_option_requires_review")
     level = document.GetElement(room.LevelId)
@@ -85,6 +149,24 @@ def room_finish_preview(document, room, row, types):
             return excluded(row["room_id"], "finish_elevation_unavailable")
         finishes.append(dict(selected, kind=kind, project_elevation_ft=elevation))
     row["horizontal_finishes"] = finishes
+    if wall_type:
+        short_curve = document.Application.ShortCurveTolerance
+        if not finite(short_curve) or short_curve <= 0:
+            row["wall_finish"] = {"status": "excluded", "reason": "short_curve_tolerance_unavailable"}
+        elif sum(len(loop) for loop in row["boundary_loops"]) > MAX_WALL_SEGMENTS:
+            row["wall_finish"] = {"status": "excluded", "reason": "wall_boundary_segment_limit"}
+        else:
+            row["wall_finish"] = dict(wall_type, status="reported")
+            for loop in row["boundary_loops"]:
+                for segment in loop:
+                    try:
+                        result = wall_segment_preview(document, segment, phase.Id, short_curve)
+                    except Exception as exc:
+                        result = {"status": "excluded", "reason": "wall_boundary_read_failed",
+                                  "error_type": type(exc).__name__}
+                    segment["wall_finish"] = result
+                    if result["status"] == "excluded":
+                        row["wall_finish"]["status"] = "incomplete"
     return row
 
 
@@ -150,16 +232,24 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids, finish_request=None):
+def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None):
     types = None
     identity = None
-    if finish_request is not None:
+    wall_type = None
+    if finish_request is not None or wall_type_id is not None:
         project = document.ProjectInformation
         if not document.PathName or project is None or not project.UniqueId:
             raise ValueError("Save the project before requesting a finish preview.")
         identity = {"project_uid": str(project.UniqueId),
                     "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
-        types = finish_types(document, finish_request)
+        types = finish_types(document, finish_request) if finish_request is not None else {}
+    if wall_type_id is not None:
+        value, = ids_from([wall_type_id])
+        element = document.GetElement(DB.ElementId(Int64(value)))
+        if (not isinstance(element, DB.WallType) or not element.UniqueId or element.Kind != DB.WallKind.Basic
+                or not finite(element.Width) or element.Width <= 0):
+            raise ValueError("Select a basic finish wall type with a known positive width.")
+        wall_type = {"type_id": str(value), "type_uid": str(element.UniqueId), "width_ft": element.Width}
     rows = []
     remaining = MAX_SEGMENTS
     options = DB.SpatialElementBoundaryOptions()
@@ -170,8 +260,8 @@ def read_boundaries(document, room_ids, finish_request=None):
                 room = document.GetElement(DB.ElementId(Int64(room_id)))
                 row, used = inspect_room(room, room_id, options, remaining)
                 remaining -= used
-                if types and row["status"] == "boundary_verified":
-                    row = room_finish_preview(document, room, row, types)
+                if types is not None and row["status"] == "boundary_verified":
+                    row = room_finish_preview(document, room, row, types, wall_type)
             except Exception as exc:
                 row = excluded(room_id, "boundary_read_failed")
                 row["error_type"] = type(exc).__name__
@@ -179,7 +269,9 @@ def read_boundaries(document, room_ids, finish_request=None):
     finally:
         options.Dispose()
     report = {
-        "status": "reported" if all(row["status"] == "boundary_verified" for row in rows) else "incomplete",
+        "status": "reported" if all(row["status"] == "boundary_verified"
+                                   and row.get("wall_finish", {}).get("status", "reported") == "reported"
+                                   for row in rows) else "incomplete",
         "rooms": rows,
         "boundary_location": "finish",
         "placement_available": False,
@@ -192,5 +284,6 @@ def read_boundaries(document, room_ids, finish_request=None):
 if doc is None or doc.IsFamilyDocument:
     result = {"error": "Open a Revit project before reading room boundaries."}
 else:
-    report = read_boundaries(doc, ids_from(inputs.get("room_ids")), inputs.get("horizontal_finishes"))
+    report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
+                             inputs.get("horizontal_finishes"), inputs.get("wall_type_id"))
     result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

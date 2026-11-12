@@ -99,13 +99,59 @@ class CeilingType:
     UniqueId = "synthetic-ceiling-type"
 
 
+class WallType:
+    UniqueId = "synthetic-wall-type"
+    Kind = "basic"
+    Width = 0.125
+
+
+class Wall:
+    WallType = WallType()
+    CrossSection = "vertical"
+    IsStackedWallMember = False
+    DesignOption = None
+
+    def __init__(self, value, inserts=()):
+        self.Id = NS(Value=value)
+        self.UniqueId = "fixture-wall-" + str(value)
+        self.inserts = [NS(Value=i) for i in inserts]
+
+    def GetPhaseStatus(self, phase_id):
+        assert phase_id.Value == 102
+        return "existing"
+
+    def FindInserts(self, *flags):
+        assert flags == (True, True, True, True)
+        return self.inserts
+
+
+class Door:
+    DesignOption = None
+    Category = NS(Id=NS(Value=-42))
+
+    def __init__(self, value, wall, low, high):
+        self.UniqueId = "fixture-door-" + str(value)
+        self.Host = wall
+        self.bounds = NS(Enabled=True, Transform=NS(IsIdentity=True),
+                         Min=Point(*low), Max=Point(*high))
+
+    def GetPhaseStatus(self, phase_id):
+        assert phase_id.Value == 102
+        return "new"
+
+    def get_BoundingBox(self, view):
+        assert view is None
+        return self.bounds
+
+
 def loop(points, closed=True, source=50, linked=-1):
     starts = points if closed else points[:-1]
     ends = points[1:] + points[:1] if closed else points[1:]
     result = Seq()
-    for a, b in zip(starts, ends):
+    for i, (a, b) in enumerate(zip(starts, ends)):
         curve = Curve(a, b)
-        result.append(NS(GetCurve=lambda c=curve: c, ElementId=NS(Value=source),
+        wall = source[i] if isinstance(source, list) else source
+        result.append(NS(GetCurve=lambda c=curve: c, ElementId=NS(Value=wall),
                          LinkElementId=NS(Value=linked)))
     return result
 
@@ -123,6 +169,9 @@ def run(monkeypatch):
         BoundaryValidation=NS(IsValidHorizontalBoundary=lambda profiles: bool(profiles)),
         Level=Level, Phase=Phase, FloorType=FloorType, CeilingType=CeilingType,
         BuiltInParameter=NS(ROOM_PHASE_ID="room-phase"), StorageType=NS(ElementId="element-id"),
+        Wall=Wall, WallType=WallType, FamilyInstance=Door, WallKind=NS(Basic="basic"),
+        WallCrossSection=NS(Vertical="vertical"), BuiltInCategory=NS(OST_Doors=-42),
+        ElementOnPhaseStatus=NS(New="new", Existing="existing"),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
@@ -131,7 +180,7 @@ def run(monkeypatch):
     def execute(rooms, ids, **extra):
         # The document stand-in has no transaction or write APIs.
         doc = NS(IsFamilyDocument=False, GetElement=lambda item: rooms.get(getattr(item, "Value", item)),
-                 PathName="fixture.rvt",
+                 PathName="fixture.rvt", Application=NS(ShortCurveTolerance=0.01),
                  ProjectInformation=NS(UniqueId="synthetic-project"))
         result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": dict(extra, room_ids=ids)})
         return json.loads(result["result"]["payload"])
@@ -206,3 +255,54 @@ def test_horizontal_finish_preview_excludes_room_without_native_scope(run):
 def test_horizontal_finish_preview_rejects_invalid_offset(run, offset):
     with pytest.raises(ValueError, match="finite number"):
         run({103: FloorType()}, ["1"], horizontal_finishes={"floor": {"type_id": "103", "offset_ft": offset}})
+
+
+def test_wall_finish_spans_skip_overlapping_door_envelopes(run):
+    wall = Wall(50, [151, 152])
+    room = Room(Seq([loop(rectangle(0, 0, 10, 8), source=[50, 51, 52, 53])]))
+    report = run({1: room, 50: wall, 51: Wall(51), 52: Wall(52), 53: Wall(53), 101: Level(),
+                  102: Phase(), 103: WallType(), 151: Door(151, wall, (2, -0.2, 0), (5, 0.2, 7)),
+                  152: Door(152, wall, (4, -0.2, 0), (6, 0.2, 7))}, ["1"], wall_type_id="103")
+    assert report["status"] == "reported" and report["placement_available"] is False
+    row, = report["rooms"]
+    assert row["wall_finish"] == {"type_id": "103", "type_uid": "synthetic-wall-type",
+                                  "width_ft": 0.125, "status": "reported"}
+    first, second, _, _ = row["boundary_loops"][0]
+    assert first["wall_finish"]["boundary_spans_ft"] == [[0.0, 2.0], [6.0, 10.0]]
+    assert first["wall_finish"]["door_envelopes"] == [
+        {"id": "151", "uid": "fixture-door-151", "start_ft": 2.0, "end_ft": 5.0},
+        {"id": "152", "uid": "fixture-door-152", "start_ft": 4.0, "end_ft": 6.0},
+    ]
+    assert second["wall_finish"]["boundary_spans_ft"] == [[0.0, 8.0]]
+
+
+def test_wall_finish_projects_all_box_corners_on_a_diagonal_boundary(run):
+    wall = Wall(50, [151])
+    room = Room(Seq([loop([(0, 10, 0), (10, 0, 0), (10, 10, 0)], source=[50, 51, 52])]))
+    door = Door(151, wall, (4, 4, 0), (6, 6, 7))
+    report = run({1: room, 50: wall, 51: Wall(51), 52: Wall(52),
+                  101: Level(), 102: Phase(), 103: WallType(), 151: door}, ["1"], wall_type_id="103")
+    first = report["rooms"][0]["boundary_loops"][0][0]["wall_finish"]
+    assert first["boundary_spans_ft"][0] == pytest.approx([0.0, 8 / 2**0.5])
+    assert first["boundary_spans_ft"][1] == pytest.approx([12 / 2**0.5, 200**0.5])
+
+
+@pytest.mark.parametrize("control,reason", [
+    ("end", "door_crosses_or_touches_boundary_end"),
+    ("unknown", "wall_insert_requires_review"),
+    ("other_host", "wall_insert_requires_review"),
+])
+def test_wall_finish_excludes_unverified_insert_without_hiding_horizontal_preview(run, control, reason):
+    wall = Wall(50, [151])
+    door = Door(151, Wall(999) if control == "other_host" else wall,
+                (-0.1 if control == "end" else 2, -0.2, 0), (4, 0.2, 7))
+    if control == "unknown":
+        door.Category = NS(Id=NS(Value=-99))
+    room = Room(Seq([loop(rectangle(0, 0, 10, 8), source=[50, 51, 52, 53])]))
+    report = run({1: room, 50: wall, 101: Level(), 102: Phase(), 103: WallType(), 104: FloorType(),
+                  151: door}, ["1"], wall_type_id="103",
+                 horizontal_finishes={"floor": {"type_id": "104", "offset_ft": 0.0}})
+    row, = report["rooms"]
+    assert report["status"] == "incomplete" and row["wall_finish"]["status"] == "incomplete"
+    assert row["horizontal_finishes"][0]["kind"] == "floor"
+    assert row["boundary_loops"][0][0]["wall_finish"] == {"status": "excluded", "reason": reason}
