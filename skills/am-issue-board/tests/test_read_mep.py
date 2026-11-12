@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace as NS
 
 import pytest
+from issue_board_fixtures import FakeFormattedText, FakeRange, SAMPLE
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "read_mep.py"
@@ -469,3 +470,105 @@ def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, st
     if scenario == "clean":
         assert all(report["coverage"][check]["evaluated"] == 1
                    for check in ("system", "connectivity", "size", "airflow"))
+
+
+@pytest.mark.parametrize("scenario", [
+    "host", "linked", "moved_link", "changed_element", "changed_evidence", "changed_note",
+    "wrong_board_project", "unguarded_inner", "missing_source_guard", "unexpected_element_link",
+])
+def test_native_mep_handoff_through_board_writer(runtime, monkeypatch, tmp_path, scenario):
+    import issue_board as ib
+
+    events = []
+
+    class TextNote:
+        Id = ElementId(40)
+        UniqueId = "board-note"
+
+        def __init__(self):
+            self.text = FakeFormattedText(SAMPLE)
+
+        def GetFormattedText(self):
+            return self.text
+
+        def SetFormattedText(self, text):
+            self.text = text
+            events.append("write")
+
+    def transaction(*_):
+        events.append("transaction")
+        return NS(Start=lambda: events.append("start"), Commit=lambda: events.append("commit"),
+                  RollBack=lambda: events.append("rollback"))
+
+    runtime.TextNote = TextNote
+    runtime.Transaction = transaction
+    runtime.TextRange = FakeRange
+    runtime.ListType = NS(**{"Bullet": "bullet", "None": "none"})
+    monkeypatch.delitem(sys.modules, "read_mep", raising=False)
+    note = TextNote()
+    system = NS(Id=ElementId(9), Name=r"BAD-id987\u0069d678", GetTypeId=lambda: ElementId(10))
+    duct = Duct([connector(4, connected=False, system=system)], flow=100)
+    elements = {42: duct, 10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow")}
+    request = {}
+    if scenario in ("linked", "moved_link", "unexpected_element_link"):
+        link = Link(model("link", elements), 50)
+        host = model("host", {40: note, 41: link, 42: Duct([])})
+        request = {"link_instance_id": "41", "link_instance_uid": link.UniqueId}
+    else:
+        host = model("host", {40: note, **elements})
+    source = execute(host, describe=True, **request)["source"]
+    snapshot = execute(host, source=source, element_ids=["42"], **request)
+    snapshot_path, report_path, note_path = [tmp_path / name for name in ("snapshot.json", "report.json", "note.json")]
+    snapshot_path.write_text(snapshot["snapshot_json"])
+    result = subprocess.run([sys.executable, str(SCRIPT.with_name("mep_qa.py")), str(snapshot_path),
+                             "--output", str(report_path)], capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(report_path.read_text())["report"]
+    assert len(report["findings"]) == 2
+    note_path.write_text(json.dumps({
+        "host_identity": ib.saved_document_identity(model("other", {})) if scenario == "wrong_board_project"
+        else source["host_identity"],
+        "note": {"id": "40", "unique_id": note.UniqueId, "sha1": ib.text_sha1(SAMPLE), "text": SAMPLE},
+    }))
+    command = [sys.executable, str(SCRIPT.with_name("board_cli.py"))]
+    legacy = subprocess.run([*command, "mep-ops", str(report_path), "MEP-0002"], capture_output=True, text=True)
+    assert legacy.returncode == 2 and not legacy.stdout
+    preview = subprocess.run([*command, "mep-native-preview", str(report_path), str(note_path), "MEP-0002"],
+                             capture_output=True, text=True)
+    if scenario == "wrong_board_project":
+        assert preview.returncode == 2 and not preview.stdout
+        return
+    assert preview.returncode == 0, preview.stderr
+    plan = json.loads(preview.stdout)
+    assert plan["kind"] == "mep-native-board-plan" and "kind" not in plan["edit"]
+    row = ib.parse_board(plan["edit"]["final_text"])["issues"][-1]
+    assert row["element_ids"] == ([] if request else [42])
+    if request:
+        assert row["findings"][0] == "Linked element 42 in Revit link instance 41"
+    if scenario == "moved_link":
+        link.offset += 1
+    elif scenario == "changed_element":
+        duct.UniqueId = "replacement"
+    elif scenario == "changed_evidence":
+        duct.flow = 150
+    elif scenario == "changed_note":
+        note.UniqueId = "replacement-note"
+    elif scenario == "unguarded_inner":
+        plan = plan["edit"]
+    elif scenario == "missing_source_guard":
+        plan.pop("source_guard")
+    elif scenario == "unexpected_element_link":
+        plan["edit"]["final_text"] = plan["edit"]["final_text"].replace("Linked element 42", "Linked element id42")
+    writer_globals = {
+        "__revit__": NS(ActiveUIDocument=NS(Document=host)),
+        "inputs": {"plan": plan, "note_id": "40"},
+    }
+    if scenario in ("host", "linked"):
+        result = runpy.run_path(str(SCRIPT.with_name("apply_board.py")), init_globals=writer_globals)["result"]
+        assert result["status"] == "ok"
+        assert events == ["transaction", "start", "write", "commit"]
+        assert note.text.GetPlainText() == plan["edit"]["final_text"]
+    else:
+        with pytest.raises(ValueError):
+            runpy.run_path(str(SCRIPT.with_name("apply_board.py")), init_globals=writer_globals)
+        assert not events and note.text.GetPlainText() == SAMPLE

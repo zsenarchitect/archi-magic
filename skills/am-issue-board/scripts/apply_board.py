@@ -18,6 +18,8 @@ result = {"status": "ok" | "stopped", "message": ..., "note_id": n,
           "format_ops": n, "paragraphs": n, "sha1_after": ...}
 Runs under IronPython 2.7 and CPython 3 (no f-strings).
 """
+import json
+
 import System
 from pyrevit.api import DB
 
@@ -25,7 +27,7 @@ import issue_board as ib
 
 doc = __revit__.ActiveUIDocument.Document  # noqa: F821
 plan = inputs["plan"]  # noqa: F821
-if plan.get("kind") != "issue-board-plan":
+if plan.get("kind") not in ("issue-board-plan", "mep-native-board-plan"):
     raise ValueError("inputs.plan is not an issue-board plan")
 
 
@@ -49,25 +51,92 @@ def list_type(name):
     return DB.ListType.Bullet if name == "bullet" else getattr(DB.ListType, "None")
 
 
-def verify_board_target(guard, note_id):
-    if (plan["mode"] != "edit" or ib.saved_document_identity(doc) != guard["host_identity"]
+def verify_board_target(guard, note_id, mode):
+    if (mode != "edit" or ib.saved_document_identity(doc) != guard["host_identity"]
             or int(note_id) != int(guard["active"]["id"])):
         raise ValueError("The plan targets a different project or board.")
+    active_text = None
     for expected in (guard["active"], guard["archive"]):
         if expected is None:
             continue
         note = doc.GetElement(eid(expected["id"]))
-        if (not isinstance(note, DB.TextNote) or str(note.UniqueId) != expected["unique_id"]
-                or ib.text_sha1(note.GetFormattedText().GetPlainText()) != expected["sha1"]):
+        if not isinstance(note, DB.TextNote) or str(note.UniqueId) != expected["unique_id"]:
             raise ValueError("The board or archive changed. Read it again and rebuild the plan.")
+        text = note.GetFormattedText().GetPlainText()
+        if ib.text_sha1(text) != expected["sha1"]:
+            raise ValueError("The board or archive changed. Read it again and rebuild the plan.")
+        if expected is guard["active"]:
+            active_text = text
+    return active_text
 
 
-if "structural_target" in plan:
-    verify_board_target(plan["structural_target"], inputs["note_id"])  # noqa: F821
-if "board_target" in plan:
-    if plan["board_target"] is None:
-        raise ValueError("Read the board and any archive with include_identity enabled, then rebuild the plan.")
-    verify_board_target(plan["board_target"], inputs["note_id"])  # noqa: F821
+def verified_mep_edit(envelope, note_id):
+    if (set(envelope) != {"kind", "version", "edit", "board_target", "source_guard"}
+            or type(envelope["version"]) is not int or envelope["version"] != 1):
+        raise ValueError("Unsupported native MEP board plan.")
+    edit, board, guard = envelope["edit"], envelope["board_target"], envelope["source_guard"]
+    if (set(edit) != {"mode", "action", "expected_sha1", "expected_length",
+                      "edits", "final_text", "formats", "operations"}
+            or set(board) != {"host_identity", "active", "archive"} or board["archive"] is not None
+            or set(guard) != {"source", "targets", "clearance", "revit_year"}
+            or not isinstance(guard["targets"], dict) or not 1 <= len(guard["targets"]) <= 100
+            or board["host_identity"] != guard["source"]["host_identity"]
+            or edit["expected_sha1"] != board["active"]["sha1"]):
+        raise ValueError("The native MEP board plan lacks matching board and source guards.")
+    board_text = verify_board_target(board, note_id, edit["mode"])
+    source = guard["source"]
+    targets = guard["targets"]
+
+    # Parse the actual preview and ensure its additions reference only the
+    # selected source. Linked numeric IDs cannot be host element links.
+    before = ib.parse_board(board_text)["issues"]
+    after = ib.parse_board(edit["final_text"])["issues"]
+    added = after[len(before):]
+    if (after[:len(before)] != before or not 1 <= len(added) <= 100
+            or len(set(row["number"] for row in after)) != len(after)):
+        raise ValueError("The native MEP board plan must only add issues.")
+    link_id = source["link_instance_id"]
+    allowed = {
+        ("Audited element id" + key if link_id is None else
+         "Linked element " + key + " in Revit link instance " + link_id): key for key in targets
+    }
+    matched = set()
+    for row in added:
+        key = allowed.get(row["findings"][0]) if row["findings"] else None
+        if key is None or row["element_ids"] != ([int(key)] if link_id is None else []):
+            raise ValueError("A native MEP board issue references an unexpected element.")
+        matched.add(key)
+    if matched != set(targets):
+        raise ValueError("The native MEP board plan and selected targets differ.")
+
+    from read_mep import run_query
+
+    fresh = run_query(doc, {
+        "source": source, "element_ids": sorted(targets, key=int),
+        "link_instance_id": link_id, "link_instance_uid": source["link_instance_uid"],
+        "clearance": guard["clearance"],
+    })
+    if fresh["status"] != "ok":
+        raise ValueError("The reviewed MEP source could not be read again.")
+    snapshot = json.loads(fresh["snapshot_json"])["snapshot"]
+    if (snapshot["source"] != source or snapshot["revit_year"] != guard["revit_year"]
+            or snapshot["clearance"] != guard["clearance"]
+            or {row["id"]: row for row in snapshot["elements"]} != targets):
+        raise ValueError("The reviewed MEP elements or evidence changed. Rebuild the audit and board plan.")
+    return dict(edit, kind="issue-board-plan")
+
+
+if plan["kind"] == "mep-native-board-plan":
+    plan = verified_mep_edit(plan, inputs["note_id"])  # noqa: F821
+else:
+    if "source_guard" in plan:
+        raise ValueError("Native MEP source guards require a native board plan.")
+    if "structural_target" in plan:
+        verify_board_target(plan["structural_target"], inputs["note_id"], plan["mode"])  # noqa: F821
+    if "board_target" in plan:
+        if plan["board_target"] is None:
+            raise ValueError("Read the board and any archive with include_identity enabled, then rebuild the plan.")
+        verify_board_target(plan["board_target"], inputs["note_id"], plan["mode"])  # noqa: F821
 
 result = {"status": "ok"}
 t = DB.Transaction(doc, "Issue board: %s" % plan.get("action", plan["mode"]))
