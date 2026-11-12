@@ -748,7 +748,7 @@ def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(re
 @pytest.mark.parametrize("fault", [None, "swatch", "extra_element", "combined", "competing_filter"])
 def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, fault, tmp_path):
     import subprocess
-    from view_color_preview import build, verify_fixture
+    from view_color_preview import build, compare_fixtures, verify_fixture
 
     mock_rules(reader)
     document, request, _, _ = native_legend_fixture(reader, monkeypatch)
@@ -896,6 +896,7 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
         assert doc is document and type_id.Value == 71
         view = db.ViewDrafting()
         view.Origin, view.RightDirection, view.UpDirection = Vec(0, 0, 0), Vec(1, 0, 0), Vec(0, 1, 0)
+        view.GetPlacementOnSheetStatus = lambda: "NotPlaced"
         view.SetElementOverrides = lambda identifier, override: settings.__setitem__(identifier.Value, override)
         view.GetElementOverrides = lambda identifier: settings[identifier.Value]
         created[41] = view
@@ -1042,6 +1043,47 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
         assert report["status"] == "verified_color_fixture_rollback"
         assert report["changes"] == result["receipt"]["changes"]
 
+        other = deepcopy(dry_run)
+        other["run_id"] = "d00000000004"
+        other_fresh = dict(fresh, run_id="e00000000005")
+        receipt = other["result"]["receipt"]
+        changed_ids = {item: str(int(item) + 1000) for item in receipt["changes"]["added"]}
+        receipt["legend"]["id"] = changed_ids[receipt["legend"]["id"]]
+        receipt["legend"]["uid"] += "-next"
+        for item in receipt["legend"]["contents"]:
+            item["id"] = changed_ids[item["id"]]
+            item["owner_id"] = receipt["legend"]["id"]
+            item["uid"] += "-next"
+        receipt["legend"]["contents"].reverse()
+        for item in receipt["filters"]:
+            item["filter_id"] = changed_ids[item["filter_id"]]
+            item["filter_uid"] += "-next"
+        receipt["ordered_filter_ids"] = [changed_ids[item] for item in receipt["ordered_filter_ids"]]
+        receipt["changes"]["added"] = [changed_ids[item] for item in receipt["changes"]["added"]]
+        other["changes"]["added"] = [{"id": int(item)} for item in receipt["changes"]["added"]]
+
+        more_paths = [tmp_path / (name + ".json") for name in ("second", "second-fresh")]
+        for path, value in zip(more_paths, (other, other_fresh)):
+            path.write_text(json.dumps(value))
+        comparison = subprocess.run(
+            [sys.executable, str(SCRIPTS / "view_color_preview.py"), str(paths[0]), "--compare-fixtures",
+             *map(str, [*paths[1:], *more_paths])], capture_output=True, text=True,
+        )
+        assert comparison.returncode == 0, comparison.stderr
+        assert json.loads(comparison.stdout)["status"] == "verified_repeatable_color_fixture"
+        with pytest.raises(ValueError, match="distinct run IDs"):
+            compare_fixtures(review, original, dry_run, fresh, other, fresh)
+        note = next(item for item in receipt["legend"]["contents"] if item["kind"] == "note")
+        note["bounds_ft"][2] += 0.01
+        with pytest.raises(ValueError, match="legend geometry"):
+            compare_fixtures(review, original, dry_run, fresh, other, other_fresh)
+        wrong_geometry = deepcopy(dry_run)
+        region = next(item for item in wrong_geometry["result"]["receipt"]["legend"]["contents"]
+                      if item["kind"] == "region")
+        region["lines"][0][0][0][0] += 1
+        with pytest.raises(ValueError, match="reviewed swatches"):
+            verify_fixture(review, original, wrong_geometry, fresh)
+
         short_samples = deepcopy(dry_run)
         short_samples["changes"]["added"].pop()
         with pytest.raises(ValueError, match="complete recipe telemetry"):
@@ -1064,8 +1106,9 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
     else:
         assert result["status"] == "legend_trial_rolled_back", result
         assert result["receipt"]["changes"] == {"added": ["41", "501", "502"], "modified": [], "deleted": []}
-        assert result["receipt"]["rows"][0]["rgb"] == proposal["legend_rows"][0]["rgb"]
-        assert result["receipt"]["rows"][0]["region_uid"] == "region-501"
+        swatch = next(item for item in result["receipt"]["legend"]["contents"] if item["kind"] == "region")
+        assert swatch["graphics"]["SurfaceForegroundPatternColor"] == proposal["legend_rows"][0]["rgb"]
+        assert swatch["uid"] == "region-501"
         review = {"proposal": proposal, "preview": display}
         records = fixture_verification_records(baseline, result)
         assert verify_fixture(review, *records)["status"] == "verified_legend_rollback"

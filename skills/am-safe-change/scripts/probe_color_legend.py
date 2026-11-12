@@ -8,10 +8,10 @@ from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 from duplicate_views import bounded, capture_changes, identifier, key, rollback
-from read_color_legend import name_of, point, read_contents
+from read_color_legend import frame, name_of, read_contents
 from read_color_parameter_values import main as read_inventory
 from view_color_preview import COLOR_TRIAL_TRANSACTION as TRANSACTION_NAME
-from view_color_preview import build, close_points, note_fits_row
+from view_color_preview import build, existing_legend_matches
 
 
 def world(view, x, y):
@@ -64,35 +64,21 @@ def create_rows(document, view, proposal):
 
 def verify_rows(document, view, proposal, created):
     validate_view(view, proposal)
-    resources = proposal["legend_preflight"]["resources"]
-    contents = {row["id"]: row for row in read_contents(document, view, Stopwatch.StartNew())}
-    if set(contents) != {item for pair in created.values() for item in pair.values()}:
-        raise ValueError("Revit added unreviewed legend contents or omitted a swatch or note.")
-    verified = []
-    for row in proposal["legend_rows"]:
-        pair = created[row["value_key"]]
-        region, note = contents[pair["region"]], contents[pair["note"]]
-        vertices = [point(vertex) for vertex in corners(view, row["swatch_bounds_ft"])]
-        edges = sorted(sorted([start, end]) for start, end in zip(vertices, vertices[1:] + vertices[:1]))
-        graphics = region["graphics"]
-        if (region["owner_id"] != key(view.Id) or region["kind"] != "region"
-                or region["type_id"] != resources["region"]["id"] or not region["visible"] or not region["lines"]
-                or not close_points(region["lines"], [edges])
-                or graphics["SurfaceForegroundPatternId"] != {"kind": "element", "id": resources["solid"]["id"]}
-                or graphics["SurfaceForegroundPatternColor"] != row["rgb"]
-                or not graphics["IsSurfaceForegroundPatternVisible"] or graphics["IsSurfaceBackgroundPatternVisible"]):
-            raise ValueError("A native swatch differs from the reviewed color or geometry.")
-        if (note["owner_id"] != key(view.Id) or note["kind"] != "note"
-                or note["type_id"] != resources["text"]["id"] or note["text"] != row["label"] or note["leaders"]
-                or not note["visible"] or not note["plain"]
-                or not close_points(note["position"], point(world(view, *row["label_origin_ft"])))):
-            raise ValueError("A native legend note differs from the reviewed text or placement.")
-        if not note_fits_row(note["bounds_ft"], row, resources["text"]["text_size_ft"]):
-            raise ValueError("A native note overlaps the swatch or extends outside its legend row.")
-        verified.append({"value_key": row["value_key"], "rgb": row["rgb"],
-                         "region_id": region["id"], "region_uid": region["uid"],
-                         "note_id": note["id"], "note_uid": note["uid"]})
-    return verified
+    if str(view.GetPlacementOnSheetStatus()) != "NotPlaced":
+        raise ValueError("Revit unexpectedly placed the new drafting legend.")
+    contents = read_contents(document, view, Stopwatch.StartNew())
+    observation = {"id": key(view.Id), "uid": str(view.UniqueId), "scale": int(view.Scale),
+                   "frame": frame(view), "contents": contents, "placements": []}
+    match = existing_legend_matches({"existing": observation,
+                                     "resources": proposal["legend_preflight"]["resources"]},
+                                    proposal["legend_rows"])
+    if match is None:
+        raise ValueError("A native legend swatch or note differs from the reviewed color, text or geometry.")
+    for pair in match["pairs"]:
+        expected = created[pair["value_key"]]
+        if pair["region_id"] != expected["region"] or pair["note_id"] != expected["note"]:
+            raise ValueError("Revit returned different swatch or note identities from the trial creation.")
+    return observation
 
 
 def read_snapshot(document, request):
@@ -193,11 +179,11 @@ def probe(document, args):
                 expected_modified.add(key(model_view.Id))
         if set(changes["added"]) != expected or set(changes["modified"]) != expected_modified:
             raise ValueError("Revit reported changes outside the reviewed legend or filter scope.")
-        receipt = {"basis_sha256": proposal["basis_sha256"], "legend_id": key(view.Id),
-                   "legend_uid": str(view.UniqueId), "rows": verify_rows(document, view, proposal, pairs),
-                   "changes": changes}
+        receipt = {"basis_sha256": proposal["basis_sha256"],
+                   "legend": verify_rows(document, view, proposal, pairs), "changes": changes}
         if filter_trial is not None:
             receipt["filters"] = verify_filters(document, model_view, baseline, filter_trial)
+            receipt["ordered_filter_ids"] = filter_trial["order"]
             fresh = read_snapshot(document, request)
             for field in ("rows", "types", "link_candidate_ids", "native_rules"):
                 if fresh[field] != baseline[field]:

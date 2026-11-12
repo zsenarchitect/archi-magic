@@ -284,14 +284,14 @@ def build(inventory):
 
 def trial_changes(baseline, proposal, receipt, combined):
     rows = proposal["legend_rows"]
-    observed = receipt["rows"]
-    if [row["value_key"] for row in observed] != [row["value_key"] for row in rows]:
-        raise ValueError("The trial did not verify every reviewed legend row.")
-    identities = [(receipt["legend_id"], receipt["legend_uid"])]
-    for row, measured in zip(rows, observed):
-        if measured["rgb"] != row["rgb"]:
-            raise ValueError("A trial swatch differs from its reviewed color.")
-        identities.extend((measured[role + "_id"], measured[role + "_uid"]) for role in ("region", "note"))
+    legend = receipt["legend"]
+    match = existing_legend_matches({"existing": legend, "resources": proposal["legend_preflight"]["resources"]},
+                                    rows)
+    if match is None or match["placements"]:
+        raise ValueError("The trial legend differs from the reviewed swatches, notes or placement.")
+    identities = [(match["view_id"], match["view_uid"])]
+    for pair in match["pairs"]:
+        identities.extend((pair[role + "_id"], pair[role + "_uid"]) for role in ("region", "note"))
     added = [element_id(item) for item, _ in identities]
     modified = []
     if combined:
@@ -318,7 +318,14 @@ def trial_changes(baseline, proposal, receipt, combined):
                 added.append(element_id(item["filter_id"]))
             if not matching_applied_filter(row, current, solid):
                 modified = [proposal["view"]["id"]]
-    elif "filters" in receipt:
+        expected_order = list(baseline["existing_filters"]["ordered_applied_ids"])
+        for item in filters:
+            if item["filter_id"] not in expected_order:
+                expected_order.append(item["filter_id"])
+        if (receipt["ordered_filter_ids"] != expected_order
+                or Counter(expected_order) != Counter(item["filter_id"] for item in filters)):
+            raise ValueError("The trial filter order differs from the reviewed stack.")
+    elif "filters" in receipt or "ordered_filter_ids" in receipt:
         raise ValueError("A legend-only trial reported filter changes.")
 
     ids = [element_id(item) for item, _ in identities]
@@ -375,17 +382,69 @@ def verify_fixture(review, original_record, probe_record, fresh_record):
             "fresh_run_id": fresh["run_id"], "changes": changes}
 
 
+def normalized_trial(proposal, receipt):
+    legend = receipt["legend"]
+    matches = existing_legend_matches({"existing": legend, "resources": proposal["legend_preflight"]["resources"]},
+                                      proposal["legend_rows"])
+    by_id = {item["id"]: item for item in legend["contents"]}
+    rows = []
+    for pair in matches["pairs"]:
+        rows.append([{
+            key: value for key, value in by_id[pair[role + "_id"]].items()
+            if key not in ("id", "uid", "owner_id")
+        } for role in ("region", "note")])
+    filters_by_id = {item["filter_id"]: item for item in receipt["filters"]}
+    filters = []
+    for filter_id in receipt["ordered_filter_ids"]:
+        state = dict(filters_by_id[filter_id])
+        if state["created"]:
+            del state["filter_id"]
+            del state["filter_uid"]
+        filters.append(state)
+    return {"legend_frame": legend["frame"], "legend_scale": legend["scale"], "rows": rows,
+            "filters": filters, "modified": receipt["changes"]["modified"]}
+
+
+def compare_fixtures(review, original, first, first_fresh, second, second_fresh):
+    reports = [verify_fixture(review, original, trial, fresh)
+               for trial, fresh in ((first, first_fresh), (second, second_fresh))]
+    if any(report["status"] != "verified_color_fixture_rollback" for report in reports):
+        raise ValueError("Comparison requires two complete combined rollback trials.")
+    run_ids = {reports[0]["original_run_id"]} | {
+        report[key] for report in reports for key in ("probe_run_id", "fresh_run_id")
+    }
+    if len(run_ids) != 5:
+        raise ValueError("Supply two independent trials and fresh queries with distinct run IDs.")
+    observed = [normalized_trial(review["proposal"], complete_record(trial)["result"]["receipt"])
+                for trial in (first, second)]
+    if observed[0] != observed[1]:
+        raise ValueError("The combined trials differed in filter graphics or legend geometry.")
+    return {"status": "verified_repeatable_color_fixture", "basis_sha256": reports[0]["basis_sha256"],
+            "document": reports[0]["document"], "run_ids": sorted(run_ids),
+            "observation_sha256": snapshot_digest(observed[0])}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runtime_record", help="Full pyRevit color and reuse inventory")
-    parser.add_argument("--verify-fixture", nargs=3, metavar=("REVIEW", "PROBE", "FRESH"),
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--verify-fixture", nargs=3, metavar=("REVIEW", "PROBE", "FRESH"),
                         help="Verify the saved review, full dry-run response, and independent fresh query")
+    action.add_argument("--compare-fixtures", nargs=5, metavar=("REVIEW", "FIRST", "FRESH1", "SECOND", "FRESH2"),
+                        help="Compare two verified combined rollback trials and their independent fresh queries")
     args = parser.parse_args()
     try:
         record = read_record(args.runtime_record, MAX_SAVED_RECORD)
         if args.verify_fixture:
             review, probe, fresh = [read_record(path, MAX_SAVED_RECORD) for path in args.verify_fixture]
             report = verify_fixture(review, record, probe, fresh)
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            return 0
+        if args.compare_fixtures:
+            review, first, first_fresh, second, second_fresh = [
+                read_record(path, MAX_SAVED_RECORD) for path in args.compare_fixtures
+            ]
+            report = compare_fixtures(review, record, first, first_fresh, second, second_fresh)
             print(json.dumps(report, ensure_ascii=True, indent=2))
             return 0
         inventory = read_payload(complete_record(record), "inventory_json")
