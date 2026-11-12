@@ -15,3 +15,20 @@ Baseline main 3dd6285f9c81ae79de6145b704ce0375230d64d8. Filed gap confirmed: boa
 - Existing board element references are numeric. A project IFC export/coordinate transform or independently provided IFC metadata is necessary to qualify model-specific camera/component alignment. Missing metadata is a visible warning.
 - Host-side Keep/Discard and a live viewer are separate from offline CLI/CI. Use a disposable Revit board for actual apply verification. Revert a merged feature commit if interoperability breaks; discard a preview, delete the new local export, or use existing board undo for any applied test.
 - Non-goals: BCF API server, direct ACC/Navisworks connector, IFC export, cloud uploads, attachment download and editing model geometry.
+
+## Viewer verification on merged main
+
+The BCF CLI from `0c523067c4313bd9e8c3898be4ffd32d874463d7` exported a synthetic board with one topic and two viewpoints. Bonsai 0.9.0-post1 loaded the archive and a disposable IFC4 in Blender 5.2.1 LTS. Activating both viewpoints preserved the following camera settings and selected only the tracked IFC wall.
+
+| Camera | Position in metres | Forward | Up | Extent |
+| --- | --- | --- | --- | --- |
+| Orthographic | (4, -7, 3) | +Y | +Z | 8 m |
+| Perspective | (-3, -6, 2) | +Y | +Z | 52 degrees |
+
+The receiving board preview preserved the title, status, both cameras and the IFC GUID. Running the import again against the preview's rendered note text returned `no_changes`. The Revit board still needs a disposable-model dry run, Keep and fresh note readback.
+
+The verified export SHA-256 was `3e91bdbb129d355340674df668f094dbaa25d3a323a3900d310f66ab68739abf`. The viewer receipt SHA-256 was `370ef52ce1c465edf19b751e295fb38bcf930dbd5e053ba926456d1315194434`.
+
+The same merged commit also passed a full offline exchange. The CLI imported the verified archive into a blank board, the production board planner applied the text operations to the repository's FormattedText fixture, and a second CLI import returned `no_changes`. A fresh export using the applied note text and its metadata preserved the topic UUID, title, status, both viewpoint records and the IFC component GUID. Bonsai reopened the second archive and reproduced both camera views and the exact component selection. The second archive SHA-256 was `0ef80c79bc95384f521131dd882fc9036251abd778fe0ca7dc30af8b18180650`. The text fixture simulates the Revit API, so the disposable-model transaction and fresh Revit note readback are still pending.
+
+The focused candidate's code at `2f18dcb954f4fbe2275258e5bb59e4794ebd2b86` repeated the exchange with a fixture board that supplied a saved project identity and an exact note ID, unique ID and text hash. The import preview bound that identity. After simulated text apply, a fresh CLI import returned `no_changes` and re-export preserved both viewpoints and the IFC component. Bonsai 0.9.0-post1 on Blender 5.2.1 LTS reproduced both camera positions, the orthographic scale of 8, the perspective field of view of 52 degrees and selection of only the tracked wall. The archive SHA-256 was `394fab9a8fcbf84f7b82e290a6be3288d047d8af61439a29969b50f12f471524`. All 109 issue-board tests and the skill checks passed. The live Revit transaction and independent note readback remain pending.

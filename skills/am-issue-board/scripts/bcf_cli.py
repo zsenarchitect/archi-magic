@@ -55,20 +55,51 @@ def marker(issue):
 
 
 def read_board(path):
-    body, formats = board_cli.read_note(bounded(path))
+    source = board_cli.load(bounded(path))
+    body, formats = board_cli.decode_note(source)
     board = ib.parse_board(body, formats)
     numbers = [row["number"] for row in board["issues"]]
     if len(numbers) != len(set(numbers)):
         raise ValueError("board has duplicate issue numbers")
-    return body, formats, board
+    return body, formats, board, source
+
+
+def note_target(source, body):
+    if "host_identity" not in source:
+        return None
+    host = source["host_identity"]
+    note = source["note"]
+    if (
+        set(host) != {"project_uid", "path_sha256"}
+        or not host["project_uid"].strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", host["path_sha256"])
+        or not re.fullmatch(r"[1-9][0-9]{0,18}", note["id"])
+        or int(note["id"]) > 2**63 - 1
+        or not note["unique_id"].strip()
+        or note["sha1"] != ib.text_sha1(body)
+    ):
+        raise ValueError("Read the board again with include_identity enabled.")
+    return {key: note[key] for key in ("id", "unique_id", "sha1")}
 
 
 def import_preview(args):
-    body, formats, board = read_board(args.board)
+    body, formats, board, source = read_board(args.board)
+    if board["header"]["archive"] or board["header"]["next_number"] is None:
+        raise ValueError("Use an active issue board for BCF import.")
+    active_target = note_target(source, body)
+    archive_target = None
     existing = {marker(row) for row in board["issues"]}
     topics, warnings = bcf.read_topics(args.input)
     if args.archive:
-        _, _, archive = read_board(args.archive)
+        archive_body, _, archive, archive_source = read_board(args.archive)
+        if not archive["header"]["archive"] or archive["header"]["next_number"] is not None:
+            raise ValueError("Use an archive note for BCF duplicate checking.")
+        archive_target = note_target(archive_source, archive_body)
+        if active_target and archive_target and (
+            source["host_identity"] != archive_source["host_identity"]
+            or active_target["id"] == archive_target["id"]
+        ):
+            raise ValueError("Read distinct board and archive notes from the same saved project.")
         existing.update(marker(row) for row in archive["issues"])
     else:
         warnings.append({"kind": "archive_note_not_checked_for_duplicates"})
@@ -96,6 +127,13 @@ def import_preview(args):
     plan = ib.plan_batch(body, ops, formats) if ops else None
     metadata = {}
     if plan:
+        plan["board_target"] = None
+        if active_target and (not args.archive or archive_target):
+            plan["board_target"] = {
+                "host_identity": source["host_identity"], "active": active_target, "archive": archive_target,
+            }
+        else:
+            warnings.append({"kind": "board_identity_required_to_apply"})
         final = ib.parse_board(plan["final_text"])
         after = {row["number"]: row for row in final["issues"]}
         if len(final["issues"]) != len(board["issues"]) + len(added) or len(after) != len(final["issues"]):
@@ -118,8 +156,91 @@ def import_preview(args):
             "skipped_topic_guids": skipped, "warnings": warnings}
 
 
+def checked_run(path, mode, status, decision, approval, note_id=None, transaction=None):
+    saved = board_cli.load(bounded(path))
+    record = saved.get("response", saved)
+    if (record.get("mode") != mode or record.get("status") != status or record.get("decision") != decision
+            or record.get("approval") != approval or record.get("result_truncated") is not False
+            or type(record.get("exit_code")) is not int or record["exit_code"] != 0
+            or not isinstance(record.get("run_id"), str) or not record["run_id"].strip()
+            or record.get("error") is not None or not isinstance(record.get("result"), dict)
+            or any(record.get(key) for key in (
+                "failures", "warnings", "dialogs", "blocked", "closed_documents", "unclosed_documents", "reckless"))):
+        raise ValueError("Use a complete pyRevit %s response with the required decision." % mode)
+    changes = record["changes"]
+    if (changes.get("other_documents") or any(changes.get(key + "_ids") for key in ("added", "modified", "deleted"))
+            or changes.get("transactions") != ([transaction] if transaction is not None else [])):
+        raise ValueError("The bridge effects do not belong to the reviewed board transaction.")
+    for key in ("added", "deleted"):
+        if type(changes.get(key + "_count")) is not int or changes[key + "_count"] != 0 or changes.get(key) != []:
+            raise ValueError("The bridge reports unexpected additions or deletions.")
+    modified = changes["modified"]
+    expected = [] if note_id is None else [(note_id, "TextNote")]
+    if (not isinstance(modified, list) or type(changes.get("modified_count")) is not int
+            or changes["modified_count"] != len(modified)
+            or [(str(row["id"]), row["class"]) for row in modified] != expected):
+        raise ValueError("The bridge did not report exactly the reviewed board note changes.")
+    counts = changes.get("by_category")
+    if (not isinstance(counts, dict) or any(type(count) is not int or count <= 0 for count in counts.values())
+            or sum(counts.values()) != len(expected)):
+        raise ValueError("The bridge category counts do not match the exact board effects.")
+    return record
+
+
+def checked_readback(path, target, expected_sha1):
+    record = checked_run(path, "query", "ok", "rolled_back", None)
+    source = record["result"]
+    text, _ = board_cli.decode_note(source)
+    if (source["host_identity"] != target["host_identity"]
+            or note_target(source, text) != dict(target["active"], sha1=expected_sha1)):
+        raise ValueError("The fresh board readback does not match the reviewed project, note, and text.")
+    return record
+
+
+def verify_import(args):
+    preview = import_preview(args)
+    if board_cli.load(bounded(args.preview)) != preview:
+        raise ValueError("The BCF import differs from the saved reviewed preview or its viewpoint metadata.")
+    plan = preview["plan"]
+    if plan is None or not plan.get("board_target"):
+        raise ValueError("Verification needs a reviewed import bound to a saved Revit board.")
+    target = plan["board_target"]
+    note = target["active"]
+    intended = ib.text_sha1(plan["final_text"])
+    transaction = "Issue board: " + plan.get("action", plan["mode"])
+
+    def verify_write(path, mode, status, decision, approval):
+        record = checked_run(path, mode, status, decision, approval, note["id"], transaction)
+        result = record["result"]
+        if (result.get("status") != "ok" or str(result.get("note_id")) != note["id"]
+                or result.get("sha1_after") != intended):
+            raise ValueError("The board write receipt does not match the approved import.")
+        return record
+
+    dry = verify_write(args.dry_run, "dry_run", "ok", "rolled_back", None)
+    restored = checked_readback(args.dry_readback, target, note["sha1"])
+    run_ids = [dry["run_id"], restored["run_id"]]
+    status = "verified_dry_run"
+    if args.decision:
+        raw = board_cli.load(bounded(args.decision))
+        decision = raw.get("response", raw).get("decision")
+        if decision not in ("committed", "discarded"):
+            raise ValueError("Use an explicit Revit Keep or Discard outcome.")
+        kept = decision == "committed"
+        final = verify_write(args.decision, "modify", "ok" if kept else "rejected", decision, "user")
+        fresh = checked_readback(args.readback, target, intended if kept else note["sha1"])
+        run_ids.extend((final["run_id"], fresh["run_id"]))
+        status = "verified_keep" if kept else "verified_discard"
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("Use a separate pyRevit run for each write and fresh readback.")
+    result = {"status": status, "note_id": note["id"], "run_ids": run_ids}
+    if status == "verified_keep":
+        result["metadata_after_keep"] = preview["metadata_after_keep"]
+    return result
+
+
 def export_topics(args):
-    _, _, board = read_board(args.board)
+    _, _, board, _ = read_board(args.board)
     metadata = {}
     if args.metadata:
         data = board_cli.load(bounded(args.metadata))
@@ -167,18 +288,30 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
     read = modes.add_parser("import")
+    verify = modes.add_parser("verify-import")
     write = modes.add_parser("export")
-    for mode in (read, write):
+    for mode in (read, verify, write):
         mode.add_argument("--board", type=Path, required=True)
         mode.add_argument("--board-uuid", type=bcf.uuid_text, required=True)
-    read.add_argument("--input", type=Path, required=True)
-    read.add_argument("--archive", type=Path)
+    for mode in (read, verify):
+        mode.add_argument("--input", type=Path, required=True)
+        mode.add_argument("--archive", type=Path)
+    verify.add_argument("--dry-run", type=Path, required=True)
+    verify.add_argument("--dry-readback", type=Path, required=True)
+    verify.add_argument("--preview", type=Path, required=True)
+    verify.add_argument("--decision", type=Path)
+    verify.add_argument("--readback", type=Path)
     write.add_argument("--output", type=Path, required=True)
     write.add_argument("--author", required=True)
     write.add_argument("--metadata", type=Path)
     args = parser.parse_args(argv)
     try:
-        result = import_preview(args) if args.mode == "import" else export_topics(args)
+        if args.mode == "verify-import":
+            if bool(args.decision) != bool(args.readback):
+                raise ValueError("Supply both the user decision and the fresh readback.")
+            result = verify_import(args)
+        else:
+            result = import_preview(args) if args.mode == "import" else export_topics(args)
         encoded = json.dumps(result, ensure_ascii=True, indent=2)
         if len(encoded) > MAX_JSON:
             raise ValueError("preview exceeds output size limit")
