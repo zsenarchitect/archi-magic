@@ -2,13 +2,57 @@
 """Read the saved project, reviewed level, and exact project family type in query mode."""
 import hashlib
 import json
+from uuid import uuid4
 
 MAX_FAMILIES = 5000
 MAX_SYMBOLS = 250
+MAX_ELEMENTS = 10000
 
 
 def eid(element):
     return str(element.Id.Value)
+
+
+def inventory(document, DB):
+    elements = {}
+    for collector in (DB.FilteredElementCollector(document).WhereElementIsElementType(),
+                      DB.FilteredElementCollector(document).WhereElementIsNotElementType()):
+        for element in collector:
+            key = eid(element)
+            if key in elements or len(elements) >= MAX_ELEMENTS:
+                raise ValueError("The disposable project exceeds the complete inventory limit.")
+            elements[key] = [str(element.UniqueId), str(element.VersionGuid)]
+    return elements
+
+
+def inventory_record(elements):
+    encoded = json.dumps(elements, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    return {"sha256": hashlib.sha256(encoded.encode("ascii")).hexdigest(), "element_count": len(elements)}
+
+
+def read_result(document, DB, request):
+    snapshot = read_snapshot(document, DB, request)
+    result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
+    if request.get("audit_inventory") is True:
+        import System
+        absent = request.get("expect_absent_ids", [])
+        if not isinstance(absent, list) or len(absent) > 3 or len(set(absent)) != len(absent):
+            raise ValueError("Supply up to three distinct provisional element IDs.")
+        elements = inventory(document, DB)
+        for key in absent:
+            number = int(key)
+            if number <= 0 or str(number) != key:
+                raise ValueError("Supply canonical positive provisional element ID strings.")
+            if key in elements or document.GetElement(DB.ElementId(System.Int64(number))) is not None:
+                raise ValueError("A provisional trial element still exists in the fresh read.")
+        transaction = request.get("trial_transaction")
+        if bool(absent) != bool(transaction) or (transaction and len(transaction) > 100):
+            raise ValueError("Use the trial transaction name with its provisional IDs.")
+        result["audit_token"] = uuid4().hex
+        result["trial_transaction"] = transaction
+        result["inventory"] = inventory_record(elements)
+        result["absent_ids"] = sorted(absent, key=int)
+    return result
 
 
 def parameter_state(symbol, field):
@@ -85,6 +129,7 @@ def read_snapshot(document, DB, request, require_unmodified=True):
         "selection_sha256": selection["selection_sha256"],
         "project": {"project_uid": str(document.ProjectInformation.UniqueId),
                     "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()},
+        "revit_year": str(document.Application.VersionNumber),
         "revit_build": str(document.Application.VersionBuild),
         "level": {"id": eid(level), "uid": str(level.UniqueId), "name": level.Name,
                   "project_elevation": float(level.ProjectElevation)},
@@ -100,7 +145,6 @@ except NameError:
 else:
     from pyrevit.api import DB
     try:
-        snapshot = read_snapshot(active_project, DB, query_inputs)
-        result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
+        result = read_result(active_project, DB, query_inputs)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         result = {"status": "blocked", "reason": str(error)}

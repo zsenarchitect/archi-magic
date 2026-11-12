@@ -206,9 +206,11 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 ### Test family placement with mandatory rollback
 
 1. Use a saved, standalone disposable project in Revit 2026. Use a reviewed nonzero level and rotation. Call `get_context` and check the active project, Revit build, CPython engine, and ask policy.
-2. Review the placement preview. Check ownership for its `ownership_ids`. Use the empty scope for active reuse or a new family with no existing write targets.
-3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`. For a missing type, also pass the exact `staging` receipt.
-4. Read the provisional element IDs, measured position, rotation, and rollback result. Stop on any unexpected effect or unresolved rollback. The missing-type trial allows only one new family, one new type, and one new instance. Use a worker-verified catalog type to test a paired load. Existing siblings and Keep/Discard require separate native qualification.
+2. Run the placement query with `audit_inventory: true`. Save its full bridge record as `before.json`. Review the placement preview and check ownership for its `ownership_ids`.
+3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`. Pass the baseline query's `audit_token` as `baseline_audit_token`. For a missing type, also pass the exact `staging` receipt.
+4. Save the full trial record as `trial.json`. For a successful rollback, run the placement query again with `audit_inventory: true`. Pass the trial's `effects.added` as `expect_absent_ids` and its `transaction` as `trial_transaction`. Save the full bridge record as `after.json`.
+5. Run `python scripts/verify_family_placement_probe.py preview.json before.json trial.json after.json`. Stop on any unexpected effect or unresolved rollback.
+6. The missing-type trial allows one new family, one new type, and one new instance. Use a worker-verified catalog type for a paired trial. Existing siblings and Keep/Discard require separate native qualification.
 
 ## Preview a CAD layout (issue #166)
 

@@ -63,7 +63,7 @@ def test_read_reuses_exact_type_and_reports_parameter_change(selection, monkeypa
     project = SimpleNamespace(PathName="/fixture/Standalone.rvt", IsFamilyDocument=False, IsReadOnly=False,
                               IsWorkshared=False, IsModelInCloud=False, IsModified=False,
                               ProjectInformation=SimpleNamespace(UniqueId="project-uid"),
-                              Application=SimpleNamespace(VersionBuild="fixture"))
+                              Application=SimpleNamespace(VersionBuild="fixture", VersionNumber="2026"))
     exact = Symbol(41, "Exact type", family)
     elements = {5: Level(), 41: exact, 43: Symbol(43, "exact type", family)}
     project.GetElement = elements.get
@@ -104,6 +104,7 @@ def test_rejects_snapshot_for_different_selection(selection):
 @pytest.mark.parametrize(("action", "extra_effect"), [("reuse", False), ("reuse", True), ("load", False)])
 def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch, action, extra_effect):
     from contextlib import contextmanager
+    import copy
     import math
     import probe_family_placement as probe
 
@@ -117,12 +118,13 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
                   "parameters": {"42": {"state": "value", "value": 2.0}}}
     baseline = {
         "kind": "family-placement-project-snapshot", "version": 1, "revit_build": "fixture",
-        "selection_sha256": selection["selection_sha256"], "project": {"project_uid": "fixture"},
+        "revit_year": "2026", "selection_sha256": selection["selection_sha256"], "project": {"project_uid": "fixture"},
         "level": {"id": "5", "uid": "level-5", "name": "Level A", "project_elevation": 20},
         "same_name_families": [], "exact_symbols": [] if loading else [symbol_row],
     }
     preview = build_preview(selection, baseline, [1, 2, 23], 90)
     args = {"index": "fixture-index", "disposable_fixture": True, "preview": preview,
+            "baseline_audit_token": "a" * 32,
             "preview_sha256": manifest_digest(preview)}
     if loading:
         args["staging"] = {"fixture": True}
@@ -148,6 +150,7 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
     class Scope:
         def __init__(self, document, name):
             self.state = "Uninitialized"
+            self.name = name
 
         def Start(self):
             self.state = "Started"
@@ -174,7 +177,7 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
             self.state = "Committed"
             event = SimpleNamespace(
                 Operation="TransactionCommitted", GetDocument=lambda: project,
-                GetTransactionNames=lambda: [probe.TRANSACTION_NAME],
+                GetTransactionNames=lambda: [self.name],
                 GetAddedElementIds=lambda: [item_id(key) for key in ([40, 41, 99] if loading else [99])],
                 GetDeletedElementIds=lambda: [],
                 GetModifiedElementIds=lambda: [] if loading else (
@@ -251,7 +254,53 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
     assert set(elements) == ({5} if loading else {5, 41}) and symbol.IsActive is False
     assert not project.Application.DocumentChanged
     if not extra_effect:
+        from verify_family_placement_probe import verify
+
         assert result["placement"]["xyz_ft"] == [1, 2, 23]
+
+        def record(run_id, mode, result, effects=None, transaction=None):
+            changes = {key + "_count": 0 for key in ("added", "deleted", "modified")}
+            changes["by_category"] = {}
+            if effects:
+                for key, ids in effects.items():
+                    changes[key] = [{"id": identifier} for identifier in ids]
+                    changes[key + "_count"] = len(ids)
+                changes["transactions"] = [transaction]
+                changes["by_category"] = {"Fixture category": sum(map(len, effects.values()))}
+            return {"run_id": run_id, "mode": mode, "status": "ok", "exit_code": 0,
+                    "decision": "rolled_back" if effects else "no_changes", "approval": None,
+                    "result_truncated": False, "engine": {"requested": "cpython"}, "changes": changes,
+                    "blocked": [], "dialogs": [], "failures": [], "warnings": [], "result": result}
+
+        initial = {"status": "ok", "snapshot_json": json.dumps(baseline),
+                   "inventory": result["baseline_inventory"], "absent_ids": [],
+                   "audit_token": args["baseline_audit_token"], "trial_transaction": None}
+        original = record("baseline-run", "query", initial)
+        trial = record("trial-run", "dry_run", result, result["effects"], result["transaction"])
+        fresh = record("fresh-run", "query", dict(initial, absent_ids=result["effects"]["added"],
+                                                  audit_token="b" * 32, trial_transaction=result["transaction"]))
+        proof = verify(preview, original, trial, fresh)
+        assert proof["status"] == "family_placement_rollback_verified"
+        assert proof["action"] == action
+
+        bad = copy.deepcopy(fresh)
+        bad["result"]["inventory"]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="restored project"):
+            verify(preview, original, trial, bad)
+        bad = copy.deepcopy(fresh)
+        bad["result"]["absent_ids"] = []
+        with pytest.raises(ValueError, match="fresh absence"):
+            verify(preview, original, trial, bad)
+        bad = dict(trial, run_id=original["run_id"])
+        with pytest.raises(ValueError, match="three independent"):
+            verify(preview, original, bad, fresh)
+        bad = copy.deepcopy(trial)
+        bad["changes"]["added"][0]["id"] = "123"
+        with pytest.raises(ValueError, match="bridge reports effects"):
+            verify(preview, original, bad, fresh)
+        bad = dict(trial, approval="auto")
+        with pytest.raises(ValueError, match="no changes, warnings, or approval"):
+            verify(preview, original, bad, fresh)
 
 
 @pytest.mark.parametrize("shared", [False, True])

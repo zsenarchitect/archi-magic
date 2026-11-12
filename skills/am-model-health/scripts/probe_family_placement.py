@@ -2,30 +2,18 @@
 
 import math
 import os
+import re
 from uuid import uuid4
 
 from family_library_discovery import manifest_digest
 from family_library_index import select_for_placement
 from family_placement_preview import build_preview
 from read_family_library import staged_pair
-from read_family_placement import eid, parameter_state, read_snapshot
+from read_family_placement import eid, inventory, inventory_record, parameter_state, read_snapshot
 
 TRANSACTION_NAME = "Trial family type placement"
-MAX_ELEMENTS = 10_000
 POSITION_TOLERANCE_FT = 1e-6
 ROTATION_TOLERANCE_DEG = 1e-5
-
-
-def inventory(document, DB):
-    elements = {}
-    for collector in (DB.FilteredElementCollector(document).WhereElementIsElementType(),
-                      DB.FilteredElementCollector(document).WhereElementIsNotElementType()):
-        for element in collector:
-            key = eid(element)
-            if key in elements or len(elements) >= MAX_ELEMENTS:
-                raise ValueError("The disposable project exceeds the complete inventory limit.")
-            elements[key] = [str(element.UniqueId), str(element.VersionGuid)]
-    return elements
 
 
 def measure(DB, instance, review):
@@ -107,9 +95,10 @@ def load_missing_symbol(document, DB, path, selection, callbacks):
 
 
 def trial(document, DB, args):
-    required = {"disposable_fixture", "index", "preview", "preview_sha256"}
+    required = {"disposable_fixture", "index", "preview", "preview_sha256", "baseline_audit_token"}
     if (set(args) not in (required, required | {"staging"})
-            or args["disposable_fixture"] is not True or document.IsModifiable):
+            or args["disposable_fixture"] is not True or document.IsModifiable
+            or not re.fullmatch("[0-9a-f]{32}", args["baseline_audit_token"])):
         raise ValueError("Use the rollback probe in a saved disposable project with no open transaction.")
     preview = args["preview"]
     review = preview["review"]
@@ -144,6 +133,7 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
     original = inventory(document, DB)
     callbacks = []
     events = []
+    transaction_name = TRANSACTION_NAME + " " + uuid4().hex
     closing = False
     invalid = False
 
@@ -154,7 +144,7 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
         try:
             if (events or not event.GetDocument().Equals(document)
                     or str(event.Operation) != "TransactionCommitted"
-                    or list(event.GetTransactionNames()) != [TRANSACTION_NAME]):
+                    or list(event.GetTransactionNames()) != [transaction_name]):
                 invalid = True
                 return
             effects = {"added": [str(item.Value) for item in event.GetAddedElementIds()],
@@ -165,8 +155,8 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
             invalid = True
 
     status = DB.TransactionStatus
-    group = DB.TransactionGroup(document, TRANSACTION_NAME)
-    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    group = DB.TransactionGroup(document, transaction_name)
+    transaction = DB.Transaction(document, transaction_name)
     application = document.Application
     failure = None
     regeneration_failed = False
@@ -269,8 +259,16 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
         return {"status": "transaction_unresolved", "reason": type(error).__name__}
     if failure:
         return {"status": "stopped", "reason": failure, "rollback_verified": True, "load_conflicts": callbacks}
+    loaded = None
+    if loaded_ids:
+        keys = ("family_id", "family_uid", "id", "uid")
+        loaded = {key: resolved["symbol"][key] for key in keys}
     return {"status": "trial_rolled_back", "preview_sha256": args["preview_sha256"],
-            "placement": placement, "effects": events[0], "load_conflicts": callbacks, "rollback_verified": True}
+            "placement": placement, "effects": events[0], "load_conflicts": callbacks,
+            "loaded_symbol": loaded, "transaction": transaction_name,
+            "baseline_sha256": manifest_digest(before), "baseline_inventory": inventory_record(original),
+            "baseline_audit_token": args["baseline_audit_token"],
+            "rollback_verified": True}
 
 
 try:
