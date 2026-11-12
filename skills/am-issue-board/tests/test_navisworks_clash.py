@@ -366,7 +366,8 @@ def test_paired_html_uses_verified_xml_identity_for_view_preview(inputs, tmp_pat
 
 @pytest.mark.parametrize("scenario,status", [
     ("duplicate_xml", "ambiguous"), ("swapped_ids", "unmatched"),
-    ("wrong_group", "different_group"), ("missing_xml_paths", "incomplete_xml_identity"),
+    ("wrong_group", "different_group"), ("missing_html_group", "incomplete_html_identity"),
+    ("missing_xml_paths", "incomplete_xml_identity"),
 ])
 def test_paired_html_refuses_unverified_identity(inputs, tmp_path, scenario, status):
     xml, snapshot, board = inputs
@@ -379,7 +380,7 @@ def test_paired_html_refuses_unverified_identity(inputs, tmp_path, scenario, sta
         rows = clash(FIRST, sides, title) + clash(SECOND, sides, title)
     elif scenario == "swapped_ids":
         rows = clash(FIRST, item("A.rvt", 9007199254740993) + item("B.rvt"), title)
-    elif scenario == "wrong_group":
+    elif scenario in ("wrong_group", "missing_html_group"):
         rows = '<clashgroup name="Group B"><clashresults>' + clash(FIRST, sides, title) + (
             "</clashresults></clashgroup>")
     else:

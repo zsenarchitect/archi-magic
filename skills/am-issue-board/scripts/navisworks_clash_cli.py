@@ -521,7 +521,10 @@ def paired_clashes(html_rows, xml_rows):
             status = "ambiguous"
         elif candidates:
             match = candidates[0]
-            if row.get("source_group") and row["source_group"] != match.get("source_group"):
+            html_group, xml_group = row.get("source_group"), match.get("source_group")
+            if xml_group and not html_group:
+                status = "incomplete_html_identity"
+            elif html_group != xml_group:
                 status = "different_group"
             elif not match["guid"] or not all(
                 item["selection_path"] and all(item["selection_path"]) for item in match["objects"]
