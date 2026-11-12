@@ -1,6 +1,7 @@
 """Check that a provisional family reload preserves project overrides and exact definitions."""
 
 from family_library_discovery import manifest_digest
+from read_family_library import WorkerUnresolved
 from read_family_parameter_transfer import inspect_loaded, project_values
 from read_family_placement import eid
 
@@ -39,12 +40,14 @@ def verify_loaded_family(ui, DB, document, family, original, sealed):
     identity = {"id": eid(family), "uid": str(family.UniqueId)}
     if identity != original["loaded_family"] or identity != sealed["loaded_family"]:
         raise ValueError("Revit did not return the exact reviewed existing project family.")
+    values = project_values(document, DB, family)
     read = inspect_loaded(ui, DB, document, family)
+    if project_values(document, DB, family) != values:
+        raise WorkerUnresolved("Project parameter values changed during the loaded-family inspection.")
     if (any(read[key] != sealed[key] for key in ("family", "category_id", "revit_build", "nested_families"))
             or read["state"]["coverage"] != {"complete": True, "issues": []}
             or manifest_digest(read["state"]) != sealed["state_sha256"]):
         raise ValueError("The provisionally loaded family differs from the independently reopened export.")
-    values = project_values(document, DB, family)
     verify_project_values(original["project_values"], values, sealed["additions"])
     return {"loaded_family": identity, "state_sha256": sealed["state_sha256"],
             "project_values_sha256": manifest_digest(values)}

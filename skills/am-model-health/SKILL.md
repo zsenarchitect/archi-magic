@@ -325,7 +325,15 @@ Open only the saved standalone project. Call `get_context`. Run `scripts/family_
 
 Run `python scripts/family_parameter_reload_preview.py --baseline project-before.json --export export.json`. Repeat `--export` for every reviewed target. Check the family identities and export digests. The preview stops if a nested family could conflict with a loaded project family.
 
-The preview makes no project changes. The guarded reload and native verification are pending.
+The preview makes no project changes.
+
+### Trial the project reload
+
+Call `get_context` and confirm the exact saved disposable project. Obtain approval for the rollback-only trial. Run `scripts/probe_family_parameter_reload.py` in guarded CPython dry-run mode. Pass the full `baseline`, reviewed `preview`, and `disposable_fixture: true`.
+
+The trial closes its inner transaction before inspecting loaded definitions. It keeps the transaction group reversible until inspection finishes. Save the full result. Stop on an unresolved result.
+
+Native verification and the guarded project Keep or Discard workflow are pending.
 
 ## Preview a CAD layout (issue #166)
 
