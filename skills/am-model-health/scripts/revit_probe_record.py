@@ -1,16 +1,16 @@
 """Validate the runtime envelope of a Revit probe that leaves no changes."""
 
 
-def require_run(record, mode, decisions):
+def require_run(record, mode, decisions, *, approval=None, status="ok"):
     if isinstance(record, dict):
         record = record.get("response", record)
-    if (not isinstance(record, dict) or record.get("mode") != mode or record.get("status") != "ok"
+    if (not isinstance(record, dict) or record.get("mode") != mode or record.get("status") != status
             or record.get("decision") not in decisions or type(record.get("exit_code")) is not int
             or record["exit_code"] != 0 or record.get("result_truncated") is not False
-            or record.get("error") is not None or record.get("approval") is not None
+            or record.get("error") is not None or record.get("approval") != approval
             or any(record.get(key) != [] for key in ("failures", "dialogs", "blocked", "warnings"))
             or record.get("unclosed_documents", [])):
-        raise ValueError("Use a complete successful Revit record with no changes, warnings, or approval.")
+        raise ValueError("Use a complete Revit record with the required status and approval, and no warnings.")
     engine = record.get("engine")
     if not isinstance(engine, dict) or engine.get("requested") != "cpython":
         raise ValueError("Use the CPython Revit run records.")

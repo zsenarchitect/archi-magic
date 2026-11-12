@@ -2,6 +2,7 @@
 """Read the saved project, reviewed level, and exact project family type in query mode."""
 import hashlib
 import json
+import math
 from uuid import uuid4
 
 MAX_FAMILIES = 5000
@@ -30,7 +31,60 @@ def inventory_record(elements):
     return {"sha256": hashlib.sha256(encoded.encode("ascii")).hexdigest(), "element_count": len(elements)}
 
 
+def decision_pose(document, DB, instance):
+    if not isinstance(instance, DB.FamilyInstance) or not isinstance(instance.Location, DB.LocationPoint):
+        raise ValueError("The expected kept point instance is unavailable.")
+    location = instance.Location
+    level = document.GetElement(instance.LevelId)
+    symbol = instance.Symbol
+    if not isinstance(level, DB.Level) or symbol is None or instance.Host is not None:
+        raise ValueError("The kept instance does not have the expected level, symbol, and host scope.")
+    return {"id": eid(instance), "uid": str(instance.UniqueId),
+            "xyz_ft": [float(location.Point.X), float(location.Point.Y), float(location.Point.Z)],
+            "rotation_deg": math.degrees(location.Rotation) % 360,
+            "level_id": eid(level), "level_uid": str(level.UniqueId),
+            "symbol_id": eid(symbol), "symbol_uid": str(symbol.UniqueId)}
+
+
+def decision_audit(document, DB, request):
+    import System
+    decision = request["decision_audit"]
+    transaction = decision["transaction"]
+    added, modified, instance_id = decision["added_ids"], decision["modified_ids"], decision["instance_id"]
+    keep = decision["kept"]
+    if (type(keep) is not bool or not transaction or len(transaction) > 100
+            or not isinstance(added, list) or not isinstance(modified, list)
+            or len(added) not in (1, 3) or len(modified) > 1 or instance_id not in added
+            or len(set(added + modified)) != len(added + modified)):
+        raise ValueError("Use the exact final transaction and provisional effect IDs.")
+    elements = inventory(document, DB)
+    present = {}
+    for key in added + modified:
+        number = int(key)
+        if number <= 0 or str(number) != key:
+            raise ValueError("Use canonical positive Revit effect ID strings.")
+        element = document.GetElement(DB.ElementId(System.Int64(number)))
+        if (element is not None) != (key in elements):
+            raise ValueError("The independent inventory and element lookup disagree.")
+        if key in modified or keep:
+            if element is None:
+                raise ValueError("An expected project element is missing after the decision.")
+            present[key] = element
+        elif element is not None:
+            raise ValueError("A provisional element still exists after Discard.")
+    pose = decision_pose(document, DB, present[instance_id]) if keep else None
+    snapshot = read_snapshot(document, DB, request, require_unmodified=False)
+    unchanged = {key: value for key, value in elements.items() if key not in added and key not in modified}
+    return {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False),
+            "inventory": inventory_record(elements), "preserved_inventory": inventory_record(unchanged),
+            "audit_token": uuid4().hex, "trial_transaction": transaction,
+            "absent_ids": [] if keep else sorted(added, key=int),
+            "present_ids": sorted(present, key=int), "pose": pose}
+
+
 def read_result(document, DB, request):
+    if "decision_audit" in request:
+        return decision_audit(document, DB, request)
     snapshot = read_snapshot(document, DB, request)
     result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
     if request.get("audit_inventory") is True:
@@ -51,6 +105,10 @@ def read_result(document, DB, request):
         result["audit_token"] = uuid4().hex
         result["trial_transaction"] = transaction
         result["inventory"] = inventory_record(elements)
+        exact = snapshot["exact_symbols"]
+        activation = exact[0]["id"] if len(exact) == 1 and not exact[0]["active"] else None
+        result["preserved_inventory"] = inventory_record({key: value for key, value in elements.items()
+                                                          if key != activation})
         result["absent_ids"] = sorted(absent, key=int)
     return result
 

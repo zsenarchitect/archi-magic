@@ -217,8 +217,9 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 1. Complete the independent rollback check first. Recheck `get_context` and review the same placement and ownership scope.
 2. Use `apply_family_placement.py` in guarded CPython modify mode on the disposable project. Pass the same probe inputs as `placement`. Pass the three full records as `before`, `trial`, and `after`.
 3. Check the active model and result in Revit. Use the Revit prompt to Keep or Discard. Save the full modify record. Check for `approval: user` and the matching `committed` or `discarded` decision.
-4. Read the project again after the decision. Verify the exact instance and pose after Keep. Verify absence of the provisional IDs and a restored inventory after Discard.
-5. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
+4. Read the project again with `read_family_placement.py` in query mode. Pass the same selection and level. Add a `decision_audit` object. Set `kept` from the bridge decision. Pass the modify result's `transaction`, `placement.id` as `instance_id`, and its `effects.added` and `effects.modified` as `added_ids` and `modified_ids`.
+5. Save the full fresh query record. Run `python scripts/verify_family_placement_decision.py preview.json before.json trial.json after.json modify.json fresh.json`. Check the result for the exact retained instance or the restored project.
+6. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
 
 ## Preview a CAD layout (issue #166)
 

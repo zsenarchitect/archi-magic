@@ -62,7 +62,7 @@ def verify_pose(review, result):
     return unique_ids([pose["id"], loaded["id"], loaded["family_id"]])
 
 
-def bridge_effects(record, expected, transaction):
+def bridge_effects(record, expected, transaction, *, decision=None):
     changes = record["changes"]
     reported = {}
     for kind in ("added", "deleted", "modified"):
@@ -80,8 +80,9 @@ def bridge_effects(record, expected, transaction):
             or sum(categories.values()) != total):
         raise ValueError("The bridge effect totals disagree with its element lists.")
     transactions = changes.get("transactions", [])
-    if total:
-        if record["decision"] != "rolled_back" or reported != expected or transactions != [transaction]:
+    if decision is not None or total:
+        if (record["decision"] != (decision or "rolled_back") or reported != expected
+                or not 1 <= len(transactions) <= 8 or set(transactions) != {transaction}):
             raise ValueError("The bridge reports effects outside the reviewed provisional transaction.")
     elif transactions and (record["decision"] != "rolled_back" or transactions != [transaction]):
         raise ValueError("The bridge reports an unrelated transaction.")

@@ -219,7 +219,7 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
         elements[identifier.Value].Location.Rotation = angle
 
     project = SimpleNamespace(IsModifiable=False, Application=SimpleNamespace(DocumentChanged=EventHook()),
-                              GetElement=elements.get, Regenerate=lambda: None,
+                              GetElement=lambda value: elements.get(getattr(value, "Value", value)), Regenerate=lambda: None,
                               Equals=lambda other: other is project,
                               Create=SimpleNamespace(NewFamilyInstance=place), LoadFamilySymbol=load)
     statuses = SimpleNamespace(**{key: key for key in ("Uninitialized", "Started", "Committed", "RolledBack")})
@@ -276,8 +276,11 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
                     "result_truncated": False, "engine": {"requested": "cpython"}, "changes": changes,
                     "blocked": [], "dialogs": [], "failures": [], "warnings": [], "result": result}
 
+        unchanged = {key: value for key, value in probe.inventory(project, db).items()
+                     if key not in preview["ownership_ids"]}
         initial = {"status": "ok", "snapshot_json": json.dumps(baseline),
                    "inventory": result["baseline_inventory"], "absent_ids": [],
+                   "preserved_inventory": probe.inventory_record(unchanged),
                    "audit_token": args["baseline_audit_token"], "trial_transaction": None}
         original = record("baseline-run", "query", initial)
         trial = record("trial-run", "dry_run", result, result["effects"], result["transaction"])
@@ -303,7 +306,7 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
         with pytest.raises(ValueError, match="bridge reports effects"):
             verify(preview, original, bad, fresh)
         bad = dict(trial, approval="auto")
-        with pytest.raises(ValueError, match="no changes, warnings, or approval"):
+        with pytest.raises(ValueError, match="required status and approval"):
             verify(preview, original, bad, fresh)
 
         import apply_family_placement as writer
@@ -335,6 +338,45 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
         assert handed_off["effects"] == result["effects"]
         assert 99 in elements and symbol.IsActive
         assert not project.Application.DocumentChanged
+
+        import read_family_placement as reader
+        from verify_family_placement_decision import verify as verify_decision
+
+        monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Int64=int))
+        monkeypatch.setattr(reader, "inventory", probe.inventory)
+        monkeypatch.setattr(reader, "read_snapshot", read_snapshot)
+        db.FamilyInstance = db.Level = SimpleNamespace
+        decision = {"kept": True, "transaction": handed_off["transaction"], "instance_id": "99",
+                    "added_ids": handed_off["effects"]["added"], "modified_ids": handed_off["effects"]["modified"]}
+        read_request = {"selection": selection, "level_id": "5", "decision_audit": decision}
+        kept_run = dict(record("modify-run", "modify", handed_off, handed_off["effects"], handed_off["transaction"]),
+                        approval="user", decision="committed")
+        checked = record("decision-read", "query", reader.read_result(project, db, read_request))
+        kept = verify_decision(preview, original, trial, fresh, kept_run, checked)
+        assert kept["status"] == "family_placement_keep_verified"
+        assert kept["placement"]["uid"] == "instance-99"
+
+        wrong_pose = copy.deepcopy(checked)
+        wrong_pose["result"]["pose"]["xyz_ft"][2] += 1
+        with pytest.raises(ValueError, match="retained instance"):
+            verify_decision(preview, original, trial, fresh, kept_run, wrong_pose)
+        unrelated = copy.deepcopy(checked)
+        unrelated["result"]["preserved_inventory"]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="preserved project scope"):
+            verify_decision(preview, original, trial, fresh, kept_run, unrelated)
+        with pytest.raises(ValueError, match="required status and approval"):
+            verify_decision(preview, original, trial, fresh, dict(kept_run, approval="auto"), checked)
+
+        decision["kept"] = False
+        with pytest.raises(ValueError, match="still exists"):
+            reader.read_result(project, db, read_request)
+        Group(project, "fixture").RollBack()
+        discarded_run = dict(kept_run, decision="discarded", status="rejected")
+        restored = record("discard-read", "query", reader.read_result(project, db, read_request))
+        assert verify_decision(preview, original, trial, fresh, discarded_run, restored)["status"] == (
+            "family_placement_discard_verified"
+        )
+
 
 
 
