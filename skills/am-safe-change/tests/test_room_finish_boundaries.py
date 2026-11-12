@@ -274,6 +274,36 @@ def test_wall_finish_spans_skip_overlapping_door_envelopes(run):
         {"id": "152", "uid": "fixture-door-152", "start_ft": 4.0, "end_ft": 6.0},
     ]
     assert second["wall_finish"]["boundary_spans_ft"] == [[0.0, 8.0]]
+    assert first["wall_finish"]["finish_footprints"] == [
+        {"status": "footprint_previewed", "span_ft": [0.0, 2.0],
+         "centerline_ft": [[0.0, 0.0625, 0], [2.0, 0.0625, 0]]},
+        {"status": "footprint_previewed", "span_ft": [6.0, 10.0],
+         "centerline_ft": [[6.0, 0.0625, 0], [10.0, 0.0625, 0]]},
+    ]
+
+
+def test_wall_finish_chooses_room_side_independent_of_segment_direction(run):
+    outer = list(reversed(rectangle(0, 0, 10, 8)))
+    room = Room(Seq([loop(outer, source=[50, 51, 52, 53])]))
+    report = run({1: room, 50: Wall(50), 51: Wall(51), 52: Wall(52), 53: Wall(53),
+                  101: Level(), 102: Phase(), 103: WallType()}, ["1"], wall_type_id="103")
+    first = report["rooms"][0]["boundary_loops"][0][0]["wall_finish"]
+    assert first["finish_footprints"][0]["centerline_ft"] == [[0.0, 7.9375, 0], [10.0, 7.9375, 0]]
+
+
+def test_wall_finish_rejects_outline_hole_inside_the_full_width(run):
+    # The hole is away from the footprint center and corners.
+    outer = loop(rectangle(0, 0, 10, 8), source=[50, 51, 52, 53])
+    hole = loop(rectangle(2, 0.02, 3, 0.05), source=-1)
+    room = Room(Seq([outer, hole]))
+    report = run({1: room, 50: Wall(50), 51: Wall(51), 52: Wall(52), 53: Wall(53),
+                  101: Level(), 102: Phase(), 103: WallType()}, ["1"], wall_type_id="103")
+    first = report["rooms"][0]["boundary_loops"][0][0]["wall_finish"]
+    assert first["status"] == "incomplete"
+    assert first["finish_footprints"] == [{
+        "status": "excluded", "span_ft": [0.0, 10.0],
+        "reason": "finish_width_does_not_fit_on_one_side",
+    }]
 
 
 def test_wall_finish_projects_all_box_corners_on_a_diagonal_boundary(run):

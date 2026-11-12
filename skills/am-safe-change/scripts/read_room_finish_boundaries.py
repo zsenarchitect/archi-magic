@@ -83,7 +83,60 @@ def door_interval(door, start, axis):
     return (min(stations), max(stations)) if all(finite(value) for value in stations) else None
 
 
-def wall_segment_preview(document, segment, phase_id, short_curve):
+def boundary_cuts_footprint(edge, bounds):
+    """Test whether an outline edge crosses the interior of a local rectangle."""
+    start, end = edge
+    enter, leave = 0.0, 1.0
+    for a, b, limits in zip(start, end, bounds):
+        low, high = limits
+        if a == b:
+            if not low < a < high:
+                return False
+            continue
+        first, last = sorted(((low - a) / (b - a), (high - a) / (b - a)))
+        enter, leave = max(enter, first), min(leave, last)
+        if enter >= leave:
+            return False
+    return True
+
+
+def finish_centerlines(outline, start, axis, spans, width):
+    normal = (-axis[1], axis[0])
+
+    def local(point):
+        dx, dy = point[0] - start[0], point[1] - start[1]
+        return dx * axis[0] + dy * axis[1], dx * normal[0] + dy * normal[1]
+
+    edges = [(local(a), local(b)) for a, b in outline]
+    result = []
+    for low, high in spans:
+        fits = []
+        for side in (-1, 1):
+            y0, y1 = sorted((0.0, width * side))
+            bounds = ((low + TOLERANCE_FT, high - TOLERANCE_FT),
+                      (y0 + TOLERANCE_FT, y1 - TOLERANCE_FT))
+            if any(a >= b for a, b in bounds) or any(boundary_cuts_footprint(edge, bounds) for edge in edges):
+                continue
+            mid_x, mid_y = (low + high) / 2.0, width * side / 2.0
+            # Odd parity across all loops places the point in the room, including rooms with holes.
+            crossings = sum(1 for (ax, ay), (bx, by) in edges
+                            if (ay > mid_y) != (by > mid_y)
+                            and mid_x < ax + (mid_y - ay) * (bx - ax) / (by - ay))
+            if crossings % 2:
+                fits.append(side)
+        record = {"span_ft": [low, high]}
+        if len(fits) == 1:
+            offset = width * fits[0] / 2.0
+            points = [[start[i] + station * axis[i] + offset * normal[i] for i in (0, 1)] + [start[2]]
+                      for station in (low, high)]
+            record.update(status="footprint_previewed", centerline_ft=points)
+        else:
+            record.update(status="excluded", reason="finish_width_does_not_fit_on_one_side")
+        result.append(record)
+    return result
+
+
+def wall_segment_preview(document, segment, phase_id, short_curve, outline, width):
     if segment["linked_source_id"] > 0 or segment["curve_type"] != "Line" or segment["source_id"] <= 0:
         return {"status": "excluded", "reason": "boundary_not_a_straight_host_wall"}
     wall = document.GetElement(DB.ElementId(Int64(segment["source_id"])))
@@ -124,8 +177,10 @@ def wall_segment_preview(document, segment, phase_id, short_curve):
         cursor = max(cursor, door["end_ft"])
     if length - cursor > short_curve:
         spans.append([cursor, length])
-    return {"status": "spans_previewed", "wall_uid": str(wall.UniqueId), "door_envelopes": doors,
-            "boundary_spans_ft": spans}
+    footprints = finish_centerlines(outline, start, axis, spans, width)
+    status = "incomplete" if any(item["status"] == "excluded" for item in footprints) else "spans_previewed"
+    return {"status": status, "wall_uid": str(wall.UniqueId), "door_envelopes": doors,
+            "boundary_spans_ft": spans, "finish_footprints": footprints}
 
 
 def room_finish_preview(document, room, row, types, wall_type):
@@ -151,22 +206,25 @@ def room_finish_preview(document, room, row, types, wall_type):
     row["horizontal_finishes"] = finishes
     if wall_type:
         short_curve = document.Application.ShortCurveTolerance
+        segments = [segment for loop in row["boundary_loops"] for segment in loop]
         if not finite(short_curve) or short_curve <= 0:
             row["wall_finish"] = {"status": "excluded", "reason": "short_curve_tolerance_unavailable"}
-        elif sum(len(loop) for loop in row["boundary_loops"]) > MAX_WALL_SEGMENTS:
+        elif len(segments) > MAX_WALL_SEGMENTS:
             row["wall_finish"] = {"status": "excluded", "reason": "wall_boundary_segment_limit"}
+        elif any(segment["curve_type"] != "Line" for segment in segments):
+            row["wall_finish"] = {"status": "excluded", "reason": "curved_room_outline_requires_review"}
         else:
             row["wall_finish"] = dict(wall_type, status="reported")
-            for loop in row["boundary_loops"]:
-                for segment in loop:
-                    try:
-                        result = wall_segment_preview(document, segment, phase.Id, short_curve)
-                    except Exception as exc:
-                        result = {"status": "excluded", "reason": "wall_boundary_read_failed",
-                                  "error_type": type(exc).__name__}
-                    segment["wall_finish"] = result
-                    if result["status"] == "excluded":
-                        row["wall_finish"]["status"] = "incomplete"
+            outline = [(segment["start_ft"], segment["end_ft"]) for segment in segments]
+            for segment in segments:
+                try:
+                    result = wall_segment_preview(document, segment, phase.Id, short_curve, outline, wall_type["width_ft"])
+                except Exception as exc:
+                    result = {"status": "excluded", "reason": "wall_boundary_read_failed",
+                              "error_type": type(exc).__name__}
+                segment["wall_finish"] = result
+                if result["status"] != "spans_previewed":
+                    row["wall_finish"]["status"] = "incomplete"
     return row
 
 
