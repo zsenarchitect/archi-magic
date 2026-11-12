@@ -213,6 +213,8 @@ Read `existing_room_boundaries` for the native area, phase, finish boundary dige
 
 Review `provenance` for prior placement from the same link, level, and layer scope. A copied tag, incomplete prior placement, moved source, or overlapping layer scope requires review. Matching tags still require a fresh geometry readback of the placed elements.
 
+For native qualification, use a disposable, non-workshared Revit 2026 project with a known DWG and independently verified source read. Keep the runtime in ask policy. After review, use `run_modify` with `dry_run: true` and `scripts/probe_cad_layout_in_revit.py`. Pass `mode: "rollback_probe"`, the original preview inputs under `preview`, and the returned `preview_sha256`. The probe requires an unchanged full preview and a clean model scan. It rolls back its own transaction and checks that its temporary elements are absent and the preview still matches. Stop on `transaction_unresolved` and inspect the disposable model. This probe still requires native qualification before any Keep workflow.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).

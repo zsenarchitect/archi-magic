@@ -90,7 +90,8 @@ def read_preview(document, request):
         result["existing_model_scan"] = scan
         result["wall_collision_scan"] = check_wall_collisions(document, proposal, walls, scan, deadline)
         result["existing_room_boundaries"] = read_existing_room_boundaries(document, scan, deadline)
-    return {"status": status, "preview_json": encoded(result, EVIDENCE_LIMIT)}
+    payload = encoded(result, EVIDENCE_LIMIT)
+    return {"status": status, "preview_json": payload, "preview_sha256": sha256(payload)}
 
 
 if "inputs" in globals():

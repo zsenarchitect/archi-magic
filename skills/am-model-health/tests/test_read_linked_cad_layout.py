@@ -1,12 +1,14 @@
 """Exercise linked CAD geometry extraction with a simulated Revit geometry tree."""
 
 from hashlib import sha256
+from importlib import import_module
 from itertools import product
 import json
 from pathlib import Path
 import runpy
 import subprocess
 import sys
+from time import monotonic
 from types import ModuleType, SimpleNamespace as Record
 
 import pytest
@@ -241,10 +243,13 @@ def linked_dwg(monkeypatch):
     monkeypatch.delitem(sys.modules, "check_cad_wall_collisions", raising=False)
     monkeypatch.delitem(sys.modules, "read_cad_room_boundaries", raising=False)
     monkeypatch.delitem(sys.modules, "cad_layout_provenance", raising=False)
+    monkeypatch.delitem(sys.modules, "preview_cad_layout_in_revit", raising=False)
+    monkeypatch.delitem(sys.modules, "probe_cad_layout_in_revit", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
-    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt", existing={}, db=db,
+    document = Record(IsFamilyDocument=False, IsLinked=False, IsReadOnly=False, IsModifiable=False,
+                      IsWorkshared=False, PathName="/tmp/test-model.rvt", existing={}, db=db,
                       schema=None, tagged=[],
                       ActiveView=view, active_option=element_id(-1), Application=Record(VersionNumber="2026"),
                       ProjectInformation=Record(UniqueId="aa-3"))
@@ -510,6 +515,128 @@ def test_native_entry_point_shows_boundary_conflicts_without_a_geometry_digest(l
     assert preview["model_write_approved"] is False
     assert "geometry_sha256" not in preview
     assert any(row["wall_ids"] == ["wall-1"] for row in preview["proposal"]["unresolved"])
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("verified", "probe_rolled_back"),
+    ("late_failure", "stopped"),
+    ("leaked_element", "transaction_unresolved"),
+    ("changed_preview", "stopped"),
+])
+def test_probe_requires_current_preview_and_verifies_rollback(linked_dwg, monkeypatch, scenario, expected):
+    document, _, _, _, id_value, _ = linked_dwg
+    preview_request = placement_request(linked_dwg)
+    before = native_preview(document, preview_request)
+    request = {"mode": "rollback_probe", "preview": preview_request, "preview_sha256": before["preview_sha256"]}
+    probe_module = import_module("probe_cad_layout_in_revit")
+    transaction_calls = []
+    document.db.TransactionStatus = Record(Started="started", RolledBack="rolled-back")
+
+    class Transaction:
+        def __init__(self, _document, _title):
+            self.status = "uninitialized"
+
+        def Start(self):
+            transaction_calls.append("start")
+            self.status = "started"
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def RollBack(self):
+            transaction_calls.append("rollback")
+            if scenario != "leaked_element":
+                document.existing.clear()
+            self.status = "rolled-back"
+            return self.status
+
+    def place(_document, preview, created):
+        assert preview["proposal"]["walls"] and preview["proposal"]["doors"] and preview["proposal"]["rooms"]
+        transient = existing_element(id_value, 110, ((610, 0, 3000), (690, 100, 3100)))
+        document.existing["OST_GenericModel"] = [transient]
+        created.append(transient.Id)
+        if scenario == "late_failure":
+            raise ValueError("Late room placement failure.")
+
+    document.db.Transaction = Transaction
+    monkeypatch.setattr(probe_module, "install_failure_guard", lambda _: object())
+    monkeypatch.setattr(probe_module, "create_probe_geometry", place)
+    if scenario == "changed_preview":
+        document.ActiveView.VersionGuid = "changed"
+        with pytest.raises(ValueError, match="reviewed preview differs"):
+            probe_module.probe(document, request)
+        assert transaction_calls == []
+        return
+    result = probe_module.probe(document, request)
+    assert result["status"] == expected
+    assert transaction_calls == ["start", "rollback"]
+    assert result.get("rollback_verified", False) == (scenario != "leaked_element")
+    if scenario == "late_failure":
+        assert result["message"] == "Late room placement failure."
+    if scenario == "verified":
+        assert result["transient_element_count"] == 1
+        assert native_preview(document, preview_request) == before
+
+
+def test_native_wall_and_door_probe_passes_exact_types_host_and_choices(linked_dwg):
+    document, _, _, _, id_value, _ = linked_dwg
+    preview = json.loads(native_preview(document, placement_request(linked_dwg))["preview_json"])
+    probe_module = import_module("probe_cad_layout_in_revit")
+    db = document.db
+    level, phase, symbol = (document.GetElement(id_value(key)) for key in (2, 95, 81))
+    symbol.IsActive = False
+    symbol.Activate = lambda: setattr(symbol, "IsActive", True)
+    db.WallLocationLine = Record(WallCenterline=0)
+    db.StorageType.Integer = "integer"
+    db.Structure = Record(StructuralType=Record(NonStructural="nonstructural"))
+    keys = ("WALL_KEY_REF_PARAM", "WALL_ATTR_ROOM_BOUNDING", "WALL_USER_HEIGHT_PARAM", "WALL_BASE_OFFSET")
+    for key in keys:
+        setattr(db.BuiltInParameter, key, key)
+    db.Line.CreateBound = staticmethod(lambda a, b: Record(
+        GetEndPoint=lambda index: (a, b)[index], Dispose=lambda: None))
+    db.WallUtils = Record(
+        DisallowWallJoinAtEnd=lambda wall, end: wall.joins.__setitem__(end, False),
+        IsWallJoinAllowedAtEnd=lambda wall, end: wall.joins[end])
+    calls = []
+
+    def create_wall(model, curve, type_id, level_id, height, offset, flip, structural):
+        assert model is document and (type_id.Value, level_id.Value) == (80, 2)
+        assert height == pytest.approx(3000 / 304.8) and offset == 0 and not flip and not structural
+        values = dict(zip(keys, (1, 0, height, offset)))
+
+        def parameter(key):
+            def set_value(value):
+                values[key] = value
+                return True
+
+            return Record(StorageType="integer" if key in keys[:2] else "double", HasValue=True, IsReadOnly=False,
+                          Set=set_value, AsInteger=lambda: values[key], AsDouble=lambda: values[key])
+
+        wall = Record(Id=id_value(110), CreatedPhaseId=phase.Id, DemolishedPhaseId=id_value(-1),
+                      LevelId=level_id, Width=200.25 / 304.8, GetTypeId=lambda: type_id,
+                      Location=Record(Curve=curve), joins=[True, True], get_Parameter=parameter, values=values)
+        calls.append(wall)
+        return wall
+
+    def create_door(location, selected, host, base_level, structure):
+        assert selected is symbol and symbol.IsActive and host is calls[0] and base_level is level
+        assert structure == "nonstructural"
+        door = Record(Id=id_value(111), CreatedPhaseId=phase.Id, DemolishedPhaseId=id_value(-1), LevelId=level.Id,
+                      Location=Record(Point=location), Host=host, GetTypeId=lambda: id_value(81),
+                      HandFlipped=False, FacingFlipped=False, CanFlipHand=True)
+        door.flipHand = lambda: setattr(door, "HandFlipped", True) or True
+        calls.append(door)
+        return door
+
+    db.Wall = Record(Create=create_wall)
+    document.Create = Record(NewFamilyInstance=create_door)
+    document.Regenerate = lambda: None
+    created = []
+    walls = probe_module.wall_and_door_probe(document, preview, level, phase, created, monotonic() + 15)
+    assert walls["wall-1"] is calls[0] and [item.Value for item in created] == [110, 111]
+    assert calls[0].values["WALL_ATTR_ROOM_BOUNDING"] == 1 and calls[0].joins == [False, False]
+    assert calls[1].HandFlipped and not calls[1].FacingFlipped
 
 
 @pytest.mark.parametrize("change,reason", [

@@ -77,7 +77,7 @@ def canonical_loop(edges):
     return min(rotate(edges), rotate(reverse))
 
 
-def read_room(document, candidate, options, deadline, remaining):
+def read_room(document, candidate, options, deadline, remaining, *, include_loops=False):
     room = document.GetElement(element_id(candidate["id"]))
     if (not isinstance(room, DB.Architecture.Room) or str(room.UniqueId) != candidate["uid"]
             or str(room.VersionGuid) != candidate["version_guid"] or room.Location is None):
@@ -106,13 +106,16 @@ def read_room(document, candidate, options, deadline, remaining):
             sources.add(edge[0])
             edges.append(edge)
         loops.append(canonical_loop(edges))
-    return {"id": candidate["id"], "uid": candidate["uid"], "near": candidate["near"],
+    result = {"id": candidate["id"], "uid": candidate["uid"], "near": candidate["near"],
             "level_id": str(room.LevelId.Value), "level_uid": str(level.UniqueId),
             "phase_id": str(phase.Id.Value), "phase_uid": str(phase.UniqueId),
             "location_mm": xyz_mm(room.Location.Point), "native_area_mm2": area,
             "enclosed": bool(loops), "segment_count": sum(map(len, loops)),
             "boundary_sha256": sha256(encoded(sorted(loops), EVIDENCE_LIMIT)),
             "boundary_sources": sorted(sources)}
+    if include_loops:
+        result["boundary_loops"] = sorted(loops)
+    return result
 
 
 def read_existing_room_boundaries(document, scan, deadline):
