@@ -167,6 +167,16 @@ try {
     $r = Invoke-Hook $t $f
     Assert-True 'reading saved feedback does not create a new note' (-not (Test-Path -LiteralPath $f)) $r.Out
 
+    $t = Write-Transcript 'unrelated-tool.jsonl' @(
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"s1","name":"Bash","input":{"command":"cat missing.txt"}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"s1","is_error":true,"content":"cat: missing.txt: No such file"}]}}'
+    )
+    $f = Join-Path $Root 'unrelated-tool.json'
+    $r = Invoke-Hook $t $f
+    Assert-True 'an unrelated tool failure does not create a Revit feedback note' (
+        $r.Code -eq 0 -and -not (Test-Path -LiteralPath $f)
+    ) $r.Out
+
     # 12. A note is logged.
     Assert-True 'note saved: logged' ((Get-LogText) -match '"step":"session-end-feedback","level":"info"') (Get-LogText)
 } finally {

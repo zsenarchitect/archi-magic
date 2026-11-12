@@ -7,7 +7,7 @@
   transcript (transcript_path from the hook input JSON on stdin) and looks for
   a small explicit list of failure signals only:
     - Revit connection errors: revit_busy, pipe_error, no instances found.
-    - Tool failures: a tool result with is_error true, or invalid_params.
+    - Tool failures: is_error true or invalid_params, excluding known unrelated tools.
     - The user saying something is broken or wrong.
   A retry is covered by the failure signal: a retry always follows a failure.
 
@@ -87,18 +87,27 @@ try {
     foreach ($line in ($tail -split "`r?`n")) {
         if ($line -match 'note_sha256.{0,12}[0-9a-f]{64}') { continue }
         if ($line -match '"type"\s*:\s*"tool_(use|result)"') {
+            $hasToolBlocks = $false
             $event = $null
             try { $event = $line | ConvertFrom-Json } catch { }
             foreach ($block in @($event.message.content)) {
                 if ($block.type -eq 'tool_use' -and $block.id) {
+                    $hasToolBlocks = $true
                     switch -Regex ([string]$block.name) {
-                        '(^|__)run_query$' { $toolActivities[$block.id] = 'revit_query' }
-                        '(^|__)run_modify$' { $toolActivities[$block.id] = 'revit_modify' }
-                        '(^|__)(get_context|list_revit_instances)$' { $toolActivities[$block.id] = 'revit_context' }
+                        '^(mcp__pyrevit__)?run_query$' { $toolActivities[$block.id] = 'revit_query' }
+                        '^(mcp__pyrevit__)?run_modify$' { $toolActivities[$block.id] = 'revit_modify' }
+                        '^(mcp__pyrevit__)?(get_context|list_revit_instances)$' { $toolActivities[$block.id] = 'revit_context' }
+                        default {
+                            if ([string]$block.name -notmatch '^mcp__pyrevit__') {
+                                $toolActivities[$block.id] = 'unrelated'
+                            }
+                        }
                     }
                 } elseif ($block.type -eq 'tool_result') {
-                    $content = $block.content | ConvertTo-Json -Compress -Depth 4
+                    $hasToolBlocks = $true
                     $activity = if ($block.tool_use_id) { $toolActivities[$block.tool_use_id] }
+                    if ($activity -eq 'unrelated') { continue }
+                    $content = $block.content | ConvertTo-Json -Compress -Depth 4
                     $stamp = [DateTimeOffset]::MinValue
                     $timestamp = $event.timestamp
                     if ($timestamp -is [DateTime] -and $timestamp.Kind -ne [DateTimeKind]::Unspecified) {
@@ -115,6 +124,7 @@ try {
                         if ($block.is_error -eq $true -or $content -match 'invalid_params') { 'tool_failed' }
                     )
                     foreach ($signal in $matched) {
+                        if (-not $found.Contains($signal)) { $found.Add($signal) }
                         if ($stamp -ne [DateTimeOffset]::MinValue -and
                             (-not $failureTimes.ContainsKey($signal) -or $stamp -gt $failureTimes[$signal])) {
                             $failureTimes[$signal] = $stamp
@@ -124,6 +134,13 @@ try {
                         }
                     }
                 }
+            }
+            if ($hasToolBlocks) {
+                $userText = @($event.message.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text })
+                if ($event.message.role -eq 'user' -and
+                    ($userText -match '\bbroken\b|\bwrong\b|\bbug\b|crash|doesn''t work|does not work|not working') -and
+                    -not $found.Contains('user_reported_broken')) { $found.Add('user_reported_broken') }
+                continue
             }
         }
         if (($line -match 'revit_busy') -and -not $found.Contains('revit_busy')) { $found.Add('revit_busy') }
