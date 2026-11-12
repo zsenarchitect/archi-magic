@@ -488,6 +488,9 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
     ("offset_location", "stopped"),
     ("joined_wall", "stopped_and_rolled_back"),
     ("cannot_copy", "stopped_and_rolled_back"),
+    ("top_constrained", "trial_rolled_back"),
+    ("bad_faces", "stopped_and_rolled_back"),
+    ("bad_volume", "stopped_and_rolled_back"),
 ])
 def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monkeypatch, fault, expected):
     document, elements, _ = model
@@ -499,6 +502,10 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
     db.WallUtils.IsWallJoinAllowedAtEnd = lambda wall, end: wall.join_allowed[end]
     db.WallUtils.DisallowWallJoinAtEnd = lambda wall, end: wall.join_allowed.__setitem__(end, False)
     db.XYZ = point
+    db.ShellLayerType = NS(Exterior="exterior", Interior="interior")
+    db.HostObjectUtils.GetSideFaces = lambda wall, layer: [layer]
+    db.Options = lambda: NS(Dispose=lambda: None)
+    db.Solid = type("Solid", (NS,), {})
     db.BuiltInParameter.WALL_KEY_REF_PARAM = "WALL_KEY_REF_PARAM"
     db.BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT = "WALL_STRUCTURAL_SIGNIFICANT"
     monkeypatch.setattr(Line, "CreateBound", staticmethod(
@@ -513,7 +520,7 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
     def mutable(identifier, storage, initial, reject=False, **details):
         item = parameter(identifier, storage, initial, **details)
         item.current = initial
-        item.AsDouble = item.AsString = lambda: item.current
+        item.AsDouble = item.AsString = item.AsElementId = lambda: item.current
 
         def set_value(value):
             if reject:
@@ -526,6 +533,9 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
         return item
 
     def wall(identifier, native_line, base_level, height, finish, flipped=True, structural=True):
+        has_top = fault == "top_constrained" and identifier == 10
+        top_level = mutable(-1001103, "e", Id(4) if has_top else Id(-1))
+        top_offset = mutable(-1001109, "d", -1 if has_top else 0)
         height_parameter = mutable(-1001105, "d", height)
         base_parameter = parameter(-1001107, "e", base_level)
         finish_parameter = mutable(50, "s", finish, reject=fault == "cannot_copy" and identifier != 10,
@@ -533,7 +543,8 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
         values = {
             "WALL_BASE_CONSTRAINT": base_parameter,
             "WALL_BASE_OFFSET": parameter(-1001108, "d", 0),
-            "WALL_HEIGHT_TYPE": parameter(-1001103, "e", Id(-1)),
+            "WALL_HEIGHT_TYPE": top_level,
+            "WALL_TOP_OFFSET": top_offset,
             "WALL_USER_HEIGHT_PARAM": height_parameter,
             "WALL_TOP_IS_ATTACHED": parameter(-14, "i", 0),
             "WALL_BOTTOM_IS_ATTACHED": parameter(-15, "i", 0),
@@ -541,6 +552,21 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
             "WALL_STRUCTURAL_SIGNIFICANT": parameter(-1001596, "i", int(structural)),
         }
         base = elements[base_level].ProjectElevation
+        def top():
+            return (base + height_parameter.current if top_level.current == Id(-1)
+                    else elements[top_level.current].ProjectElevation + top_offset.current)
+
+        def side(layer):
+            exterior = layer == "exterior"
+            y = 0.5 if exterior else 0
+            span = top()
+            corners = [(0, y, base), (4, y, base), (4, y, span), (0, y, span)]
+            if fault == "bad_faces" and identifier != 10:
+                corners = [corners[i] for i in (0, 2, 1, 3)]
+            return PlanarFace(FaceNormal=point(0, 1 if exterior else -1, 0),
+                              GetEdgesAsCurveLoops=lambda: [[Line(a, b) for a, b in
+                                  zip(corners, corners[1:] + corners[:1])]])
+
         location = LocationCurve(Curve=native_line, neighbors=[[elements[100]] if fault == "joined_wall"
                                                                 and identifier != 10 else [], []])
         common = {key: value for key, value in vars(template).items()
@@ -549,8 +575,11 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
         return native(Wall, identifier, **common, Location=location, join_allowed=[True, identifier != 10],
                       Orientation=point(0, 1 if flipped else -1, 0), Flipped=flipped,
                       Parameters=[*values.values(), finish_parameter], get_Parameter=values.get,
+                      GetGeometryObjectFromReference=side,
+                      get_Geometry=lambda _: [db.Solid(Volume=2 * (top() - base) + int(
+                          fault == "bad_volume" and identifier != 10))],
                       get_BoundingBox=lambda _: NS(
-                          Min=point(0, 0, base), Max=point(4, 0.5, base + height_parameter.current),
+                          Min=point(0, 0, base), Max=point(4, 0.5, top()),
                           Transform=NS(OfPoint=lambda value: value, IsIdentity=True)))
 
     def create(_, line, type_id, level_id, height, offset, flipped, structural):
@@ -571,13 +600,18 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
     before_request["scope"] = [before_request["scope"][0]]
     before = invoke(document, before_request)
     assert before["status"] == "ok", before
+    if fault == "top_constrained":
+        adjustments = [(1, 20, 2, 0), (2, 7, 3, 0), (3, 4, 4, -1)]
+    else:
+        adjustments = [(1, 8, -1, 0), (2, 7, -1, 0), (3, 5, -1, 0)]
     approval = json.dumps({"kind": "element-split-readback-approval",
                            "snapshot_sha256": sha256(before["snapshot_json"].encode()).hexdigest(),
                            "inventory_sha256": sha256(before["inventory_json"].encode()).hexdigest(),
                            "piece_adjustments": [
                                {"source_id": "10", "piece": index, "values": {
-                                   "parameter:-1001107": str(level_id), "parameter:-1001105": height}}
-                               for index, (level_id, height) in enumerate(((1, 8), (2, 7), (3, 5)), 1)]})
+                                   "parameter:-1001107": str(base_id), "parameter:-1001105": height,
+                                   "parameter:-1001103": str(top_id), "parameter:-1001109": offset}}
+                               for index, (base_id, height, top_id, offset) in enumerate(adjustments, 1)]})
     result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
         "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
         "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
@@ -587,10 +621,14 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
     assert not any(identifier in elements for identifier in created)
     if fault == "offset_location":
         assert started == []
-    elif fault == "none":
-        assert constructor_calls == [(100, 2, 7, 0, True, True, 8), (100, 3, 5, 0, True, True, 15)]
+    elif fault in ("none", "top_constrained"):
+        final_height = 4 if fault == "top_constrained" else 5
+        assert constructor_calls == [(100, 2, 7, 0, True, True, 8), (100, 3, final_height, 0, True, True, 15)]
         receipt = json.loads(result["trial_json"])
         assert receipt["inner_effects"] == {"added": ["300", "301"], "modified": ["10"], "deleted": []}
         measured = json.loads(receipt["readback_json"])
         assert all(any(row["identity"] == "shared:wall-finish" and row["value"] == "Reviewed"
                        for row in item["parameters"]) for item in measured["pieces"])
+        assert [receipt["wall_measurements"][key]["solid_volume_cuft"] for key in ("10", "300", "301")] == [
+            16, 14, 2 * final_height,
+        ]
