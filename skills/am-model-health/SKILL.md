@@ -74,6 +74,24 @@ Use this report for Revit links, IFC links, or a Manage Links path and visibilit
 
 Use the focused report in chat. Keep it out of the dashboard snapshot flow. It classifies link paths without returning the path strings. Compare the flagged link in Manage Links before proposing a repath or reload.
 
+### Inspect one linked element
+
+Use Revit 2024 through 2026. Open the host view and load the RVT link. Call `get_context` and `get_skill("revit-scripting")`. Run `scripts/inspect_linked_element.py` with `run_query`.
+
+| To do this | Pass these inputs |
+|---|---|
+| Inspect a picked element | Use Tab in the host view to select one linked element. Pass `{"mode":"inspect"}`. |
+| Inspect a known ID | Pass `{"mode":"inspect","link_instance_id":"101","linked_element_id":"202"}`. Use the element ID from the linked file. |
+| Inspect by exact name | Pass `{"mode":"inspect","link_instance_id":"101","category_id":"-2000014","name":"Door A"}`. Use the actual linked category ID and the exact name. |
+| Select the inspected element | Pass `{"mode":"select","target":{...}}`. Use the exact `selection_target` returned by inspection. |
+| Verify the selection | Pass `{"mode":"selection"}` in a new query after the select call returns. |
+
+The IDs are decimal strings. Two placements of one link can contain the same linked element ID. Check the link instance ID before selecting. If that placement moves or rotates, inspect it again before selecting. If the name search returns several matches, ask the user which ID to inspect. Use the linked ID when a search is incomplete.
+
+Decode the result's `payload` JSON. Recover a truncated tool result with `get_run`. Report the element ID, category, link and parameters. Add `parameter_names` to request up to 20 exact parameter names. The default reads visible instance parameters. Keep parameter data private. It can contain project text or file paths.
+
+Confirm the target with the user before selecting it. Run the select query in the same host view. This changes the current selection. The script checks the reference after selecting. Run the separate verification query and confirm both IDs. If the host view or link changed, inspect again. Report an unverified restoration if Revit cannot confirm the prior selection.
+
 ### CAD link audit
 
 `result.cad_links[]` has one row for each CAD instance (`ImportInstance`): `name` (file name), `kind` (`linked` or `imported`), `path`, `path_kind`, `status`, `workset`, `pinned`, `view_specific`, `owner_view`, `origin_ft` and `rotation_deg` (insertion point and angle from `GetTotalTransform()`), `extent_ft` (bounding box width and depth), `views`, `creator` and `flags[]`.
