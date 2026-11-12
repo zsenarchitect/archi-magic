@@ -15,6 +15,7 @@ from family_library_discovery import (
 )
 from family_parameter_transfer_preview import reviewed_snapshot
 from family_placement_preview import load_json
+from family_transfer_nested import nested_families, nested_names
 from probe_family_parameter_transfer import pinned_copy
 from read_batch_models import normalized_path
 from read_family_library import encode_record, read_request_file, worker_document
@@ -33,6 +34,12 @@ def reserve(transfer, before, trial, after, modify, fresh, raw_destination):
         raise ValueError("A verified native Keep is required to reserve an export.")
     audit, _ = read_audit(fresh.get("response", fresh))
     target = reviewed_snapshot(transfer["target_read"], "target", transfer["request"]["target_sha256"])
+    additions = {}
+    for name, identifier in decision["added_ids"].items():
+        field = audit["state"]["definitions"][identifier]
+        additions[name] = {"data_type": field["data_type"], "storage": field["storage"],
+                           "type_values": {type_name: values[identifier]
+                                           for type_name, values in audit["state"]["types"].items()}}
     if os.name == "nt" and sys.version_info < (3, 13):
         raise ValueError("Use Python 3.13 or newer to reserve a private Windows export.")
     destination = root_path(raw_destination)
@@ -55,7 +62,8 @@ def reserve(transfer, before, trial, after, modify, fresh, raw_destination):
                            "preview_sha256": decision["preview_sha256"], "target_sha256": target["read_sha256"],
                            "project": target["project"], "loaded_family": target["loaded_family"],
                            "family": target["family"], "category_id": target["category_id"],
-                           "revit_build": target["revit_build"], "state_sha256": manifest_digest(audit["state"])}
+                           "revit_build": target["revit_build"], "state_sha256": manifest_digest(audit["state"]),
+                           "additions": additions}
             request["request_sha256"] = manifest_digest(request)
             with new_file(directory, REQUEST_FILE) as stream:
                 stream.write(encode_record(request))
@@ -73,13 +81,14 @@ def read_request(parent, expected_sha256):
     return request
 
 
-def export_receipt(workspace, request, rfa, runtime):
+def export_receipt(workspace, request, rfa, runtime, nested):
     if (runtime["engine"] != "CPython" or not runtime["pyrevit_build"] or not runtime["engine_version"]):
         raise ValueError("Use the qualified disposable CPython worker with a reported pyRevit build.")
+    nested_names(nested)
     retained = ("request_sha256", "output_identity", "decision_sha256", "preview_sha256", "target_sha256",
-                "project", "loaded_family", "family", "category_id", "revit_build", "state_sha256")
+                "project", "loaded_family", "family", "category_id", "revit_build", "state_sha256", "additions")
     receipt = {key: request[key] for key in retained}
-    receipt.update(kind="family-transfer-derived-rfa", version=1, workspace=str(workspace), rfa=rfa, runtime=runtime)
+    receipt.update(kind="family-transfer-derived-rfa", version=1, workspace=str(workspace), rfa=rfa, runtime=runtime, nested_families=nested)
     return dict(receipt, derived_sha256=manifest_digest(receipt))
 
 
@@ -98,9 +107,10 @@ def reopen(ui, DB, raw_workspace, request_sha256, pyrevit_build):
                         or read["state"]["coverage"] != {"complete": True, "issues": []}
                         or manifest_digest(read["state"]) != request["state_sha256"]):
                     raise ValueError("The reopened export differs from the independently verified kept family.")
+                nested = nested_families(ui, DB, document)
         runtime = {"pyrevit_build": str(pyrevit_build), "engine": platform.python_implementation(),
                    "engine_version": platform.python_version()}
-        receipt = export_receipt(workspace, request, rfa, runtime)
+        receipt = export_receipt(workspace, request, rfa, runtime, nested)
         with new_file(parent, RECEIPT_FILE) as stream:
             stream.write(encode_record(receipt))
     return receipt
@@ -115,7 +125,7 @@ def verified_export(raw_workspace, request_sha256, *, expected_derived_sha256=No
         if expected_derived_sha256 is not None and receipt["derived_sha256"] != expected_derived_sha256:
             raise ValueError("The exported family receipt differs from the reviewed reload input.")
         with pinned_export(parent, workspace, request) as (path, rfa):
-            if receipt != export_receipt(workspace, request, rfa, receipt["runtime"]):
+            if receipt != export_receipt(workspace, request, rfa, receipt["runtime"], receipt["nested_families"]):
                 raise ValueError("The export receipt does not match the reservation and current file bytes.")
             yield path, receipt
 

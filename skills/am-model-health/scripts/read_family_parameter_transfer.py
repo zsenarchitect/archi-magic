@@ -5,6 +5,7 @@ import math
 import os
 
 from family_library_discovery import manifest_digest
+from family_transfer_nested import nested_families
 from read_batch_family_derivation import family_state
 from read_batch_models import normalized_path
 from read_family_library import WorkerUnresolved, bounded_text, staged_pair, worker_document
@@ -199,6 +200,41 @@ def project_values(document, DB, family):
             "instances": sorted(instances, key=lambda row: int(row["id"]))}
 
 
+def inspect_loaded(ui, DB, document, family):
+    """Inspect one loaded family while the project is nonmodifiable."""
+    app = ui.Application
+    active = ui.ActiveUIDocument
+    if (document.IsModifiable or active is None or not active.Document.Equals(document)
+            or list(app.Documents) != [document]):
+        raise ValueError("Close the project transaction before inspecting the loaded family.")
+    expected = (str(family.Name), eid(family.FamilyCategory))
+    inspected = None
+    try:
+        opened = document.EditFamily(family)
+        if opened is None or opened.Equals(document):
+            raise WorkerUnresolved("Revit did not return an independent inspection family.")
+        inspected = opened
+        current = list(app.Documents)
+        if len(current) != 2 or document not in current or inspected not in current:
+            raise WorkerUnresolved("Revit opened an unexpected document during family inspection.")
+        if ui.ActiveUIDocument is None or not ui.ActiveUIDocument.Document.Equals(document):
+            raise WorkerUnresolved("The active project changed during family inspection.")
+        read = snapshot(inspected, DB)
+        read["nested_families"] = nested_families(ui, DB, inspected)
+        if (read["family"], read["category_id"]) != expected:
+            raise ValueError("The inspected family differs from the loaded project family.")
+    finally:
+        try:
+            closed = inspected is None or inspected.Close(False)
+            restored = (list(app.Documents) == [document] and ui.ActiveUIDocument is not None
+                        and ui.ActiveUIDocument.Document.Equals(document))
+        except Exception as error:
+            raise WorkerUnresolved("Revit could not confirm inspection family closure.") from error
+        if not closed or not restored:
+            raise WorkerUnresolved("Revit did not restore the exact original open project.")
+    return read
+
+
 def loaded_target(ui, DB, document, request):
     project = saved_project_identity(document)
     app = ui.Application
@@ -215,32 +251,9 @@ def loaded_target(ui, DB, document, request):
     if (not isinstance(family, DB.Family) or str(family.UniqueId) != request["family_uid"]
             or not family.IsEditable or family.IsInPlace or family.FamilyCategory is None):
         raise ValueError("The exact editable loaded project family is unavailable.")
-    expected = (str(family.Name), eid(family.FamilyCategory))
     baseline = inventory(document, DB)
     overrides = project_values(document, DB, family)
-    inspected = None
-    try:
-        opened = document.EditFamily(family)
-        if opened is None or opened.Equals(document):
-            raise WorkerUnresolved("Revit did not return an independent inspection family.")
-        inspected = opened
-        current = list(app.Documents)
-        if len(current) != 2 or document not in current or inspected not in current:
-            raise WorkerUnresolved("Revit opened an unexpected document during family inspection.")
-        if ui.ActiveUIDocument is None or not ui.ActiveUIDocument.Document.Equals(document):
-            raise WorkerUnresolved("The active project changed during family inspection.")
-        read = snapshot(inspected, DB)
-        if (read["family"], read["category_id"]) != expected:
-            raise ValueError("The inspected family differs from the loaded project family.")
-    finally:
-        try:
-            closed = inspected is None or inspected.Close(False)
-            restored = (list(app.Documents) == [document] and ui.ActiveUIDocument is not None
-                        and ui.ActiveUIDocument.Document.Equals(document))
-        except Exception as error:
-            raise WorkerUnresolved("Revit could not confirm inspection family closure.") from error
-        if not closed or not restored:
-            raise WorkerUnresolved("Revit did not restore the exact original open project.")
+    read = inspect_loaded(ui, DB, document, family)
     if (document.IsModified or document.IsModifiable or inventory(document, DB) != baseline
             or project_values(document, DB, family) != overrides):
         raise WorkerUnresolved("The project changed during the read-only family inspection.")

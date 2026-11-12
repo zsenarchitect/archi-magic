@@ -135,6 +135,7 @@ def test_loaded_target_uses_independent_family_and_checks_closure(case, monkeypa
     project.EditFamily = open_family
     family_doc.Close = close
     monkeypatch.setattr(transfer, "inventory", lambda *args: {"20": ["family-20", "v1"]})
+    monkeypatch.setattr(transfer, "nested_families", lambda *args: [])
     request = {"role": "target", "family_id": "20", "family_uid": "family-20", "revit_build": "fixture"}
     if outcome == "extra_document":
         with pytest.raises(WorkerUnresolved, match="restore the exact original"):

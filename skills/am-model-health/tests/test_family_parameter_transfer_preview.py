@@ -30,7 +30,7 @@ def read(role, fields, types):
               }}
     if role == "target":
         record.update(project={"project_uid": "fixture"}, loaded_family={"id": "20", "uid": "family-20"},
-                      project_values={"types": [], "instances": []})
+                      project_values={"types": [], "instances": []}, nested_families=[])
     return record
 
 
@@ -471,6 +471,7 @@ def test_seal_requires_independent_exact_reopen(decision_records, tmp_path, monk
     ui = SimpleNamespace(Application=app, ActiveUIDocument=None)
     read = {"family": "Fixture", "category_id": "-1000", "revit_build": "fixture", "state": state}
     monkeypatch.setattr(export, "snapshot", lambda doc, db: read)
+    monkeypatch.setattr(export, "nested_families", lambda ui, db, doc: [])
     workspace = reservation["workspace"]
     request_digest = reservation["request_sha256"]
     if changed_state:
@@ -495,3 +496,121 @@ def test_seal_requires_independent_exact_reopen(decision_records, tmp_path, monk
     with pytest.raises(ValueError, match="does not match the reservation and current file bytes"):
         with export.verified_export(workspace, request_digest):
             pytest.fail("Replaced export was made available")
+
+
+@pytest.mark.parametrize("collision", [None, "nested", "top_level", "different_tree", "stale_target"])
+def test_project_reload_preview_binds_sealed_export_and_rejects_collisions(records, collision):
+    from family_parameter_reload_preview import build_preview
+
+    _, target, _ = records
+    child = {"id": "30", "uid": "family-30", "name": "Inset", "category_id": "-1000", "children": []}
+    target["nested_families"] = [child]
+    target["read_sha256"] = manifest_digest(target)
+    receipt = {"kind": "family-transfer-derived-rfa", "version": 1, "target_sha256": target["read_sha256"],
+               "rfa": {"bytes": 32}, **{key: target[key] for key in ("project", "loaded_family", "family", "category_id", "revit_build",
+                                             "nested_families")}}
+    families = {"20": {"name": "Fixture", "uid": "family-20"}}
+    if collision == "nested":
+        families["99"] = {"name": "INSET", "uid": "existing-99"}
+    elif collision == "top_level":
+        families["99"] = {"name": "fixture", "uid": "existing-99"}
+    elif collision == "different_tree":
+        receipt["nested_families"] = []
+    elif collision == "stale_target":
+        receipt["target_sha256"] = "older target"
+    receipt["derived_sha256"] = manifest_digest(receipt)
+    baseline = {"kind": "family-transfer-reload-baseline", "version": 1, "project": target["project"],
+                "revit_build": target["revit_build"], "families": families, "targets": [target]}
+    baseline["baseline_sha256"] = manifest_digest(baseline)
+    if collision:
+        with pytest.raises(ValueError):
+            build_preview(baseline, [receipt])
+    else:
+        result = build_preview(baseline, [receipt])
+        assert result["rows"] == [{"loaded_family": target["loaded_family"], "name": "Fixture", "receipt": receipt}]
+        assert result.pop("preview_sha256") == manifest_digest(result)
+
+
+def test_nested_inventory_opens_and_closes_descendants(monkeypatch):
+    from types import SimpleNamespace
+    from family_transfer_nested import nested_families
+
+    def identity(identifier, name):
+        return SimpleNamespace(Id=SimpleNamespace(Value=identifier), UniqueId=f"uid-{identifier}", Name=name,
+                               FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-1000)), IsEditable=True,
+                               IsInPlace=False)
+
+    owner, child, grandchild = identity(1, "Top"), identity(2, "Child"), identity(3, "Grandchild")
+    actions = []
+
+    class Family:
+        pass
+
+    class Symbol:
+        pass
+
+    def make_document(family, embedded):
+        document = SimpleNamespace(OwnerFamily=family, IsFamilyDocument=True, IsModifiable=False, IsModified=False,
+                                   IsWorkshared=False, IsModelInCloud=False, embedded=embedded)
+
+        def edit(item):
+            assert item in document.embedded
+            opened = nested_documents[item.Id.Value]
+            application.Documents.append(opened)
+            actions.append(("open", item.Name))
+            return opened
+
+        def close(save):
+            assert save is False
+            application.Documents.remove(document)
+            actions.append(("close", family.Name))
+            return True
+
+        document.EditFamily = edit
+        document.Close = close
+        document.Equals = lambda other: other is document
+        return document
+
+    parent = make_document(owner, [child])
+    nested_documents = {2: make_document(child, [grandchild]), 3: make_document(grandchild, [])}
+    application = SimpleNamespace(Documents=[parent])
+    ui = SimpleNamespace(Application=application, ActiveUIDocument=None)
+    db = SimpleNamespace(Family=Family, FamilySymbol=Symbol, FilteredElementCollector=lambda document: SimpleNamespace(
+        OfClass=lambda cls: document.embedded if cls is Family else [
+            SimpleNamespace(Family=item) for item in document.embedded]))
+    result = nested_families(ui, db, parent)
+    assert result[0]["name"] == "Child"
+    assert result[0]["children"] == [
+        {"id": "3", "uid": "uid-3", "name": "Grandchild", "category_id": "-1000", "children": []}]
+    assert actions == [("open", "Child"), ("open", "Grandchild"), ("close", "Grandchild"), ("close", "Child")]
+    assert application.Documents == [parent]
+
+
+@pytest.mark.parametrize("change", [None, "type_override", "instance_override", "new_type_value", "extra_parameter"])
+def test_reload_checks_every_existing_override_and_new_type_value(change):
+    from copy import deepcopy
+    from family_parameter_reload_effects import verify_project_values
+
+    before = {"types": [{"id": "21", "uid": "type-21", "type_id": "21", "type_name": "Target A",
+                        "parameters": {"40": {"state": "value", "value": 12.0}}}],
+              "instances": [{"id": "31", "parameters": {"41": {"state": "value", "value": 17.0}}}]}
+    after = deepcopy(before)
+    added = {"owner_id": "21", "owner_uid": "type-21", "name": "Panel Width", "shared_guid": None,
+             "built_in": None, "data_type": "length", "storage": "Double", "state": "value", "value": 4.0}
+    fields = after["types"][0]["parameters"]
+    fields["42"] = added
+    additions = {"Panel Width": {"data_type": "length", "storage": "Double",
+                                 "type_values": {"Target A": {"state": "value", "value": 4.0}}}}
+    if change == "type_override":
+        fields["40"]["value"] = 2.0
+    elif change == "instance_override":
+        after["instances"][0]["parameters"]["41"]["value"] = 3.0
+    elif change == "new_type_value":
+        added["value"] = 2.0
+    elif change == "extra_parameter":
+        fields["43"] = dict(added, name="Extra")
+    if change:
+        with pytest.raises(ValueError):
+            verify_project_values(before, after, additions)
+    else:
+        verify_project_values(before, after, additions)

@@ -319,7 +319,13 @@ Verify both decisions in native Revit before use on project data.
 3. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR` to the returned workspace. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR_REQUEST_SHA256` to the returned request digest. Run `pyrevit run scripts/family_parameter_transfer_export.py --revit=2026` in a disposable CPython worker with no model arguments. Wait for the worker to exit.
 4. Run `family_parameter_transfer_export.py collect --workspace <workspace> --request-sha256 <digest>`. Save the receipt. It binds the reopened family state and file bytes to the exact loaded project target.
 
-The guarded project reload still requires native verification.
+### Review the project reload
+
+Open only the saved standalone project. Call `get_context`. Run `scripts/family_parameter_reload_preview.py` in CPython query mode. Pass the exact `revit_build` and a `targets` list with each loaded family's `id` and `uid`. Save the full read as `project-before.json`.
+
+Run `python scripts/family_parameter_reload_preview.py --baseline project-before.json --export export.json`. Repeat `--export` for every reviewed target. Check the family identities and export digests. The preview stops if a nested family could conflict with a loaded project family.
+
+The preview makes no project changes. The guarded reload and native verification are pending.
 
 ## Preview a CAD layout (issue #166)
 
