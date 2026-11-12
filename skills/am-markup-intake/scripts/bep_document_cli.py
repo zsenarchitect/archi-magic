@@ -311,6 +311,7 @@ def paragraph_references(text, reviewed, known_names):
             value = labeled[1].strip().strip('"“”')
         if FIELD_REFERENCE.fullmatch(value) and len(re.findall(RV, value, re.I)) == 1:
             return [value]
+        return []
     if len(text) <= MAX_VALUE and normalize(text) in known_names:
         return [text]
     matches = islice(REFERENCES.finditer(text), MAX_REFERENCES + 1)
