@@ -269,3 +269,71 @@ def test_host_refuses_identical_staged_replacement_after_metadata_preflight(batc
     receipt = json.loads((work / "host-receipt.json").read_text())
     assert [row["status"] for row in receipt["rows"]] == ["staged_changed"] + ["audited"] * 4
     assert ("open", "model-001.rvt") not in events
+
+
+def test_qualification_launch_uses_only_the_pinned_worker(batch, tmp_path):
+    import qualify_batch_host as launcher
+
+    root, work, _, _ = batch
+    executable = tmp_path / "pyrevit.exe"
+    executable.write_bytes(b"fixture executable")
+    command, directory, manifest = launcher.qualification_command(str(executable), str(work))
+    assert command == [str(executable), "run", str(work / "read_batch_models.py"), "--revit=2026"]
+    assert directory == work and str(root) not in json.dumps(manifest)
+    worker = work / "read_batch_models.py"
+    worker.write_bytes(b"changed worker")
+    manifest["audit_sha256"][worker.name] = sha256(worker.read_bytes()).hexdigest()
+    (work / "host-manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="does not match the bundled worker"):
+        launcher.qualification_command(str(executable), str(work))
+
+
+def test_qualification_releases_real_bootstrap_only_after_assignment(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    import qualify_batch_host as launcher
+
+    marker = tmp_path / "started"
+    command = [sys.executable, "-c", "from pathlib import Path; Path('started').write_text('started')"]
+
+    class TestJob:
+        def session(self):
+            return nullcontext()
+
+        def contain(self, process):
+            assert process.poll() is None and not marker.exists()
+            self.process = process
+
+        def active(self):
+            return int(self.process.poll() is None)
+
+        def terminate(self):
+            self.process.kill()
+
+    class RefusedJob(TestJob):
+        def contain(self, process):
+            super().contain(process)
+            raise ValueError("Assignment refused.")
+
+    with pytest.raises(ValueError, match="Assignment refused"):
+        launcher.run_contained(command, tmp_path, 5, job=RefusedJob())
+    assert not marker.exists()
+    launcher.run_contained(command, tmp_path, 5, job=TestJob())
+    assert marker.read_text() == "started"
+    marker.unlink()
+
+    monkeypatch.setattr(launcher, "LOG_LIMIT", 8)
+    noisy = [sys.executable, "-c", "print('bounded stdout and stderr')"]
+    with pytest.raises(ValueError, match="exceeded its output limit"):
+        launcher.run_contained(noisy, tmp_path, 5, job=TestJob())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="non-Windows guard")
+def test_qualification_command_refuses_other_platforms(tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "qualify_batch_host.py"), "--pyrevit", str(tmp_path / "pyrevit.exe"),
+         "--workspace", str(tmp_path), "--offline-fixture-host"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires Windows" in result.stderr
+    assert not (tmp_path / "qualification-attempt").exists()
