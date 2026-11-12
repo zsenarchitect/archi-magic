@@ -426,6 +426,7 @@ tr.fold button:hover { color: var(--ink); }
 
 <script type="application/json" id="data">__DATA_JSON__</script>
 <script type="application/json" id="data2">__DATA2_JSON__</script>
+<script type="application/json" id="deletions">__DELETIONS_JSON__</script>
 <script>
 (function () {
   "use strict";
@@ -850,6 +851,14 @@ tr.fold button:hover { color: var(--ink); }
     $("banner").innerHTML = blocked + status + chips;
 
     var pre = "";
+    var deletions = opt.compareMode ? [] : parse("deletions") || [];
+    if (deletions.length) {
+      pre += '<div class="notes"><h2>Delete: ' + deletions.length +
+        (deletions.length === 1 ? " element" : " elements") + '</h2><ul>' +
+        deletions.map(function (item) {
+          return "<li>ID " + esc(item.id) + " | " + esc(item.category) + " | " + esc(item.name) + "</li>";
+        }).join("") + "</ul></div>";
+    }
     if (nw) {
       pre += '<div class="warnings"><h2><span class="am-status warn" aria-hidden="true"></span>Warnings</h2><ul>' + cp.warnings.map(function (w) {
         return '<li><a data-key="' + esc(w.row) + '">' + esc(w.row) + "</a> " + esc(w.text) + "</li>";
