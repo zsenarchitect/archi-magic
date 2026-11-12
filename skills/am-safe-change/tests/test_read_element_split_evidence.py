@@ -357,6 +357,72 @@ class Changed:
             handler(None, event)
 
 
+def independent_baseline(document, source_request):
+    audit = {"source_request": source_request, "controls": [{"id": "11", "uid": "uid-11"}],
+             "trial_transaction": None, "absent_ids": []}
+    before = invoke(document, {"rollback_audit": audit})
+    assert before["status"] == "ok", before
+    context = {"audit_token": before["audit_token"], "controls_sha256": sha256(before["controls_json"].encode()).hexdigest(),
+               "controls": audit["controls"]}
+    return audit, before, context
+
+
+def check_independent_trial(tmp_path, document, audit, baseline, result, approval, cascade=None):
+    receipt = json.loads(result["trial_json"])
+    name = receipt["transaction"]
+    fresh = invoke(document, {"rollback_audit": dict(audit, trial_transaction=name,
+                                                    absent_ids=receipt["inner_effects"]["added"])})
+    assert fresh["status"] == "ok", fresh
+    assert fresh["audit_token"] != baseline["audit_token"]
+
+    def bridge(identifier, mode, result, added=(), modified=(), deleted=(), names=()):
+        return {"run_id": identifier, "status": "ok", "mode": mode, "decision": "rolled_back", "exit_code": 0,
+                "result_truncated": False, "engine": {"requested": "cpython"}, "result": result,
+                "changes": {"added": [{"id": int(value)} for value in added], "added_count": len(added),
+                            "modified": [{"id": int(value)} for value in modified], "modified_count": len(modified),
+                            "deleted": list(map(int, deleted)), "deleted_count": len(deleted),
+                            "transactions": list(names),
+                            "by_category": {"Fixture": len(added) + len(modified)} if added or modified else {}}}
+
+    if cascade is None:
+        saved_trial = bridge("trial-2", "dry_run", result, modified=["12"], names=[name])
+    else:
+        # Released AgentChangeSet records restored IDs as added and retains their earlier deletion IDs.
+        saved_trial = bridge("trial-2", "dry_run", result, added=["13", "20", "23"], deleted=["13", "20", "23"], names=[name])
+    saved_before = bridge("before-1", "query", baseline)
+    saved_after = bridge("after-3", "query", fresh)
+    paths = [tmp_path / name for name in ("before.json", "trial.json", "after.json", "approval.json")]
+    paths[-1].write_text(approval)
+    command = [sys.executable, str(SCRIPTS / "verify_split_trial_receipt.py"), *map(str, paths)]
+    if cascade is not None:
+        path = tmp_path / "cascade.json"
+        path.write_text(cascade)
+        command.extend(["--floor-cascade", str(path)])
+    for fault in ("none", "same_run", "changed_control", "omitted_id", "extra_bridge_effect"):
+        if cascade is not None and fault != "none":
+            continue
+        after = json.loads(json.dumps(saved_after))
+        trial = json.loads(json.dumps(saved_trial))
+        if fault == "same_run":
+            after["run_id"] = "before-1"
+        elif fault == "changed_control":
+            after["result"]["controls_json"] = '{"11":"different"}'
+        elif fault == "omitted_id":
+            after["result"]["confirmed_absent_ids"] = fresh["confirmed_absent_ids"][:-1]
+        elif fault == "extra_bridge_effect":
+            trial["changes"]["modified"][0]["id"] = 100
+        for path, record in zip(paths, (saved_before, trial, after)):
+            path.write_text(json.dumps(record))
+        checked = subprocess.run(command, capture_output=True, text=True)
+        if fault == "none":
+            assert checked.returncode == 0, checked.stderr
+            verified = json.loads(checked.stdout)
+            assert verified["status"] == "verified_split_trial_rollback"
+            assert verified["run_ids"] == ["before-1", "trial-2", "after-3"]
+        else:
+            assert checked.returncode == 2 and not checked.stdout, checked
+
+
 def install_trial_transactions(db, document, elements, created, changes, status, fault, original):
     started = []
     class Transaction:
@@ -410,7 +476,7 @@ def install_trial_transactions(db, document, elements, created, changes, status,
     ("wrong_point_native", "stopped_and_rolled_back"),
     ("point_twist", "stopped_and_rolled_back"),
 ])
-def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, monkeypatch, fault, expected):
+def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, monkeypatch, tmp_path, fault, expected):
     document, elements, _ = model
     db = sys.modules["pyrevit.api"].DB
     monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
@@ -478,9 +544,11 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
                                    "parameter:-1001357": low, "parameter:-1001358": high - 20}}
                                for index, (low, high) in enumerate(((0, 8), (8, 15), (15, 20)), 1)]})
     approval_sha = sha256(approval.encode()).hexdigest()
+    audit, baseline, context = independent_baseline(document, before_request)
     result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
         "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
         "approval_json": approval, "approval_sha256": "f" * 64 if fault == "digest" else approval_sha,
+        "audit_context": context,
     }})["result"]
     assert result["status"] == expected, result
     assert not changes.handlers
@@ -504,6 +572,8 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
         assert [row["location"] for row in receipt["column_cuts"]] == ["point" if point_based else "curve"] * 2
         assert [row["spans_ft"] for row in receipt["column_cuts"]] == [[[0, 8], [8, 20]], [[8, 15], [15, 20]]]
         assert invoke(document, before_request) == before
+        if fault == "none":
+            check_independent_trial(tmp_path, document, audit, baseline, result, approval)
 
 
 @pytest.mark.parametrize("fault, expected", [
@@ -753,7 +823,7 @@ def test_floor_cascade_discovery_reconciles_exact_owned_ids_after_rollback(model
     ("extra_creation", "transaction_unresolved"),
     ("wrong_thickness", "stopped_and_rolled_back"),
 ])
-def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, monkeypatch, fault, expected):
+def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, monkeypatch, tmp_path, fault, expected):
     document, elements, _ = model
     db = sys.modules["pyrevit.api"].DB
     for name in ("read_element_split_evidence", "probe_floor_split_cascade", "floor_split_replacement"):
@@ -916,10 +986,11 @@ def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, mo
                           "snapshot_sha256": snapshot_sha, "inventory_sha256": inventory_sha,
                           "source": {"id": "13", "uid": "uid-13"}, "sketch": {"id": "20", "uid": "uid-20"},
                           "deleted": [{"id": str(i), "uid": f"uid-{i}"} for i in (13, 20, 23)]})
+    audit, baseline, context = independent_baseline(document, before_request)
     result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
         "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
         "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
-        "floor_cascade_json": cascade,
+        "audit_context": context, "floor_cascade_json": cascade,
         "floor_cascade_sha256": "f" * 64 if fault == "wrong_cascade_sha" else sha256(cascade.encode()).hexdigest(),
     }})["result"]
     assert result["status"] == expected, result
@@ -938,3 +1009,4 @@ def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, mo
         readback = json.loads(receipt["readback_json"])
         assert all(any(row["identity"] == "shared:floor-finish" and row["value"] == "Reviewed"
                        for row in piece["parameters"]) for piece in readback["pieces"])
+        check_independent_trial(tmp_path, document, audit, baseline, result, approval, cascade)

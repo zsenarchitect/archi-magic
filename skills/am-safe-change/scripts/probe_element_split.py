@@ -31,6 +31,8 @@ def preflight(document, args):
     required = {"mode", "disposable_fixture", "source_request", "approval_json", "approval_sha256"}
     if floor_input:
         required.update(("floor_cascade_json", "floor_cascade_sha256"))
+    if isinstance(args, dict) and "audit_context" in args:
+        required.add("audit_context")
     planner.fields(args, required)
     if args["mode"] != "rollback_trial" or args["disposable_fixture"] is not True:
         raise ValueError("Use the rollback trial on an approved disposable fixture.")
@@ -38,7 +40,15 @@ def preflight(document, args):
     if (not isinstance(approval_text, str) or len(approval_text.encode("utf-8")) > planner.MAX_BYTES
             or digest(approval_text) != args["approval_sha256"]):
         raise ValueError("The reviewed approval digest does not match.")
+    planner.fields(args["source_request"], {"host_identity", "scope"})
     source = reader.main(document, args["source_request"])
+    audit_context = args.get("audit_context")
+    if audit_context is not None:
+        planner.fields(audit_context, {"audit_token", "controls_sha256", "controls"})
+        if (len(planner.uid(audit_context["audit_token"])) != 32
+                or digest(reader.audit_controls(document, args["source_request"], audit_context["controls"]))
+                != audit_context["controls_sha256"]):
+            raise ValueError("The unrelated controls differ from the independent baseline.")
     snapshot = parse(source["snapshot_json"])
     inventory = parse(source["inventory_json"])
     approved = parse(approval_text)
@@ -470,6 +480,10 @@ def run(document, args):
             raise ValueError("A trial piece still resolves after rollback.")
         if reader.main(document, args["source_request"]) != source:
             raise ValueError("The original source evidence differs after rollback.")
+        audit_context = args.get("audit_context")
+        if audit_context is not None and digest(
+                reader.audit_controls(document, args["source_request"], audit_context["controls"])) != audit_context["controls_sha256"]:
+            raise ValueError("The unrelated controls differ after rollback.")
         if floor_basis is not None:
             floor_trial.verify_restored(document, floor_basis, snapshot["elements"][0]["geometry"])
         budget = reader.ReadBudget()
@@ -493,7 +507,10 @@ def run(document, args):
     report = {"status": "trial_rolled_back", "transaction": transaction_name, "approval_sha256": args["approval_sha256"],
               "inner_effects": serializable(commit_events[0]), "rollback_events": list(map(serializable, rollback_events)),
               "comparison": comparison, "readback_json": readback_text, "wall_measurements": wall_measurements,
-              "column_cuts": column_cuts}
+              "column_cuts": column_cuts, "snapshot_sha256": digest(source["snapshot_json"]),
+              "inventory_sha256": digest(source["inventory_json"])}
+    if audit_context is not None:
+        report.update(baseline_audit_token=audit_context["audit_token"], controls_sha256=audit_context["controls_sha256"])
     if floor_basis is not None:
         report.update(floor_measurements=floor_measurements, floor_cascade_sha256=args["floor_cascade_sha256"])
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False)

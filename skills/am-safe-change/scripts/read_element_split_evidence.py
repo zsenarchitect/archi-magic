@@ -4,6 +4,7 @@ from hashlib import sha256
 import json
 import math
 from time import monotonic
+from uuid import uuid4
 
 from System import Int64
 from pyrevit.api import DB
@@ -350,6 +351,41 @@ def readback(document, args, project, version):
     return {"status": "ok", "readback_json": encoded}
 
 
+def audit_controls(document, source_request, controls):
+    source_ids = {row["source"]["id"] for row in source_request["scope"]}
+    budget = ReadBudget()
+    measured = {}
+    for control in bounded_list(controls, 1, MAX_SOURCES, "unrelated controls"):
+        geometry, inventory = read_source(document, {"source": control, "cuts": []},
+                                          budget, require_split_eligible=False)
+        element_id = geometry["id"]
+        if element_id in source_ids or element_id in measured:
+            raise ValueError("Each rollback control must be distinct from the split sources and other controls.")
+        measured[element_id] = {"geometry": geometry, "inventory": inventory}
+    encoded = json.dumps(measured, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded) > MAX_BYTES or monotonic() >= budget.deadline:
+        raise ValueError("The rollback control read exceeded its evidence budget.")
+    return encoded
+
+
+def rollback_audit(document, args, project):
+    fields(args, {"source_request", "controls", "trial_transaction", "absent_ids"})
+    fields(args["source_request"], {"host_identity", "scope"})
+    source = main(document, args["source_request"])
+    controls = audit_controls(document, args["source_request"], args["controls"])
+    name = args["trial_transaction"]
+    absent = [identifier(value) for value in bounded_list(args["absent_ids"], 0, MAX_DEPENDENCIES + 2, "trial IDs")]
+    if (absent != sorted(set(absent), key=int) or (name is None) != (not absent)
+            or name is not None and not isinstance(name, str)):
+        raise ValueError("Use the exact trial name and sorted distinct addition IDs for a post-rollback audit.")
+    if any(document.GetElement(DB.ElementId(Int64(int(value)))) is not None for value in absent):
+        raise ValueError("A trial addition still resolves in the fresh project audit.")
+    if project_identity(document) != project or sum(len(source[key]) for key in ("snapshot_json", "inventory_json")) + len(controls) > MAX_BYTES:
+        raise ValueError("The rollback audit source changed or its evidence is too large.")
+    return dict(source, controls_json=controls, audit_token=uuid4().hex, trial_transaction=name,
+                confirmed_absent_ids=absent)
+
+
 def main(document, args):
     reading_results = isinstance(args, dict) and "readback" in args
     project = project_identity(document, allow_modified=reading_results)
@@ -358,6 +394,9 @@ def main(document, args):
         raise ValueError("Use Revit 2026 for the initial native split qualification.")
     if reading_results:
         return readback(document, args, project, version)
+    if isinstance(args, dict) and "rollback_audit" in args:
+        fields(args, {"rollback_audit"})
+        return rollback_audit(document, args["rollback_audit"], project)
     if args == {"describe": True}:
         return {"status": "ok", "host_identity": project, "revit_version": version}
     fields(args, {"host_identity", "scope"})

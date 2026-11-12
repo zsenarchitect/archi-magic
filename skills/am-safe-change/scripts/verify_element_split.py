@@ -27,11 +27,11 @@ ADJUSTABLE = {
 }
 
 
-def read_json(path):
+def read_json(path, max_bytes=MAX_BYTES):
     with path.open("rb") as stream:
-        raw = stream.read(MAX_BYTES + 1)
-    if len(raw) > MAX_BYTES:
-        raise ValueError("A readback input exceeds 2 MiB.")
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"A readback input exceeds {max_bytes} bytes.")
     return json.loads(raw, parse_float=Decimal, object_pairs_hook=exact_object), sha256(raw).hexdigest()
 
 
