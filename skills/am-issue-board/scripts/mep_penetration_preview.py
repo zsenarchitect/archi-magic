@@ -19,6 +19,10 @@ def fingerprint(value):
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
+def crossing_key(project, link, link_instance, host_uid, run_uid):
+    return fingerprint([project, link, link_instance, host_uid, run_uid])
+
+
 def vector(value, size):
     if not isinstance(value, (list, tuple)) or len(value) != size:
         raise ValueError("Invalid measured coordinates.")
@@ -103,7 +107,7 @@ def tracked_status(rows, key, host, run, pair, complete, clearance, tolerance):
         opening = uid(row["opening_uid"])
         if (digest(row["crossing_key"]) != key or opening != uid(row["observed_uid"])
                 or uid(row["observed_host_uid"]) != row["host_uid"] or row["cut_verified"] is not True):
-            return "unresolved", "The tracking identity or actual host cut could not be verified."
+            return "unresolved", row.get("reason") or "The tracking identity or actual host cut could not be verified."
         if not complete or host is None or run is None or pair is None:
             return "unresolved", "Current link or host evidence is incomplete."
         prior = row["geometry"]
@@ -117,6 +121,8 @@ def tracked_status(rows, key, host, run, pair, complete, clearance, tolerance):
             return "unresolved", "The current gross host crossing could not be verified."
         geometry = measured_geometry(host, run, pair, clearance, tolerance)
         if geometry_matches(prior, geometry, tolerance):
+            if pair["status"] != "gross_crossing" or pair.get("existing_cut_verified") is not True:
+                return "unresolved", "The linked run still crosses host material or the void evidence is incomplete."
             return "current", "The tracked opening and linked crossing still match."
         return "out_of_date", "The linked crossing or host geometry changed."
     except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
@@ -145,12 +151,13 @@ def preview(snapshot):
     for row in bounded_list(snapshot["tracked"], MAX_PAIRS):
         tracked.setdefault(pair_key(row), []).append(row)
 
-    complete = snapshot["complete"] is True and len(pairs) == len(hosts) * len(runs)
+    tracking_issues = bounded_list(snapshot.get("tracking_issues", []), MAX_PAIRS)
+    complete = snapshot["complete"] is True and not tracking_issues and len(pairs) == len(hosts) * len(runs)
     findings, proposed = {}, {}
     for host_id, run_id in sorted(pairs.keys() | tracked.keys()):
         pair = pairs.get((host_id, run_id))
         host, run = hosts.get(host_id), runs.get(run_id)
-        key = fingerprint([project, link, link_instance, host_id, run_id])
+        key = crossing_key(project, link, link_instance, host_id, run_id)
         report = {"crossing_key": key, "ruleId": "MEP-PEN-01", "host_uid": host_id, "run_uid": run_id,
                   "host_id": host["id"] if host else None, "linked_run_id": run["id"] if run else None,
                   "system": run.get("system") if run else None}
@@ -192,7 +199,8 @@ def preview(snapshot):
                     finding = findings[key]
                     finding.update(status="unresolved", reason="An opening leaves too little material beside another cut.")
                     finding.setdefault("spacing_conflicts", []).append(conflict)
-    return {"kind": "mep-penetration-preview", "complete": complete, "findings": list(findings.values())}
+    return {"kind": "mep-penetration-preview", "complete": complete,
+            "tracking_issues": tracking_issues, "findings": list(findings.values())}
 
 
 def main():

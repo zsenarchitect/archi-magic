@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from issue_board import saved_document_identity
 from mep_penetration_preview import fingerprint
 from mep_penetration_spacing import profile, scalar, spacing_conflicts, vertices
-from structural_compare_cli import LIMIT, bounded_list, checked_id, uid
+from mep_penetration_tracking import read_tracking
+from structural_compare_cli import LIMIT, bounded_list, checked_id, identity, uid
 
 
 class ReadLimit(ValueError):
@@ -548,14 +549,19 @@ def read(DB, document, args):
             reason = str(error) if isinstance(error, ValueError) else type(error).__name__
             row = {"status": "unresolved", "reason": reason}
         pairs.append(dict(row, host_uid=host["uid"], run_uid=run["uid"]))
+    link_uid = uid(str(link.UniqueId))
+    tracking_hosts = {row["uid"]: (row, geometry[1] if geometry is not None else None) for row, geometry in hosts}
+    tracked, tracking_issues = read_tracking(DB, document, tracking_hosts, identity(project), identity(linked_identity),
+                                            link_uid, tolerance, budget)
     if document.IsModified or linked.IsModified or document.IsModifiable:
         raise ValueError("The host or linked document changed during the read.")
     report = {"kind": "mep-penetration-evidence", "frame": "revit_host_internal_feet",
-              "host_identity": project, "link_identity": linked_identity, "link_instance_uid": uid(str(link.UniqueId)),
+              "host_identity": project, "link_identity": linked_identity, "link_instance_uid": link_uid,
               "link_instance_id": checked_id(str(link.Id.Value)),
               "link_transform": {key: xyz(getattr(transform, key)) for key in ("Origin", "BasisX", "BasisY", "BasisZ")},
-              "clearance_ft": clearance, "tolerance_ft": tolerance, "complete": True,
-              "hosts": [row for row, _ in hosts], "runs": [row for row, _ in runs], "pairs": pairs, "tracked": []}
+              "clearance_ft": clearance, "tolerance_ft": tolerance, "complete": not tracking_issues,
+              "hosts": [row for row, _ in hosts], "runs": [row for row, _ in runs], "pairs": pairs, "tracked": tracked,
+              "tracking_issues": tracking_issues}
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     budget.visit()
     if len(encoded) > LIMIT:

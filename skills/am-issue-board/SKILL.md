@@ -192,7 +192,9 @@ Pass `link_instance_id`, `host_ids`, and `run_ids` as exact decimal strings. Use
 
 Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The reader covers rectangular host solids and finite straight runs with measured exterior profiles. It checks round and rectangular cuts against both face outlines and the full host depth. It reports an existing cut without a tracking record as untracked. Unsupported or ambiguous geometry stays unresolved.
 
-Verify this reader on a disposable Revit fixture before use. Native tracking storage and guarded placement are pending.
+The query reads versioned tracking records on existing opening instances. It checks the recorded opening and host IDs, the actual cut, and the measured opening shape. A copied tag or a missing cut cannot establish a current opening. A damaged record blocks proposals for that scan.
+
+Verify this reader on a disposable Revit fixture before use. Writing tracking records and guarded placement are pending.
 
 ## Rules
 

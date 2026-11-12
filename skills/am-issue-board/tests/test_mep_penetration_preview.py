@@ -78,7 +78,7 @@ def test_cli_sizes_reviewed_crossing_with_explicit_clearance(tmp_path, evidence,
 def test_tracking_distinguishes_motion_missing_evidence_and_existing_voids(evidence, change, status):
     key = track(evidence)
     pair = evidence["pairs"][0]
-    pair["status"] = "gross_crossing"
+    pair.update(status="gross_crossing", existing_cut_verified=True)
     if change in {"small_measurement_noise", "moved_within_host"}:
         shift = 0.0001 if change == "small_measurement_noise" else 1.0
         pair["entry_ft"][1] += shift
