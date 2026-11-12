@@ -17,6 +17,31 @@ Check these categories: line styles, text types, dimension types, filled region 
 
 Call `get_context` before the first Revit call. If Revit answers `revit_busy`, stop and tell the user which dialog blocks Revit.
 
+### Inventory placed door and window types
+
+Use `scripts/read_opening_types.py` with `run_query` in a saved host project. Decode `snapshot_json`. It lists each placed door or window type once, with its placement count, type mark, and nominal width and height. Unused types and linked documents are outside this inventory.
+
+Review missing nominal sizes and any measured variation before choosing a label. A repeated type mark does not combine two types. This query prepares the type list for a legend.
+
+Pass `{"legend_id":"123"}` to compare the inventory with an existing legend. The query reads components and text notes owned by that view. In Revit 2026, `coverage` lists missing and duplicate elevations, elevations of unplaced types, and unresolved directions. For other versions, the report gives raw direction values. Check the direction in Revit before drawing conclusions about coverage.
+
+In Revit 2026, add `source_legend_id`, `seed_component_id`, and `text_type_id` to read the layout for a proposed update. Use a separate source legend with a measured door or window front elevation. The query records target graphics, front-elevation coverage, and every sheet placement. Check the viewport box and label bounds separately.
+
+Save the full layout query as `read.json`. Set `grid` in `intent.json` with `origin_uv_ft`, `columns`, `cell_width_ft`, and `cell_height_ft`. Run `python scripts/opening_legend_preview.py read.json intent.json > preview.json`. Pass explicit single-line `labels` keyed by type UID for unresolved mark or size data. A refresh also needs the previous kept-run `receipt`. Render the change preview and check adds, refreshes, and retirements. For each retirement, show and review both exact IDs in the Delete list before running the dry run. Revit must verify the actual graphics and sheet fit before any update. For a legend on sheets, include `sheet_rectangles_ft` keyed by sheet ID. Give each available rectangle as `[min_x,min_y,max_x,max_y]` in paper-space feet.
+
+Use a disposable Revit 2026 project to qualify the writer. Follow am-safe-change for the preview, ownership check and approval.
+
+1. Run `scripts/apply_opening_legend.py` with `run_modify` and `dry_run: true`. Set `workspace` to this skill's scripts folder. Pass the full approved JSON as `{"preview": {...}}`.
+2. Recover the full run and save it as `dry.json`. Repeat the original layout query and save it as `fresh.json`. Run `python scripts/opening_legend_preview.py fresh.json preview.json --verify dry-run --run dry.json`. Stop if it fails. Show the added, edited, deleted and regenerated viewport counts.
+3. Recheck the Revit context, approval policy and ownership. Run the same preview. Use Keep or Discard under `ask`. Under `auto`, get approval again after the dry run. Save the complete run as `real.json`.
+4. Run the original layout query again. Verify the new `fresh.json` with `--verify discard --run real.json` after Discard. After Keep, use `--verify keep --run real.json` and save the returned receipt for the next update. Use Undo if the kept read differs.
+5. Inspect the actual elevation, label and sheet layout in Revit. Use the kept receipt in the next intent only after confirming the result.
+
+
+
+
+
+
 ### 2. Run the coverage check first (read only)
 
 Read the model. For each category, read the type names in the model. For each sample view, read each row: the label text and the type the sample itself uses. Do not fix anything yet. Feed the read result into `scripts/check_samples.py` as JSON (see Data shapes). Show the report to the user. The report lists four findings:
