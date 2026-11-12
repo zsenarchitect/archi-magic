@@ -64,6 +64,7 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
 
     symbols = {}
     attempts = []
+    version = "v1"
     family = SimpleNamespace(Id=identifier(40), UniqueId="family-40", Name="Fixture",
                              FamilyCategory=SimpleNamespace(Id=identifier(-1000)),
                              GetFamilySymbolIds=lambda: [symbol.Id for symbol in symbols.values()])
@@ -89,7 +90,7 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
         return {"project": "fixture", "rows": rows}
 
     def inventory(*args):
-        found = {"19": ["existing", "v1"]}
+        found = {"19": ["existing", version]}
         if symbols:
             found["40"] = ["family-40", "v1"]
             found.update({str(symbol.Id.Value): [symbol.UniqueId, "v1"] for symbol in symbols.values()})
@@ -104,7 +105,7 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
             return family
         return next((symbol for symbol in symbols.values() if symbol.Id.Value == key), None)
 
-    project = SimpleNamespace(GetElement=get_element, Application=SimpleNamespace(DocumentChanged=EventHook()),
+    project = SimpleNamespace(GetElement=get_element, IsModifiable=False, Application=SimpleNamespace(DocumentChanged=EventHook()),
                               LoadFamilySymbol=load, Regenerate=lambda: None,
                               Equals=lambda other: other is project)
     monkeypatch.setattr(probe, "read_project", snapshot)
@@ -186,6 +187,33 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
         with pytest.raises(ValueError, match="does not prove the recorded decision"):
             verifier.verify_decision({}, {}, preview, before, trial, after, modify, tampered)
 
+        skip_rows = [{"line": row["line"], "existing": row["existing"]} for row in snapshot()["rows"]]
+        rerun_lookup = {"rows": snapshot()["rows"]}
+        skip_preview = {"review": {"exports": [], "skipped": skip_rows}, "blocked": False}
+        monkeypatch.setattr(probe, "build_load_preview", lambda *args: skip_preview)
+        monkeypatch.setattr(verifier, "build_load_preview", lambda *args: skip_preview)
+        version = "v2-after-save"
+        rerun_before = audit("rerun-before")
+        rerun_args = {"disposable_fixture": True, "lookup": rerun_lookup, "preview": skip_preview, "staging": {},
+                      "preview_sha256": manifest_digest(skip_preview),
+                      "baseline_audit_token": rerun_before["result"]["audit_token"]}
+        count = len(attempts)
+        rerun = envelope("rerun", "dry_run", probe.run_trial(project, db, rerun_args))
+        assert len(attempts) == count
+        rerun_after = audit("rerun-after")
+        repeat = verifier.verify_rerun(rerun_lookup, {}, checked, skip_preview, rerun_before, rerun, rerun_after)
+        assert repeat["status"] == "batch_family_load_rerun_verified" and repeat["skipped"] == skip_rows
+        wrong = copy.deepcopy(rerun)
+        wrong["changes"]["transactions"] = ["Unreviewed transaction"]
+        with pytest.raises(ValueError, match="saved no-op result"):
+            verifier.verify_rerun(rerun_lookup, {}, checked, skip_preview, rerun_before, wrong, rerun_after)
+        wrong = copy.deepcopy(rerun_after)
+        wrong["result"]["inventory"]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="left the project unchanged"):
+            verifier.verify_rerun(rerun_lookup, {}, checked, skip_preview, rerun_before, rerun, wrong)
+
+        monkeypatch.setattr(verifier, "build_load_preview", lambda *args: preview)
+        version = "v1"
         Scope(project, "discard").RollBack()
         modify = envelope("modify", "modify", replay, decision="discarded", approval="user")
         fresh = audit("discard-read", replay["transaction"], replay["effects"]["added"])

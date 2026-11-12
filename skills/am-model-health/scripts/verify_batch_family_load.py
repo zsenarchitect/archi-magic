@@ -130,7 +130,43 @@ def verify_decision(lookup, staging, preview, before, trial, after, modify, fres
         raise ValueError("Discard did not restore the original project.")
     return {"status": "batch_family_load_keep_verified" if kept else "batch_family_load_discard_verified",
             "project": baseline["project"], "modify_run_id": modify["run_id"], "fresh_run_id": fresh["run_id"],
-            "effects": effects}
+            "effects": effects, "run_ids": proof["run_ids"] + [modify["run_id"], fresh["run_id"]],
+            "snapshot_sha256": manifest_digest(observed)}
+
+
+def verify_rerun(lookup, staging, kept, preview, before, rerun, after):
+    if kept["status"] != "batch_family_load_keep_verified":
+        raise ValueError("Verify the user's Keep before checking a repeated batch.")
+    before = require_no_changes(before, "query")
+    rerun = require_no_changes(rerun, "dry_run")
+    after = require_no_changes(after, "query")
+    run_ids = [record["run_id"] for record in (before, rerun, after)]
+    if len(set(kept["run_ids"] + run_ids)) != len(kept["run_ids"]) + 3:
+        raise ValueError("Use independent project reads and a fresh no-op run.")
+    baseline, original = audit(before)
+    observed, current = audit(after)
+    if manifest_digest(baseline) != kept["snapshot_sha256"] or baseline != observed:
+        raise ValueError("The repeated batch does not see the exact retained project types.")
+    if (original["audit_token"] == current["audit_token"] or original["transaction"] is not None
+            or current["transaction"] is not None or original["present_ids"] or current["present_ids"]
+            or original["absent_ids"] or current["absent_ids"]
+            or original["inventory"] != current["inventory"]
+            or original["preserved_inventory"] != original["inventory"]
+            or current["preserved_inventory"] != current["inventory"]):
+        raise ValueError("The fresh audits do not prove that the repeated batch left the project unchanged.")
+    if (build_load_preview(lookup, baseline, staging, []) != preview or preview["review"]["exports"]
+            or preview["blocked"] or len(preview["review"]["skipped"]) != len(lookup["rows"])):
+        raise ValueError("The repeated preview does not skip every row of the reviewed batch.")
+    result = rerun["result"]
+    if (result.get("status") != "no_derivation_needed" or result.get("skipped") != preview["review"]["skipped"]
+            or result.get("preview_sha256") != manifest_digest(preview)
+            or result.get("baseline_audit_token") != original["audit_token"]
+            or result.get("baseline_sha256") != manifest_digest(baseline)
+            or result.get("baseline_inventory") != original["inventory"]
+            or rerun["changes"].get("transactions")):
+        raise ValueError("The saved no-op result does not match the repeated all-skip preview.")
+    return {"status": "batch_family_load_rerun_verified", "project": kept["project"],
+            "skipped": result["skipped"], "run_ids": run_ids}
 
 
 def main():
@@ -140,13 +176,21 @@ def main():
         parser.add_argument(name)
     parser.add_argument("--modify")
     parser.add_argument("--fresh")
+    rerun_names = ("rerun_preview", "rerun_before", "rerun", "rerun_after")
+    for name in rerun_names:
+        parser.add_argument("--" + name.replace("_", "-"))
     args = parser.parse_args()
+    rerun_paths = [getattr(args, name) for name in rerun_names]
+    if any(rerun_paths) and (not all(rerun_paths) or not args.modify or not args.fresh):
+        parser.error("Supply the Keep records and all four repeat-run artifacts.")
     if bool(args.modify) != bool(args.fresh):
         parser.error("Supply both --modify and --fresh to verify a final decision.")
     try:
         records = [load_json(getattr(args, name)) for name in names]
         proof = (verify_decision(*records, load_json(args.modify), load_json(args.fresh))
                  if args.modify else verify(*records))
+        if all(rerun_paths):
+            proof = verify_rerun(records[0], records[1], proof, *(load_json(path) for path in rerun_paths))
     except (AttributeError, KeyError, OSError, OverflowError, RecursionError, TypeError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2

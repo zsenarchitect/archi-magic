@@ -184,7 +184,10 @@ def run_trial(document, DB, args, *, handoff=None, expected_state=None):
     if build_load_preview(args["lookup"], before, args["staging"], exports) != preview:
         raise ValueError("The project or sealed exports changed after review.")
     if not groups:
-        return {"status": "no_derivation_needed", "skipped": preview["review"]["skipped"]}
+        return {"status": "no_derivation_needed", "skipped": preview["review"]["skipped"],
+                "preview_sha256": args["preview_sha256"], "baseline_audit_token": token,
+                "baseline_sha256": manifest_digest(before),
+                "baseline_inventory": inventory_record(inventory(document, DB))}
     with ExitStack() as stack:
         bound = []
         for workspace, group in zip(exports, groups):

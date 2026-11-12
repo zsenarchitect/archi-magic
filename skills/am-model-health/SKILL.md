@@ -264,7 +264,8 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 5. Run `verify_batch_family_load.py lookup.json staging.json preview.json before.json trial.json after.json`. Review the exact effects and confirmed project restoration.
 6. Recheck the project and ask policy. Obtain approval for the real load. Run `apply_batch_family_load.py` in guarded CPython modify mode. Pass the same trial inputs as `load_run` and the full records as `before`, `trial`, and `after`.
 7. Use Revit's Keep or Discard prompt. Save the full modify record. Run the project query again with its transaction and effect IDs. Set `kept: true` only after Keep. Run the verifier with `--modify modify.json --fresh fresh.json`.
-8. Save the project after a verified Keep. Rerun the table and check that the preview skips the retained types. This workflow still requires native qualification with the loaded Revit bridge.
+8. Save the project after a verified Keep. Run a fresh project audit and rebuild the preview for the same lookup with no exports. Run the rollback probe with that preview and the fresh audit token. Save the no-op record and another independent project audit.
+9. Pass `--rerun-preview`, `--rerun-before`, `--rerun`, and `--rerun-after` to the verifier with the Keep records. Check that every row skipped and the project inventory stayed unchanged. This workflow still requires native qualification with the loaded Revit bridge.
 
 ## Preview a CAD layout (issue #166)
 
