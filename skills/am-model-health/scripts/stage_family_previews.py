@@ -1,6 +1,7 @@
 """Stage verified working copies for a Revit family thumbnail batch."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -209,8 +210,13 @@ def verify(manifest_path, source_only, family=None):
         results.append(result)
     ready = all(row["source"] == "verified" and row.get("staged", "verified") == "verified"
                 and row.get("output", "available") == "available" for row in results)
-    return {"kind": "family-preview-stage-verification", "status": "verified" if ready else "incomplete",
-            "source_only": source_only, "families": results}
+    report = {"kind": "family-preview-stage-verification", "status": "verified" if ready else "incomplete",
+              "source_only": source_only, "families": results}
+    if ready and family is not None and not source_only:
+        path_key = os.path.normcase(str(work / family)).encode("utf-8")
+        report["revit_inputs"] = {"staged_path_sha256": hashlib.sha256(path_key).hexdigest(),
+                                  "staged_file_sha256": rows[0]["sha256"]}
+    return report
 
 
 def main(argv=None):

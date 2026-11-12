@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -52,7 +54,14 @@ def test_stage_selected_families_and_verify_before_and_after_one_save(folders):
     assert json.loads(report.stdout)["families"][0] == {
         "name": "Model.rfa", "source": "verified", "staged": "changed or unavailable", "output": "conflict",
     }
-    assert run("verify", path, "--family", "Other.0001.rfa").returncode == 0
+    next_family = run("verify", path, "--family", "Other.0001.rfa")
+    assert next_family.returncode == 0, next_family.stderr
+    staged = path.parent / "Other.0001.rfa"
+    assert json.loads(next_family.stdout)["revit_inputs"] == {
+        "staged_path_sha256": hashlib.sha256(os.path.normcase(str(staged)).encode()).hexdigest(),
+        "staged_file_sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
+    }
+    assert "revit_inputs" not in json.loads(run("verify", path, "--family", "Model.rfa").stdout)
     assert run("verify", path, "--source-only").returncode == 0
     original = source / "Model.rfa"
     moved = source / "previous.bin"

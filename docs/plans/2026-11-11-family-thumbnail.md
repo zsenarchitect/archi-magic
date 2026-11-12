@@ -30,6 +30,9 @@ python skills/am-model-health/scripts/stage_family_previews.py verify <manifest-
 
 Verify each family immediately before opening its staged file. The same command checks for an existing output with that name. After Save As, add `--source-only` to confirm the library source still matches the manifest.
 
+Call `get_context` and `get_skill("revit-scripting")` on the disposable host. Open the verified staged family and activate an uncropped orthographic 3D view if one is available. Run `skills/am-model-health/scripts/read_family_preview.py` with `run_query`. Pass the two fields from `revit_inputs` as the query inputs. Read `snapshot_json` for the current thumbnail view, active view settings, and solid extents in internal feet. The solid check uses geometry returned for that view. It does not establish the final rendered thumbnail. Leave clipped, missing, or unexamined geometry unresolved.
+
+
 ## Test fixtures and remaining evidence
 
 - Confirmed offline on two Autodesk sample RFAs. The [architecture basic family](https://help.autodesk.com/cloudhelp/2022/ENU/Revit-GetStarted/files/GUID-73E0E508-B9DA-4405-BAB4-C46D803BC1DE.htm) and [Key Plan generic annotation](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-Customize/files/GUID-DEADF731-AD3F-47F8-B2C8-B31341CA0C5F.htm) each contain a 128 × 128 PNG in the `RevitPreview4.0` stream. CRCs were checked from IHDR through IEND. This gives an independent saved-thumbnail baseline without relying on Revit's UI cache. The [Autodesk developer note](https://blog.autodesk.io/rvt-and-rfa-thumbnail-image/) describes the storage mechanism. The sample files stay outside the repository.
