@@ -99,10 +99,10 @@ def test_ancestor_swap_never_redirects_the_read(root, monkeypatch):
     original = library.checked_file
     read_hashes = []
 
-    def swap(parent, name, enumerated, cap, budget):
+    def swap(parent, name, enumerated, cap, budget, output=None):
         inside.rename(root.parent / "moved")
         inside.symlink_to(outside, target_is_directory=True)
-        result = original(parent, name, enumerated, cap, budget)
+        result = original(parent, name, enumerated, cap, budget, output)
         read_hashes.append(result["sha256"])
         return result
 
@@ -121,10 +121,10 @@ def test_leaf_swap_is_rejected_before_reading_bytes(root, monkeypatch):
     outside.write_bytes(b"outside")
     original = library.checked_file
 
-    def swap(parent, name, enumerated, cap, budget):
+    def swap(parent, name, enumerated, cap, budget, output=None):
         leaf.unlink()
         leaf.symlink_to(outside)
-        return original(parent, name, enumerated, cap, budget)
+        return original(parent, name, enumerated, cap, budget, output)
 
     monkeypatch.setattr(library, "checked_file", swap)
     manifest = library.discover(str(root))

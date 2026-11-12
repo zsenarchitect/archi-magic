@@ -2,7 +2,7 @@
 
 import argparse
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -100,13 +100,17 @@ def pinned_directory(parent, name, expected=None):
 
 
 @contextmanager
-def pinned_root(path):
+def pinned_root(path, ancestry=None):
     if os.name == "nt":
         windows.require_local_volume(path.anchor)
     with ExitStack() as opened:
         parent = opened.enter_context(pinned_directory(None, path.anchor))
+        if ancestry is not None:
+            ancestry.append(identity(directory_info(parent)))
         for name in path.parts[1:]:
             parent = opened.enter_context(pinned_directory(parent, name))
+            if ancestry is not None:
+                ancestry.append(identity(directory_info(parent)))
         yield parent
 
 
@@ -126,7 +130,7 @@ def open_file(parent, name):
         yield stream, lambda opened: os.fstat(opened.fileno())
 
 
-def checked_file(parent, name, enumerated, cap, budget):
+def checked_file(parent, name, enumerated, cap, budget, output=None):
     if not ordinary_file(enumerated, cap):
         raise ValueError("Expected a bounded regular file without links.")
     budget["bytes"] += enumerated.st_size
@@ -148,6 +152,8 @@ def checked_file(parent, name, enumerated, cap, budget):
             if size > opened.st_size:
                 raise ValueError("A source file grew while it was being read.")
             digest.update(data)
+            if output is not None:
+                output.write(data)
         final = child_info(parent, name)
         if size != opened.st_size or file_stamp(opened) != file_stamp(info(stream)) or (
                 file_stamp(opened) != file_stamp(final)):
@@ -170,7 +176,7 @@ def classify_entries(parent, budget):
     return by_name
 
 
-def record_pair(parent, name, info, catalog_names, budget):
+def record_pair(parent, name, info, catalog_names, budget, copy_to=None):
     if len(catalog_names) > 1:
         raise ValueError("The companion catalog has case-colliding filenames.")
     catalog = None
@@ -179,8 +185,10 @@ def record_pair(parent, name, info, catalog_names, budget):
         catalog_info = child_info(parent, companion)
         if inode is not None and catalog_info.st_ino != inode:
             raise ValueError("The companion catalog changed after enumeration.")
-        catalog = checked_file(parent, companion, catalog_info, MAX_CATALOG_BYTES, budget)
-    rfa = checked_file(parent, name, info, MAX_FAMILY_BYTES, budget)
+        with copy_to(companion) if copy_to else nullcontext() as output:
+            catalog = checked_file(parent, companion, catalog_info, MAX_CATALOG_BYTES, budget, output)
+    with copy_to(name) if copy_to else nullcontext() as output:
+        rfa = checked_file(parent, name, info, MAX_FAMILY_BYTES, budget, output)
     if catalog is not None and file_stamp(catalog_info) != file_stamp(
             child_info(parent, companion)):
         raise ValueError("The companion catalog changed during the paired read.")
@@ -241,10 +249,19 @@ def walk(parent, relative, ancestors, budget, files, skipped):
         report_skip(skipped, relative, "Directory contents changed during discovery.")
 
 
-def discover(raw_root):
+def manifest_digest(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def root_path(raw_root):
     if not isinstance(raw_root, str) or not raw_root or ".." in Path(raw_root).parts:
         raise ValueError("Select one local folder without parent-directory traversal.")
-    root = local_path(raw_root)
+    return local_path(raw_root)
+
+
+def discover(raw_root):
+    root = root_path(raw_root)
     budget = {"entries": 0, "families": 0, "bytes": 0, "deadline": monotonic() + MAX_SECONDS, "limited": False}
     files, skipped = [], []
     with pinned_root(root) as parent:
@@ -257,8 +274,7 @@ def discover(raw_root):
         "kind": "family-library-discovery", "version": 1, "root": str(root), "root_identity": root_identity,
         "complete": not skipped, "files": files, "skipped": skipped,
     }
-    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    manifest["manifest_sha256"] = hashlib.sha256(encoded).hexdigest()
+    manifest["manifest_sha256"] = manifest_digest(manifest)
     return manifest
 
 
