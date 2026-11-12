@@ -62,6 +62,8 @@ def setup(monkeypatch, tmp_path, fault):
             FamilyCategory=NS(Id=NS(Value=-1)), GetFamilySymbolIds=lambda: [NS(Value=3)])
         symbol = Symbol(Id=NS(Value=3), UniqueId="symbol", IsActive=False, Name="Reviewed")
         symbol.Activate = lambda: calls.append("activate")
+        symbol.GetParameters = lambda _: [NS(StorageType="string", AsString=lambda: (
+            "b" * 64 if fault == "provenance" else "a" * 64))]
         records.update({2: family, 3: symbol})
         return True
 
@@ -84,7 +86,7 @@ def setup(monkeypatch, tmp_path, fault):
         Level=Level, Family=Family, FamilySymbol=Symbol, LocationPoint=LocationPoint,
         FilteredElementCollector=collector, FamilyPlacementType=NS(OneLevelBased="level"),
         BuiltInCategory=NS(OST_GenericModel=-1), Element=NS(Name=NS(GetValue=lambda symbol: symbol.Name)),
-        XYZ=lambda x, y, z: NS(X=x, Y=y, Z=z), Structure=NS(StructuralType=NS(NonStructural="non-structural")),
+        StorageType=NS(String="string"), XYZ=lambda x, y, z: NS(X=x, Y=y, Z=z), Structure=NS(StructuralType=NS(NonStructural="non-structural")),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
@@ -105,6 +107,10 @@ def setup(monkeypatch, tmp_path, fault):
         "rfa_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "placement_level_relative_ft": [3, 4, 2.5],
     }
+    args["verified_rfa"] = {"status": "verified", "kind": "verified-spec-family-rfa",
+                            "family_name": "Equipment", "type_name": "Reviewed",
+                            "rfa_sha256": args["rfa_sha256"], "pdf_source_sha256": "a" * 64,
+                            "revit_build": "different-build" if fault == "receipt" else "fixture-build"}
     if fault == "digest":
         source.write_bytes(b"other file")
     if fault == "collision":
@@ -126,6 +132,7 @@ def test_placement_uses_pinned_copy_and_reads_level_relative_world_position(monk
 @pytest.mark.parametrize(("fault", "status"), [
     ("load_false", "stopped"), ("late", "stopped"), ("world_z", "stopped"), ("wrong_name", "stopped"),
     ("retained", "transaction_unresolved"), ("wrong_retained", "transaction_unresolved"),
+    ("provenance", "stopped"),
 ])
 def test_late_failure_or_wrong_family_still_requires_verified_rollback(monkeypatch, tmp_path, fault, status):
     doc, args, calls, records, copies = setup(monkeypatch, tmp_path, fault)
@@ -137,7 +144,9 @@ def test_late_failure_or_wrong_family_still_requires_verified_rollback(monkeypat
         assert result["rollback_verified"] and list(records) == [1]
 
 
-@pytest.mark.parametrize(("fault", "message"), [("digest", "reviewed SHA-256"), ("collision", "already exists")])
+@pytest.mark.parametrize(("fault", "message"), [
+    ("digest", "reviewed SHA-256"), ("collision", "already exists"), ("receipt", "verification receipt"),
+])
 def test_changed_file_or_existing_family_stops_before_load(monkeypatch, tmp_path, fault, message):
     doc, args, calls, _, copies = setup(monkeypatch, tmp_path, fault)
     result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": args})["result"]

@@ -66,18 +66,18 @@ def fixture(document, level_id, family_name):
             "level_project_elevation_ft": elevation}
 
 
-def pinned_bytes(path, digest):
+def local_rfa_bytes(path):
     if (not isinstance(path, TEXT) or not os.path.isabs(path) or path.startswith(("\\\\", "//"))
             or os.path.splitext(path)[1].lower() != ".rfa" or not os.path.isfile(path)):
         raise ValueError("Supply an absolute path to a local RFA file.")
     with open(path, "rb") as stream:
         data = stream.read(MAX_RFA_BYTES + 1)
-    if not data or len(data) > MAX_RFA_BYTES or hashlib.sha256(data).hexdigest() != digest:
-        raise ValueError("The RFA does not match the reviewed SHA-256 or exceeds 32 MiB.")
+    if not data or len(data) > MAX_RFA_BYTES:
+        raise ValueError("The RFA is empty or exceeds 32 MiB.")
     return data
 
 
-def load_and_place(document, path, baseline, type_name, coordinates, created):
+def load_and_place(document, path, baseline, type_name, coordinates, source_digest, created):
     if not document.LoadFamilySymbol(path, type_name):
         raise ValueError("Revit did not load the exact reviewed RFA type.")
     families = [family for family in loaded_families(document)
@@ -95,6 +95,10 @@ def load_and_place(document, path, baseline, type_name, coordinates, created):
             or family.FamilyCategory.Id.Value != DB.ElementId(DB.BuiltInCategory.OST_GenericModel).Value):
         raise ValueError("The loaded family, type, placement mode or category differs from the reviewed RFA.")
     symbol = candidates[0]
+    provenance = list(symbol.GetParameters("PDF Source SHA256"))
+    if (len(provenance) != 1 or provenance[0].StorageType != DB.StorageType.String
+            or provenance[0].AsString() != source_digest):
+        raise ValueError("The loaded type PDF source digest differs from the verified RFA.")
     if not symbol.IsActive:
         symbol.Activate()
         document.Regenerate()
@@ -118,7 +122,7 @@ def load_and_place(document, path, baseline, type_name, coordinates, created):
 
 def probe(document, args):
     if not isinstance(args, dict) or set(args) != {
-            "baseline", "type_name", "rfa_path", "rfa_sha256", "placement_level_relative_ft"}:
+            "baseline", "type_name", "rfa_path", "rfa_sha256", "placement_level_relative_ft", "verified_rfa"}:
         raise ValueError("Supply the reviewed project baseline, RFA, type and level-relative placement.")
     baseline, type_name = args["baseline"], args["type_name"]
     coordinates = args["placement_level_relative_ft"]
@@ -127,7 +131,18 @@ def probe(document, args):
         raise ValueError("Supply the exact type name and finite level-relative XYZ in internal feet.")
     if fixture(document, baseline["level_id"], baseline["family_name"]) != baseline:
         raise ValueError("The active project or level differs from the reviewed fixture.")
-    data = pinned_bytes(args["rfa_path"], args["rfa_sha256"])
+    verified = args["verified_rfa"]
+    if (not isinstance(verified, dict) or verified.get("status") != "verified"
+            or verified.get("kind") != "verified-spec-family-rfa"
+            or verified.get("family_name") != baseline["family_name"] or verified.get("type_name") != type_name
+            or verified.get("rfa_sha256") != args["rfa_sha256"]
+            or verified.get("revit_build") != str(document.Application.VersionBuild)
+            or not isinstance(verified.get("pdf_source_sha256"), TEXT)
+            or not re.match(r"[0-9a-f]{64}\Z", verified["pdf_source_sha256"])):
+        raise ValueError("Supply the matching saved RFA verification receipt from this Revit build.")
+    data = local_rfa_bytes(args["rfa_path"])
+    if hashlib.sha256(data).hexdigest() != args["rfa_sha256"]:
+        raise ValueError("The RFA does not match the reviewed SHA-256.")
     directory = tempfile.mkdtemp(prefix="archi-spec-family-probe-")
     cleanup_error = None
     try:
@@ -139,7 +154,8 @@ def probe(document, args):
         try:
             if transaction.Start() != DB.TransactionStatus.Started:
                 raise ValueError("Revit did not confirm the placement transaction started.")
-            result = load_and_place(document, path, baseline, type_name, coordinates, created)
+            result = load_and_place(document, path, baseline, type_name, coordinates,
+                                    verified["pdf_source_sha256"], created)
         except ValueError as error:
             failure = {"message": str(error)}
         except Exception as error:
