@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import os
+import re
 from uuid import uuid4
 
 from family_parameter_reload_effects import verify_loaded_family
@@ -12,6 +13,7 @@ from probe_batch_family_derivation import effect_record
 from probe_family_placement import rollback
 from read_family_library import WorkerUnresolved
 from read_family_placement import eid, inventory, inventory_record
+from revit_probe_record import require_no_changes
 
 TRANSACTION_NAME = "Trial project family parameter reload"
 
@@ -53,6 +55,11 @@ def load_targets(document, DB, baseline, bound):
     return loaded
 
 
+def target_scopes(baseline):
+    return [{target["loaded_family"]["id"], *(row["id"] for row in target["project_values"]["types"])}
+            for target in baseline["targets"]]
+
+
 def review_effects(baseline, original, current, events):
     if len(events) != 1 or original.keys() != current.keys():
         raise ValueError("The reload did not expose one complete transaction with unchanged element identities.")
@@ -60,8 +67,7 @@ def review_effects(baseline, original, current, events):
     changed = {key for key, value in original.items() if value != current[key]}
     modified = set(event["modified"])
     allowed = set()
-    for target in baseline["targets"]:
-        scope = {target["loaded_family"]["id"], *(row["id"] for row in target["project_values"]["types"])}
+    for scope in target_scopes(baseline):
         if not scope <= original.keys() or not modified & scope:
             raise ValueError("Revit did not report effects for an exact reviewed family and its types.")
         allowed.update(scope)
@@ -156,13 +162,24 @@ def execute(ui, DB, document, baseline, bound, original, *, handoff=None):
             "transaction": name, "families": observed, "effects": effects, "inventory": inventory_record(current)}
 
 
+def reviewed_reload(args):
+    before = require_no_changes(args["baseline"], "query")
+    result = before["result"]
+    token = result.get("audit_token")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token) or result.get("trial_transaction") is not None:
+        raise ValueError("Use the original complete project audit from before the trial.")
+    requested = baseline_record(before)
+    preview = args["preview"]
+    receipts = [row["receipt"] for row in preview["rows"]]
+    if build_preview(requested, receipts) != preview:
+        raise ValueError("The reload preview does not match the reviewed project and sealed exports.")
+    return requested, token
+
+
 def run_trial(ui, DB, document, args, *, handoff=None):
     if args["disposable_fixture"] is not True:
         raise ValueError("Use a saved standalone disposable project for this reload.")
-    requested = baseline_record(args["baseline"])
-    receipts = [row["receipt"] for row in args["preview"]["rows"]]
-    if build_preview(requested, receipts) != args["preview"]:
-        raise ValueError("The reload preview does not match the reviewed project and sealed exports.")
+    requested, token = reviewed_reload(args)
     query = {"revit_build": requested["revit_build"], "targets": [row["loaded_family"] for row in requested["targets"]]}
     if read_baseline(ui, DB, document, query) != requested:
         raise ValueError("The project or loaded family evidence changed after review.")
@@ -191,7 +208,8 @@ def run_trial(ui, DB, document, args, *, handoff=None):
         if not restored:
             return {"status": "transaction_unresolved", "reason": "The exact project baseline was not restored."}
         result["rollback_verified"] = True
-    return dict(result, preview_sha256=args["preview"]["preview_sha256"], baseline_sha256=requested["baseline_sha256"])
+    return dict(result, preview_sha256=args["preview"]["preview_sha256"], baseline_sha256=requested["baseline_sha256"],
+                baseline_audit_token=token)
 
 
 try:

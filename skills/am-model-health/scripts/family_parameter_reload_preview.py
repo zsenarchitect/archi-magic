@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from uuid import uuid4
 
 from batch_family_type_preview import validate_record
 from family_library_discovery import MAX_FAMILY_BYTES, MAX_TOTAL_BYTES, manifest_digest
@@ -135,7 +136,8 @@ else:
     from pyrevit.api import DB
     try:
         baseline = read_baseline(current_ui, DB, active_project, query_inputs)
-        result = {"status": "ok", "snapshot_json": json.dumps(baseline, ensure_ascii=True, allow_nan=False)}
+        result = {"status": "ok", "snapshot_json": json.dumps(baseline, ensure_ascii=True, allow_nan=False),
+                  "audit_token": uuid4().hex, "trial_transaction": query_inputs.get("trial_transaction")}
     except WorkerUnresolved as error:
         result = {"status": "worker_unresolved", "reason": str(error)}
     except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:

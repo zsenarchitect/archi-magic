@@ -331,9 +331,18 @@ The preview makes no project changes.
 
 Call `get_context` and confirm the exact saved disposable project. Obtain approval for the rollback-only trial. Run `scripts/probe_family_parameter_reload.py` in guarded CPython dry-run mode. Pass the full `baseline`, reviewed `preview`, and `disposable_fixture: true`.
 
-The trial closes its inner transaction before inspecting loaded definitions. It keeps the transaction group reversible until inspection finishes. Save the full result. Stop on an unresolved result.
+Save the trial inputs as `reload.json`. The trial closes its inner transaction before inspecting loaded definitions. The transaction group stays reversible until inspection finishes. Save the full result as `project-trial.json`. Stop on an unresolved result.
 
-Native verification and the guarded project Keep or Discard workflow are pending.
+### Verify and replay the project reload
+
+1. Repeat the project baseline query with the trial's `transaction` as `trial_transaction`. Save it as `project-after.json`.
+2. Run `python scripts/verify_family_parameter_reload.py reload.json project-trial.json project-after.json`. Check the verified rollback and exact effect IDs.
+3. Confirm the active project and ask policy. Obtain approval for replay. Run `scripts/apply_family_parameter_reload.py` in guarded CPython modify mode. Pass `reload`, `trial`, and `after`.
+4. Use Revit's Keep or Discard prompt. Save the full modify result as `project-modify.json`.
+5. After Keep, run `scripts/read_family_parameter_reload_audit.py` in query mode. Pass `reload` and the modify result's `transaction` as `trial_transaction`. After Discard, repeat the project baseline query with the same transaction name. Save the full query as `project-fresh.json`.
+6. Run the same verifier with `--modify project-modify.json --fresh project-fresh.json`. If Keep fails readback, stop and identify the named Revit Undo entry before any further edit.
+
+Verify the complete workflow in native Revit before use on project data.
 
 ## Preview a CAD layout (issue #166)
 
