@@ -174,7 +174,7 @@ def run(monkeypatch):
         SpatialElementBoundaryLocation=NS(Finish="finish"),
         BoundaryValidation=NS(IsValidHorizontalBoundary=lambda profiles: bool(profiles)),
         Level=Level, Phase=Phase, FloorType=FloorType, CeilingType=CeilingType,
-        BuiltInParameter=NS(ROOM_PHASE_ID="room-phase"), StorageType=NS(ElementId="element-id"),
+        BuiltInParameter=NS(ROOM_PHASE_ID="room-phase"), StorageType=NS(ElementId="element-id", String="text"),
         Wall=Wall, WallType=WallType, FamilyInstance=Door, WallKind=NS(Basic="basic"),
         WallCrossSection=NS(Vertical="vertical"), BuiltInCategory=NS(OST_Doors=-42),
         ElementOnPhaseStatus=NS(New="new", Existing="existing"),
@@ -261,6 +261,44 @@ def test_horizontal_finish_preview_excludes_room_without_native_scope(run):
 def test_horizontal_finish_preview_rejects_invalid_offset(run, offset):
     with pytest.raises(ValueError, match="finite number"):
         run({103: FloorType()}, ["1"], horizontal_finishes={"floor": {"type_id": "103", "offset_ft": offset}})
+
+
+def test_room_finish_rules_map_each_room_and_exclude_unresolved_values(run):
+    def room_with(*parameters):
+        room = Room(Seq([loop(rectangle(0, 0, 8, 8))]))
+
+        def get(name):
+            assert name == "Finish Code"
+            return list(parameters)
+
+        room.GetParameters = get
+        return room
+
+    def text_param(value):
+        return NS(StorageType="text", HasValue=True, Id=NS(Value=305), AsString=lambda: value)
+
+    rooms = {
+        1: room_with(text_param(" A ")), 2: room_with(text_param("B")), 3: room_with(text_param("a")),
+        4: room_with(text_param("A"), text_param("B")), 5: room_with(), 6: room_with(NS(StorageType="number")),
+    }
+    rules = {"parameter": "Finish Code", "by_value": {
+        "A": {"horizontal_finishes": {"floor": {"type_id": "103", "offset_ft": 0}}},
+        "B": {"horizontal_finishes": {"ceiling": {"type_id": "104", "offset_ft": 9}}},
+    }}
+    rooms.update({101: Level(), 102: Phase(), 103: FloorType(), 104: CeilingType()})
+    report = run(rooms, ["1", "2", "3", "4", "5", "6"], finish_rules=rules)
+    first, second, *excluded = report["rooms"]
+    assert report["status"] == "incomplete"
+    assert first["finish_rule"] == {"parameter": "Finish Code", "parameter_id": "305", "value": "A"}
+    assert first["horizontal_finishes"][0]["kind"] == "floor"
+    assert second["finish_rule"]["value"] == "B"
+    assert second["horizontal_finishes"][0]["kind"] == "ceiling"
+    assert [item["reason"] for item in excluded] == [
+        "finish_parameter_value_unmapped", "finish_parameter_ambiguous", "finish_parameter_missing",
+        "finish_parameter_value_unavailable",
+    ]
+    with pytest.raises(ValueError, match="Choose direct finish types"):
+        run({}, ["1"], finish_rules=rules, horizontal_finishes=rules["by_value"]["A"]["horizontal_finishes"])
 
 
 def test_wall_finish_spans_skip_overlapping_door_envelopes(run):

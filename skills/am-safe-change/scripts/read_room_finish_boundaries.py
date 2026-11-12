@@ -14,6 +14,8 @@ MAX_SEGMENTS = 2000
 MAX_WALL_SEGMENTS = 200
 MAX_INSERTS_PER_WALL = 100
 TOLERANCE_FT = 1e-6
+FINISH_FIELDS = {"horizontal_finishes", "wall_type_id", "wall_dimensions"}
+TEXT = (str, type(u""))
 
 
 def ids_from(values):
@@ -386,13 +388,8 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False,
-                    wall_dimensions=None):
-    types = None
-    identity = None
+def review_finish_types(document, finish_request, wall_type_id, wall_dimensions):
     wall_type = None
-    if type(audit_existing) is not bool or (audit_existing and finish_request is None and wall_type_id is None):
-        raise ValueError("Select finish types before requesting an existing-finish audit.")
     if wall_dimensions is not None:
         if (wall_type_id is None or not isinstance(wall_dimensions, dict)
                 or set(wall_dimensions) != {"height_ft", "base_offset_ft"}
@@ -400,13 +397,7 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
                 or not 0 < wall_dimensions["height_ft"] <= 30000
                 or not -30000 <= wall_dimensions["base_offset_ft"] <= 30000):
             raise ValueError("Supply a wall type, positive wall height, and level-relative base offset in feet.")
-    if finish_request is not None or wall_type_id is not None:
-        project = document.ProjectInformation
-        if not document.PathName or project is None or not project.UniqueId:
-            raise ValueError("Save the project before requesting a finish preview.")
-        identity = {"project_uid": str(project.UniqueId),
-                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
-        types = finish_types(document, finish_request) if finish_request is not None else {}
+    types = finish_types(document, finish_request) if finish_request is not None else {}
     if wall_type_id is not None:
         value, = ids_from([wall_type_id])
         element = document.GetElement(DB.ElementId(Int64(value)))
@@ -416,6 +407,61 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
         wall_type = {"type_id": str(value), "type_uid": str(element.UniqueId), "width_ft": element.Width}
         if wall_dimensions is not None:
             wall_type.update({key: float(value) + 0.0 for key, value in wall_dimensions.items()})
+    return types, wall_type
+
+
+def read_finish_rules(document, rules):
+    if not isinstance(rules, dict) or set(rules) != {"parameter", "by_value"}:
+        raise ValueError("Supply a room text parameter and its explicit finish mapping.")
+    name, table = rules["parameter"], rules["by_value"]
+    if (not isinstance(name, TEXT) or not 1 <= len(name) <= 120 or name != name.strip()
+            or not isinstance(table, dict) or not 1 <= len(table) <= 100):
+        raise ValueError("Supply a parameter name and 1 to 100 finish mapping rows.")
+    reviewed = {}
+    for value, choice in table.items():
+        if (not isinstance(value, TEXT) or not 1 <= len(value) <= 120 or value != value.strip()
+                or not isinstance(choice, dict) or set(choice) - FINISH_FIELDS
+                or all(choice.get(field) is None for field in ("horizontal_finishes", "wall_type_id"))):
+            raise ValueError("Every mapping row needs an exact value and at least one finish type.")
+        reviewed[value] = review_finish_types(document, choice.get("horizontal_finishes"),
+                                               choice.get("wall_type_id"), choice.get("wall_dimensions"))
+    return name, reviewed
+
+
+def mapped_room_finish(document, room, row, name, table):
+    parameters = list(room.GetParameters(name))
+    if len(parameters) != 1:
+        reason = "finish_parameter_ambiguous" if parameters else "finish_parameter_missing"
+        return excluded(row["room_id"], reason)
+    parameter = parameters[0]
+    if parameter.StorageType != DB.StorageType.String or not parameter.HasValue:
+        return excluded(row["room_id"], "finish_parameter_value_unavailable")
+    value = (parameter.AsString() or "").strip()
+    if value not in table:
+        return excluded(row["room_id"], "finish_parameter_value_unmapped")
+    types, wall_type = table[value]
+    row = room_finish_preview(document, room, row, types, wall_type)
+    row["finish_rule"] = {"parameter": name, "parameter_id": str(parameter.Id.Value), "value": value}
+    return row
+
+
+def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False,
+                    wall_dimensions=None, finish_rules=None):
+    has_direct_types = finish_request is not None or wall_type_id is not None or wall_dimensions is not None
+    if finish_rules is not None and has_direct_types:
+        raise ValueError("Choose direct finish types or room parameter rules.")
+    finish_selected = has_direct_types or finish_rules is not None
+    if type(audit_existing) is not bool or (audit_existing and not finish_selected):
+        raise ValueError("Select finish types before requesting an existing-finish audit.")
+    identity = None
+    if finish_selected:
+        project = document.ProjectInformation
+        if not document.PathName or project is None or not project.UniqueId:
+            raise ValueError("Save the project before requesting a finish preview.")
+        identity = {"project_uid": str(project.UniqueId),
+                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+    name, table = read_finish_rules(document, finish_rules) if finish_rules is not None else (None, {})
+    types, wall_type = review_finish_types(document, finish_request, wall_type_id, wall_dimensions)
     rows = []
     remaining = MAX_SEGMENTS
     options = DB.SpatialElementBoundaryOptions()
@@ -426,8 +472,9 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
                 room = document.GetElement(DB.ElementId(Int64(room_id)))
                 row, used = inspect_room(room, room_id, options, remaining)
                 remaining -= used
-                if types is not None and row["status"] == "boundary_verified":
-                    row = room_finish_preview(document, room, row, types, wall_type)
+                if finish_selected and row["status"] == "boundary_verified":
+                    row = (mapped_room_finish(document, room, row, name, table) if name else
+                           room_finish_preview(document, room, row, types, wall_type))
             except Exception as exc:
                 row = excluded(room_id, "boundary_read_failed")
                 row["error_type"] = type(exc).__name__
@@ -459,5 +506,6 @@ if "inputs" in globals():
     else:
         report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
                                  inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
-                                 inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"))
+                                 inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"),
+                                 inputs.get("finish_rules"))
         result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

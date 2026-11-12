@@ -41,7 +41,7 @@ class Entity:
 
 @pytest.mark.parametrize("outcome", [
     "committed", "offset_mismatch", "provenance_missing", "unqualified_schema", "stale_profile",
-    "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned",
+    "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned", "workflow_mapping_changed",
 ])
 def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(monkeypatch, outcome):
     def xyz(x, y, z):
@@ -220,6 +220,10 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
             return runpy.run_path(script, init_globals={"doc": document, "inputs": inputs})["result"]
 
         request = {"room_ids": ["1"], "horizontal_finishes": {"floor": {"type_id": "30", "offset_ft": 0.125}}}
+        if outcome == "workflow_mapping_changed":
+            choice = {"horizontal_finishes": request.pop("horizontal_finishes")}
+            request["finish_rules"] = {"parameter": "Finish Code", "by_value": {"A": choice, "B": choice}}
+            row["finish_rule"] = {"parameter": "Finish Code", "parameter_id": "305", "value": "A"}
         if outcome == "workflow_commit":
             configured = []
 
@@ -251,6 +255,9 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
         assert len(preview["steps"]) == 1 and preview["ownership_ids"] == ["1", "70"]
         if outcome == "workflow_stale":
             document.ActiveView.UniqueId = "changed-view"
+        if outcome == "workflow_mapping_changed":
+            assert preview["columns"][-1] == "Room finish code" and preview["after"][0][-1] == "A"
+            row["finish_rule"]["value"] = "B"
         receipt = execute(mode="apply", plan=preview)
         if outcome == "workflow_commit":
             assert events == ["started", "committed"] and receipt["status"] == "ok"

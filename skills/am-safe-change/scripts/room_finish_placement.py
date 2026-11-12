@@ -159,7 +159,7 @@ def finish_preview(document, request):
     from read_room_finish_boundaries import ids_from, read_boundaries
 
     if not isinstance(request, dict) or set(request) - {
-            "room_ids", "horizontal_finishes", "wall_type_id", "wall_dimensions"}:
+            "room_ids", "horizontal_finishes", "wall_type_id", "wall_dimensions", "finish_rules"}:
         raise ValueError("Supply the reviewed room and finish type scope.")
     if document is None or document.IsFamilyDocument or document.Application.VersionNumber != "2026":
         raise ValueError("Open the saved Revit 2026 project for this finish recipe.")
@@ -175,7 +175,7 @@ def finish_preview(document, request):
         raise ValueError("Switch to the main model before previewing room finishes.")
     phase_id = str(phase.AsElementId().Value)
     report = read_boundaries(document, ids_from(request.get("room_ids")), request.get("horizontal_finishes"),
-                             request.get("wall_type_id"), True, request.get("wall_dimensions"))
+                             request.get("wall_type_id"), True, request.get("wall_dimensions"), request.get("finish_rules"))
     basis = {"report": report, "view_uid": str(view.UniqueId), "phase_id": phase_id,
              "workshared": bool(document.IsWorkshared)}
     return compute_preview(request, basis)
@@ -184,6 +184,7 @@ def finish_preview(document, request):
 def compute_preview(request, basis):
     warnings, steps, after = [], [], []
     ownership_ids = set()
+    mapped = request.get("finish_rules") is not None
     for row in basis["report"]["rooms"]:
         room_id = str(row["room_id"])
         audit = row.get("existing_finishes", {})
@@ -192,6 +193,8 @@ def compute_preview(request, basis):
             warnings.append({"row": room_id, "text": row["reason"], "blocking": False})
         elif row["phase"]["id"] != basis["phase_id"]:
             warnings.append({"row": room_id, "text": "Room phase differs from the active view.", "blocking": False})
+        elif "wall_finish" in row and "height_ft" not in row["wall_finish"]:
+            warnings.append({"row": room_id, "text": "Resolve the wall scope and include wall dimensions.", "blocking": False})
         elif nearby != "none_in_scope" or audit.get("status") not in ("no_tagged_pieces", "tagged_set_matches"):
             warnings.append({"row": room_id, "text": "Resolve existing or incomplete finish evidence.", "blocking": False})
         elif audit["status"] == "tagged_set_matches":
@@ -208,13 +211,17 @@ def compute_preview(request, basis):
                            next(finish["type_id"] for finish in row["horizontal_finishes"] if finish["kind"] == kind))
                 steps.append({"room_id": room_id, "piece_key": key, "type_id": type_id})
                 after.append([key, room_id, kind, type_id, row["level"]["id"],
-                              piece.get("offset_ft", piece.get("base_offset_ft")), piece.get("height_ft")])
+                              piece.get("offset_ft", piece.get("base_offset_ft")), piece.get("height_ft")]
+                             + ([row["finish_rule"]["value"]] if mapped else []))
     blocked = len(steps) > MAX_PIECES
     if blocked:
         warnings.append({"row": "scope", "text": "Preview at most 200 new finishes per run.", "blocking": True})
+    columns = ["Piece", "Room ID", "Finish", "Type ID", "Level ID", "Offset ft", "Height ft"]
+    if mapped:
+        columns.append("Room finish code")
     return {"kind": "change-preview", "recipe": "room-finishes", "title": "Place reviewed room finishes",
             "request": request, "basis": basis, "basis_sha256": digest(basis),
-            "columns": ["Piece", "Room ID", "Finish", "Type ID", "Level ID", "Offset ft", "Height ft"],
+            "columns": columns,
             "keyColumn": "Piece", "changedColumns": ["Finish"], "before": [], "after": after,
             "steps": [] if blocked else steps, "warnings": warnings, "blocked": blocked,
             "ownership_ids": sorted(ownership_ids, key=int),

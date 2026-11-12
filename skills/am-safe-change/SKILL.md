@@ -217,6 +217,20 @@ Pass `wall_type_id` to review a basic wall finish type and its width. Review eac
 
 Pass `wall_dimensions` with `height_ft` and `base_offset_ft` to include wall height and base offset in the preview. Set the base offset relative to the room level. Use the same dimensions when checking a previous tagged set.
 
+To select finishes per room, pass `finish_rules` with the room text parameter and its mapping. Use this in place of the direct finish type inputs. The query trims outer spaces from parameter values and matches each value with case preserved. Missing, ambiguous, and unmapped values exclude the room from placement.
+
+```json
+{
+  "finish_rules": {
+    "parameter": "Finish Code",
+    "by_value": {
+      "OFFICE": {"horizontal_finishes": {"floor": {"type_id": "123", "offset_ft": 0}}},
+      "CORRIDOR": {"wall_type_id": "456", "wall_dimensions": {"height_ft": 9, "base_offset_ft": 0}}
+    }
+  }
+}
+```
+
 Review `finish_footprints` for the centerlines that fit inside the room outline at the selected width. The check accounts for holes in straight-edged outlines. Curved outlines need separate review. Within each room, longer pieces take priority when footprints overlap. Review `original_span_ft` and `span_ft` for any trim. Check oblique joints for gaps before placement.
 
 Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict.
