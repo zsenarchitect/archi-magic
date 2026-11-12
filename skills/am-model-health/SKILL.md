@@ -267,6 +267,12 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 8. Save the project after a verified Keep. Run a fresh project audit and rebuild the preview for the same lookup with no exports. Run the rollback probe with that preview and the fresh audit token. Save the no-op record and another independent project audit.
 9. Pass `--rerun-preview`, `--rerun-before`, `--rerun`, and `--rerun-after` to the verifier with the Keep records. Check that every row skipped and the project inventory stayed unchanged. This workflow still requires native qualification with the loaded Revit bridge.
 
+## Check family formula dependencies (issue #163)
+
+Run `python scripts/family_formula_dependencies.py request.json` before reviewing a family transfer. Supply the exact source definitions as `definitions`, with a `name` and `formula` for each parameter. Use null for an unset formula. Supply the reviewed names as `selected`.
+
+The report resolves arithmetic dependencies through selected and reused definitions. It rejects ambiguous references, unsupported syntax, and cycles. Revit must still verify the transferred formula values and references.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
