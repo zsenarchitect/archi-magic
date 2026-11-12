@@ -18,6 +18,18 @@ Baseline `0c523067c4313bd9e8c3898be4ffd32d874463d7`. The filed gap is confirmed.
 5. Open and activate the kept dedicated view in the staged family. Check the preview source and regeneration option in the Save As dialog. Save only to a new reviewed output path. Stop at an overwrite prompt. Hash the original again and record the output fingerprint. Keep separate outcomes for kept but unsaved, saved but unverified, verified, unsupported, refused, and failed. Resume verification only when the source hash, preset and output fingerprint match. If Save As was interrupted before a receipt was recorded, inspect the output and reconcile its identity or choose a new path. Keep any output with an unresolved conflict outside the verified set.
 6. Reopen the output and verify the persistent view settings. Inspect its actual thumbnail in a fresh Revit process using [Load Family](https://help.autodesk.com/cloudhelp/2024/ENU/Revit-Model/files/GUID-2A6C26DE-63D7-48E8-A986-CAB6C362049A.htm) at the new output path. Compare the embedded thumbnail with the source when the stream is available. Use a contrasting orientation or color on a known asymmetric family, and include an unchanged control. Record Revit build, runtime and source revision. Require at least one supported 3D family and a verified output for every supported candidate. Keep #164 open while any candidate has unresolved eligibility. Report unsupported and unresolved candidates with distinct reasons. Preserve the sources so a wrong output can be set aside. Keep library replacement, global display preferences, automatic upgrades and geometry changes outside this workflow.
 
+## Prepare working copies
+
+Run these commands from the repository root on the machine that will open the families. Use a staging parent inside your private user directory. Create an empty output folder before staging. Save the manifest locally.
+
+```text
+python skills/am-model-health/scripts/stage_family_previews.py inventory C:/work/library
+python skills/am-model-health/scripts/stage_family_previews.py stage C:/work/library --staging-parent C:/work/private-stage --output C:/work/exports --family "Example A.rfa" --family "Example B.rfa"
+python skills/am-model-health/scripts/stage_family_previews.py verify <manifest-path> --family "Example A.rfa"
+```
+
+Verify each family immediately before opening its staged file. The same command checks for an existing output with that name. After Save As, add `--source-only` to confirm the library source still matches the manifest.
+
 ## Test fixtures and remaining evidence
 
 - Confirmed offline on two Autodesk sample RFAs. The [architecture basic family](https://help.autodesk.com/cloudhelp/2022/ENU/Revit-GetStarted/files/GUID-73E0E508-B9DA-4405-BAB4-C46D803BC1DE.htm) and [Key Plan generic annotation](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-Customize/files/GUID-DEADF731-AD3F-47F8-B2C8-B31341CA0C5F.htm) each contain a 128 × 128 PNG in the `RevitPreview4.0` stream. CRCs were checked from IHDR through IEND. This gives an independent saved-thumbnail baseline without relying on Revit's UI cache. The [Autodesk developer note](https://blog.autodesk.io/rvt-and-rfa-thumbnail-image/) describes the storage mechanism. The sample files stay outside the repository.
