@@ -14,12 +14,12 @@ from read_mep_penetrations import area, matches_outline
 from structural_compare_cli import checked_id, digest, read_input, uid
 
 
-def require_run(raw, mode, decisions):
+def require_run(raw, mode, decisions, *, approval=None, status="ok"):
     run = raw.get("response", raw)
-    if (run.get("mode") != mode or run.get("status") != "ok" or run.get("decision") not in decisions
+    if (run.get("mode") != mode or run.get("status") != status or run.get("decision") not in decisions
             or type(run.get("exit_code")) is not int or run["exit_code"] != 0
             or run.get("result_truncated") is not False or run.get("error") is not None
-            or run.get("approval") is not None or run.get("engine", {}).get("requested") != "cpython"
+            or run.get("approval") != approval or run.get("engine", {}).get("requested") != "cpython"
             or any(run.get(key) for key in ("blocked", "warnings", "failures", "dialogs", "unclosed_documents"))):
         raise ValueError("Use a complete CPython Revit run with the expected mode and no warnings.")
     identifier = run.get("run_id")
@@ -125,7 +125,8 @@ def verify(choices, before_raw, trial_raw, after_raw):
             or result.get("preview_sha256") != fingerprint(plan) or result.get("baseline_audit_token") != before_token
             or result.get("baseline_inventory_sha256") != inventory or before_token == after_token
             or fresh != snapshot or fresh_inventory != inventory or original_absent
-            or before["result"].get("trial_transaction") is not None or after["result"].get("trial_transaction") != name):
+            or before["result"].get("trial_transaction") is not None or after["result"].get("trial_transaction") != name
+            or before["result"].get("kept") is True or after["result"].get("kept") is True):
         raise ValueError("The independent audit does not prove rollback of the exact reviewed placement.")
     effects, opening_uids = measured(plan, snapshot, result)
     if set(absent) != opening_uids:

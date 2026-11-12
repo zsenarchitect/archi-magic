@@ -210,7 +210,19 @@ The trial measures the host before and after each cut. It attaches tracking only
 
 Repeat the project query with `audit`. Set `trial_transaction` to the trial's transaction name. Set `absent_opening_uids` to every trial opening UID. Save the full result as `after.json`.
 
-Run `python scripts/verify_mep_penetration_trial.py choices.json before.json trial.json after.json`. Check the measured cuts, exact element effects, and restored project inventory. Native verification and the project Keep or Discard workflow are pending.
+Run `python scripts/verify_mep_penetration_trial.py choices.json before.json trial.json after.json`. Check the measured cuts, exact element effects, and restored project inventory.
+
+### Qualify ask policy and verify the native decision
+
+Use a separate saved disposable Revit project for the approval control. Set its Project Information name to `Archi Magic approval fixture`. Confirm ask policy with `get_context`.
+
+Run `scripts/apply_mep_penetration_placement.py` in guarded CPython modify mode for the control. Pass `runtime_control` with `disposable_fixture: true` and `project` containing the exact saved document identity. Choose Discard on the first run and check that the original name remains. Choose Keep on the second run and check the name `Archi Magic approval control`. Save both full run records. Restore or close the control fixture without saving.
+
+Return to the exact placement fixture. Confirm ask policy and obtain approval to replay the verified trial. Run the same script in guarded modify mode. Pass `placement` with the original trial inputs. Pass the full `before`, `trial`, and `after` records, plus `runtime_controls` with the saved `keep` and `discard` controls.
+
+Save the full placement decision as `modify.json`. Run an independent query with the same geometry inputs and `audit.trial_transaction` set to the replay transaction. After Keep, pass `audit.kept: true`. After Discard, pass the replay opening UIDs as `audit.absent_opening_uids`. Save the complete result as `fresh.json`.
+
+Run `python scripts/verify_mep_penetration_decision.py choices.json before.json trial.json after.json modify.json fresh.json`. Stop and identify the named Undo entry if Keep fails verification. Verify the workflow on the installed Revit bridge before using project data.
 
 ## Rules
 

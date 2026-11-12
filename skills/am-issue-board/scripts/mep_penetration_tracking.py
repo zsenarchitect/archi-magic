@@ -5,7 +5,7 @@ import math
 
 from mep_penetration_preview import crossing_key, fingerprint, vector
 from mep_penetration_spacing import profile, scalar
-from structural_compare_cli import digest, finite_float, identity, reject_constant, uid, unique_json
+from structural_compare_cli import checked_id, digest, finite_float, identity, reject_constant, uid, unique_json
 
 SCHEMA_GUID = "be7c896f-91f5-4229-9480-0e469149e7e4"
 SCHEMA_NAME = "ArchiMagicMepPenetrationTracking"
@@ -93,7 +93,8 @@ def tracking_rows(DB, document, elements, read_entity, hosts, project, link, lin
                    "geometry": record["geometry"], "geometry_sha256": record["geometry_sha256"],
                    "opening_uid": record["opening_uid"], "opening_sha256": record["opening_sha256"],
                    "tracking_sha256": fingerprint(record),
-                   "observed_uid": uid(str(opening.UniqueId)), "observed_host_uid": actual_host_uid,
+                   "observed_uid": uid(str(opening.UniqueId)), "observed_id": checked_id(str(opening.Id.Value)),
+                   "observed_host_uid": actual_host_uid,
                    "cut_verified": False}
         host = hosts.get(host_uid)
         if host is not None and host[1] is not None and current["observed_uid"] == current["opening_uid"]:

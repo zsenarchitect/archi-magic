@@ -43,7 +43,7 @@ def test_cut_verification_requires_unchanged_existing_cuts(evidence):
         probe.verify_new_cut(before, current, geometry, 0.001)
 
 
-@pytest.mark.parametrize("failure", [None, "late_tracking", "unreviewed_effect", "commit_drift"])
+@pytest.mark.parametrize("failure", [None, "late_tracking", "unreviewed_effect", "commit_drift", "handoff"])
 def test_trial_rolls_back_openings_cuts_and_tags_as_one_batch(monkeypatch, failure):
     statuses = SimpleNamespace(Uninitialized="uninitialized", Started="started", Committed="committed",
                                RolledBack="rolled_back")
@@ -97,7 +97,10 @@ def test_trial_rolls_back_openings_cuts_and_tags_as_one_batch(monkeypatch, failu
             return self.state
 
     class Group(Scope):
-        pass
+        def Assimilate(self):
+            actions.append(("handoff", self.__class__.__name__))
+            self.state = statuses.Committed
+            return self.state
 
     def place(document, DB, snapshot, row, budget):
         host_id = row["host_id"]
@@ -124,7 +127,16 @@ def test_trial_rolls_back_openings_cuts_and_tags_as_one_batch(monkeypatch, failu
     monkeypatch.setattr(probe, "project_inventory", lambda *args: dict(contents))
     plan = {"rows": [{"host_id": "10"}, {"host_id": "11"}]}
     snapshot = {"baseline": True}
-    result = probe.execute_trial(doc, db, snapshot, plan, lambda: snapshot)
+    def approve(rows, effects):
+        assert set(effects["added"]) == {"30", "31"}
+
+    result = probe.execute_trial(doc, db, snapshot, plan, lambda: snapshot,
+                                 handoff=approve if failure == "handoff" else None)
+    if failure == "handoff":
+        assert result["status"] == "awaiting_bridge_decision"
+        assert tags == {"opening-30", "opening-31"}
+        assert actions[-1] == ("handoff", "Group")
+        return
     assert contents == original
     assert not tags
     assert actions[:2] == [("cut", "10"), ("cut", "11")]
@@ -223,3 +235,109 @@ def test_trial_verifier_accepts_bridge_no_changes_after_internal_rollback(saved_
     trial["decision"] = "no_changes"
     trial["changes"] = before["changes"]
     assert verify(choices, before, trial, after)["status"] == "mep_opening_trial_verified"
+
+
+@pytest.fixture
+def saved_decision(saved_trial):
+    from copy import deepcopy
+    import json
+    from mep_penetration_preview import fingerprint
+
+    choices, before, dry, after = saved_trial
+    name = probe.TRANSACTION_NAME + " " + "f" * 32
+    replay = deepcopy(dry["result"])
+    replay.update(status="awaiting_bridge_decision", transaction=name, inventory_sha256="e" * 64,
+                  runtime_sha256="f" * 64)
+    row = replay["rows"][0]
+    row.update(opening_id="55", opening_uid="opening-55", tracking_sha256="9" * 64)
+    replay["effects"]["added"] = ["55"]
+    modify = dict(dry, run_id="replay", mode="modify", decision="committed", approval="user", result=replay)
+    modify["changes"] = {**dry["changes"], "added": [{"id": "55"}], "transactions": [name]}
+    discard = dict(modify, decision="discarded", status="rejected")
+    kept_snapshot = json.loads(before["result"]["snapshot_json"])
+    geometry = probe.placement_plan(kept_snapshot, choices)["rows"][0]["geometry"]
+    kept_snapshot["pairs"][0].update(status="gross_crossing", existing_cut_verified=True, gross_verified=True)
+    kept_snapshot["tracked"] = [{"crossing_key": row["crossing_key"], "host_uid": "wall-10", "run_uid": "duct-20",
+                                "opening_uid": "opening-55", "observed_uid": "opening-55", "observed_id": "55",
+                                "observed_host_uid": "wall-10", "cut_verified": True,
+                                "opening_sha256": row["opening_sha256"], "observed_opening_sha256": row["opening_sha256"],
+                                "tracking_sha256": row["tracking_sha256"], "geometry": geometry,
+                                "geometry_sha256": fingerprint(geometry)}]
+    keep_audit = dict(after, run_id="fresh", result={
+        **after["result"], "audit_token": "3" * 32, "inventory_sha256": replay["inventory_sha256"],
+        "trial_transaction": name, "kept": True, "absent_opening_uids": [], "snapshot_json": json.dumps(kept_snapshot)})
+    discard_audit = dict(after, run_id="fresh", result={
+        **after["result"], "audit_token": "3" * 32, "trial_transaction": name, "absent_opening_uids": ["opening-55"]})
+    return saved_trial, (modify, keep_audit), (discard, discard_audit)
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_decision_audits_actual_replay_ids_instead_of_trial_ids(saved_decision, keep):
+    from verify_mep_penetration_decision import verify_decision
+
+    base, kept, discarded = saved_decision
+    receipt = verify_decision(*base, *(kept if keep else discarded))
+    assert receipt["status"] == ("mep_openings_kept" if keep else "mep_openings_discarded")
+    assert receipt["opening_ids"] == (["55"] if keep else [])
+
+
+@pytest.mark.parametrize("problem", ["no_approval", "reused_audit", "wrong_opening", "wrong_inventory", "wrong_effect"])
+def test_decision_rejects_wrong_native_outcome_or_readback(saved_decision, problem):
+    import json
+    from verify_mep_penetration_decision import verify_decision
+
+    base, (modify, fresh), _ = saved_decision
+    if problem == "no_approval":
+        modify["approval"] = "auto"
+    elif problem == "reused_audit":
+        fresh["result"]["audit_token"] = base[-1]["result"]["audit_token"]
+    elif problem == "wrong_opening":
+        snapshot = json.loads(fresh["result"]["snapshot_json"])
+        snapshot["tracked"][0]["observed_id"] = "40"
+        fresh["result"]["snapshot_json"] = json.dumps(snapshot)
+    elif problem == "wrong_inventory":
+        fresh["result"]["inventory_sha256"] = "0" * 64
+    elif problem == "wrong_effect":
+        modify["result"]["effects"]["modified"] = ["10"]
+        modify["changes"]["modified"] = [{"id": "10"}]
+        modify["changes"]["modified_count"] = 1
+    with pytest.raises(ValueError):
+        verify_decision(*base, modify, fresh)
+
+
+def test_apply_requires_exact_native_ask_controls_and_rechecks_before_handoff(saved_decision, monkeypatch):
+    import apply_mep_penetration_placement as application
+
+    (choices, before, dry, after), (modify, _), _ = saved_decision
+    expected = "f" * 64
+    observed = []
+    control = {"runtime_control": "disposable_ask", "runtime_sha256": expected,
+               "project": {"project_uid": "fixture", "path_sha256": "a" * 64},
+               "control_id": "90", "before": application.CONTROL_BEFORE, "after": application.CONTROL_AFTER}
+    changes = {"added_count": 0, "deleted_count": 0, "modified_count": 1, "modified": [{"id": "90"}]}
+    keep = dict(modify, run_id="control-keep", changes=changes, result=control)
+    discard = dict(keep, run_id="control-discard", status="rejected", decision="discarded")
+    inputs = {"runtime_controls": {"keep": keep, "discard": discard}, "placement": {
+        "choices": choices, "preview_sha256": dry["result"]["preview_sha256"],
+        "baseline_inventory_sha256": dry["result"]["baseline_inventory_sha256"],
+        "baseline_audit_token": dry["result"]["baseline_audit_token"]},
+        "before": before, "trial": dry, "after": after}
+
+    def read_policy(context):
+        observed.append(context)
+        return expected
+
+    def trial(document, DB, replay, *, handoff):
+        assert replay == inputs["placement"]
+        handoff(modify["result"]["rows"], modify["result"]["effects"])
+        return modify["result"]
+
+    monkeypatch.setattr(application, "runtime_identity", read_policy)
+    monkeypatch.setattr(application, "trial", trial)
+    context = SimpleNamespace(Mode="modify")
+    assert application.apply(None, None, inputs, context)["runtime_sha256"] == expected
+    assert observed == [context, context]
+    discard["approval"] = "auto"
+    with pytest.raises(ValueError):
+        application.apply(None, None, inputs, context)
+    assert observed == [context, context]

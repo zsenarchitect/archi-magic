@@ -207,7 +207,7 @@ def verified_effects(plan, rows, original, current, events):
 TRANSACTION_NAME = "Trial linked MEP openings"
 
 
-def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, baseline_inventory=None):
+def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, baseline_inventory=None, handoff=None):
     name = TRANSACTION_NAME + " " + uuid4().hex
     status = DB.TransactionStatus
     group = DB.TransactionGroup(document, name)
@@ -220,7 +220,8 @@ def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, 
     rows, events = [], []
     failure = None
     restored = subscribed = closing = unexpected = unresolved = False
-    effects = None
+    effects = current_inventory = None
+    handed_off = False
 
     def record(sender, event):
         nonlocal unexpected
@@ -250,7 +251,13 @@ def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, 
         verify_after_commit(document, DB, snapshot, plan, rows, budget)
         if unexpected:
             raise ValueError("Revit reported an unexpected project transaction.")
-        effects = verified_effects(plan, rows, original, project_inventory(document, DB, budget), events)
+        current_inventory = project_inventory(document, DB, budget)
+        effects = verified_effects(plan, rows, original, current_inventory, events)
+        if handoff is not None:
+            handoff(rows, effects)
+            if group.Assimilate() != status.Committed or group.GetStatus() != status.Committed:
+                raise ValueError("Revit did not hand the exact reviewed placement to its approval prompt.")
+            handed_off = True
     except Exception as error:
         unresolved = type(error).__name__ == "RegenerationFailedException"
         failure = str(error) if isinstance(error, ValueError) else type(error).__name__
@@ -264,7 +271,9 @@ def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, 
                 current = transaction.GetStatus()
             if current not in (status.Uninitialized, status.Committed, status.RolledBack):
                 raise RuntimeError("The inner transaction remains unresolved.")
-            if group.GetStatus() == status.Started:
+            if handed_off:
+                restored = True
+            elif group.GetStatus() == status.Started:
                 restored = group.RollBack() == status.RolledBack and group.GetStatus() == status.RolledBack
             else:
                 restored = group.GetStatus() == status.Uninitialized and current == status.Uninitialized
@@ -282,6 +291,12 @@ def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, 
                 except Exception:
                     restored = False
 
+    if handed_off:
+        if not restored or unresolved:
+            raise RuntimeError("The handoff did not close cleanly. The bridge must roll back.")
+        return {"status": "awaiting_bridge_decision", "transaction": name, "rows": rows, "effects": effects,
+                "preview_sha256": fingerprint(plan), "baseline_audit_token": baseline_token,
+                "baseline_inventory_sha256": inventory_digest, "inventory_sha256": fingerprint(current_inventory)}
     try:
         restored = (restored and not unresolved and reread() == snapshot
                     and project_inventory(document, DB, ReadBudget()) == original
@@ -297,8 +312,8 @@ def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, 
             "baseline_audit_token": baseline_token, "baseline_inventory_sha256": inventory_digest}
 
 
-def trial(document, DB, args):
-    if (args["disposable_fixture"] is not True or document.IsWorkshared
+def trial(document, DB, args, *, handoff=None):
+    if (args["disposable_fixture"] is not True or document.IsModified or document.IsWorkshared
             or str(document.Application.VersionNumber) != "2026"):
         raise ValueError("Use a saved standalone disposable Revit 2026 project.")
     baseline_token = args["baseline_audit_token"]
@@ -314,8 +329,11 @@ def trial(document, DB, args):
     plan = placement_plan(snapshot, args["choices"])
     if fingerprint(plan) != args["preview_sha256"]:
         raise ValueError("The live crossing evidence or mapping changed after preview.")
-    return execute_trial(document, DB, snapshot, plan, reread,
-                         baseline_token=baseline_token, baseline_inventory=baseline_inventory)
+    result = execute_trial(document, DB, snapshot, plan, reread, baseline_token=baseline_token,
+                           baseline_inventory=baseline_inventory, handoff=handoff)
+    if handoff is not None and result["status"] != "awaiting_bridge_decision":
+        raise ValueError(result.get("reason", "The replay did not reach the native approval prompt."))
+    return result
 
 
 def main():

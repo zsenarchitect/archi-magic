@@ -23,7 +23,7 @@ def tagged_opening(evidence):
     host = SimpleNamespace(UniqueId="wall-10")
     frame = SimpleNamespace(Origin=XYZ(0, 0, 0), XVector=XYZ(0, 1, 0), YVector=XYZ(0, 0, 1))
     pose = SimpleNamespace(Origin=XYZ(0, 2, 3), BasisX=XYZ(0, 1, 0), BasisY=XYZ(0, 0, 1), BasisZ=XYZ(1, 0, 0))
-    opening = Opening(UniqueId="opening-30", Host=host, Symbol=SimpleNamespace(UniqueId="symbol-99"),
+    opening = Opening(Id=SimpleNamespace(Value=30), UniqueId="opening-30", Host=host, Symbol=SimpleNamespace(UniqueId="symbol-99"),
                       GetTransform=lambda: pose)
     db = SimpleNamespace(FamilyInstance=Opening, InstanceVoidCutUtils=SimpleNamespace(
         InstanceVoidCutExists=lambda target, item: target is host and item is opening))

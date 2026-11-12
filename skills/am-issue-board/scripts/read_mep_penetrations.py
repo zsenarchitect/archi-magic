@@ -534,7 +534,9 @@ def project_inventory(document, DB, budget):
 
 
 def read(DB, document, args):
-    if document is None or document.IsFamilyDocument or document.IsModifiable or document.IsModified:
+    audit = args.get("audit")
+    kept = audit is not None and audit.get("kept") is True and bool(audit.get("trial_transaction"))
+    if document is None or document.IsFamilyDocument or document.IsModifiable or (document.IsModified and not kept):
         raise ValueError("Open the saved Revit project in read-only query mode.")
     project = saved_document_identity(document)
     link, = selected(document, DB, [args["link_instance_id"]])
@@ -581,7 +583,7 @@ def read(DB, document, args):
     tracking_hosts = {row["uid"]: (row, geometry[1] if geometry is not None else None) for row, geometry in hosts}
     tracked, tracking_issues = read_tracking(DB, document, tracking_hosts, identity(project), identity(linked_identity),
                                             link_uid, tolerance, budget)
-    if document.IsModified or linked.IsModified or document.IsModifiable:
+    if (document.IsModified and not kept) or linked.IsModified or document.IsModifiable:
         raise ValueError("The host or linked document changed during the read.")
     report = {"kind": "mep-penetration-evidence", "frame": "revit_host_internal_feet",
               "host_identity": project, "link_identity": linked_identity, "link_instance_uid": link_uid,
@@ -595,7 +597,6 @@ def read(DB, document, args):
     if len(encoded) > LIMIT:
         raise ReadLimit("The crossing snapshot exceeds 2 MiB.")
     result = {"status": "ok", "snapshot_json": encoded}
-    audit = args.get("audit")
     if audit is not None:
         transaction = audit.get("trial_transaction")
         absent = [uid(value) for value in bounded_list(audit.get("absent_opening_uids", []), 10)]
@@ -604,7 +605,7 @@ def read(DB, document, args):
         if any(document.GetElement(identifier) is not None for identifier in absent):
             raise ValueError("A trial opening is still present after rollback.")
         result.update(audit_token=uuid4().hex, inventory_sha256=fingerprint(project_inventory(document, DB, budget)),
-                      trial_transaction=transaction, absent_opening_uids=absent)
+                      trial_transaction=transaction, absent_opening_uids=absent, kept=kept)
     return result
 
 
