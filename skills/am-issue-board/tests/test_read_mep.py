@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace as NS
 
 import pytest
+from issue_board_fixtures import FakeFormattedText, FakeRange, SAMPLE
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "read_mep.py"
@@ -529,6 +530,7 @@ def test_category_discovery_is_bounded_and_distinguishes_complete_empty(runtime)
     ("empty", 0, "empty_scope", []),
     ("mixed", 2, None, []),
     ("wrong_count", 2, None, []),
+    ("duplicate_uid", 2, None, []),
     ("incomplete_inventory", 2, None, []),
 ])
 def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, status, rules):
@@ -550,6 +552,11 @@ def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, st
         snapshot["elements"] = snapshot["snapshot"]["elements"]
     elif scenario == "wrong_count":
         snapshot["snapshot"]["coverage"]["connectors_retained"] += 1
+    elif scenario == "duplicate_uid":
+        payload = snapshot["snapshot"]
+        payload["elements"].append(dict(payload["elements"][0], id="43"))
+        for key in payload["coverage"]:
+            payload["coverage"][key] *= 2
     elif scenario == "incomplete_inventory":
         snapshot["snapshot"]["status"] = "incomplete"
     source_path, report_path = tmp_path / "snapshot.json", tmp_path / "report.json"
@@ -574,3 +581,150 @@ def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, st
     if scenario == "clean":
         assert all(report["coverage"][check]["evaluated"] == 1
                    for check in ("system", "connectivity", "size", "airflow"))
+
+
+def test_large_native_audit_uses_complete_runtime_pages(runtime, tmp_path):
+    system = NS(Id=ElementId(9), Name="SA-01", GetTypeId=lambda: ElementId(10))
+    connected = [connector(index, connected=True, system=system) for index in range(4)]
+    ducts = {identifier: Duct(connected, flow=120) for identifier in range(1000, 1500)}
+    for identifier, duct in ducts.items():
+        duct.UniqueId = f"duct-{identifier}"
+    host = model("host", {10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow"), **ducts})
+    request = {"source": execute(host, describe=True)["source"], "element_ids": [str(item) for item in ducts]}
+    result = execute(host, **request)
+    assert result["status"] == "ok", result
+    assert 200 * 1024 < len(result["snapshot_json"]) <= 512 * 1024
+    encoded = json.dumps(result).encode("utf-16-le")
+    units = len(encoded) // 2
+    response = {"run_id": "a00000000001", "mode": "query", "decision": "rolled_back", "status": "ok",
+                "exit_code": 0, "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0}}
+    pages = []
+    for start in range(0, units, 100 * 1024):
+        end = min(start + 100 * 1024, units)
+        pages.append({"response": dict(response, result_truncated=True, result=None, result_page={
+            "offset": start, "length": end - start, "total_length": units,
+            "text": encoded[2 * start:2 * end].decode("utf-16-le", "surrogatepass"),
+        })})
+
+    source, output = tmp_path / "runtime.json", tmp_path / "report.json"
+    cli = [sys.executable, str(SCRIPT.with_name("mep_qa.py")), str(source), "--runtime-record",
+           "--output", str(output)]
+    for record in (list(reversed(pages)), dict(response, result_truncated=False, result=result)):
+        source.write_text(json.dumps(record))
+        invocation = subprocess.run(cli, capture_output=True, text=True)
+        assert invocation.returncode == 0, invocation.stderr
+        report = json.loads(output.read_text())["report"]
+        assert report["status"] == "audited" and report["findings"] == []
+        assert report["inventory"] == {"elements": 500, "connectors_visited": 2000, "connectors_retained": 2000}
+        assert report["coverage"]["airflow"]["evaluated"] == 500
+        output.unlink()
+
+    foreign = dict(pages[1]["response"], run_id="b00000000002")
+    dirty = dict(pages[0]["response"], changes={"modified_count": 1})
+    for invalid in (pages[1:], [pages[0], foreign, *pages[2:]], [dirty, *pages[1:]], [*pages, pages[0]]):
+        source.write_text(json.dumps(invalid))
+        invocation = subprocess.run(cli, capture_output=True, text=True)
+        assert invocation.returncode == 2 and "incomplete or its pages disagree" in invocation.stderr
+        assert not output.exists()
+
+
+@pytest.mark.parametrize("scenario", [
+    "host", "linked", "moved_link", "changed_element", "changed_evidence", "changed_note",
+    "wrong_board_project", "unguarded_inner", "missing_source_guard", "unexpected_element_link",
+])
+def test_native_mep_handoff_through_board_writer(runtime, monkeypatch, tmp_path, scenario):
+    import issue_board as ib
+
+    events = []
+
+    class TextNote:
+        Id = ElementId(40)
+        UniqueId = "board-note"
+
+        def __init__(self):
+            self.text = FakeFormattedText(SAMPLE)
+
+        def GetFormattedText(self):
+            return self.text
+
+        def SetFormattedText(self, text):
+            self.text = text
+            events.append("write")
+
+    def transaction(*_):
+        events.append("transaction")
+        return NS(Start=lambda: events.append("start"), Commit=lambda: events.append("commit"),
+                  RollBack=lambda: events.append("rollback"))
+
+    runtime.TextNote = TextNote
+    runtime.Transaction = transaction
+    runtime.TextRange = FakeRange
+    runtime.ListType = NS(**{"Bullet": "bullet", "None": "none"})
+    monkeypatch.delitem(sys.modules, "read_mep", raising=False)
+    note = TextNote()
+    system = NS(Id=ElementId(9), Name=r"BAD-id987\u0069d678", GetTypeId=lambda: ElementId(10))
+    duct = Duct([connector(4, connected=False, system=system)], flow=100)
+    elements = {42: duct, 10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow")}
+    request = {}
+    if scenario in ("linked", "moved_link", "unexpected_element_link"):
+        link = Link(model("link", elements), 50)
+        host = model("host", {40: note, 41: link, 42: Duct([])})
+        request = {"link_instance_id": "41", "link_instance_uid": link.UniqueId}
+    else:
+        host = model("host", {40: note, **elements})
+    source = execute(host, describe=True, **request)["source"]
+    snapshot = execute(host, source=source, element_ids=["42"], **request)
+    snapshot_path, report_path, note_path = [tmp_path / name for name in ("snapshot.json", "report.json", "note.json")]
+    snapshot_path.write_text(snapshot["snapshot_json"])
+    result = subprocess.run([sys.executable, str(SCRIPT.with_name("mep_qa.py")), str(snapshot_path),
+                             "--output", str(report_path)], capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(report_path.read_text())["report"]
+    assert len(report["findings"]) == 2
+    note_path.write_text(json.dumps({
+        "host_identity": ib.saved_document_identity(model("other", {})) if scenario == "wrong_board_project"
+        else source["host_identity"],
+        "note": {"id": "40", "unique_id": note.UniqueId, "sha1": ib.text_sha1(SAMPLE), "text": SAMPLE},
+    }))
+    command = [sys.executable, str(SCRIPT.with_name("board_cli.py"))]
+    legacy = subprocess.run([*command, "mep-ops", str(report_path), "MEP-0002"], capture_output=True, text=True)
+    assert legacy.returncode == 2 and not legacy.stdout
+    preview = subprocess.run([*command, "mep-native-preview", str(report_path), str(note_path), "MEP-0002"],
+                             capture_output=True, text=True)
+    if scenario == "wrong_board_project":
+        assert preview.returncode == 2 and not preview.stdout
+        return
+    assert preview.returncode == 0, preview.stderr
+    plan = json.loads(preview.stdout)
+    assert plan["kind"] == "mep-native-board-plan" and "kind" not in plan["edit"]
+    row = ib.parse_board(plan["edit"]["final_text"])["issues"][-1]
+    assert row["element_ids"] == ([] if request else [42])
+    if request:
+        assert row["findings"][0] == "Linked element 42 in Revit link instance 41"
+    if scenario == "moved_link":
+        link.offset += 1
+    elif scenario == "changed_element":
+        duct.UniqueId = "replacement"
+    elif scenario == "changed_evidence":
+        duct.flow = 150
+    elif scenario == "changed_note":
+        note.UniqueId = "replacement-note"
+    elif scenario == "unguarded_inner":
+        plan = plan["edit"]
+    elif scenario == "missing_source_guard":
+        plan.pop("source_guard")
+    elif scenario == "unexpected_element_link":
+        plan["edit"]["final_text"] = plan["edit"]["final_text"].replace("Linked element 42", "Linked element id42")
+    writer_globals = {
+        "__revit__": NS(ActiveUIDocument=NS(Document=host)),
+        "inputs": {"plan": plan, "note_id": "40"},
+    }
+    if scenario in ("host", "linked"):
+        result = runpy.run_path(str(SCRIPT.with_name("apply_board.py")), init_globals=writer_globals)["result"]
+        assert result["status"] == "ok"
+        assert events == ["transaction", "start", "write", "commit"]
+        assert note.text.GetPlainText() == plan["edit"]["final_text"]
+    else:
+        with pytest.raises(ValueError):
+            runpy.run_path(str(SCRIPT.with_name("apply_board.py")), init_globals=writer_globals)
+        assert not events and note.text.GetPlainText() == SAMPLE

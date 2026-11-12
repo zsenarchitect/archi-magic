@@ -12,6 +12,7 @@ The READ file is the "note" object from read_board.py, saved as JSON
     python board_cli.py relate  READ.json A B
     python board_cli.py batch   READ.json OPS.json
     python board_cli.py mep-ops FINDINGS.json FINDING_ID [FINDING_ID ...]
+    python board_cli.py mep-native-preview REPORT.json READ.json FINDING_ID [FINDING_ID ...]
     python board_cli.py archive READ.json ARCHIVE.json [--status DONE] [--title "..."]
     python board_cli.py replace READ.json NUMBER finding|todo LINES.json
 
@@ -57,6 +58,24 @@ def decode_note(note):
     return ib.unescape(note["text"]), note.get("formats")
 
 
+def note_target(source, body):
+    if "host_identity" not in source:
+        return None
+    host = source["host_identity"]
+    note = source["note"]
+    if (
+        set(host) != {"project_uid", "path_sha256"}
+        or not host["project_uid"].strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", host["path_sha256"])
+        or not re.fullmatch(r"[1-9][0-9]{0,18}", note["id"])
+        or int(note["id"]) > 2**63 - 1
+        or not note["unique_id"].strip()
+        or note["sha1"] != ib.text_sha1(body)
+    ):
+        raise ValueError("Read the board again with include_identity enabled.")
+    return {key: note[key] for key in ("id", "unique_id", "sha1")}
+
+
 def read_archive(path):
     """(text, formats) of an archive note file, or (None, None) when the file
     is missing or holds no note: that means the archive note is created."""
@@ -79,7 +98,7 @@ def load_ops(path):
     return data
 
 
-def mep_operations(report, selection):
+def selected_mep_findings(report, selection):
     if not 1 <= len(selection) <= 100 or len(set(selection)) != len(selection):
         raise ValueError("Select one to 100 distinct IDs from the reviewed MEP report.")
     rows = report.get("findings") if isinstance(report, dict) else None
@@ -96,10 +115,12 @@ def mep_operations(report, selection):
             findings[row["id"]] = row
     if reviewed != findings.keys():
         raise ValueError("A selected finding ID is absent from the MEP report.")
+    return [findings[finding_id] for finding_id in selection]
 
+
+def mep_board_ops(findings, link_id=None, *, native=False):
     ops = []
-    for finding_id in selection:
-        row = findings[finding_id]
+    for row in findings:
         rule = row["ruleId"]
         severity = row["severity"]
         raw_element_id = row["elementId"]
@@ -116,7 +137,11 @@ def mep_operations(report, selection):
             raise ValueError("A selected finding needs a readable message.")
         # The report text may describe other IDs. The board must link only the reviewed target.
         message = ib.ID_RE.sub(r"ID \1", message)
-        lines = ["Audited element id" + element_id, message]
+        if native:
+            message = message.replace("\\", "\uff3c")
+        target = "Audited element id" + element_id if link_id is None else (
+            "Linked element " + element_id + " in Revit link instance " + link_id)
+        lines = [target, message]
         point = row.get("location")
         if isinstance(point, dict):
             coords = [point.get(axis) for axis in "xyz"]
@@ -124,7 +149,57 @@ def mep_operations(report, selection):
                 lines.append("Audit coordinates (x, y, z): " + ", ".join(map(str, coords)))
         ops.append({"op": "add", "issue": {"title": rule + " audit finding", "status": "OPEN",
                                             "severity": severity.capitalize(), "findings": lines}})
-    return {"ops": ops}
+    return ops
+
+
+def mep_operations(report, selection):
+    if isinstance(report, dict) and str(report.get("kind", "")).startswith("mep-native-"):
+        raise ValueError("Native MEP reports require mep-native-preview.")
+    return {"ops": mep_board_ops(selected_mep_findings(report, selection))}
+
+
+def native_mep_preview(data, board, selection):
+    from mep_qa import validate_native_source
+
+    if (set(data) != {"kind", "version", "report"} or data["kind"] != "mep-native-report"
+            or type(data["version"]) is not int or data["version"] != 1):
+        raise ValueError("Expected a version 1 native MEP findings report.")
+    report = data["report"]
+    if report["status"] not in ("audited", "incomplete_evaluation"):
+        raise ValueError("Select findings from an evaluated native MEP report.")
+    source = report["source"]
+    validate_native_source(source)
+    body, formats = decode_note(board)
+    note = note_target(board, body)
+    if note is None or board["host_identity"] != source["host_identity"]:
+        raise ValueError("Read the board with include_identity from the audited host project.")
+    findings = selected_mep_findings(report, selection)
+    link_id = source["link_instance_id"]
+    ops = mep_board_ops(findings, link_id, native=True)
+    targets = {}
+    for row in findings:
+        element_id = row["elementId"]
+        evidence = report["targets"][element_id]
+        if (evidence["id"] != element_id or not isinstance(evidence["uid"], str)
+                or not 0 < len(evidence["uid"]) <= 160):
+            raise ValueError("A selected finding lacks the audited element identity.")
+        targets[element_id] = evidence
+    before = ib.parse_board(body)
+    edit = ib.plan_batch(body, ops, formats)
+    edit.pop("kind")
+    after = ib.parse_board(edit["final_text"])
+    new_rows = after["issues"][len(before["issues"]):]
+    if (after["issues"][:len(before["issues"])] != before["issues"] or len(new_rows) != len(findings)
+            or len({row["number"] for row in after["issues"]}) != len(after["issues"])
+            or any(row["element_ids"] != ([] if link_id else [int(finding["elementId"])])
+                   for row, finding in zip(new_rows, findings))):
+        raise ValueError("The MEP board preview changed an existing issue or added an unexpected element link.")
+    return {
+        "kind": "mep-native-board-plan", "version": 1, "edit": edit,
+        "board_target": {"host_identity": source["host_identity"], "active": note, "archive": None},
+        "source_guard": {"source": source, "targets": targets, "clearance": report["clearance"],
+                         "revit_year": report["revit_year"]},
+    }
 
 
 def main(argv):
@@ -138,6 +213,8 @@ def main(argv):
             out = ib.plan_create(spec["title_line"], spec.get("issues", []), spec.get("next_number"))
         elif cmd == "mep-ops":
             out = mep_operations(load(argv[1]), argv[2:])
+        elif cmd == "mep-native-preview":
+            out = native_mep_preview(load(argv[1]), load(argv[2]), argv[3:])
         elif cmd == "batch":
             text, formats = read_note(argv[1])
             out = ib.plan_batch(text, load_ops(argv[2]), formats)
@@ -182,7 +259,7 @@ def main(argv):
             else:
                 sys.stderr.write("unknown command: %s\n" % cmd)
                 return 2
-    except (ib.BoardError, IndexError, KeyError, ValueError) as e:
+    except (ib.BoardError, OSError, IndexError, KeyError, TypeError, AttributeError, ValueError) as e:
         sys.stderr.write("cannot plan: %s\n" % e)
         return 2
     sys.stdout.write(json.dumps(out, indent=1, ensure_ascii=True))

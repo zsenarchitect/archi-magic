@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, List
@@ -457,16 +458,19 @@ def run_native_audit(data):
             or not 0 <= inventory["connectors_retained"] <= inventory["connectors_visited"] <= 4000
             or inventory["connectors_retained"] > 2000):
         raise ValueError("The native MEP snapshot does not have complete inventory counts.")
-    seen, findings, targets, diagnostics = set(), [], {}, []
+    seen_ids, seen_uids = set(), set()
+    findings, targets, diagnostics = [], {}, []
     coverage = {key: dict.fromkeys(("evaluated", "unavailable", "not_applicable"), 0) for key in NATIVE_CHECKS}
     for row in rows:
-        if (not positive_id(row["id"]) or row["id"] in seen
+        if (not positive_id(row["id"]) or row["id"] in seen_ids
                 or not isinstance(row["uid"], str) or not 0 < len(row["uid"]) <= 160
+                or row["uid"] in seen_uids
                 or row["category"] not in SYSTEM_CATEGORIES | DISTRIBUTION_CATEGORIES
                 or (clearance is None and row["category"] == "Mechanical Equipment"
                     and row["clearance"] != "unavailable")):
             raise ValueError("The native MEP snapshot contains an invalid element identity or category.")
-        seen.add(row["id"])
+        seen_ids.add(row["id"])
+        seen_uids.add(row["uid"])
         violations, checks = native_element_findings(row)
         for check, state in checks.items():
             coverage[check][state] += 1
@@ -492,21 +496,67 @@ def run_native_audit(data):
     }
 
 
+def read_runtime_snapshot(path):
+    """Load a complete native query or all retained result pages from one query."""
+    limit = 512 * 1024
+    with open(path, "rb") as stream:
+        encoded = stream.read(8 * limit + 1)
+    if len(encoded) > 8 * limit:
+        raise ValueError("The saved MEP query exceeds its size limit.")
+    saved = json.loads(encoded)
+    pages = saved if isinstance(saved, list) else [saved]
+    if not 1 <= len(pages) <= 64:
+        raise ValueError("Supply up to 64 result pages from one MEP query.")
+    for page in pages:
+        response = page.get("response", page)
+        if (response.get("mode") != "query"
+                or response.get("decision") not in ("rolled_back", "no_changes")
+                or type(response.get("exit_code")) is not int or response["exit_code"] != 0
+                or not isinstance(response.get("changes"), dict)
+                or type(response.get("result_truncated")) is not bool
+                or not re.fullmatch(r"[0-9a-f]{12}", response.get("run_id", ""))
+                or (response.get("result_truncated") is True and response.get("result") is not None)):
+            raise ValueError("Supply the full saved responses for one successful pyRevit query.")
+        if response.get("result_truncated") is True:
+            total = response.get("result_page", {}).get("total_length")
+            if type(total) is not int or not 0 < total <= 2 * limit:
+                raise ValueError("The retained MEP query exceeds its result size limit.")
+
+    # Reuse the project page's reader for pyRevit envelopes and UTF-16 page offsets.
+    viewer_scripts = Path(__file__).resolve().parents[2] / "am-bim-viewer" / "scripts"
+    sys.path.insert(0, str(viewer_scripts))
+    try:
+        from project_page import read_saved_result
+    except ImportError as error:
+        raise ValueError("The Archi Magic BIM viewer scripts are required for runtime-record input.") from error
+    finally:
+        sys.path.pop(0)
+    result = read_saved_result(saved, ("query",), "The saved MEP query is incomplete or its pages disagree.")
+    payload = result["snapshot_json"] if result.get("status") == "ok" else None
+    if not isinstance(payload, str) or len(payload) > limit or not payload.isascii():
+        raise ValueError("The query did not return a complete bounded native MEP snapshot.")
+    return json.loads(payload)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MEP QA Audit Tool (Issue #186 Phase 1)")
     parser.add_argument("input", help="Path to JSON file containing extracted MEP elements")
+    parser.add_argument("--runtime-record", action="store_true", help="Read a full saved pyRevit query or its pages")
     parser.add_argument("--output", help="Path to write issue board findings JSON")
     parser.add_argument("--summary", action="store_true", help="Print summary only")
 
     args = parser.parse_args()
 
     try:
-        with open(args.input, "r", encoding="utf-8") as stream:
-            data = json.load(stream)
-            native = isinstance(data, dict) and (
-                "snapshot" in data or str(data.get("kind", "")).startswith("mep-native-"))
-            if native and stream.tell() > 512 * 1024:
-                raise ValueError("The native MEP snapshot exceeds 512 KiB.")
+        if args.runtime_record:
+            data, native = read_runtime_snapshot(args.input), True
+        else:
+            with open(args.input, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+                native = isinstance(data, dict) and (
+                    "snapshot" in data or str(data.get("kind", "")).startswith("mep-native-"))
+                if native and stream.tell() > 512 * 1024:
+                    raise ValueError("The native MEP snapshot exceeds 512 KiB.")
         result = run_native_audit(data) if native else run_mep_audit(audit_input(data))
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError) as error:
         print(f"MEP audit could not read the input. {error}", file=sys.stderr)

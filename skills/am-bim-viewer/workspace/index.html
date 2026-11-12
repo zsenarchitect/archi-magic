@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archi Magic workspace</title>
+<style>
+:root { color-scheme: light dark; font: 100%/1.5 system-ui, sans-serif; }
+body { max-width: 72rem; margin: 2rem auto; padding: 0 1rem; }
+header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; }
+h1, h2, h3 { line-height: 1.2; }
+label, textarea { display: block; margin: .5rem 0; }
+input, button, textarea, select { font: inherit; }
+button, select { margin: .25rem 0; }
+textarea { width: 100%; max-width: 36rem; }
+li { margin-bottom: .5rem; overflow-wrap: anywhere; }
+li p { margin: .25rem 0; white-space: pre-wrap; }
+section { margin: 1.5rem 0; }
+.document-table { overflow: auto; }
+.document-table th, .document-table td { padding: .35rem .65rem; text-align: left; white-space: pre-wrap; }
+[aria-pressed="true"] { font-weight: bold; }
+</style>
+</head>
+<body>
+<header><h1 id="heading">Archi Magic workspace</h1><button type="button" id="sign-out" hidden>Sign out</button></header>
+<p id="connection" role="status"></p>
+<form id="sign-in" hidden>
+  <label>Project <input name="project" required pattern="[a-z0-9][a-z0-9\-]{0,62}"></label>
+  <label>Access token <input name="token" type="password" autocomplete="current-password" required></label>
+  <button>Sign in</button>
+</form>
+<main id="workspace" hidden>
+  <div id="artifacts"></div>
+  <section id="review" hidden aria-labelledby="selected-title">
+    <h2 id="selected-title"></h2>
+    <p id="review-state"></p>
+    <ul id="comments"></ul>
+    <form id="review-form" hidden>
+      <label>Review status <select name="status"><option>open</option><option>resolved</option><option>waived</option></select></label>
+      <label>Assignee <select name="assignee"></select></label>
+      <button name="action" value="update">Save status and assignment</button>
+      <label>Comment <textarea name="comment" rows="4"></textarea></label>
+      <button name="action" value="comment">Post comment</button>
+    </form>
+    <p id="edit-message" role="status"></p>
+  </section>
+</main>
+<!-- workspace script -->
+</body>
+</html>
