@@ -221,6 +221,10 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 5. Save the full fresh query record. Run `python scripts/verify_family_placement_decision.py preview.json before.json trial.json after.json modify.json fresh.json`. Check the result for the exact retained instance or the restored project.
 6. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
 
+## Validate a batch family type table (issue #165)
+
+Use `python scripts/batch_family_type_table.py --table types.csv --manifest discovery.json` to validate the input. Start the CSV with `source_path,seed_type,type`. Add size columns with explicit units, such as `Width[mm]` or `Ratio[1]`. Use exact library paths and type names. This step binds the table to the reviewed source files. Project classification and native type creation require separate qualification.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
