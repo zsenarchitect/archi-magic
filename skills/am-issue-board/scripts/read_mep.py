@@ -370,6 +370,28 @@ def read_route_elbow(source, request):
     return dict(request, diameter_ft=float(diameter), domain=domain, elbow=part)
 
 
+def read_route_trial_types(source, request):
+    if set(request) != {"elbow", "system_type", "level"}:
+        raise ReadError("Supply reviewed elbow, system type and level selections.")
+    fitting = read_route_elbow(source, request["elbow"])
+    system_class = (DB.Mechanical.MechanicalSystemType if fitting["domain"] == "DomainHvac"
+                    else DB.Plumbing.PipingSystemType)
+    selections = {}
+    for role, expected_class in (("system_type", system_class), ("level", DB.Level)):
+        reviewed = request[role]
+        if set(reviewed) != {"id", "uid"}:
+            raise ReadError("A reviewed system type or level needs its ID and UID.")
+        item = source.GetElement(element_id(reviewed["id"]))
+        uid = reviewed["uid"]
+        if (not isinstance(item, expected_class) or not isinstance(uid, TEXT)
+                or not 1 <= len(uid) <= 160 or str(item.UniqueId) != uid):
+            raise ReadError("The reviewed route " + role + " is missing, changed or incompatible.")
+        selections[role] = dict(reviewed)
+        if role == "system_type":
+            selections[role]["classification"] = str(item.SystemClassification)
+    return dict(selections, fitting=fitting)
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -380,6 +402,18 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
+        if "route_trial_types" in request:
+            if link_id is not None or any(field in request for field in (
+                    "route_elbow", "route_endpoints", "route_obstacles", "element_ids", "clearance")):
+                raise ReadError("Use a separate host-project query for route trial types.")
+            types = read_route_trial_types(source, request["route_trial_types"])
+            current_source, _, current_identity = resolve_source(host, link_id, link_uid)
+            if (current_identity != identity
+                    or read_route_trial_types(current_source, request["route_trial_types"]) != types):
+                raise ReadError("The route trial types changed while being read.")
+            check_time(clock)
+            payload = {"kind": "mep-route-trial-types", "version": 1, "source": identity, "types": types}
+            return {"status": "ok", "trial_types_json": json.dumps(payload, ensure_ascii=True, allow_nan=False)}
         if "route_elbow" in request:
             if link_id is not None or any(field in request for field in (
                     "route_endpoints", "route_obstacles", "element_ids", "clearance")):

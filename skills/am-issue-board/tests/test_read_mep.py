@@ -228,7 +228,10 @@ def test_read_reviewed_route_endpoints(runtime, scenario):
         assert a["origin_ft"] == [1.0, 2.0, 3.0] and a["axes"][2] == [0.0, 0.0, 1.0]
 
 
-@pytest.mark.parametrize("scenario", ["duct", "pipe", "no_match", "changed", "wrong_type", "missing_symbol"])
+@pytest.mark.parametrize("scenario", [
+    "duct", "pipe", "no_match", "changed", "wrong_type", "missing_symbol",
+    "trial_types", "wrong_system_domain", "stale_level",
+])
 def test_route_elbow_uses_the_reviewed_type_and_both_end_sizes(runtime, scenario):
     class Resource:
         def __init__(self, **fields):
@@ -250,8 +253,21 @@ def test_route_elbow_uses_the_reviewed_type_and_both_end_sizes(runtime, scenario
     class FamilySymbol:
         UniqueId = "elbow-type"
 
-    runtime.Mechanical, runtime.Plumbing = NS(DuctType=DuctType), NS(PipeType=PipeType)
+    class MechanicalSystemType:
+        UniqueId = "system-uid"
+        SystemClassification = "SupplyAir"
+
+    class PipingSystemType:
+        UniqueId = "system-uid"
+        SystemClassification = "DomesticColdWater"
+
+    class Level:
+        UniqueId = "level-uid"
+
+    runtime.Mechanical = NS(DuctType=DuctType, MechanicalSystemType=MechanicalSystemType)
+    runtime.Plumbing = NS(PipeType=PipeType, PipingSystemType=PipingSystemType)
     runtime.FamilySymbol = FamilySymbol
+    runtime.Level = Level
     runtime.RoutingPreferenceErrorLevel = NS(**{"None": "none"})
     runtime.RoutingPreferenceRuleGroupType = NS(Elbows="elbows")
     runtime.ElementId.InvalidElementId = ElementId(-1)
@@ -274,18 +290,33 @@ def test_route_elbow_uses_the_reviewed_type_and_both_end_sizes(runtime, scenario
     curve_type.RoutingPreferenceManager = Resource(OwnerId=ElementId(42), GetMEPPartId=get_part)
     if scenario == "wrong_type":
         curve_type.Shape = "Rectangular"
-    host = model("host", {42: curve_type, 43: None if scenario == "missing_symbol" else FamilySymbol()})
+    system = PipingSystemType() if scenario == "wrong_system_domain" else MechanicalSystemType()
+    host = model("host", {42: curve_type, 43: None if scenario == "missing_symbol" else FamilySymbol(),
+                          44: system, 45: Level()})
     identity = execute(host, describe=True)["source"]
     reviewed = {"curve_type_id": "42", "curve_type_uid": "curve-type", "diameter_ft": 0.5}
-    result = execute(host, source=identity, route_elbow=reviewed)
+    trial = scenario in ("trial_types", "wrong_system_domain", "stale_level")
+    selection = {"elbow": reviewed, "system_type": {"id": "44", "uid": "system-uid"},
+                 "level": {"id": "45", "uid": "stale" if scenario == "stale_level" else "level-uid"}}
+    request = {"route_trial_types": selection} if trial else {"route_elbow": reviewed}
+    result = execute(host, source=identity, **request)
     errors = {"changed": "changed while being read", "wrong_type": "round duct or pipe",
-              "missing_symbol": "unresolved routing preference"}
+              "missing_symbol": "unresolved routing preference", "wrong_system_domain": "route system_type",
+              "stale_level": "route level"}
     if scenario in errors:
         assert result["status"] == "incomplete" and errors[scenario] in result["message"]
-        assert "elbow_json" not in result
+        assert "elbow_json" not in result and "trial_types_json" not in result
         return
     assert observed == [[0.5, 0.5], [0.5, 0.5]]
     expected = None if scenario == "no_match" else {"id": "43", "uid": "elbow-type"}
+    if trial:
+        assert json.loads(result["trial_types_json"]) == {
+            "kind": "mep-route-trial-types", "version": 1, "source": identity,
+            "types": {"fitting": dict(reviewed, domain="DomainHvac", elbow=expected),
+                      "system_type": {"id": "44", "uid": "system-uid", "classification": "SupplyAir"},
+                      "level": {"id": "45", "uid": "level-uid"}},
+        }
+        return
     assert json.loads(result["elbow_json"]) == {
         "kind": "mep-route-elbow", "version": 1, "source": identity,
         "fitting": dict(reviewed, domain="DomainPiping" if scenario == "pipe" else "DomainHvac", elbow=expected),
