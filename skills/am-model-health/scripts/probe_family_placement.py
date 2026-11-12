@@ -94,7 +94,7 @@ def load_missing_symbol(document, DB, path, selection, callbacks):
     return symbol
 
 
-def trial(document, DB, args):
+def trial(document, DB, args, *, handoff=None, expected_state=None):
     required = {"disposable_fixture", "index", "preview", "preview_sha256", "baseline_audit_token"}
     if (set(args) not in (required, required | {"staging"})
             or args["disposable_fixture"] is not True or document.IsModifiable
@@ -123,14 +123,21 @@ def trial(document, DB, args):
         with staged_pair(args["staging"], current["source"]["path"]) as (path, pair):
             if (pair["rfa"], pair["catalog"]) != (current["source"]["rfa"], current["source"]["catalog"]):
                 raise ValueError("The staged load does not match the reviewed source pair.")
-            return execute_trial(document, DB, args, review, request, before, path)
+            return execute_trial(document, DB, args, review, request, before, path,
+                                 handoff=handoff, expected_state=expected_state)
     if "staging" in args:
         raise ValueError("A reused project type has no load input.")
-    return execute_trial(document, DB, args, review, request, before)
+    return execute_trial(document, DB, args, review, request, before,
+                         handoff=handoff, expected_state=expected_state)
 
 
-def execute_trial(document, DB, args, review, request, before, staged_path=None):
+def execute_trial(document, DB, args, review, request, before, staged_path=None, *, handoff=None, expected_state=None):
     original = inventory(document, DB)
+    baseline_sha256 = manifest_digest(before)
+    baseline_inventory = inventory_record(original)
+    if expected_state is not None and (baseline_sha256 != expected_state["baseline_sha256"]
+                                       or baseline_inventory != expected_state["baseline_inventory"]):
+        raise ValueError("The project changed after the verified rollback trial.")
     callbacks = []
     events = []
     transaction_name = TRANSACTION_NAME + " " + uuid4().hex
@@ -161,7 +168,9 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
     failure = None
     regeneration_failed = False
     placement = None
+    loaded = None
     restored = False
+    handed_off = False
     application.DocumentChanged += record
     try:
         if group.Start() != status.Started or transaction.Start() != status.Started:
@@ -230,13 +239,21 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
             raise ValueError("The project type or level changed beyond the reviewed placement effects.")
         validate_effects(original, inventory(document, DB), events[0], loaded_ids + [placement["id"]],
                          review["ownership_ids"])
+        if loaded_ids:
+            keys = ("family_id", "family_uid", "id", "uid")
+            loaded = {key: resolved["symbol"][key] for key in keys}
+        if handoff is not None:
+            handoff(placement, events[0])
+            if group.Assimilate() != status.Committed or group.GetStatus() != status.Committed:
+                raise ValueError("Revit did not transfer the validated placement to the bridge.")
+            handed_off = True
     except Exception as error:
         regeneration_failed = type(error).__name__ == "RegenerationFailedException"
         failure = str(error) if isinstance(error, ValueError) else type(error).__name__
     finally:
         closing = True
         try:
-            restored = rollback(transaction, group, status)
+            restored = handed_off or rollback(transaction, group, status)
         except Exception:
             restored = False
         finally:
@@ -251,7 +268,13 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
                     restored = False
 
     if not restored or regeneration_failed:
+        if handoff is not None:
+            raise RuntimeError("The placement did not close cleanly. The bridge must roll it back.")
         return {"status": "transaction_unresolved", "reason": failure or "Rollback was not confirmed."}
+    if handed_off:
+        return {"status": "awaiting_bridge_decision", "preview_sha256": args["preview_sha256"],
+                "placement": placement, "effects": events[0], "loaded_symbol": loaded,
+                "transaction": transaction_name}
     try:
         if read_snapshot(document, DB, request, require_unmodified=False) != before or inventory(document, DB) != original:
             return {"status": "transaction_unresolved", "reason": "The baseline changed after rollback."}
@@ -259,14 +282,10 @@ def execute_trial(document, DB, args, review, request, before, staged_path=None)
         return {"status": "transaction_unresolved", "reason": type(error).__name__}
     if failure:
         return {"status": "stopped", "reason": failure, "rollback_verified": True, "load_conflicts": callbacks}
-    loaded = None
-    if loaded_ids:
-        keys = ("family_id", "family_uid", "id", "uid")
-        loaded = {key: resolved["symbol"][key] for key in keys}
     return {"status": "trial_rolled_back", "preview_sha256": args["preview_sha256"],
             "placement": placement, "effects": events[0], "load_conflicts": callbacks,
             "loaded_symbol": loaded, "transaction": transaction_name,
-            "baseline_sha256": manifest_digest(before), "baseline_inventory": inventory_record(original),
+            "baseline_sha256": baseline_sha256, "baseline_inventory": baseline_inventory,
             "baseline_audit_token": args["baseline_audit_token"],
             "rollback_verified": True}
 

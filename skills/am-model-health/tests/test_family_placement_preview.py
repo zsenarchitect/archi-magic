@@ -163,6 +163,10 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
             pass
 
     class Group(Scope):
+        def Assimilate(self):
+            self.state = "Committed"
+            return self.state
+
         def RollBack(self):
             symbol.IsActive = False
             elements.pop(99, None)
@@ -301,6 +305,37 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
         bad = dict(trial, approval="auto")
         with pytest.raises(ValueError, match="no changes, warnings, or approval"):
             verify(preview, original, bad, fresh)
+
+        import apply_family_placement as writer
+        approvals = []
+
+        def ask(context):
+            approvals.append(context)
+            if len(approvals) == 2:
+                raise ValueError("Policy changed before the bridge handoff.")
+
+        monkeypatch.setattr(writer, "require_ask", ask)
+        request = {"placement": args, "before": original, "trial": trial, "after": fresh}
+        stopped = writer.apply(project, db, request, "bridge")
+        assert stopped["status"] == "stopped"
+        assert stopped["rollback_verified"]
+        assert set(elements) == ({5} if loading else {5, 41})
+
+        def require_ask(context):
+            approvals.append(context)
+
+        monkeypatch.setattr(writer, "require_ask", require_ask)
+        elements[123] = SimpleNamespace(UniqueId="changed-project")
+        with pytest.raises(ValueError, match="project changed"):
+            writer.apply(project, db, request, "bridge")
+        assert 99 not in elements
+        del elements[123]
+        handed_off = writer.apply(project, db, request, "bridge")
+        assert handed_off["status"] == "awaiting_bridge_decision"
+        assert handed_off["effects"] == result["effects"]
+        assert 99 in elements and symbol.IsActive
+        assert not project.Application.DocumentChanged
+
 
 
 @pytest.mark.parametrize("shared", [False, True])

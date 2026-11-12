@@ -123,7 +123,9 @@ def verify(preview, before_record, trial_record, after_record):
     bridge_effects(trial, effects, transaction)
     return {"status": "family_placement_rollback_verified", "preview_sha256": result["preview_sha256"],
             "project": baseline["project"], "revit_build": baseline["revit_build"],
-            "action": review["action"], "effects": effects, "run_ids": run_ids}
+            "action": review["action"], "effects": effects, "run_ids": run_ids,
+            "baseline_sha256": result["baseline_sha256"], "baseline_inventory": inventory,
+            "placement": result["placement"]}
 
 
 def main():

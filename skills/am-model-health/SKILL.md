@@ -212,6 +212,14 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 5. Run `python scripts/verify_family_placement_probe.py preview.json before.json trial.json after.json`. Stop on any unexpected effect or unresolved rollback.
 6. The missing-type trial allows one new family, one new type, and one new instance. Use a worker-verified catalog type for a paired trial. Existing siblings and Keep/Discard require separate native qualification.
 
+### Qualify the Keep/Discard handoff
+
+1. Complete the independent rollback check first. Recheck `get_context` and review the same placement and ownership scope.
+2. Use `apply_family_placement.py` in guarded CPython modify mode on the disposable project. Pass the same probe inputs as `placement`. Pass the three full records as `before`, `trial`, and `after`.
+3. Check the active model and result in Revit. Use the Revit prompt to Keep or Discard. Save the full modify record. Check for `approval: user` and the matching `committed` or `discarded` decision.
+4. Read the project again after the decision. Verify the exact instance and pose after Keep. Verify absence of the provisional IDs and a restored inventory after Discard.
+5. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
