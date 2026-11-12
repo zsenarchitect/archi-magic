@@ -20,7 +20,7 @@ def field(identifier, name, formula=None, **changes):
 
 def read(role, fields, types):
     record = {"kind": "family-parameter-transfer-read", "version": 1, "role": role, "revit_build": "fixture",
-              "category_id": "-1000", "state": {
+              "category_id": "-1000", "family": "Fixture", "state": {
                   "definitions": {row["id"]: row for row in fields},
                   "types": {name: {key: {"state": "value", "value": value} for key, value in values.items()}
                             for name, values in types.items()},
@@ -306,15 +306,23 @@ def test_native_mutation_applies_literal_before_formula_and_restores_current_typ
 
 
 @pytest.fixture
-def decision_records(records, trial_states):
-    from copy import deepcopy
+def decision_records(records, trial_states, tmp_path):
+    from hashlib import sha256
+    from family_library_discovery import directory_info, identity, pinned_root
     from probe_family_parameter_transfer import TRANSACTION_NAME
 
     plan, state, changed, added = trial_states
     source, target, request = seal(records)
-    transfer = {"source_read": source, "target_read": target, "request": request, "working_copy": {},
+    working = tmp_path / "private-copy"
+    working.mkdir()
+    data = b"private family"
+    (working / "Fixture.rfa").write_bytes(data)
+    with pinned_root(working) as directory:
+        working_copy = {"workspace": str(working), "workspace_identity": identity(directory_info(directory)),
+                        "file": {"basename": "Fixture.rfa", "bytes": len(data), "sha256": sha256(data).hexdigest()}}
+    transfer = {"source_read": source, "target_read": target, "request": request, "working_copy": working_copy,
                 "preview_sha256": plan["preview_sha256"]}
-    baseline = {"preview_sha256": plan["preview_sha256"], "copy_sha256": manifest_digest({}), "owner": "20",
+    baseline = {"preview_sha256": plan["preview_sha256"], "copy_sha256": manifest_digest(working_copy), "owner": "20",
                 "inventory": {"20": ["owner", "original"]}, "state": state, "kept": False}
 
     def envelope(mode, run_id, decision, result, effects=None, approval=None, status="ok"):
@@ -413,3 +421,77 @@ def test_replay_must_match_values_and_logical_effects_before_handoff(decision_re
     monkeypatch.setattr(module, "run_trial", replay)
     assert apply(None, None, None, requested, None) == "verified"
     assert actions == ["ask checked", "ask checked"]
+
+
+def test_reserve_requires_keep_and_uses_a_separate_private_destination(decision_records, tmp_path):
+    from family_parameter_transfer_export import reserve
+
+    trial_records, keep, discard = decision_records
+    with pytest.raises(ValueError, match="verified native Keep"):
+        reserve(*trial_records, *discard, str(tmp_path))
+    with pytest.raises(ValueError, match="outside the reviewed working-copy"):
+        reserve(*trial_records, *keep, trial_records[0]["working_copy"]["workspace"])
+    reservation = reserve(*trial_records, *keep, str(tmp_path))
+    destination = Path(reservation["save_as"])
+    assert destination.parent.parent.parent == tmp_path
+    assert destination.name == "Fixture.rfa"
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("changed_state", [False, True])
+def test_seal_requires_independent_exact_reopen(decision_records, tmp_path, monkeypatch, changed_state):
+    from types import SimpleNamespace
+    import family_parameter_transfer_export as export
+
+    trial_records, (modify, fresh), _ = decision_records
+    reservation = export.reserve(*trial_records, modify, fresh, str(tmp_path))
+    destination = Path(reservation["save_as"])
+    destination.write_bytes(b"kept family")
+    audit = json.loads(fresh["result"]["snapshot_json"])
+    state = audit["state"]
+    if changed_state:
+        state["definitions"]["22"]["formula"] = "Panel Width + 2"
+    calls = []
+    document = SimpleNamespace(PathName=str(destination))
+
+    def open_document(path):
+        assert path == str(destination)
+        app.Documents.append(document)
+        calls.append("open")
+        return document
+
+    def close(save):
+        assert save is False
+        app.Documents.remove(document)
+        calls.append("close")
+        return True
+
+    document.Close = close
+    app = SimpleNamespace(Documents=[], OpenDocumentFile=open_document)
+    ui = SimpleNamespace(Application=app, ActiveUIDocument=None)
+    read = {"family": "Fixture", "category_id": "-1000", "revit_build": "fixture", "state": state}
+    monkeypatch.setattr(export, "snapshot", lambda doc, db: read)
+    workspace = reservation["workspace"]
+    request_digest = reservation["request_sha256"]
+    if changed_state:
+        with pytest.raises(ValueError, match="differs from the independently verified kept family"):
+            export.reopen(ui, None, workspace, request_digest, "pyRevit fixture")
+        assert not (Path(workspace) / export.RECEIPT_FILE).exists()
+        assert calls == ["open", "close"]
+        return
+    receipt = export.reopen(ui, None, workspace, request_digest, "pyRevit fixture")
+    assert calls == ["open", "close"]
+    assert not app.Documents
+    assert receipt["loaded_family"] == {"id": "20", "uid": "family-20"}
+    assert receipt["state_sha256"] == manifest_digest(state)
+    with export.verified_export(workspace, request_digest, expected_derived_sha256=receipt["derived_sha256"]) as sealed:
+        assert sealed == (destination, receipt)
+    with pytest.raises(ValueError, match="differs from the reviewed reload input"):
+        with export.verified_export(workspace, request_digest, expected_derived_sha256="wrong digest"):
+            pytest.fail("Unexpected export was made available")
+    with pytest.raises(FileExistsError):
+        export.reopen(ui, None, workspace, request_digest, "pyRevit fixture")
+    destination.write_bytes(b"replaced family")
+    with pytest.raises(ValueError, match="does not match the reservation and current file bytes"):
+        with export.verified_export(workspace, request_digest):
+            pytest.fail("Replaced export was made available")

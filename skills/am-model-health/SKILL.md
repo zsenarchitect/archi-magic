@@ -310,7 +310,16 @@ Save the full trial as `trial.json`. Run the audit again with the trial's `trans
 3. Use Revit's Keep or Discard prompt. Save the full modify record as `modify.json`. Run the audit again with the replay's `transaction` as `trial_transaction`. Set `kept` to true only after Keep. Save the full audit as `fresh.json`.
 4. Run the same verifier with `--modify modify.json --fresh fresh.json`. Save the decision receipt. Stop if the audit does not match the decision.
 
-Verify both decisions in native Revit before use on project data. The private export and guarded project reload also require native verification.
+Verify both decisions in native Revit before use on project data.
+
+### Seal the private family export
+
+1. After a verified Keep, run `family_parameter_transfer_export.py reserve`. Pass the six saved files with `--transfer`, `--before`, `--trial`, `--after`, `--modify`, and `--fresh`. Pass a separate private parent with `--destination`.
+2. Close all transaction groups. Use Revit Save As to write only to the returned `save_as` path. Close the exported family.
+3. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR` to the returned workspace. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR_REQUEST_SHA256` to the returned request digest. Run `pyrevit run scripts/family_parameter_transfer_export.py --revit=2026` in a disposable CPython worker with no model arguments. Wait for the worker to exit.
+4. Run `family_parameter_transfer_export.py collect --workspace <workspace> --request-sha256 <digest>`. Save the receipt. It binds the reopened family state and file bytes to the exact loaded project target.
+
+The guarded project reload still requires native verification.
 
 ## Preview a CAD layout (issue #166)
 
