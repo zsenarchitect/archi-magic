@@ -319,7 +319,8 @@ def audit_records(monkeypatch):
         changes = {key: [] for key in verifier.EFFECTS}
         changes.update({key + "_count": 0 for key in verifier.EFFECTS})
         changes.update(by_category={}, transactions=[] if mode == "query" else [name])
-        return {"mode": mode, "status": "ok", "decision": "no_changes", "run_id": run_id, "exit_code": 0,
+        decision = "rolled_back" if mode == "query" else "no_changes"
+        return {"mode": mode, "status": "ok", "decision": decision, "run_id": run_id, "exit_code": 0,
                 "result_truncated": False, "result": result, "changes": changes}
 
     before = record("query", "before", baseline)
@@ -347,6 +348,7 @@ def test_independent_verifier_proves_exact_rollback(audit_records):
     (lambda data: data.after["result"].update(inventory_json="{}"), "same reviewed fixture"),
     (lambda data: data.after["result"]["confirmed_absent"][0].update(uid="wrong"), "exact trial additions"),
     (lambda data: data.trial["changes"].update(added_count=1), "empty net effect set"),
+    (lambda data: data.after.update(decision="no_changes"), "complete successful query"),
     (lambda data: data.receipt["effects"][1]["deleted"].pop(), "native effects"),
     (lambda data: data.receipt["views"][0]["crop_world"][0].__setitem__(2, 999), "displaced"),
 ])

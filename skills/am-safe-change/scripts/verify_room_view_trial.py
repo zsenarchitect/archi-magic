@@ -28,8 +28,9 @@ def digest(value):
 
 def run_record(raw, mode, transactions):
     record = raw.get("response", raw)
+    decision = "rolled_back" if mode == "query" else "no_changes"
     if (record.get("mode") != mode or record.get("status") != "ok"
-            or record.get("decision") != "no_changes"
+            or record.get("decision") != decision
             or type(record.get("exit_code")) is not int or record["exit_code"] != 0
             or record.get("result_truncated") is not False or record.get("approval") is not None
             or record.get("error") is not None or not planner.text(record.get("run_id"))
