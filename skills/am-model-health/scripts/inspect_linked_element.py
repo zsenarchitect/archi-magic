@@ -298,13 +298,15 @@ def select(host, ui, view, target):
     expected = {"link_instance_id": target["link_instance_id"], "linked_element_id": target["linked_element_id"]}
     if reference_pair(created) != expected:
         raise ValueError("Revit could not construct the exact linked reference.")
+    expected_identity = stable_refs(host, [created])
     before = references(ui)
     prior_identity = stable_refs(host, before)
     desired, restore = typed_refs([created]), typed_refs(before)
     failure = {"status": "selection_failed", "reason": "reference_readback_mismatch"}
     try:
         ui.Selection.SetReferences(desired)
-        if [reference_pair(item) for item in references(ui)] == [expected]:
+        selected = references(ui)
+        if [reference_pair(item) for item in selected] == [expected] and stable_refs(host, selected) == expected_identity:
             return dict(expected, status="selected", view_id=key(view.Id))
     except Exception as error:
         failure.update(reason="selection_operation_failed", error_type=type(error).__name__)

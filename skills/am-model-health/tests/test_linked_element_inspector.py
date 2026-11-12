@@ -196,6 +196,23 @@ def test_restores_exact_subelements_if_setter_throws_after_mutation(fixture):
     assert fixture.calls[1] == prior
 
 
+def test_same_element_ids_on_a_different_subelement_restore_selection(fixture):
+    target = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))["selection_target"]
+    prior = list(fixture.current)
+    substituted = Reference(link=6, linked=LARGE, stable="different-face")
+
+    def substitute_once(items):
+        fixture.calls.append(list(items))
+        fixture.current[:] = [substituted] if len(fixture.calls) == 1 else items
+
+    fixture.ui.Selection.SetReferences = substitute_once
+    failure = fixture.run(mode="select", target=target)
+    assert failure == {"status": "selection_failed", "reason": "reference_readback_mismatch",
+                       "previous_selection": "restored"}
+    assert fixture.current == prior
+    assert fixture.calls[1] == prior
+
+
 def test_bounds_response_and_withholds_target_on_incomplete_name_search(fixture, monkeypatch):
     item = fixture.linked.items[LARGE]
     many = References(parameter(100 + i, f"Label {i}", "String", "\U0001f600" * 2100) for i in range(40))
