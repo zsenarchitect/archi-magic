@@ -198,6 +198,89 @@ def test_link_audit_uses_runtime_entry_point_and_separates_source_and_cache(quer
         assert secret not in output
 
 
+def test_long_windows_paths_and_conflicting_ifc_source_risk(query, capsys):
+    execute, _ = query
+    profile = LinkType(1, r"\\?\C:\Users\private-long-owner\OneDrive\private-long-model.rvt")
+    network = LinkType(2, r"\\?\UNC\private-long-server\share\private-long-model.rvt")
+    device = LinkType(3, r"\\.\private-device\private-long-model.rvt")
+    relative_components = LinkType(4, r"C:\Projects\..\Users\private-long-owner\Desktop\model.rvt")
+    ifc = LinkType(5, r"C:\Cache\private-long-model.ifc.rvt")
+    ifc.resources["ifc"] = NS(InSessionPath=r"\\private-long-server\share\private-long-model.ifc")
+    ifc.source = r"\\?\C:\Users\private-long-owner\Documents\private-long-model.ifc"
+    result = execute(Document([profile, network, device, relative_components, ifc], {}))
+    rows = result["revit_links"]["types"]
+    assert [(row["source_path_kind"], row["path_risk"]) for row in rows] == [
+        ("personal", "personal"), ("network", None), (None, None), ("personal", "personal"), (None, "personal"),
+    ]
+    assert rows[-1]["source_path_kind_candidates"] == ["network", "personal"]
+    output = json.dumps(result) + capsys.readouterr().out
+    assert all(value not in output for value in (
+        "private-long-owner", "private-long-model", "private-long-server", "private-device"))
+
+
+@pytest.mark.parametrize("saved_path_type", ["Absolute", None])
+def test_rvt_audit_keeps_personal_saved_path_when_resolved_path_is_shared(query, capsys, saved_path_type):
+    execute, _ = query
+    shared = NS(path=r"\\private-server\share\private-model.rvt", CloudPath=False, ServerPath=False)
+    personal = NS(path=r"C:\Users\private-owner\Documents\private-model.rvt", CloudPath=False, ServerPath=False)
+    conflicting = LinkType(1, None)
+    conflicting.PathType = saved_path_type
+    conflicting.GetExternalFileReference = lambda: NS(GetAbsolutePath=lambda: shared, GetPath=lambda: personal)
+    control = LinkType(2, None)
+    control.PathType = "Relative"
+    control.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=lambda: personal, GetPath=lambda: NS(path=r"..\links\private-model.rvt"))
+    result = execute(Document([conflicting, control], {}))
+    first, second = result["revit_links"]["types"]
+    assert first["saved_model_path_type"] == saved_path_type
+    assert (first["model_path_kind"], first["source_path_kind"], first["path_risk"]) == ("network", None, "personal")
+    assert first["source_path_kind_candidates"] == ["network", "personal"]
+    assert (second["saved_model_path_type"], second["source_path_kind"], second["path_risk"]) == (
+        "Relative", "personal", "personal")
+    output = json.dumps(result) + capsys.readouterr().out
+    assert all(value not in output for value in ("private-owner", "private-model", "private-server"))
+
+
+@pytest.mark.parametrize(("workshared", "expected"), [(False, "personal"), (True, None)])
+def test_relative_path_uses_standalone_host_only_when_absolute_path_is_unavailable(query, workshared, expected):
+    execute, _ = query
+    link = LinkType(1, None)
+    link.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=fail, GetPath=lambda: NS(path=r"..\links\fixture.rvt"))
+    document = Document([link], {})
+    document.PathName = r"C:\Users\private-owner\Office\Host.rvt"
+    document.IsWorkshared, document.IsModelInCloud = workshared, False
+    row, = execute(document)["revit_links"]["types"]
+    assert row["saved_model_path_type"] == "Relative"
+    assert row["source_path_kind"] == row["path_risk"] == expected
+
+
+def test_unreadable_absolute_path_preserves_saved_evidence_without_inventing_locality(query, capsys):
+    execute, _ = query
+    opaque = NS(CloudPath=False, ServerPath=False)
+    personal = LinkType(1, None)
+    personal.local = True
+    personal.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=lambda: opaque,
+        GetPath=lambda: NS(path=r"C:\Users\private-profile\Documents\private-saved.rvt"))
+    relative = LinkType(2, None)
+    relative.local = True
+    relative.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=fail, GetPath=lambda: NS(path=r"..\links\private-relative.rvt"))
+    cloud = LinkType(3, None)
+    cloud.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=lambda: NS(CloudPath=True, ServerPath=False),
+        GetPath=lambda: NS(path=r"C:\Users\private-profile\Documents\private-cache.rvt"))
+    result = execute(Document([personal, relative, cloud], {}))
+    one, two, three = result["revit_links"]["types"]
+    assert (one["format"], one["source_path_kind"], one["path_risk"]) == ("RVT", "personal", "personal")
+    assert (two["format"], two["saved_model_path_type"], two["source_path_kind"], two["path_risk"]) == (
+        "RVT", "Relative", None, None)
+    assert (three["source_path_kind"], three["path_risk"]) == ("cloud", None)
+    output = json.dumps(result) + capsys.readouterr().out
+    assert all(value not in output for value in ("private-profile", "private-saved", "private-relative", "private-cache"))
+
+
 def test_unavailable_collector_cannot_claim_absence_and_templates_are_invalid(query):
     execute, _ = query
     view = View(VIEW_ID)
