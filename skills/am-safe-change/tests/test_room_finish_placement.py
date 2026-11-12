@@ -328,6 +328,26 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
             assert receipt["added_sketch_elements"] == [
                 {"id": "210", "uid": "sketch-210"}, {"id": "300", "uid": "curve-300"},
             ]
+            keep = {"mode": "verify-keep", "plan": preview, "receipt": receipt}
+            assert "persisted room finish set" in execute(**keep)["message"]
+            audit["status"] = "tagged_set_matches"
+            assert execute(**keep) == {
+                "status": "keep_verified", "basis_sha256": preview["basis_sha256"],
+                "created": receipt["created"], "added_sketch_elements": receipt["added_sketch_elements"],
+                "repeat_creates": 0,
+            }
+            repeat = json.loads(execute(mode="preview", request=request)["preview_json"])
+            assert execute(mode="apply", plan=repeat) == {"status": "no_changes"}
+            created[0].values["floor-offset"] = 3.5
+            assert "does not match the reviewed geometry" in execute(**keep)["message"]
+            created[0].values["floor-offset"] = 0.125
+            document.elements[300].UniqueId = "replacement-curve"
+            assert "does not resolve by both ID and UID" in execute(**keep)["message"]
+            document.elements[300].UniqueId = "curve-300"
+            row["level"]["id"] = "different"
+            assert "original room scope changed" in execute(**keep)["message"]
+            row["level"]["id"] = "10"
+            audit["status"] = "no_tagged_pieces"
             rollback = {"mode": "verify-rollback", "plan": preview, "receipt": receipt}
             assert "still resolves" in execute(**rollback)["message"]
             for identifier in (200, 210, 300):

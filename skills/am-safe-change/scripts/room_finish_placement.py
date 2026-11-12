@@ -77,14 +77,18 @@ def create_piece(document, prepared, intended):
     return element
 
 
-def write_provenance(document, element, piece, schema, field):
+def measured_provenance(document, element, piece):
     intended = piece["intended"]
     observed = observed_piece(document, element, intended["kind"])
     if not element.UniqueId or not matches_piece(intended, observed):
         raise ValueError("The created finish does not match the reviewed geometry and type.")
-    record = dict({key: intended[key] for key in ("kind", "type_uid", "level_uid")},
-                  room_uid=piece["room_uid"], element_uid=str(element.UniqueId), piece_key=piece["piece_key"],
-                  observed_sha256=digest(observed))
+    return dict({key: intended[key] for key in ("kind", "type_uid", "level_uid")},
+                room_uid=piece["room_uid"], element_uid=str(element.UniqueId), piece_key=piece["piece_key"],
+                observed_sha256=digest(observed))
+
+
+def write_provenance(document, element, piece, schema, field):
+    record = measured_provenance(document, element, piece)
     encoded = json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     entity = Entity(schema)
     entity.Set[String](field, encoded)
@@ -394,7 +398,7 @@ def apply_preview(document, approved):
             profile.Dispose()
 
 
-def verify_rollback(document, approved, receipt):
+def check_reviewed_receipt(document, approved, receipt):
     if (document is None or document.IsModifiable or approved.get("recipe") != "room-finishes"
             or approved.get("blocked") is not False or receipt.get("status") != "ok"
             or digest(approved["basis"]) != approved["basis_sha256"]
@@ -409,21 +413,91 @@ def verify_rollback(document, approved, receipt):
     if (not isinstance(sketches, list) or len(sketches) > MAX_SKETCH_ELEMENTS
             or [item["id"] for item in sketches] != receipt["added_sketch_element_ids"]):
         raise ValueError("The provisional receipt does not cover the exact sketch elements.")
-    identifiers, uids, absent = set(), set(), []
+    identifiers, uids = set(), set()
     for item in created + sketches:
         identifier, uid = item["id"], item["uid"]
+        native_id(identifier)
         if not hasattr(uid, "strip") or not uid.strip() or identifier in identifiers or uid in uids:
             raise ValueError("The provisional receipt repeats or omits a native identity.")
-        if document.GetElement(native_id(identifier)) is not None or document.GetElement(uid) is not None:
-            raise ValueError("A provisional finish or sketch element still resolves by ID or UID.")
         identifiers.add(identifier)
         uids.add(uid)
+    return created, sketches
+
+
+def verify_rollback(document, approved, receipt):
+    created, sketches = check_reviewed_receipt(document, approved, receipt)
+    absent = []
+    for item in created + sketches:
+        identifier, uid = item["id"], item["uid"]
+        if document.GetElement(native_id(identifier)) is not None or document.GetElement(uid) is not None:
+            raise ValueError("A provisional finish or sketch element still resolves by ID or UID.")
         absent.append({"id": identifier, "uid": uid})
     current = finish_preview(document, approved["request"])
     if current["basis"] != approved["basis"] or current["steps"] != approved["steps"]:
         raise ValueError("The original room finish scope changed after rollback.")
     return {"status": "rollback_verified", "basis_sha256": approved["basis_sha256"],
             "confirmed_absent": sorted(absent, key=lambda item: int(item["id"]))}
+
+
+def persisted_element(document, identity):
+    identifier = native_id(identity["id"])
+    element = document.GetElement(identifier)
+    by_uid = document.GetElement(identity["uid"])
+    if (element is None or str(element.UniqueId) != identity["uid"]
+            or by_uid is None or by_uid.Id.Value != identifier.Value):
+        raise ValueError("A kept finish or sketch element does not resolve by both ID and UID.")
+    return element
+
+
+def verify_kept(document, approved, receipt):
+    created, sketches = check_reviewed_receipt(document, approved, receipt)
+    current = finish_preview(document, approved["request"])
+    original = approved["basis"]
+    restored = current["basis"]
+    rooms = original["report"]["rooms"]
+    touched = {step["room_id"] for step in approved["steps"]}
+    fresh_rooms = restored["report"]["rooms"]
+    if len(fresh_rooms) != len(rooms):
+        raise ValueError("The reviewed room inventory changed after Keep.")
+    compared = []
+    for prior, fresh in zip(rooms, fresh_rooms):
+        if str(prior["room_id"]) in touched:
+            audit = fresh.get("existing_finishes", {})
+            if (audit.get("status") != "tagged_set_matches"
+                    or audit.get("nearby", {}).get("status") != "none_in_scope"):
+                raise ValueError("The persisted room finish set is incomplete, changed, or overlaps another finish.")
+            fresh = dict(fresh, existing_finishes=prior["existing_finishes"])
+        compared.append(fresh)
+    normalized = dict(restored, report=dict(restored["report"], rooms=compared))
+    if normalized != original or current["steps"]:
+        raise ValueError("The original room scope changed or a repeat would create more finishes.")
+
+    source = {str(room["room_id"]): room for room in rooms if str(room["room_id"]) in touched}
+    expected = {key: expected_pieces(room) for key, room in source.items()}
+    schema = Schema.Lookup(Guid(SCHEMA_GUID))
+    if schema is None:
+        raise ValueError("The room-finish provenance schema is unavailable.")
+    field = payload_field(schema)
+    dependencies = set()
+    for step, identity in zip(approved["steps"], created):
+        room_id, key = step["room_id"], step["piece_key"]
+        intended = expected[room_id][key]
+        element = persisted_element(document, identity)
+        measured = measured_provenance(document, element, {
+            "intended": intended, "room_uid": source[room_id]["room_uid"], "piece_key": key,
+        })
+        entity = element.GetEntity(schema)
+        if (measured["observed_sha256"] != identity["observed_sha256"] or not entity.IsValid()
+                or json.loads(entity.Get[String](field)) != measured):
+            raise ValueError("The persisted finish geometry or provenance differs from the receipt.")
+        if intended["kind"] != "wall":
+            dependencies.update(finish_sketch_dependencies(document, element))
+    for sketch in sketches:
+        persisted_element(document, sketch)
+        if sketch["id"] not in dependencies:
+            raise ValueError("A persisted sketch element is outside the kept finish profiles.")
+    return {"status": "keep_verified", "basis_sha256": approved["basis_sha256"], "created": created,
+            "added_sketch_elements": sketches, "repeat_creates": len(current["steps"])}
 
 
 if "inputs" in globals():
@@ -438,8 +512,10 @@ if "inputs" in globals():
             result = apply_preview(doc, inputs["plan"])
         elif mode == "verify-rollback":
             result = verify_rollback(doc, inputs["plan"], inputs["receipt"])
+        elif mode == "verify-keep":
+            result = verify_kept(doc, inputs["plan"], inputs["receipt"])
         else:
-            raise ValueError("Choose schema-check, preview, apply, or verify-rollback.")
+            raise ValueError("Choose schema-check, preview, apply, verify-rollback, or verify-keep.")
     except (ValueError, KeyError, TypeError) as error:
         result = {"status": "stopped", "message": str(error)}
     except Exception as error:
