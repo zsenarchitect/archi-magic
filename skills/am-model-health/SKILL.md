@@ -189,6 +189,13 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 3. Set `ARCHI_MAGIC_FAMILY_WORKER_DIR` to the printed directory in the shell that launches the worker. Run `pyrevit run scripts/read_family_library.py --revit=2026` with no model arguments. Use a CPython-capable batch runner. Set a timeout outside Revit and confirm the disposable process exits.
 4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt lists thumbnail availability for each embedded type and reports catalog coverage separately. Add `--metadata-only` during preparation to qualify the metadata read alone. Prepare a new request for any retry.
 
+### Publish and search a local family index
+
+1. Run `python scripts/family_library_index.py begin <private-index-directory> discovery.json --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use a separate index folder outside the library.
+2. Stage the exact sources from that manifest. Prepare each worker with the same parameter selection and builds. Pass the refresh token as `--generation` to the worker's prepare command. Run one worker at a time.
+3. Run `python scripts/family_library_index.py publish <private-index-directory> <token> --worker <worker-directory>`. Repeat `--worker` for each completed receipt. Read the coverage for sources without a receipt.
+4. Run `python scripts/family_library_index.py search <private-index-directory> --name window --category windows`. Add `--parameter <ID-or-name> --equals <value>` to filter by a type parameter. Numeric filters use the stored Revit internal value. Use the source path to distinguish equal family and type names.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

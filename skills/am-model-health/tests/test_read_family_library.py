@@ -324,3 +324,67 @@ def test_catalog_pair_reports_previews_pending_without_opening_scratch(staged):
     assert result["metadata"]["catalog_coverage"] == "pending"
     assert result["thumbnails"] == [{"type": "600 × 900", "status": "catalog_pending"}]
     assert len(worker.opened) == 1 and not list(directory.glob("*.png"))
+
+
+def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypatch):
+    from family_library_index import begin, publish, search
+    from family_library_thumbnails import png_record
+
+    root = tmp_path.resolve() / "library"
+    work = tmp_path.resolve() / "staging"
+    index = str(tmp_path.resolve() / "index")
+    root.mkdir()
+    work.mkdir()
+    for name in ("A", "B"):
+        (root / name).mkdir()
+        (root / name / "Fixture.rfa").write_bytes(name.encode())
+    monkeypatch.setattr(staging, "free_bytes", lambda parent: 10 * staging.HEADROOM)
+    manifest = discover(str(root))
+    token = begin(index, manifest, ["Width"], "fixture", "pyrevit-fixture")["token"]
+    paths = ["A/Fixture.rfa", "B/Fixture.rfa"]
+    receipt = staging.stage(manifest, paths, str(work))
+    workers = []
+    for position, path in enumerate(paths):
+        directory = prepare_worker(receipt, path, ["Width"], "2026", "fixture", "pyrevit-fixture", generation=token)
+        ui = SimpleNamespace(Application=Worker(), ActiveUIDocument=None)
+        data = fixture_png(position)
+        image = png_record(data)
+        row = {"type": "600 × 900", "status": "available", "image": image}
+        run_worker(ui, "pyrevit-fixture", str(directory), lambda *_: ([row], {image["file"]: data}))
+        workers.append(str(directory))
+
+    publish(index, token, workers)
+    found = search(index, name="ＦＩＸＴＵＲＥ", category="walls", parameter="43", equals="2")
+    assert [row["path"] for row in found["matches"]] == paths
+    assert [row["parameter"]["value"] for row in found["matches"]] == [2.0, 2.0]
+    assert [Path(row["thumbnail"]["path"]).read_bytes() for row in found["matches"]] == [
+        fixture_png(0), fixture_png(1),
+    ]
+    assert search(index, parameter="Width")["ambiguous_parameter_paths"] == paths
+    first = Path(found["matches"][0]["thumbnail"]["path"])
+    first.write_bytes(fixture_png(200))
+    assert search(index)["matches"][0]["thumbnail"] == {"status": "asset_unavailable"}
+
+    newer = begin(index, manifest, ["Width"], "fixture", "pyrevit-fixture")["token"]
+    assert search(index)["generation"] == token
+    with pytest.raises(ValueError, match="no longer owns"):
+        publish(index, token, workers)
+    with pytest.raises(ValueError, match="does not belong"):
+        publish(index, newer, workers)
+    (root / "A" / "Fixture.rfa").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="discovery changed"):
+        publish(index, newer, [])
+    assert search(index)["generation"] == token
+    (root / "A").rename(tmp_path / "removed")
+    (root / "Link").symlink_to(tmp_path / "removed", target_is_directory=True)
+    partial = discover(str(root))
+    latest = begin(index, partial, ["Width"], "fixture", "pyrevit-fixture")["token"]
+    publish(index, latest, [])
+    found = search(index)
+    assert found["discovery_complete"] is False
+    assert found["matches"] == []
+    assert found["unavailable"] == [
+        {"path": "A/Fixture.rfa", "status": "source_unconfirmed"},
+        {"path": "B/Fixture.rfa", "status": "worker_unavailable"},
+    ]
+    assert not list(Path(index).glob("thumbnail-*.png"))

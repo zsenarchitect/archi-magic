@@ -277,13 +277,16 @@ def encode_record(record):
     return data
 
 
-def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_build, pyrevit_build, *, thumbnails=True):
+def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_build, pyrevit_build, *, thumbnails=True, generation=None):
     """Make a private, one-use native worker request for an exact source pair."""
     validate_parameter_names(parameter_names)
     if (type(thumbnails) is not bool or revit_year != "2026"
             or any(not isinstance(build, str) or not build.strip() or len(build) > 100
                    for build in (revit_build, pyrevit_build))):
         raise ValueError("Supply the expected Revit 2026 and pyRevit build identifiers.")
+    if generation is not None and (not isinstance(generation, str) or len(generation) != 32
+                                   or any(c not in "0123456789abcdef" for c in generation)):
+        raise ValueError("Use the refresh token from the family index.")
     workspace = root_path(receipt["workspace"])
     name = "metadata-worker-" + uuid4().hex
     with staged_pair(receipt, source_path):
@@ -298,7 +301,7 @@ def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_buil
                 "directory_identity": identity(directory_info(directory)),
                 "source_path": source_path, "parameter_names": sorted(parameter_names),
                 "revit_year": revit_year, "revit_build": revit_build, "pyrevit_build": pyrevit_build,
-                "staging": receipt, "thumbnails": thumbnails,
+                "staging": receipt, "thumbnails": thumbnails, "generation": generation,
             }
             request["request_sha256"] = manifest_digest(request)
             data = encode_record(request)
@@ -348,7 +351,7 @@ def run_worker(ui, runtime, raw_directory, thumbnail_reader=capture_thumbnails):
             "request_sha256": request["request_sha256"],
             "runtime": {"pyrevit_build": str(runtime), "engine": platform.python_implementation(),
                         "engine_version": platform.python_version()},
-            "metadata": metadata, "thumbnails": thumbnails,
+            "metadata": metadata, "thumbnails": thumbnails, "generation": request["generation"],
         }
         result["receipt_sha256"] = manifest_digest(result)
         data = encode_record(result)
@@ -366,7 +369,8 @@ def collect_worker(raw_directory):
         if (result.get("kind") != "family-library-worker-receipt" or result.get("version") != 1
                 or result.get("request_sha256") != request["request_sha256"]
                 or result.get("receipt_sha256") != manifest_digest(basis)
-                or result["runtime"]["pyrevit_build"] != request["pyrevit_build"]):
+                or result["runtime"]["pyrevit_build"] != request["pyrevit_build"]
+                or result.get("generation") != request["generation"]):
             raise ValueError("The family worker receipt is incomplete or belongs to a different request.")
         metadata = result["metadata"]
         staging = request["staging"]
@@ -392,6 +396,7 @@ def main():
     prepare = commands.add_parser("prepare", help=prepare_worker.__doc__)
     prepare.add_argument("staging_receipt")
     prepare.add_argument("--path", required=True, help="Exact staged RFA path")
+    prepare.add_argument("--generation", help="Refresh token from the family index")
     prepare.add_argument("--metadata-only", action="store_true")
     prepare.add_argument("--parameter", action="append", default=[])
     prepare.add_argument("--revit-build", required=True)
@@ -409,7 +414,7 @@ def main():
             with pinned_root(staging.parent) as parent:
                 receipt = read_request_file(parent, staging.name)
             directory = prepare_worker(receipt, args.path, args.parameter, "2026", args.revit_build,
-                                       args.pyrevit_build, thumbnails=not args.metadata_only)
+                                       args.pyrevit_build, thumbnails=not args.metadata_only, generation=args.generation)
             print(directory)
     except (AttributeError, KeyError, OSError, TypeError, ValueError, RecursionError) as error:
         print(str(error), file=sys.stderr)
