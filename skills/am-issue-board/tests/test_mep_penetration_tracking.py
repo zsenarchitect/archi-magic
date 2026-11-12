@@ -123,3 +123,66 @@ def test_native_schema_query_uses_the_string_field(evidence, monkeypatch):
     assert issues == []
     assert rows[0]["cut_verified"]
     assert rows[0]["opening_sha256"] == rows[0]["observed_opening_sha256"]
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_tracking_write_checks_the_exact_native_readback(evidence, monkeypatch, drift):
+    import mep_penetration_tracking as tracking
+
+    _, db, opening, _, _, sealed = tagged_opening(evidence)
+    record = {key: value for key, value in sealed.items() if key != "record_sha256"}
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Guid=lambda value: value, String=str))
+    monkeypatch.setitem(sys.modules, "clr", SimpleNamespace(GetClrType=lambda value: value))
+    field = object()
+    calls = []
+
+    class Generic:
+        def __init__(self, method):
+            self.method = method
+
+        def __getitem__(self, value_type):
+            assert value_type is str
+            return self.method
+
+    class Entity:
+        def __init__(self, schema):
+            self.raw = None
+            self.Set = Generic(self.set)
+            self.Get = Generic(self.get)
+
+        def set(self, supplied, encoded):
+            assert supplied is field
+            self.raw = encoded
+
+        def get(self, supplied):
+            assert supplied is field
+            return self.raw
+
+        def IsValid(self):
+            return self.raw is not None
+
+    schema = SimpleNamespace(SchemaName=tracking.SCHEMA_NAME, GetField=lambda key: field if key == tracking.FIELD else None)
+    builder = SimpleNamespace(
+        SetSchemaName=lambda name: calls.append(("name", name)), SetReadAccessLevel=lambda level: None,
+        SetWriteAccessLevel=lambda level: None, AddSimpleField=lambda key, typ: calls.append(("field", key, typ)),
+        Finish=lambda: schema, Dispose=lambda: calls.append(("dispose",)))
+    db.ExtensibleStorage = SimpleNamespace(
+        Schema=SimpleNamespace(Lookup=lambda guid: None), SchemaBuilder=lambda guid: builder,
+        AccessLevel=SimpleNamespace(Public="public"), Entity=Entity)
+    opening.Document = SimpleNamespace(IsModifiable=True)
+    entities = []
+
+    def set_entity(entity):
+        if drift:
+            entity.raw = "{}"
+        entities.append(entity)
+
+    opening.GetEntity = lambda current_schema: entities[-1] if entities else Entity(current_schema)
+    opening.SetEntity = set_entity
+    if drift:
+        with pytest.raises(ValueError, match="did not retain"):
+            tracking.write_tracking(db, opening, record)
+    else:
+        assert tracking.write_tracking(db, opening, record) == sealed["record_sha256"]
+        assert tracking.decode_tracking(entities[0].raw) == record
+    assert calls == [("name", tracking.SCHEMA_NAME), ("field", tracking.FIELD, str), ("dispose",)]

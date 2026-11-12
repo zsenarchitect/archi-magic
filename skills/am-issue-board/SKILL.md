@@ -194,7 +194,17 @@ Save the full `snapshot_json` as the preview input. Stop if the read stops or th
 
 The query reads versioned tracking records on existing opening instances. It checks the recorded opening and host IDs, the actual cut, and the measured opening shape. A copied tag or a missing cut cannot establish a current opening. A damaged record blocks proposals for that scan.
 
-Verify this reader on a disposable Revit fixture before use. Writing tracking records and guarded placement are pending.
+Verify this reader on a disposable Revit fixture before use.
+
+### Trial placement and tracking
+
+Add `symbol_ids` to the Revit query for the reviewed opening types. Prepare a choices file with exact `crossing_keys` and a `symbols` map keyed by host and shape, for example `wall:rectangular`. For each symbol, include its `id`, `uid`, and `parameters`. Map `width`, `height`, and `depth` or `diameter` and `depth` to exact instance parameter IDs.
+
+Run `python scripts/probe_mep_penetration_placement.py evidence.json choices.json`. Save the preview and its digest. Show the before and after rows. Use am-safe-change to check ownership and review the exact host and symbol IDs.
+
+In the disposable project, call `get_context` and confirm ask policy. Obtain approval for the rollback trial. Use guarded CPython dry-run mode with the same script. Pass `read`, `choices`, `preview_sha256`, and `disposable_fixture: true`.
+
+The trial measures the host before and after each cut. It attaches tracking only after the cut matches the preview. It rolls back every opening, host cut, and record together. Stop on an unresolved result. Native verification and the project Keep or Discard workflow are pending.
 
 ## Rules
 

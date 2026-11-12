@@ -18,8 +18,8 @@ class ReadLimit(ValueError):
 
 
 class ReadBudget:
-    def __init__(self):
-        self.deadline = monotonic() + 10
+    def __init__(self, seconds=10):
+        self.deadline = monotonic() + seconds
         self.visits = 0
         self.intersections = 0
 
@@ -278,8 +278,7 @@ def element_scope(element):
     return {"version_guid": str(element.VersionGuid), "created_phase_id": str(element.CreatedPhaseId.Value)}
 
 
-def principal_host(DB, element, minimum_web, tolerance, budget):
-    scope = element_scope(element)
+def principal_references(DB, element):
     if isinstance(element, DB.Wall) and element.WallType.Kind == DB.WallKind.Basic:
         kind = "wall"
         refs = [DB.HostObjectUtils.GetSideFaces(element, side)
@@ -291,7 +290,13 @@ def principal_host(DB, element, minimum_web, tolerance, budget):
         raise ValueError("Use planar basic walls or flat floors.")
     if any(len(rows) != 1 for rows in refs):
         raise ValueError("The host does not expose two unambiguous principal faces.")
-    faces = [element.GetGeometryObjectFromReference(list(rows)[0]) for rows in refs]
+    return kind, [list(rows)[0] for rows in refs]
+
+
+def principal_host(DB, element, minimum_web, tolerance, budget):
+    scope = element_scope(element)
+    kind, refs = principal_references(DB, element)
+    faces = [element.GetGeometryObjectFromReference(reference) for reference in refs]
     if not all(isinstance(face, DB.PlanarFace) for face in faces):
         raise ValueError("The host principal faces are not planar.")
     first, second = faces
@@ -536,6 +541,15 @@ def read(DB, document, args):
                       lambda element: principal_host(DB, element, minimum_web, tolerance, budget), budget)
     runs = inventory(selected(linked, DB, args["run_ids"]),
                      lambda element: measured_run(DB, linked, element, transform, tolerance, budget), budget)
+    symbols = []
+    if args.get("symbol_ids"):
+        for symbol in selected(document, DB, args["symbol_ids"]):
+            budget.visit()
+            if not isinstance(symbol, DB.FamilySymbol):
+                raise ValueError("An opening type ID does not identify a family symbol.")
+            symbols.append(dict(element_record(symbol), version_guid=str(symbol.VersionGuid),
+                                is_active=bool(symbol.IsActive),
+                                placement_type=str(symbol.Family.FamilyPlacementType)))
     pairs = []
     for (host, host_geometry), (run, run_geometry) in product(hosts, runs):
         budget.visit()
@@ -561,7 +575,7 @@ def read(DB, document, args):
               "link_transform": {key: xyz(getattr(transform, key)) for key in ("Origin", "BasisX", "BasisY", "BasisZ")},
               "clearance_ft": clearance, "tolerance_ft": tolerance, "complete": not tracking_issues,
               "hosts": [row for row, _ in hosts], "runs": [row for row, _ in runs], "pairs": pairs, "tracked": tracked,
-              "tracking_issues": tracking_issues}
+              "tracking_issues": tracking_issues, "symbols": symbols}
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     budget.visit()
     if len(encoded) > LIMIT:

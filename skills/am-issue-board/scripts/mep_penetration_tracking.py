@@ -92,6 +92,7 @@ def tracking_rows(DB, document, elements, read_entity, hosts, project, link, lin
         current = {"host_uid": host_uid, "run_uid": record["run_uid"], "crossing_key": record["crossing_key"],
                    "geometry": record["geometry"], "geometry_sha256": record["geometry_sha256"],
                    "opening_uid": record["opening_uid"], "opening_sha256": record["opening_sha256"],
+                   "tracking_sha256": fingerprint(record),
                    "observed_uid": uid(str(opening.UniqueId)), "observed_host_uid": actual_host_uid,
                    "cut_verified": False}
         host = hosts.get(host_uid)
@@ -129,3 +130,39 @@ def read_tracking(DB, document, hosts, project, link, link_instance, tolerance, 
         return str(entity.Get[String](field))
 
     return tracking_rows(DB, document, collector, read_entity, hosts, project, link, link_instance, tolerance, budget)
+
+
+def write_tracking(DB, opening, record):
+    """Attach the verified cut record in the caller's reversible transaction."""
+    import clr
+    from System import Guid, String
+
+    if not opening.Document.IsModifiable or str(opening.UniqueId) != record["opening_uid"]:
+        raise ValueError("The verified opening is outside the active tracking transaction.")
+    sealed = dict(record, record_sha256=fingerprint(record))
+    encoded = json.dumps(sealed, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    decode_tracking(encoded)
+
+    storage = DB.ExtensibleStorage
+    guid = Guid(SCHEMA_GUID)
+    schema = storage.Schema.Lookup(guid)
+    if schema is None:
+        builder = storage.SchemaBuilder(guid)
+        try:
+            builder.SetSchemaName(SCHEMA_NAME)
+            builder.SetReadAccessLevel(storage.AccessLevel.Public)
+            builder.SetWriteAccessLevel(storage.AccessLevel.Public)
+            builder.AddSimpleField(FIELD, clr.GetClrType(String))
+            schema = builder.Finish()
+        finally:
+            builder.Dispose()
+    field = schema.GetField(FIELD)
+    if schema.SchemaName != SCHEMA_NAME or field is None or opening.GetEntity(schema).IsValid():
+        raise ValueError("The tracking schema conflicts with an existing entity.")
+    entity = storage.Entity(schema)
+    entity.Set[String](field, encoded)
+    opening.SetEntity(entity)
+    current = opening.GetEntity(schema)
+    if not current.IsValid() or str(current.Get[String](field)) != encoded:
+        raise ValueError("Revit did not retain the verified opening tracking record.")
+    return sealed["record_sha256"]
