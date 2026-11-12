@@ -49,10 +49,10 @@ def list_type(name):
     return DB.ListType.Bullet if name == "bullet" else getattr(DB.ListType, "None")
 
 
-def verify_structural_target(guard, note_id):
+def verify_board_target(guard, note_id):
     if (plan["mode"] != "edit" or ib.saved_document_identity(doc) != guard["host_identity"]
             or int(note_id) != int(guard["active"]["id"])):
-        raise ValueError("The structural plan targets a different project or board.")
+        raise ValueError("The plan targets a different project or board.")
     for expected in (guard["active"], guard["archive"]):
         if expected is None:
             continue
@@ -63,7 +63,11 @@ def verify_structural_target(guard, note_id):
 
 
 if "structural_target" in plan:
-    verify_structural_target(plan["structural_target"], inputs["note_id"])  # noqa: F821
+    verify_board_target(plan["structural_target"], inputs["note_id"])  # noqa: F821
+if "board_target" in plan:
+    if plan["board_target"] is None:
+        raise ValueError("Read the board and any archive with include_identity enabled, then rebuild the plan.")
+    verify_board_target(plan["board_target"], inputs["note_id"])  # noqa: F821
 
 result = {"status": "ok"}
 t = DB.Transaction(doc, "Issue board: %s" % plan.get("action", plan["mode"]))

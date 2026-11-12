@@ -55,20 +55,47 @@ def marker(issue):
 
 
 def read_board(path):
-    body, formats = board_cli.read_note(bounded(path))
+    source = board_cli.load(bounded(path))
+    body, formats = board_cli.decode_note(source)
     board = ib.parse_board(body, formats)
     numbers = [row["number"] for row in board["issues"]]
     if len(numbers) != len(set(numbers)):
         raise ValueError("board has duplicate issue numbers")
-    return body, formats, board
+    return body, formats, board, source
+
+
+def note_target(source, body):
+    if "host_identity" not in source:
+        return None
+    host = source["host_identity"]
+    note = source["note"]
+    if (
+        set(host) != {"project_uid", "path_sha256"}
+        or not host["project_uid"].strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", host["path_sha256"])
+        or not re.fullmatch(r"[1-9][0-9]{0,18}", note["id"])
+        or int(note["id"]) > 2**63 - 1
+        or not note["unique_id"].strip()
+        or note["sha1"] != ib.text_sha1(body)
+    ):
+        raise ValueError("Read the board again with include_identity enabled.")
+    return {key: note[key] for key in ("id", "unique_id", "sha1")}
 
 
 def import_preview(args):
-    body, formats, board = read_board(args.board)
+    body, formats, board, source = read_board(args.board)
+    active_target = note_target(source, body)
+    archive_target = None
     existing = {marker(row) for row in board["issues"]}
     topics, warnings = bcf.read_topics(args.input)
     if args.archive:
-        _, _, archive = read_board(args.archive)
+        archive_body, _, archive, archive_source = read_board(args.archive)
+        archive_target = note_target(archive_source, archive_body)
+        if active_target and archive_target and (
+            source["host_identity"] != archive_source["host_identity"]
+            or active_target["id"] == archive_target["id"]
+        ):
+            raise ValueError("Read distinct board and archive notes from the same saved project.")
         existing.update(marker(row) for row in archive["issues"])
     else:
         warnings.append({"kind": "archive_note_not_checked_for_duplicates"})
@@ -96,6 +123,13 @@ def import_preview(args):
     plan = ib.plan_batch(body, ops, formats) if ops else None
     metadata = {}
     if plan:
+        plan["board_target"] = None
+        if active_target and (not args.archive or archive_target):
+            plan["board_target"] = {
+                "host_identity": source["host_identity"], "active": active_target, "archive": archive_target,
+            }
+        else:
+            warnings.append({"kind": "board_identity_required_to_apply"})
         final = ib.parse_board(plan["final_text"])
         after = {row["number"]: row for row in final["issues"]}
         if len(final["issues"]) != len(board["issues"]) + len(added) or len(after) != len(final["issues"]):
@@ -119,7 +153,7 @@ def import_preview(args):
 
 
 def export_topics(args):
-    _, _, board = read_board(args.board)
+    _, _, board, _ = read_board(args.board)
     metadata = {}
     if args.metadata:
         data = board_cli.load(bounded(args.metadata))

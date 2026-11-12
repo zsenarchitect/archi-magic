@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import runpy
 import subprocess
 import sys
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -49,6 +51,62 @@ def topic():
 
 def seed(path, data=None):
     path.write_bytes(bcf.write_topics([data or topic()], "author@example.com"))
+
+
+@pytest.mark.parametrize("target", ["reviewed", "other_project", "other_note", "other_archive", "offline"])
+def test_bcf_plan_binds_revit_target_before_transaction(board, tmp_path, monkeypatch, target):
+    from board_cli import read_note
+
+    text, _ = read_note(board)
+    document = SimpleNamespace(PathName="C:/Tests/Original.rvt",
+                               ProjectInformation=SimpleNamespace(UniqueId="project-id"))
+    if target != "offline":
+        board.write_text(json.dumps({
+            "host_identity": ib.saved_document_identity(document),
+            "note": {"id": "40", "unique_id": "note-id", "sha1": ib.text_sha1(text), "text": text},
+        }))
+    archive = tmp_path / "archive.json"
+    archive.write_text(json.dumps({
+        "host_identity": ib.saved_document_identity(document),
+        "note": {"id": "41", "unique_id": "archive-id", "sha1": ib.text_sha1(text), "text": text},
+    }))
+    source = tmp_path / "source.bcfzip"
+    seed(source)
+    preview = invoke("import", board, "--input", source, "--archive", archive)
+    assert preview.returncode == 0, preview.stderr
+    plan = json.loads(preview.stdout)["plan"]
+
+    class TextNote:
+        def __init__(self, uid):
+            self.UniqueId = uid
+
+        def GetFormattedText(self):
+            return SimpleNamespace(GetPlainText=lambda: text)
+
+    if target == "other_project":
+        document.PathName = "C:/Tests/Copy.rvt"
+    notes = {
+        40: TextNote("other-note" if target == "other_note" else "note-id"),
+        41: TextNote("other-archive" if target == "other_archive" else "archive-id"),
+    }
+    document.GetElement = notes.get
+
+    class TransactionReached(Exception):
+        pass
+
+    def transaction(*_):
+        raise TransactionReached()
+
+    db = SimpleNamespace(ElementId=int, TextNote=TextNote, Transaction=transaction)
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Int64=int))
+    monkeypatch.setitem(sys.modules, "pyrevit.api", SimpleNamespace(DB=db))
+    globals_ = {
+        "inputs": {"plan": plan, "note_id": "40"},
+        "__revit__": SimpleNamespace(ActiveUIDocument=SimpleNamespace(Document=document)),
+    }
+    expected = TransactionReached if target == "reviewed" else ValueError
+    with pytest.raises(expected):
+        runpy.run_path(str(SCRIPTS / "apply_board.py"), init_globals=globals_)
 
 
 def test_cli_import_export_preserves_cameras_and_components(board, tmp_path):
