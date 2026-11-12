@@ -174,3 +174,23 @@ def test_distinct_header_footer_parts_are_capped(tmp_path, facts):
     rewrite(path, entries)
     assert invoke(path, "--facts", facts) == (
         2, {"status": "rejected", "error": "DOCX header and footer part limit exceeded"})
+
+
+def test_reviewed_field_requires_the_whole_reference(tmp_path, facts):
+    path = tmp_path / "ambiguous.docx"
+    document = Document()
+    document.add_paragraph("Central model: Old Tower.rvt, see archive")
+    document.add_paragraph("Central model: C:/Working/Tower.rvt or Backup.rvt")
+    document.add_paragraph('Central model: "Old Tower.rvt"')
+    document.save(path)
+    code, result = invoke(path, "--facts", facts, "--field", "body/block:1=central",
+                          "--field", "body/block:2=central", "--field", "body/block:3=central")
+    assert code == 0
+    assert result["status"] == "incomplete"
+    assert result["skipped_examples"] == [
+        {"location": "body/block:1", "reason": "reviewed_field_requires_one_reference"},
+        {"location": "body/block:2", "reason": "reviewed_field_requires_one_reference"},
+    ]
+    assert [(row["location"], row["reference"], row["status"]) for row in result["references"]] == [
+        ("body/block:3", "Old Tower.rvt", "mismatch"),
+    ]
