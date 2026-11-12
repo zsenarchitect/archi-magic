@@ -1,6 +1,8 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace as NS
 
@@ -399,3 +401,79 @@ def test_stale_source_stops_before_transaction_and_failed_rollback_is_unresolved
     outcome = trial(plan)
     assert outcome["status"] == "transaction_unresolved"
     assert "rollback_verified" not in outcome
+
+
+def saved_run(run_id, mode, result):
+    return {
+        "run_id": run_id, "mode": mode, "status": "ok", "decision": "no_changes",
+        "exit_code": 0, "result_truncated": False, "error": None, "approval": None,
+        "warnings": [], "dialogs": [], "failures": [], "blocked": [],
+        "engine": {"requested": "cpython"},
+        "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
+        "result": result,
+    }
+
+
+def test_saved_dimension_probe_requires_independent_absence_and_exact_measurements(probe, tmp_path):
+    run, _, trial, _, _ = probe
+    rows = [row("grid", ["10", "11", "12"])]
+    original = saved_run("a00000000001", "query", run(requests=rows))
+    plan = probe_plan(json.loads(original["result"]["snapshot_json"]))
+    receipt = trial(plan)
+    assert receipt["status"] == "trial_rolled_back"
+    dry = saved_run("b00000000002", "dry_run", receipt)
+    fresh = saved_run("c00000000003", "query",
+                      run(requests=rows, check_absent_ids=receipt["temporary_dimension_ids"]))
+
+    paths = [tmp_path / name for name in ("plan.json", "original.json", "trial.json", "fresh.json")]
+    cmd = [sys.executable, str(SCRIPTS / "verify_plan_dimension_probe.py"), *map(str, paths)]
+
+    def verify(*records):
+        for path, value in zip(paths, records):
+            path.write_text(json.dumps(value))
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    accepted = verify(plan, {"response": original}, dry, fresh)
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout) == {
+        "status": "plan_dimension_rollback_verified",
+        "basis_sha256": plan["basis_sha256"],
+        "revit": {"version": "2026", "build": "fixture"},
+        "temporary_dimension_ids": ["100"],
+        "original_run_id": "a00000000001",
+        "trial_run_id": "b00000000002",
+        "fresh_run_id": "c00000000003",
+    }
+
+    outer_effects = deepcopy(dry)
+    outer_effects["decision"] = "rolled_back"
+    outer_effects["changes"].update(
+        added_count=1, added=[{"id": 100}], deleted_count=1, deleted=[100],
+        transactions=[receipt["transaction"]], by_category={"Dimensions": 1},
+    )
+    assert verify(plan, original, outer_effects, fresh).returncode == 0
+
+    wrong_effect = deepcopy(outer_effects)
+    wrong_effect["changes"]["deleted"] = [101]
+    wrong_transaction = deepcopy(outer_effects)
+    wrong_transaction["changes"]["transactions"] = ["Different trial"]
+    wrong_measurement = deepcopy(dry)
+    wrong_measurement["result"]["measurements"]["grid"]["segments_ft"] = [4, 3]
+    wrong_view = deepcopy(dry)
+    wrong_view["result"]["measurements"]["grid"]["owner_view_id"] = "42"
+    wrong_build = deepcopy(dry)
+    wrong_build["result"]["revit"]["build"] = "different-build"
+    for invalid in (wrong_effect, wrong_transaction, wrong_measurement, wrong_view, wrong_build):
+        assert verify(plan, original, invalid, fresh).returncode == 2
+
+    missing_absence = deepcopy(fresh)
+    del missing_absence["result"]["confirmed_absent_ids"]
+    assert verify(plan, original, dry, missing_absence).returncode == 2
+    assert verify(plan, original, dry, dict(fresh, run_id=original["run_id"])).returncode == 2
+    assert verify(plan, original, dict(dry, result_truncated=True), fresh).returncode == 2
+
+    drifted = deepcopy(fresh)
+    changed = json.loads(drifted["result"]["snapshot_json"])
+    changed["view"]["crop_active"] = True
+    drifted["result"]["snapshot_json"] = json.dumps(changed)
+    assert verify(plan, original, dry, drifted).returncode == 2

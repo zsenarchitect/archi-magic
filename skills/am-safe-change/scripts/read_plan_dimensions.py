@@ -213,7 +213,8 @@ def read_dimension(document, dimension, frame):
     curve = dimension.Curve
     if not isinstance(curve, DB.Line):
         raise ValueError("An existing linear dimension does not expose a straight support line.")
-    row = dict(identity(dimension), type_id=key(dimension.GetTypeId()), references=references, segments_ft=values)
+    row = dict(identity(dimension), owner_view_id=key(dimension.OwnerViewId), type_id=key(dimension.GetTypeId()),
+               references=references, segments_ft=values)
     if curve.IsBound:
         row["line"] = line_points(curve, frame)
     else:
