@@ -308,6 +308,93 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 8. Save the project after a verified Keep. Run a fresh project audit and rebuild the preview for the same lookup with no exports. Run the rollback probe with that preview and the fresh audit token. Save the no-op record and another independent project audit.
 9. Pass `--rerun-preview`, `--rerun-before`, `--rerun`, and `--rerun-after` to the verifier with the Keep records. Check that every row skipped and the project inventory stayed unchanged. This workflow still requires native qualification with the loaded Revit bridge.
 
+## Check family formula dependencies (issue #163)
+
+Run `python scripts/family_formula_dependencies.py request.json` before reviewing a family transfer. Supply the exact source definitions as `definitions`, with a `name` and `formula` for each parameter. Use null for an unset formula. Supply the reviewed names as `selected`.
+
+The report resolves arithmetic dependencies through selected and reused definitions. It rejects ambiguous references, unsupported syntax, and cycles. Revit must still verify the transferred formula values and references.
+
+### Read the source and loaded family
+
+Run `scripts/read_family_parameter_transfer.py` with the Revit CPython bridge. Read the full result with `get_run`. Keep the snapshot private.
+
+- For the source, supply `role: "source"`, `staging`, `source_path`, and `revit_build`. Start with no open documents in the disposable worker.
+- For the target, supply `role: "target"`, `family_id`, `family_uid`, and `revit_build`. Use a decimal string for `family_id`. Open only the saved standalone project.
+- Stop if the read fails, the snapshot is partial, or the worker state is unresolved. Retain the definitions, formulas, values, labels, and associations for review. Keep dimension reference strings tied to the family document that produced them.
+
+The reader closes the inspection document without saving. Verify this workflow in Revit 2026 before use on project data.
+
+### Review the transfer
+
+Run `python scripts/family_parameter_transfer_preview.py --source source.json --target target.json --request request.json`. Supply the two complete Revit snapshots as files.
+
+Set `source_sha256` and `target_sha256` to the reviewed read digests. List the exact parameter names in `selected`. Map every target type name to a source type name in `type_map`.
+
+Review each proposed addition and the expected values for each target type. Equivalent target definitions are retained. The preview stops on incomplete reference evidence, incompatible retained values, or missing formula dependencies. Use a separate preview for each target.
+
+The preview makes no model changes.
+
+### Trial the private family copy
+
+Use only a disposable Revit fixture. Open only the private writable copy of the loaded target. Keep its RFA in a separate folder with no companion files. Call `get_context` and confirm the open document. Obtain approval for the rollback-only trial. Run `scripts/probe_family_parameter_transfer.py` in guarded CPython dry-run mode.
+
+Supply `source_read`, `target_read`, `request`, and the reviewed `preview_sha256`. Set `disposable_fixture` to true. Supply `working_copy` with its absolute `workspace`, the directory `workspace_identity`, and the reviewed RFA `file` record. Use the directory identity and file record format from the family library scanner.
+
+Save the trial inputs as `transfer.json`. Run `scripts/read_family_parameter_transfer_audit.py` in query mode before the trial. Pass the inputs as `transfer`. Save the full query as `before.json`.
+
+Save the full trial as `trial.json`. Run the audit again with the trial's `transaction` as `trial_transaction`. Save it as `after.json`. Stop on an unresolved result.
+
+### Verify rollback and replay
+
+1. Run `python scripts/verify_family_parameter_transfer.py transfer.json before.json trial.json after.json`. Check the measured values and the restored family.
+2. Confirm the active family and ask policy. Obtain approval for replay. Run `scripts/apply_family_parameter_transfer.py` in guarded CPython modify mode. Pass `transfer`, `before`, `trial`, and `after`.
+3. Use Revit's Keep or Discard prompt. Save the full modify record as `modify.json`. Run the audit again with the replay's `transaction` as `trial_transaction`. Set `kept` to true only after Keep. Save the full audit as `fresh.json`.
+4. Run the same verifier with `--modify modify.json --fresh fresh.json`. Save the decision receipt. Stop if the audit does not match the decision.
+
+Verify both decisions in native Revit before use on project data.
+
+### Qualify native formula bindings
+
+Use a disposable fixture with at least two mapped types. Use distinct values for each numeric input across the types. Include a new formula that depends on a new input and a retained input.
+
+Run `scripts/probe_family_formula_binding.py` in guarded CPython dry-run mode. Pass the reviewed family trial inputs as `transfer`. Pass a `cases` list with one case for each mapped type and writable arithmetic input.
+
+Set `type` and `parameter` to the exact names. Set `value` to the new typed value record. Set `expected` to independently calculated typed value records keyed by each affected formula name. Use `{"state": "value", "value": 12.0}` for a numeric record.
+
+Save the full trial, the exact cases list as `cases.json`, and the independent post-rollback family audit. Run `python scripts/verify_family_parameter_transfer.py transfer.json before.json trial.json after.json --formula-cases cases.json`. Record the verified case count and observation digest. The trial rolls back each input change before it tests the next input.
+
+### Seal the private family export
+
+1. After a verified Keep, run `family_parameter_transfer_export.py reserve`. Pass the six saved files with `--transfer`, `--before`, `--trial`, `--after`, `--modify`, and `--fresh`. Pass a separate private parent with `--destination`.
+2. Close all transaction groups. Use Revit Save As to write only to the returned `save_as` path. Close the exported family.
+3. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR` to the returned workspace. Set `ARCHI_MAGIC_TRANSFER_EXPORT_DIR_REQUEST_SHA256` to the returned request digest. Run `pyrevit run scripts/family_parameter_transfer_export.py --revit=2026` in a disposable CPython worker with no model arguments. Wait for the worker to exit.
+4. Run `family_parameter_transfer_export.py collect --workspace <workspace> --request-sha256 <digest>`. Save the receipt. It binds the reopened family state and file bytes to the exact loaded project target.
+
+### Review the project reload
+
+Open only the saved standalone project. Call `get_context`. Run `scripts/family_parameter_reload_preview.py` in CPython query mode. Pass the exact `revit_build` and a `targets` list with each loaded family's `id` and `uid`. Save the full read as `project-before.json`.
+
+Run `python scripts/family_parameter_reload_preview.py --baseline project-before.json --export export.json`. Repeat `--export` for every reviewed target. Check the family identities and export digests. The preview stops if a nested family could conflict with a loaded project family.
+
+The preview makes no project changes.
+
+### Trial the project reload
+
+Call `get_context` and confirm the exact saved disposable project. Obtain approval for the rollback-only trial. Run `scripts/probe_family_parameter_reload.py` in guarded CPython dry-run mode. Pass the full `baseline`, reviewed `preview`, and `disposable_fixture: true`.
+
+Save the trial inputs as `reload.json`. The trial closes its inner transaction before inspecting loaded definitions. The transaction group stays reversible until inspection finishes. Save the full result as `project-trial.json`. Stop on an unresolved result.
+
+### Verify and replay the project reload
+
+1. Repeat the project baseline query with the trial's `transaction` as `trial_transaction`. Save it as `project-after.json`.
+2. Run `python scripts/verify_family_parameter_reload.py reload.json project-trial.json project-after.json`. Check the verified rollback and exact effect IDs.
+3. Confirm the active project and ask policy. Obtain approval for replay. Run `scripts/apply_family_parameter_reload.py` in guarded CPython modify mode. Pass `reload`, `trial`, and `after`.
+4. Use Revit's Keep or Discard prompt. Save the full modify result as `project-modify.json`.
+5. After Keep, run `scripts/read_family_parameter_reload_audit.py` in query mode. Pass `reload` and the modify result's `transaction` as `trial_transaction`. After Discard, repeat the project baseline query with the same transaction name. Save the full query as `project-fresh.json`.
+6. Run the same verifier with `--modify project-modify.json --fresh project-fresh.json`. If Keep fails readback, stop and identify the named Revit Undo entry before any further edit.
+
+Verify the complete workflow in native Revit before use on project data.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
