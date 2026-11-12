@@ -353,12 +353,15 @@ def inspect_room(room, room_id, options, remaining):
                 return excluded(room_id, "open_boundary_loop"), count
             for segment, curve, start, end in zip(segments, curves, starts, ends):
                 profile.Append(curve)
-                loop_facts.append({
+                facts_for_curve = {
                     "start_ft": xyz(start), "end_ft": xyz(end),
                     "curve_type": curve.GetType().Name,
                     "source_id": int(segment.ElementId.Value),
                     "linked_source_id": int(segment.LinkElementId.Value),
-                })
+                }
+                if facts_for_curve["curve_type"] == "Arc":
+                    facts_for_curve["midpoint_ft"] = xyz(curve.Evaluate(0.5, True))
+                loop_facts.append(facts_for_curve)
             if not profile.HasPlane():
                 return excluded(room_id, "nonplanar_boundary_loop"), count
             plane = profile.GetPlane()
@@ -381,10 +384,12 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None):
+def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False):
     types = None
     identity = None
     wall_type = None
+    if type(audit_existing) is not bool or (audit_existing and finish_request is None and wall_type_id is None):
+        raise ValueError("Select finish types before requesting an existing-finish audit.")
     if finish_request is not None or wall_type_id is not None:
         project = document.ProjectInformation
         if not document.PathName or project is None or not project.UniqueId:
@@ -417,9 +422,13 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None):
             rows.append(row)
     finally:
         options.Dispose()
+    if audit_existing:
+        from room_finish_provenance import audit_existing_finishes
+        audit_existing_finishes(document, rows)
     report = {
         "status": "reported" if all(row["status"] == "boundary_verified"
                                    and row.get("wall_finish", {}).get("status", "reported") == "reported"
+                                   and row.get("existing_finishes", {}).get("status") != "conflict"
                                    for row in rows) else "incomplete",
         "rooms": rows,
         "boundary_location": "finish",
@@ -434,5 +443,6 @@ if doc is None or doc.IsFamilyDocument:
     result = {"error": "Open a Revit project before reading room boundaries."}
 else:
     report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
-                             inputs.get("horizontal_finishes"), inputs.get("wall_type_id"))
+                             inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
+                             inputs.get("audit_existing_finishes", False))
     result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

@@ -217,6 +217,8 @@ Pass `wall_type_id` to review a basic wall finish type and its width. Review eac
 
 Review `finish_footprints` for the centerlines that fit inside the room outline at the selected width. The check accounts for holes in straight-edged outlines. Curved outlines need separate review. Within each room, longer pieces take priority when footprints overlap. Review `original_span_ft` and `span_ft` for any trim. Check oblique joints for gaps before placement.
 
+Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict. Check untagged finishes separately. This query registers no schema and writes no elements.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.

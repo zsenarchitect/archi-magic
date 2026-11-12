@@ -1,4 +1,5 @@
 import json
+import importlib
 from math import dist
 from pathlib import Path
 import runpy
@@ -162,6 +163,7 @@ def rectangle(x1, y1, x2, y2, z=0):
 
 @pytest.fixture
 def run(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
     db = NS(
         Architecture=NS(Room=Room), CurveLoop=CurveLoop, ElementId=int,
         SpatialElementBoundaryOptions=lambda: NS(Dispose=lambda: None),
@@ -174,7 +176,7 @@ def run(monkeypatch):
         ElementOnPhaseStatus=NS(New="new", Existing="existing"),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
-    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
+    monkeypatch.setitem(sys.modules, "System", NS(Int64=int, Guid=str, String=str))
     monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=ListFactory()))
 
     def execute(rooms, ids, **extra):
@@ -354,3 +356,85 @@ def test_wall_finish_excludes_unverified_insert_without_hiding_horizontal_previe
     assert report["status"] == "incomplete" and row["wall_finish"]["status"] == "incomplete"
     assert row["horizontal_finishes"][0]["kind"] == "floor"
     assert row["boundary_loops"][0][0]["wall_finish"] == {"status": "excluded", "reason": reason}
+
+
+@pytest.mark.parametrize("state", ["empty", "match", "partial", "copied", "edited", "wrong_geometry"])
+def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monkeypatch, state):
+    db = sys.modules["pyrevit.api"].DB
+    db.StorageType.Double = "double"
+    db.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM = "floor-offset"
+    db.BuiltInParameter.CEILING_HEIGHTABOVELEVEL_PARAM = "ceiling-offset"
+    tagged = []
+    field = NS(FieldName="Payload", ValueType=NS(FullName="System.String"), ContainerType="simple")
+    schema = NS(SchemaName="ArchiMagicRoomFinishV1", ListFields=lambda: [field])
+    ext = NS(ContainerType=NS(Simple="simple"), Schema=NS(Lookup=lambda _guid: schema),
+             ExtensibleStorageFilter=lambda guid: guid)
+    monkeypatch.setitem(sys.modules, "Autodesk.Revit.DB.ExtensibleStorage", ext)
+    monkeypatch.delitem(sys.modules, "room_finish_provenance", raising=False)
+    provenance = importlib.import_module("room_finish_provenance")
+
+    class Floor:
+        DesignOption = None
+        LevelId = NS(Value=101)
+        CreatedPhaseId = NS(Value=102)
+        DemolishedPhaseId = NS(Value=-1)
+
+        def __init__(self, value, type_id, offset, curves):
+            self.Id = NS(Value=value)
+            self.UniqueId = "finish-" + str(value)
+            self.type_id, self.offset = type_id, offset
+            self.SketchId = NS(Value=value + 10)
+            self.sketch = db.Sketch()
+            self.sketch.OwnerId = self.Id
+            self.sketch.Profile = [curves]
+
+        def GetTypeId(self):
+            return self.type_id
+
+        def get_Parameter(self, _name):
+            return NS(StorageType="double", HasValue=True, AsDouble=lambda: self.offset)
+
+        def GetEntity(self, actual_schema):
+            assert actual_schema is schema
+            return NS(IsValid=lambda: True, Get={str: lambda _field: json.dumps(self.record)})
+
+    db.Floor = Floor
+    db.Ceiling = type("Ceiling", (Floor,), {})
+    db.Sketch = type("Sketch", (), {})
+    db.Wall = Wall
+    db.FilteredElementCollector = lambda _doc: NS(WherePasses=lambda _filter: tagged, Dispose=lambda: None)
+
+    boundary = loop(rectangle(0, 0, 8, 8))
+    room = Room(Seq([boundary]))
+    models = {1: room, 101: Level(), 102: Phase(), 103: FloorType(), 104: CeilingType()}
+    horizontal = {"floor": {"type_id": "103", "offset_ft": 0},
+                  "ceiling": {"type_id": "104", "offset_ft": 9}}
+    preview = run(models, ["1"], horizontal_finishes=horizontal)["rooms"][0]
+    expected = provenance.expected_pieces(preview)
+    curves = [segment.GetCurve() for segment in boundary]
+    floor, ceiling = Floor(201, 103, 0, curves), db.Ceiling(202, 104, 9, curves)
+    models.update({211: floor.sketch, 212: ceiling.sketch})
+    doc = NS(GetElement=lambda item: models.get(getattr(item, "Value", item)))
+    if state == "wrong_geometry":
+        ceiling.sketch.Profile = [[segment.GetCurve() for segment in loop(rectangle(1, 0, 8, 8))]]
+    for key, piece in expected.items():
+        element = floor if piece["kind"] == "floor" else ceiling
+        observed = provenance.observed_piece(doc, element, piece["kind"])
+        element.record = dict({field: piece[field] for field in ("kind", "type_uid", "level_uid")},
+                              room_uid=room.UniqueId, element_uid=element.UniqueId, piece_key=key,
+                              observed_sha256=provenance.digest(observed))
+    if state == "copied":
+        floor.UniqueId = "copied-floor"
+    if state == "edited":
+        floor.offset = 0.5
+    tagged.extend([] if state == "empty" else [floor] if state == "partial" else [floor, ceiling])
+    report = run(models, ["1"], horizontal_finishes=horizontal, audit_existing_finishes=True)
+    audit = report["rooms"][0]["existing_finishes"]
+    assert audit["expected_piece_keys"] == sorted(expected)
+    if state in ("empty", "match"):
+        assert report["status"] == "reported"
+        assert audit["status"] == ("no_tagged_pieces" if state == "empty" else "tagged_set_matches")
+    else:
+        assert report["status"] == "incomplete" and audit["status"] == "conflict"
+        assert audit["reason"] == ("tagged_piece_set_differs" if state == "partial"
+                                    else "tagged_piece_changed_or_copied")
