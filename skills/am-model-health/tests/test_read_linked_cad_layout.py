@@ -174,6 +174,9 @@ def linked_dwg(monkeypatch):
         def WhereElementIsNotElementType(self):
             return iter(self.document.existing.get(self.category, ()))
 
+        def WherePasses(self, _):
+            return iter(self.document.tagged)
+
         def Dispose(self):
             pass
 
@@ -224,18 +227,25 @@ def linked_dwg(monkeypatch):
                 SpatialElementBoundaryOptions=Options, SpatialElementBoundaryLocation=Record(Finish="finish"),
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
     api, system, generic = ModuleType("pyrevit.api"), ModuleType("System"), ModuleType("System.Collections.Generic")
-    api.DB, system.Int64, generic.List = db, int, NativeList
+    storage = ModuleType("Autodesk.Revit.DB.ExtensibleStorage")
+    api.DB, system.Int64, system.Guid, system.String, generic.List = db, int, str, str, NativeList
+    storage.Schema = Record(Lookup=lambda _: document.schema)
+    storage.ExtensibleStorageFilter = lambda _: Record(Dispose=lambda: None)
+    storage.ContainerType = Record(Simple="simple")
     monkeypatch.setitem(sys.modules, "pyrevit.api", api)
     monkeypatch.setitem(sys.modules, "System", system)
     monkeypatch.setitem(sys.modules, "System.Collections.Generic", generic)
+    monkeypatch.setitem(sys.modules, "Autodesk.Revit.DB.ExtensibleStorage", storage)
     monkeypatch.delitem(sys.modules, "read_linked_cad_layout", raising=False)
     monkeypatch.delitem(sys.modules, "read_cad_layout_surroundings", raising=False)
     monkeypatch.delitem(sys.modules, "check_cad_wall_collisions", raising=False)
     monkeypatch.delitem(sys.modules, "read_cad_room_boundaries", raising=False)
+    monkeypatch.delitem(sys.modules, "cad_layout_provenance", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
     document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt", existing={}, db=db,
+                      schema=None, tagged=[],
                       ActiveView=view, active_option=element_id(-1), Application=Record(VersionNumber="2026"),
                       ProjectInformation=Record(UniqueId="aa-3"))
     document.GetElement = lambda id: objects.get(id.Value) or next(
@@ -290,6 +300,10 @@ def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_d
     assert preview.pop("existing_model_scan")["status"] == "none_found"
     assert preview.pop("wall_collision_scan")["status"] == "none_measured"
     assert preview.pop("existing_room_boundaries")["status"] == "none_found"
+    assert preview.pop("provenance")["status"] == "no_tags"
+    manifest = preview.pop("placement_manifest")
+    assert sorted(piece["kind"] for piece in manifest["pieces"].values()) == [
+        "door", "room", "separator", "separator", "separator", "wall"]
     digest = preview.pop("geometry_sha256")
     canonical = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
     assert digest == sha256(canonical.encode("ascii")).hexdigest()
@@ -310,6 +324,64 @@ def existing_element(id_value, identifier, bounds, *, placed=True, created=96, d
     return Record(Id=id_value(identifier), UniqueId=f"existing-{identifier}", VersionGuid="existing-v1",
                   CreatedPhaseId=id_value(created), DemolishedPhaseId=id_value(demolished),
                   Location=object() if placed else None, get_BoundingBox=get_bounding_box)
+
+
+def tagged_piece(id_value, identifier, manifest, key, *, copied=False):
+    uid = f"tagged-{identifier}"
+    piece = manifest["pieces"][key]
+    payload = json.dumps({"scope": manifest["scope"], "lineage_sha256": manifest["lineage_sha256"],
+                          "plan_sha256": manifest["plan_sha256"], "piece_key": key, "kind": piece["kind"],
+                          "element_uid": "different-element" if copied else uid,
+                          "expected_sha256": piece["expected_sha256"], "observed_sha256": "a" * 64})
+
+    class EntityGet:
+        def __getitem__(self, _):
+            return lambda _field: payload
+
+    entity = Record(IsValid=lambda: True, Get=EntityGet())
+    return Record(Id=id_value(identifier), UniqueId=uid, GetEntity=lambda _: entity)
+
+
+def test_preview_detects_partial_copied_and_moved_cad_placements(linked_dwg):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+
+    def preview():
+        return json.loads(native_preview(document, request)["preview_json"])
+
+    manifest = preview()["placement_manifest"]
+    document.schema = Record(SchemaName="ArchiMagicCadLayoutV1", ListFields=lambda: [
+        Record(FieldName="Payload", ValueType=Record(FullName="System.String"), ContainerType="simple")])
+    document.tagged = [tagged_piece(id_value, index, manifest, key)
+                       for index, key in enumerate(manifest["pieces"], 100)]
+    assert preview()["provenance"]["status"] == "matching_tags_pending_readback"
+    removed = document.tagged.pop()
+    partial = preview()["provenance"]
+    assert partial["status"] == "conflict" and len(partial["missing_piece_keys"]) == 1
+    document.tagged.append(tagged_piece(id_value, 105, manifest, partial["missing_piece_keys"][0], copied=True))
+    assert preview()["provenance"]["conflicts"] == [{"id": "105", "reason": "copied_provenance"}]
+    document.tagged[-1] = removed
+
+    link = document.GetElement(id_value(1))
+    original = link.geometry[0].Transform.OfPoint
+
+    def moved(point):
+        value = original(point)
+        return Record(X=value.X + 10000 / 304.8, Y=value.Y, Z=value.Z)
+
+    link.geometry[0].Transform.OfPoint = moved
+    source = request["source"]
+    del source["expected_evidence_sha256"]
+    source["room_points_mm"] = {}
+    candidate, = read(document, source)["room_candidates"]
+    source["room_points_mm"] = {candidate["id"]: [9250, 500, 3000]}
+    source["expected_evidence_sha256"] = read(document, source)["evidence_sha256"]
+    changed = preview()
+    assert changed["placement_manifest"]["lineage_sha256"] == manifest["lineage_sha256"]
+    assert changed["placement_manifest"]["plan_sha256"] != manifest["plan_sha256"]
+    assert changed["existing_model_scan"]["status"] == "none_found"
+    assert changed["provenance"]["status"] == "conflict"
+    assert {row["reason"] for row in changed["provenance"]["conflicts"]} == {"stale_placement"}
 
 
 def test_native_scan_finds_model_candidates_including_later_phases_and_reports_unknowns(linked_dwg):

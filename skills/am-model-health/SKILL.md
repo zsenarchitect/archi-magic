@@ -211,6 +211,8 @@ Read `wall_collision_scan` for measured overlaps between proposed wall bodies an
 
 Read `existing_room_boundaries` for the native area, phase, finish boundary digest, and source elements of nearby host rooms. A linked boundary identifies both the host link instance and its source element. Review any room with incomplete boundary evidence. This read does not inspect Revit's plan circuits.
 
+Review `provenance` for prior placement from the same link, level, and layer scope. A copied tag, incomplete prior placement, moved source, or overlapping layer scope requires review. Matching tags still require a fresh geometry readback of the placed elements.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).

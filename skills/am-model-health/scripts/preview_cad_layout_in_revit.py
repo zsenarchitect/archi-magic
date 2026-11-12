@@ -6,6 +6,7 @@ from time import monotonic
 from pyrevit.api import DB
 
 from cad_layout_preview import classify_room_boundaries, fields, number, propose
+from cad_layout_provenance import audit_tags, placement_manifest
 from check_cad_wall_collisions import check_wall_collisions
 from read_cad_room_boundaries import read_existing_room_boundaries
 from read_cad_layout_surroundings import MAX_SECONDS, scan_surroundings
@@ -68,7 +69,8 @@ def read_preview(document, request):
         raise ValueError("Supply the reviewed DWG request with its evidence SHA-256.")
     evidence = read_snapshot(document, source)
     view = view_scope(document, request, element_id(evidence["level_element_id"]))
-    proposal = propose(json.loads(evidence["snapshot_json"]), json.loads(evidence["verified_mapping_json"]))
+    snapshot, mapping = (json.loads(evidence[key]) for key in ("snapshot_json", "verified_mapping_json"))
+    proposal = propose(snapshot, mapping)
     result = {"kind": "revit-cad-layout-preview", "document": evidence["document"], "view": view,
               "source_evidence_sha256": evidence["evidence_sha256"], "level_id": evidence["level_element_id"],
               "proposal": proposal}
@@ -81,6 +83,9 @@ def read_preview(document, request):
     if status == "proposed":
         result["geometry_sha256"] = sha256(encoded(result, EVIDENCE_LIMIT))
         deadline = monotonic() + MAX_SECONDS
+        manifest = placement_manifest(evidence, result, snapshot, mapping)
+        result["placement_manifest"] = manifest
+        result["provenance"] = audit_tags(document, manifest, deadline)
         scan = scan_surroundings(document, proposal, walls, deadline)
         result["existing_model_scan"] = scan
         result["wall_collision_scan"] = check_wall_collisions(document, proposal, walls, scan, deadline)
