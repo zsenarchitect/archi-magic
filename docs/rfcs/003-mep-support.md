@@ -35,3 +35,31 @@ archi-magic historically focused on architectural standards, rooms, doors, sched
 - **Assisted Routing**: Suggest connection routes between two open connectors with standard 45°/90° elbows, avoiding architectural bounding obstacles.
 - **Rule-Based Sizing**: Suggest cross-sectional duct/pipe dimensions based on lookup velocity or friction tables.
 - **Safety Guarantee**: Every geometry routing transaction is wrapped in an `am-safe-change` dry-run transaction. Users inspect changes visually in 3D and must confirm via the native Revit Keep/Discard dialog.
+
+### Review-only sizing table
+
+Run `python skills/am-safe-change/scripts/mep_sizing_preview.py sizing.json > sizing-preview.json` and open the result in the existing change-preview renderer. Use a table reviewed for the project and retain the input alongside the preview. The preview identifies the table and binds the input bytes by SHA-256.
+
+The example uses synthetic values. Each rule matches service, profile, system, demand kind and demand unit exactly. Put the preferred qualifying rule first. The first matching rule with capacity at or above demand supplies the nominal dimensions. A missing rule or insufficient capacity blocks that row. Dimension units are explicit and the preview does no conversions. Use diameter for round sections and width then height for rectangular or oval sections.
+
+```json
+{
+  "table_id": "Fixture table",
+  "rules": [
+    {
+      "id": "D-100", "service": "duct", "profile": "rectangular",
+      "system": "Supply Air", "demand_kind": "flow", "demand_unit": "L/s",
+      "max_demand": 100, "dimensions": [300, 200], "dimension_unit": "mm"
+    }
+  ],
+  "requests": [
+    {
+      "id": "branch-01", "service": "duct", "profile": "rectangular",
+      "system": "Supply Air", "demand_kind": "flow", "demand_unit": "L/s",
+      "demand": 80
+    }
+  ]
+}
+```
+
+Supported services are `duct`, `pipe`, `conduit` and `cable_tray`. A preview with blocked rows returns exit 1. Invalid input returns exit 2 and emits no preview. The preview carries no model-write steps. Revit type availability, routing, clearances and Keep/Discard still require native qualification.
