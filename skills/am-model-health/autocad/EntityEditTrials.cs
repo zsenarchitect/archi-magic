@@ -9,7 +9,6 @@ namespace ArchiMagic.AutoCAD;
 public static class EntityEditTrials
 {
     private const int MaxAttributes = 100;
-    private const int MaxAttributeBytes = 255;
 
     [CommandMethod("AMCADTRYLAYERMAP", CommandFlags.Modal)]
     public static void TryLayerMap() => DrawingTrial.Execute(document =>
@@ -87,7 +86,7 @@ public static class EntityEditTrials
 
     private static DrawingTrial.Target InspectAttribute(Document document, ObjectId insertId, string tag, string text)
     {
-        if (string.IsNullOrWhiteSpace(tag) || tag.Length > 255 || !IsLiteral(text))
+        if (string.IsNullOrWhiteSpace(tag) || tag.Length > 255 || !EditRequest.LiteralAttribute(text))
             throw new InvalidOperationException("Use an existing tag and nonempty printable ASCII text without AutoCAD formatting codes.");
 
         using var transaction = document.Database.TransactionManager.StartOpenCloseTransaction();
@@ -145,15 +144,4 @@ public static class EntityEditTrials
 
     private static string DescribeLayer(LayerTableRecord layer) => layer.Name + " [" + layer.Handle + "]";
 
-    private static bool IsLiteral(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text) || text.Length > MaxAttributeBytes)
-            return false;
-
-        foreach (var character in text)
-            if (character < ' ' || character > '~' || character is '%' or '\\' or '{' or '}')
-                return false;
-
-        return true;
-    }
 }

@@ -45,3 +45,28 @@ Use `AMCADTRYPURGE` to select an exact layer, block definition, dimension style,
 ## Rollback-only Xref repath
 
 Use `AMCADTRYXREFPATH` to select one direct Xref insert, enter the approved physical local root and supply a proposed path relative to the host drawing. The trial checks the exact direct graph node and block record, pins the target DWG and verifies the physical path through Windows handles. The fixture paths must match their on-disk capitalization. Reparse points, hard-linked target files, rooted paths and paths outside the approved root are refused. Review the exact stored path, target digest and native reference status before choosing Trial. The command changes the stored path in the abort-only transaction, checks that the resolved status and loaded database filename match the baseline, and verifies the original path and drawing after rollback. Windows fixture qualification must observe file access to confirm whether AutoCAD performs any implicit reference loading. [Windows final path by handle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+
+## Read-only batch request check
+
+Run `AMCADCHECKREQUEST` against the clean active drawing and select a local JSON file. Copy the drawing fingerprint and version from `AMCADINSPECT` and obtain the SHA-256 from the saved disposable DWG with `Get-FileHash`. The command verifies those values, checks each target's native class and original value, and reports the SHA-256 of the exact request bytes and the number of checked rows. A successful check establishes the baseline. Operation eligibility, physical Xref confinement and native rollback are evaluated by the separate trial commands.
+
+```json
+{
+  "drawing_fingerprint": "aabbccdd-0000-0000-0000-000000000001",
+  "drawing_version": "aabbccdd-0000-0000-0000-000000000002",
+  "file_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "edits": [
+    {
+      "kind": "rename_layer",
+      "handle": "1A",
+      "native_class": "LAYER",
+      "before": "Existing",
+      "after": "Proposed"
+    }
+  ]
+}
+```
+
+For `map_entity`, use the original and destination layer handles as `before` and `after`. For `repath_xref`, add `approved_root` and use the stored path and proposed host-relative path. For `fill_attribute`, add `owner_handle` and `tag`. Use the original symbol name for `purge_layer`, `purge_block` and `purge_dim_style`. For `purge_block`, also supply `owned_handles` in block-begin and block-end order. For `erase_empty_text`, supply an empty `before` value. Omit `after` from purge and erase rows.
+
+Run the parser contract checks with `dotnet run --project skills/am-model-health/tests/autocad/ArchiMagic.AutoCAD.ContractTests.csproj`. The contract tests use the same parser as the native command and require no Autodesk dependencies.

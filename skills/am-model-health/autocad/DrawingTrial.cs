@@ -73,6 +73,12 @@ internal static class DrawingTrial
 
     private static Baseline ReadBaseline(Document document, Func<Target> inspect)
     {
+        var identity = ReadDrawing(document);
+        return new Baseline(identity.Fingerprint, identity.Version, identity.FileName, identity.Digest, inspect());
+    }
+
+    internal static (string Fingerprint, string Version, string FileName, string Digest) ReadDrawing(Document document)
+    {
         if (AcadApplication.DocumentManager.MdiActiveDocument != document
             || Convert.ToInt32(AcadApplication.GetSystemVariable("DBMOD")) != 0)
             throw new InvalidOperationException("Open the clean saved disposable drawing as the active document.");
@@ -84,7 +90,7 @@ internal static class DrawingTrial
             || !Guid.TryParse(version, out var versionId) || versionId == Guid.Empty)
             throw new InvalidOperationException("The fixture has no verifiable drawing fingerprint or version.");
 
-        return new Baseline(fingerprint, version, database.Filename, HashDrawing(database.Filename), inspect());
+        return (fingerprint, version, database.Filename, HashDrawing(database.Filename));
     }
 
     internal static bool ReservedLayer(string name) =>
