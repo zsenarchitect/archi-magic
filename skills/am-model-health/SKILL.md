@@ -184,6 +184,14 @@ This is a development workflow for standalone Revit 2026 files. Use only disposa
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
 
+To extract a linked DWG, use Revit 2026 and the CPython engine. Call `get_context` and `get_skill("revit-scripting")`. Run `scripts/read_linked_cad_layout.py` with `run_query` and the scripts directory as workspace. Pass the exact link and level IDs, selected layer names, and an empty room-point map for the first read.
+
+```json
+{"link_id":"101","level_id":"102","segment_layers":["A-WALL","A-DOOR"],"room_layers":["A-ROOM"],"room_points_mm":{}}
+```
+
+Review `unresolved` and `room_candidates`. Supply a reviewed interior point in millimetres for each room ID, then rerun the read. Save the decoded `snapshot_json` as the geometry input below. Preserve the full read record with the proposal. The reader uses native lines and closed polylines. Verify their layer, coordinates and curve fidelity against the source DWG in the disposable Revit fixture.
+
 1. Prepare a geometry JSON file for one linked drawing and one level. Set `coordinate_frame` to `revit_internal_axes_mm`. Record `link_id`, `level_id` and `level_mm`. Use exact IDs and model-space coordinates. Each item in `segments` has `id`, `layer`, `start` and `end`. A room in `room_loops` has `id`, `layer`, `closed`, `vertices` and `interior_point`. Use XYZ points in millimetres. For a room, set `closed` to true and list the vertices once.
 2. Prepare a mapping JSON file. Set `tolerance_mm`, `minimum_overlap_mm` and `door_setback_mm`. In `walls` and `doors`, map each exact layer name to a `type_id` and `width_mm`. Add room boundary layers to `room_layers`. Map each layer to one role.
 3. Run `python scripts/cad_layout_preview.py snapshot.json --mapping mapping.json`. Review the wall axes, maximum face errors, uncovered lengths, door spans, and room outlines. The door marker must lie along its proposed host wall. Check each unresolved item. Exit 1 means geometry needs review. Exit 2 means the input or calculation failed.
