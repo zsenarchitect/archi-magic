@@ -170,7 +170,8 @@ def load(path):
 def read_snapshot(record):
     response = record.get("response", record)
     if "result" in response:
-        if response.get("status", "ok") != "ok" or response.get("error"):
+        if (response.get("status", "ok") != "ok" or response.get("error")
+                or response.get("result_truncated", False) is not False):
             raise ValueError("The Revit revision query did not complete.")
         response = response["result"]
     if "snapshot_json" in response:
@@ -183,17 +184,28 @@ def read_snapshot(record):
 
 def report_dry_run(plan, record):
     envelope = record.get("response", record)
-    changes = envelope.get("result", envelope).get("changes") or envelope.get("changes") or {}
+    run_id = envelope.get("run_id")
+    exit_code = envelope.get("exit_code")
+    if ((envelope.get("mode"), envelope.get("status"), envelope.get("decision")) != ("dry_run", "ok", "rolled_back")
+            or not isinstance(run_id, TEXT) or not run_id.strip() or envelope.get("result_truncated") is not False
+            or type(exit_code) is not int or exit_code != 0 or envelope.get("approval") is not None
+            or any(envelope.get(field) for field in ("error", "failures", "dialogs", "blocked", "warnings",
+                                                     "unclosed_documents"))):
+        raise ValueError("Use the full successful rolled-back pyRevit dry-run record.")
+    changes = envelope["changes"]
     categories = changes.get("by_category")
     count = changes.get("modified_count")
-    if (changes.get("added_count") != 0 or changes.get("deleted_count") != 0
-            or changes.get("other_documents") or not isinstance(categories, dict)
+    if (any(type(changes.get(field)) is not int or changes[field] != 0 for field in ("added_count", "deleted_count"))
+            or any(changes.get(field) for field in ("added", "deleted", "added_ids", "deleted_ids", "other_documents"))
+            or not isinstance(categories, dict)
             or type(count) is not int or count < len(plan["ownership_ids"])
             or any(type(value) is not int or value < 0 for value in categories.values())
             or sum(categories.values()) != count):
         raise ValueError("Dry-run telemetry does not confirm the reviewed sheet edit. Check the full run.")
-    modified = changes.get("modified", [])
-    ids = {str(row["id"]) for row in modified}
+    modified = changes.get("modified")
+    if not isinstance(modified, list) or len(modified) != count:
+        raise ValueError("Dry-run telemetry did not identify every reviewed edit. Check the full run.")
+    ids = {positive_id(str(row["id"])) for row in modified}
     if len(ids) != count or not set(plan["ownership_ids"]) <= ids:
         raise ValueError("Dry-run telemetry did not identify every reviewed edit. Check the full run.")
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
@@ -223,8 +235,12 @@ def main(argv=None):
         if args.verify or args.check_dry_run:
             approved_steps(record, record["basis"])
             verify_result(record, snapshot)
+            if args.check_dry_run:
+                status = report_dry_run(record, source)
+                if status != 0:
+                    return status
             print("Revit revision readback matches the preview.")
-            return report_dry_run(record, source) if args.check_dry_run else 0
+            return 0
         preview = compute(snapshot, record)
         encoded = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, indent=2)
         if len(encoded) > LIMIT:

@@ -240,11 +240,23 @@ def test_apply_checks_native_membership_and_preserves_other_revisions(inventory,
     changes = {"added_count": 0, "deleted_count": 0, "modified_count": len(plan["steps"]),
                "by_category": {"Sheets": len(plan["steps"])},
                "modified": [{"id": int(value)} for value in plan["ownership_ids"]]}
-    dry_run = {"status": "ok", "result": dict(result, changes=changes)}
+    dry_run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back",
+               "run_id": "revision-dry-run", "result_truncated": False, "exit_code": 0, "changes": changes,
+               "result": result}
     source.write_text(json.dumps(dry_run))
     command = [sys.executable, str(SCRIPT.with_name("sheet_revision_preview.py")), str(source), str(record),
                "--check-dry-run"]
     assert subprocess.run(command, text=True, capture_output=True).returncode == 0
+    tampered = {**dry_run, "result": {**result, "changes": changes},
+                "changes": {**changes, "deleted_count": 1, "deleted": [104]}}
+    source.write_text(json.dumps({"response": tampered}))
+    rejected = subprocess.run(command, text=True, capture_output=True)
+    assert rejected.returncode == 2 and "Dry-run telemetry" in rejected.stderr
+    assert "matches the preview" not in rejected.stdout
+    for fields in ({"mode": "modify"}, {"decision": "committed"}, {"result_truncated": True}):
+        source.write_text(json.dumps({**dry_run, **fields}))
+        rejected = subprocess.run(command, text=True, capture_output=True)
+        assert rejected.returncode == 2 and "matches the preview" not in rejected.stdout
     changes["modified"][0] = {"id": 104}
     source.write_text(json.dumps(dry_run))
     bad = subprocess.run(command, text=True, capture_output=True)
