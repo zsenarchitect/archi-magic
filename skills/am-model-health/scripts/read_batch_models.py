@@ -184,12 +184,14 @@ def model_result(app, DB, path, model, year, scripts, audit=audit_source):
             row["status"] = "staged_changed"
             return row
         document = app.OpenDocumentFile(model_path, DB.OpenOptions())
-        if (document.IsFamilyDocument or document.IsWorkshared or document.IsModelInCloud
+        if (len(list(app.Documents)) != 1 or document.IsFamilyDocument or document.IsWorkshared or document.IsModelInCloud
                 or document.IsModified or normalized_path(document.PathName) != normalized_path(path)):
             return row
         health = audit(scripts[0], document, app, {"max_ids": 1, "top_warnings": 5})
+        if len(list(app.Documents)) != 1 or document.IsModified:
+            return row
         parameters = audit(scripts[1], document, app, {"max_ids": 1, "max_rows": 1})
-        if document.IsModified:
+        if len(list(app.Documents)) != 1 or document.IsModified:
             return row
         summary = summarize(health, parameters)
         row["summary"] = summary
