@@ -184,9 +184,12 @@ def approved_view(host, plan, display):
 
 def view_receipt(host, view, plan):
     expected = plan["view"]
+    view_type = host.GetElement(element_id(expected["view_type_id"]))
     if (not isinstance(view, DB.View3D) or view.IsTemplate or view.IsPerspective
             or view.ViewTemplateId.Value != -1 or view.Name != expected["name"]
             or str(view.GetTypeId().Value) != expected["view_type_id"]
+            or not isinstance(view_type, DB.ViewFamilyType)
+            or str(view_type.UniqueId) != expected["view_type_uid"]
             or not view.IsSectionBoxActive or not view.UniqueId
             or ib.saved_document_identity(host) != plan["host_identity"]):
         raise ValueError("The new view differs from its approved identity or type.")
@@ -200,6 +203,53 @@ def view_receipt(host, view, plan):
             "view_name": view.Name, "view_type_id": str(view.GetTypeId().Value),
             "box_min": low, "box_max": high, "basis_sha256": plan["basis_sha256"],
             "host_identity": plan["host_identity"]}
+
+
+def potentially_visible(host, view, target, clock):
+    link_id = target["link_instance_id"]
+    args = (host, view.Id) if link_id is None else (host, view.Id, element_id(link_id))
+    collector = DB.FilteredElementCollector(*args)
+    try:
+        for index, element in enumerate(collector.WhereElementIsNotElementType()):
+            budget_check(clock)
+            if index >= 20000:
+                raise ValueError("Clash visibility exceeded the 20,000-element read limit.")
+            if str(element.Id.Value) == target["element_id"] and str(element.UniqueId) == target["element_uid"]:
+                return True
+        budget_check(clock)
+        return False
+    finally:
+        collector.Dispose()
+
+
+def verify_kept(host, plan, receipt):
+    if host is None or host.IsFamilyDocument or host.ActiveView is None:
+        raise ValueError("Activate the kept clash view in its saved Revit project.")
+    view = host.ActiveView
+    if (not isinstance(view, DB.View3D) or str(view.Id.Value) != receipt["view_id"]
+            or str(view.UniqueId) != receipt["view_uid"]):
+        raise ValueError("Activate the exact kept clash view before verifying it.")
+    if plan["blocked"] is not False or view_receipt(host, view, plan) != receipt:
+        raise ValueError("The active clash view differs from its creation receipt.")
+    targets = plan["targets"]
+    if len(targets) != 2 or len({(item["model_id"], item["element_uid"]) for item in targets}) != 2:
+        raise ValueError("Verify two distinct reviewed clash targets.")
+    clock = Stopwatch.StartNew()
+    scopes = {scope.get("link_instance_id"): scope for scope in plan["request"]["sources"]}
+    for target in targets:
+        scope = dict(scopes[target["link_instance_id"]], element_ids=[target["element_id"]])
+        source = read_scope(host, scope, view, clock)
+        expected = {"unique_id": target["element_uid"], "min": target["min"], "max": target["max"]}
+        if (any(source[key] != target[key] for key in ("model_id", "link_instance_uid", "document_identity"))
+                or source["elements"].get(target["element_id"]) != expected
+                or not all(a <= b <= c <= d for a, b, c, d in
+                           zip(receipt["box_min"], target["min"], target["max"], receipt["box_max"]))):
+            raise ValueError("A reviewed target changed identity, is hidden, or has different bounds.")
+        if not potentially_visible(host, view, target, clock):
+            raise ValueError("Revit did not list a reviewed target as potentially visible in the kept view.")
+    payload = json.dumps({"view": receipt, "potentially_visible": targets},
+                         ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return {"status": "ok", "verification_json": payload}
 
 
 def rollback(transaction, group):
@@ -280,8 +330,10 @@ def run(host, args):
     mode = args.get("mode", "read")
     if mode == "apply":
         return apply_view(host, args["plan"], args["preview"])
+    if mode == "verify":
+        return verify_kept(host, args["plan"], args["receipt"])
     if mode != "read":
-        raise ValueError("Choose read or apply for the clash view.")
+        raise ValueError("Choose read, apply, or verify for the clash view.")
     return main(host, args)
 
 

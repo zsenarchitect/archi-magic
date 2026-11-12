@@ -312,3 +312,36 @@ def test_guarded_view_rejects_changed_mapping_or_display_before_writes(view_writ
     with pytest.raises(ValueError, match="no longer matches"):
         run(host, {"mode": "apply", "plan": plan, "preview": display})
     assert host.views == []
+
+
+@pytest.mark.parametrize("state", ["ready", "wrong_view", "changed_box", "missing_link_target"])
+def test_verify_kept_view_checks_both_link_instances(view_writer, state):
+    run, host, plan, display = view_writer
+    receipt = json.loads(run(host, {"mode": "apply", "plan": plan, "preview": display})["receipt_json"])
+    view = host.views[0]
+    host.ActiveView = NS(Id=Id(101), UniqueId="other") if state == "wrong_view" else view
+    if state == "changed_box":
+        view.box.Min = xyz(0, 0, 0)
+    opened, disposed = [], []
+
+    def collector(document, view_id, link_id):
+        assert document is host and view_id.Value == 100
+        opened.append(link_id.Value)
+        element = host.GetElement(link_id).GetLinkDocument().GetElement(Id(42))
+        element.Id = Id(42)
+        visible = [] if state == "missing_link_target" and link_id.Value == 7 else [element]
+        return NS(WhereElementIsNotElementType=lambda: visible, Dispose=lambda: disposed.append(link_id.Value))
+
+    run.__globals__["DB"].FilteredElementCollector = collector
+    args = {"mode": "verify", "plan": plan, "receipt": receipt}
+    if state == "ready":
+        evidence = json.loads(run(host, args)["verification_json"])
+        assert evidence == {"view": receipt, "potentially_visible": plan["targets"]}
+    else:
+        messages = {"wrong_view": "Activate the exact kept clash view",
+                    "changed_box": "section box differs",
+                    "missing_link_target": "potentially visible"}
+        with pytest.raises(ValueError, match=messages[state]):
+            run(host, args)
+    assert opened == disposed == ([6, 7] if state in ("ready", "missing_link_target") else [])
+    assert host.views == [view]
