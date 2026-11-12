@@ -60,12 +60,17 @@ public static class EditRequestInspection
             if ((item.Attributes & FileAttributes.ReparsePoint) != 0)
                 throw new InvalidOperationException("The edit request path contains a reparse point.");
 
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var buffer = new byte[EditRequest.MaxBytes + 1];
-        var size = stream.ReadAtLeast(buffer, buffer.Length, false);
-        if (size > EditRequest.MaxBytes)
+        using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read);
+        XrefRepathTrial.VerifyPhysicalHandle(stream.SafeFileHandle, file.FullName, directory: false);
+        var length = stream.Length;
+        if (length > EditRequest.MaxBytes)
             throw new InvalidOperationException("The edit request exceeds 64 KiB.");
-        return buffer[..size];
+        var buffer = new byte[checked((int)length)];
+        stream.ReadExactly(buffer);
+        XrefRepathTrial.VerifyPhysicalHandle(stream.SafeFileHandle, file.FullName, directory: false);
+        if (stream.Length != length)
+            throw new InvalidOperationException("The edit request changed while it was being read.");
+        return buffer;
     }
 
     private static void CheckBaseline(Database database, Transaction transaction, EditRow row)

@@ -119,6 +119,9 @@ internal static class DrawingTrial
         var length = file.Length;
         var modified = file.LastWriteTimeUtc;
         using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        XrefRepathTrial.VerifyPhysicalHandle(stream.SafeFileHandle, file.FullName, directory: false);
+        if (stream.Length != length)
+            throw new InvalidOperationException("The fixture changed while it was being opened.");
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[64 * 1024];
         int count;
@@ -129,6 +132,7 @@ internal static class DrawingTrial
             hash.AppendData(buffer, 0, count);
         }
 
+        XrefRepathTrial.VerifyPhysicalHandle(stream.SafeFileHandle, file.FullName, directory: false);
         if (stream.Position != length || stream.Length != length
             || File.GetLastWriteTimeUtc(file.FullName) != modified)
             throw new InvalidOperationException("The fixture changed while it was being read.");

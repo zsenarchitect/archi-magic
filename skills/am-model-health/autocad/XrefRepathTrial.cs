@@ -136,10 +136,10 @@ public static class XrefRepathTrial
     private static void VerifyTarget(string host, string root, string path, FileStream stream)
     {
         var expected = ResolveLocalPath(host, root, path);
-        VerifyHandle(stream.SafeFileHandle, expected, directory: false);
+        VerifyPhysicalHandle(stream.SafeFileHandle, expected, directory: false);
     }
 
-    private static void VerifyHandle(SafeFileHandle handle, string expected, bool directory)
+    internal static void VerifyPhysicalHandle(SafeFileHandle handle, string expected, bool directory)
     {
         var buffer = new StringBuilder(1024);
         var length = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
@@ -149,7 +149,7 @@ public static class XrefRepathTrial
             || (info.Attributes & FileAttributes.ReparsePoint) != 0
             || ((info.Attributes & FileAttributes.Directory) != 0) != directory
             || (!directory && info.LinkCount != 1))
-            throw new InvalidOperationException("The Xref path could not be bound to exact physical files and directories.");
+            throw new InvalidOperationException("The opened handle could not be bound to the exact local file or directory.");
     }
 
     private sealed class DirectoryHandles : IDisposable
@@ -164,7 +164,7 @@ public static class XrefRepathTrial
             handles.Add(handle);
             if (handle.IsInvalid)
                 throw new InvalidOperationException("The Xref path directory could not be held for the trial.");
-            VerifyHandle(handle, directory, directory: true);
+            VerifyPhysicalHandle(handle, directory, directory: true);
         }
 
         public void Dispose()
