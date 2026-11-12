@@ -31,3 +31,11 @@ The proxy run used two independent HTTP clients and synthetic data. Native Revit
 ### Exact publication and viewer byte limits
 
 Using the same workspace code and loopback Apache configuration, a valid small model with synthetic ASCII padding exercised the exact limits. The normal publisher accepted a 268,435,456-byte publication. It rejected a 268,435,457-byte replacement and the normal publication reader confirmed that the prior generation and digest were still current. The offline builder rejected a 268,435,457-byte viewer. Two concurrent authorized requests each streamed the exact 268,435,456-byte viewer through Apache, both with SHA-256 `bba2b8ef54445329aebe58cdc0958f73b58bff3e0793f8bfd919026e12806c28`. Protected HTTP and WebSocket routes continued to reject unauthenticated clients, cross-project clients and invalid Host or Origin values as applicable. These are byte-boundary tests. The separate 5,000-element fixture above exercises geometry capacity.
+
+### Chromium review through Apache HTTPS
+
+Chromium 157.0.8103.78 used three isolated browser contexts through Apache HTTP Server 2.4.66 and aiohttp 3.14.5. The workspace files matched `c5944755de6a9ea9ee4939d1e5fc50073d0cc254`. The proxy kept the 75-second upstream timeout, and the app used its default 20-second heartbeat and two-second publication poll. The viewer's WebSocket stayed connected without reconnecting for 76.0 seconds.
+
+The editor changed a finding's status and assignee, and the viewer saw both updates with editing controls hidden. A second editor's stale edit was rejected. A script-like comment rendered as text, and a viewer reload recovered the saved annotation and reconnected. A malformed publication showed the last valid results as stale and hid editing controls. Restoring the valid file recovered the controls. Publishing a new generation updated the viewer and retained the earlier annotation in history. Sign-out returned the viewer to sign-in. The workspace Python suite passed 42 tests and the viewer JavaScript suite passed 64.
+
+The browser test used synthetic audit content, temporary accounts, and loopback HTTPS. Native Revit audit and preview evidence and a run on the approved office host are still pending.
