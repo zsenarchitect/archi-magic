@@ -11,6 +11,8 @@ def apply(document, DB, args, context):
     require_ask(context)
     requested = args["derivation_run"]
     proof = verify(requested["derivation"], requested["preview"], args["before"], args["trial"], args["after"])
+    if not proof["effects"] or not proof["effects"][0]["modified"]:
+        raise ValueError("The trial did not expose a family change for the native approval prompt.")
     if requested["working_read"] != args["before"]:
         raise ValueError("The replay uses a different working-family query.")
 

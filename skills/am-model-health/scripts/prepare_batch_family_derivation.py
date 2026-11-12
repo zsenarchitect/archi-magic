@@ -106,7 +106,9 @@ def create_working_copy(lookup, project_read, preview, staging, source_path, raw
         "kind": "batch-family-type-derivation", "version": 1,
         "request_sha256": request["request_sha256"], "lookup_sha256": lookup["lookup_sha256"],
         "preview_sha256": manifest_digest(preview), "review_sha256": preview["review_sha256"],
-        "staging_sha256": staging["staging_sha256"], "source": source, "rows": rows,
+        "staging_sha256": staging["staging_sha256"], "staging_workspace_identity": staging["workspace_identity"],
+        "source": source, "rows": rows,
+        "root": request["root"], "root_identity": request["root_identity"],
         "project": preview["review"]["project"], "revit_build": preview["review"]["revit_build"],
         "workspace": str(working), "workspace_identity": scratch_identity, "working_file": rfa,
     }

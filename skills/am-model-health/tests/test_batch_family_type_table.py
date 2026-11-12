@@ -433,3 +433,56 @@ def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, f
         assert replay["types"] == report["types"]
         assert [row.Name for row in manager.Types] == ["Seed", "New"]
         assert not document.Application.DocumentChanged
+
+        import batch_family_export as exporter
+        from read_batch_family_derivation import query_result
+        from verify_batch_family_derivation import verify_decision
+
+        def modify_envelope(result, decision="committed"):
+            value = envelope("modify-run", "modify", result)
+            value.update(decision=decision, approval="user", status="ok" if decision == "committed" else "rejected")
+            value["changes"].update(modified_count=1, modified=[{"id": "20"}],
+                                    transactions=[result["transaction"]], by_category={"Family": 1})
+            return value
+
+        kept_read = query_result(document, db, {"derivation": plan, "kept": True,
+                                                "trial_transaction": replay["transaction"]})
+        kept = verify_decision(plan, preview, before, trial, after, modify_envelope(replay),
+                               envelope("keep-read", "query", kept_read))
+        assert kept["status"] == "kept_verified"
+        with pytest.raises(ValueError, match="required status and approval"):
+            verify_decision(plan, preview, before, trial, after, dict(modify_envelope(replay), approval="auto"),
+                            envelope("keep-read", "query", kept_read))
+
+        _, _, _, staging, _, destination = derivation_input
+        monkeypatch.setattr(exporter, "free_bytes", lambda _: 10 * exporter.HEADROOM)
+        export = exporter.reserve_export(plan, kept, destination)
+        file = Path(export["save_as"])
+        assert not file.exists()
+        file.write_bytes(b"derived RFA")
+        documents = []
+
+        def open_file(path):
+            assert path == str(file)
+            reopened = SimpleNamespace(**vars(document))
+            reopened.PathName = path
+            reopened.Close = lambda save: documents.remove(reopened) is None and save is False
+            documents.append(reopened)
+            return reopened
+
+        ui = SimpleNamespace(ActiveUIDocument=None,
+                             Application=SimpleNamespace(Documents=documents, OpenDocumentFile=open_file))
+        receipt = exporter.reopen_export(ui, export["workspace"], "pyrevit-fixture")
+        assert documents == []
+        assert exporter.collect_export(export["workspace"], staging) == receipt
+        file.with_suffix(".txt").write_bytes(b"unexpected companion")
+        with pytest.raises(ValueError, match="unexpected files"):
+            exporter.collect_export(export["workspace"], staging)
+
+        Scope(document, "discard").RollBack()
+        discarded_read = query_result(document, db, {"derivation": plan, "trial_transaction": replay["transaction"]})
+        discarded = verify_decision(plan, preview, before, trial, after, modify_envelope(replay, "discarded"),
+                                    envelope("discard-read", "query", discarded_read))
+        assert discarded["status"] == "discard_verified"
+        with pytest.raises(ValueError, match="verified user Keep"):
+            exporter.reserve_export(plan, discarded, destination)

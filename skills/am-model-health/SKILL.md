@@ -245,7 +245,15 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 4. Save the full trial record. Run the family query again with the same derivation. Pass the trial's `transaction` as `trial_transaction`. Save the full fresh query.
 5. Run `python scripts/verify_batch_family_derivation.py derivation.json preview.json before.json trial.json after.json`. Check the measured values, effects, and restored family state.
 6. Recheck the active family and ask policy. Obtain approval to replay. Run `apply_batch_family_derivation.py` in guarded CPython modify mode. Pass the same trial inputs as `derivation_run` and the full records as `before`, `trial`, and `after`.
-7. Use Revit's Keep or Discard prompt. Save the full modify record. A kept family still requires independent readback and private export before a project load.
+7. Use Revit's Keep or Discard prompt. Save the full modify record. Run the family query again with the same derivation and the modify transaction. Set `kept: true` only after Keep.
+8. Run the same verifier with `--modify modify.json --fresh fresh.json`. Save its decision receipt.
+
+### Verify the privately exported family
+
+1. Use `batch_family_export.py reserve --derivation derivation.json --decision decision.json --destination <private-parent>`. Save the returned workspace and exact Save As path.
+2. After all transactions and groups close, use Revit Save As outside the guarded script. Save only to the reserved path. Close the exported file.
+3. Set `ARCHI_MAGIC_FAMILY_EXPORT_DIR` to the reserved workspace. Run `pyrevit run scripts/batch_family_export.py --revit=2026` in the qualified disposable CPython worker with no model arguments. Wait for the host to exit.
+4. Run `batch_family_export.py collect --workspace <workspace> --staging staging.json`. The receipt verifies the reopened types, exact RFA bytes, and companion absence. Project loading still requires a separate reviewed workflow.
 
 ## Preview a CAD layout (issue #166)
 

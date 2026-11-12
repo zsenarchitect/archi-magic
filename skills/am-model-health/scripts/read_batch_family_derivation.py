@@ -54,14 +54,15 @@ def family_state(document):
     }
 
 
-def read_working_family(document, plan, DB=None):
+def read_working_family(document, plan, DB=None, *, kept=False):
     with verified_working_copy(plan) as path:
-        if (document is None or not document.IsFamilyDocument or document.IsReadOnly or document.IsModified
+        if (document is None or not document.IsFamilyDocument or document.IsReadOnly or (document.IsModified and not kept)
                 or document.IsWorkshared or document.IsModelInCloud or document.IsModifiable
                 or not document.PathName or normalized_path(document.PathName) != normalized_path(path)
                 or str(document.Application.VersionNumber) != "2026"
                 or str(document.Application.VersionBuild) != plan["revit_build"]):
             raise ValueError("Open the exact saved writable family copy in the reviewed Revit 2026 build.")
+        modified = document.IsModified
         family = document.OwnerFamily
         category = family.FamilyCategory
         identity = {"family": bounded_text(family.Name), "category_id": str(category.Id.Value)}
@@ -71,7 +72,11 @@ def read_working_family(document, plan, DB=None):
         for row in plan["rows"]:
             if identity != {"family": row["family"], "category_id": row["category"]["id"]}:
                 raise ValueError("The working family name or category differs from the reviewed source.")
-            if row["seed_type"] not in state["types"] or row["type"].casefold() in names:
+            if row["seed_type"] not in state["types"]:
+                raise ValueError("A reviewed seed is missing or the requested type already exists.")
+            if kept and row["type"] not in state["types"]:
+                raise ValueError("A reviewed kept type is unavailable.")
+            if not kept and row["type"].casefold() in names:
                 raise ValueError("A reviewed seed is missing or the requested type already exists.")
             for size in row["sizes"]:
                 expected = size["definition"]
@@ -80,13 +85,28 @@ def read_working_family(document, plan, DB=None):
                         or actual["reporting"] or actual["storage"] != "Double"
                         or any(actual[key] != value for key, value in expected.items())):
                     raise ValueError(f"The reviewed size parameter {size['parameter']} changed or is not writable.")
-        baseline_inventory = inventory_record(inventory(document, DB)) if DB is not None else None
-        if document.IsModified:
+        elements = inventory(document, DB) if DB is not None else None
+        baseline_inventory = inventory_record(elements) if elements is not None else None
+        preserved = inventory_record({key: value for key, value in elements.items() if key != owner["id"]}) \
+            if elements is not None else None
+        if document.IsModified != modified:
             raise ValueError("The active family changed during the read.")
     receipt = {"kind": "batch-family-working-read", "version": 1,
                "derivation_sha256": plan["derivation_sha256"], "revit_build": plan["revit_build"],
-               **identity, "owner": owner, "state": state, "inventory": baseline_inventory}
+               **identity, "owner": owner, "state": state, "inventory": baseline_inventory,
+               "preserved_inventory": preserved, "kept": kept}
     return dict(receipt, working_read_sha256=manifest_digest(receipt))
+
+
+
+def query_result(document, DB, inputs):
+    kept = inputs.get("kept", False)
+    transaction = inputs.get("trial_transaction")
+    if type(kept) is not bool or (kept and not transaction):
+        raise ValueError("A kept read needs the exact modify transaction.")
+    read = read_working_family(document, inputs["derivation"], DB, kept=kept)
+    return {"status": "ok", "snapshot_json": json.dumps(read, ensure_ascii=True, allow_nan=False),
+            "audit_token": uuid4().hex, "trial_transaction": transaction}
 
 
 try:
@@ -96,8 +116,6 @@ except NameError:
 else:
     from pyrevit.api import DB
     try:
-        read = read_working_family(active_family, query_inputs["derivation"], DB)
-        result = {"status": "ok", "snapshot_json": json.dumps(read, ensure_ascii=True, allow_nan=False),
-                  "audit_token": uuid4().hex, "trial_transaction": query_inputs.get("trial_transaction")}
+        result = query_result(active_family, DB, query_inputs)
     except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:
         result = {"status": "blocked", "reason": str(error)}
