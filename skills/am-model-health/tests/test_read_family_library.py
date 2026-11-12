@@ -8,7 +8,7 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from family_library_discovery import discover, manifest_digest
-from read_family_library import WorkerUnresolved, read_family
+from read_family_library import WorkerUnresolved, collect_worker, prepare_worker, read_family, run_worker
 import stage_family_library as staging
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Use the POSIX staging fixture with Revit API doubles.")
@@ -151,3 +151,63 @@ def test_stop_worker_when_document_state_is_unresolved(staged, condition):
         read(worker, receipt)
     assert worker.closed == ([] if condition == "open_at_start" else [False])
     assert len(worker.Documents) == 1
+
+
+def test_worker_handoff_binds_build_and_cannot_be_replayed(staged):
+    receipt, _ = staged
+    directory = prepare_worker(receipt, "Fixture.rfa", ["Width"], "2026", "fixture", "pyrevit-fixture")
+    worker = Worker()
+    ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
+
+    with pytest.raises(ValueError, match="build differs"):
+        run_worker(ui, "unexpected-build", str(directory))
+    assert not worker.opened
+    assert not (directory / "worker.started").exists()
+    with pytest.raises(FileNotFoundError):
+        collect_worker(str(directory))
+
+    run_worker(ui, "pyrevit-fixture", str(directory))
+    report = collect_worker(str(directory))
+    assert report["runtime"]["pyrevit_build"] == "pyrevit-fixture"
+    assert report["metadata"]["revit_build"] == "fixture"
+    assert report["metadata"]["requested_parameters"] == ["Width"]
+    assert report["metadata"]["embedded_types"] == [{"name": "600 × 900", "values": {
+        "43": {"state": "value", "value": 2.0},
+        "45": {"state": "unset"},
+    }}]
+    assert worker.closed == [False] and worker.Documents == []
+    with pytest.raises(FileExistsError):
+        run_worker(ui, "pyrevit-fixture", str(directory))
+    assert len(worker.opened) == 1
+
+
+def test_collect_rejects_partial_receipt_and_changed_pair(staged):
+    receipt, pair = staged
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    worker = Worker()
+    ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
+    run_worker(ui, "pyrevit-fixture", str(directory))
+
+    receipt_path = directory / "receipt.json"
+    complete = receipt_path.read_bytes()
+    receipt_path.write_bytes(complete[:-1])
+    with pytest.raises(ValueError):
+        collect_worker(str(directory))
+
+    receipt_path.write_bytes(complete)
+    (pair / "Fixture.txt").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="staged file bytes"):
+        collect_worker(str(directory))
+
+
+def test_unresolved_close_cannot_publish_worker_receipt(staged):
+    receipt, _ = staged
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    worker = Worker()
+    worker.close_ok = False
+    ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
+    with pytest.raises(WorkerUnresolved):
+        run_worker(ui, "pyrevit-fixture", str(directory))
+    assert (directory / "worker.started").is_file()
+    with pytest.raises(FileNotFoundError):
+        collect_worker(str(directory))
