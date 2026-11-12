@@ -85,6 +85,22 @@ def test_preview_pairs_reordered_rows_and_shows_additions_and_removals():
     assert "<td>Unchanged</td><td>Same</td><td>3</td>" in out
 
 
+def test_preview_links_only_exact_existing_changed_and_removed_elements():
+    identifier = "9007199254740993"
+    preview = {"columns": ["Element ID", "Text"], "keyColumn": "Element ID", "changedColumns": ["Text"],
+               "before": [[identifier, "Before"], [2, "Retire"], [3, "Same"], [5, "Ambiguous"]],
+               "after": [[4, "New"], [3, "Same"], [identifier, "After"], [5, "Changed"]],
+               "review_only": True}
+    facets = {identifier: {}, "2": {}, "3": {}, "4": {}, "5": None}
+    out = pp.render_preview(preview, "model.viewer.html", facets)
+    assert f"<del>Before</del> &rarr; <ins>After</ins></td><td><a href='model.viewer.html#elements={identifier}'" in out
+    assert "<td>Removed</td><td>2</td><td>Retire</td><td><a href='model.viewer.html#elements=2'" in out
+    assert all(f"#elements={item}" not in out for item in (3, 4, 5))
+    assert "Review only" in out
+    generic = dict(preview, columns=["ID", "Text"], keyColumn="ID")
+    assert "#elements=" not in pp.render_preview(generic, "model.viewer.html", facets)
+
+
 def test_creation_only_preview_shows_rows_and_blocking_status():
     preview = {
         "columns": ["Id", "Name"],

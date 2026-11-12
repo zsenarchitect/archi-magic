@@ -170,6 +170,7 @@ Build one read-only HTML page that shows audit results, a change preview, and an
 - Use a BIM export from the same project to filter by category and level. These filters use exact element IDs from the board.
 - Pass a BIM JSON export with `--model` to include a link to the offline 3D viewer. Install the locked viewer dependency with `npm ci` first. Keep the generated viewer HTML beside the project page when moving the report.
 - Open **Frame issue elements** to fit the camera to the matched elements. The page shows when only part of an issue is in the export.
+- Open **Frame element** on a changed or removed preview row to inspect its current geometry. The link uses the exact element ID.
 - The page escapes all model text. It sets a strict content policy.
 
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)

@@ -281,13 +281,15 @@ def read_change_preview(value):
     return value
 
 
-def render_preview(preview: Dict[str, Any]) -> str:
+def render_preview(preview: Dict[str, Any], viewer_name=None, model_facets=None) -> str:
     if not preview:
         return "<p>No change preview supplied.</p>"
     cols = preview.get("columns", [])
     changed = set(preview.get("changedColumns", []))
     head = "<th>Status</th>" + "".join(f"<th>{_e(c)}</th>" for c in cols)
-    body = []
+    id_columns = [i for i, name in enumerate(cols) if name.casefold().replace(" ", "") == "elementid"]
+    id_column = id_columns[0] if len(id_columns) == 1 else None
+    rows = []
     for before, after in pair_preview_rows(preview):
         if before is None:
             status = "Added"
@@ -305,7 +307,19 @@ def render_preview(preview: Dict[str, Any]) -> str:
                 cells.append(f"<td class='chg'><del>{_e(old)}</del> &rarr; <ins>{_e(new)}</ins></td>")
             else:
                 cells.append(f"<td>{_e(old if after is None else new)}</td>")
-        body.append(f"<tr><td>{status}</td>" + "".join(cells) + "</tr>")
+        link = ""
+        if (viewer_name and model_facets and id_column is not None
+                and status in ("Changed", "Removed") and id_column < len(before)):
+            identifier = issue_element_id(before[id_column])
+            same_element = after is None or (id_column < len(after) and issue_element_id(after[id_column]) == identifier)
+            if identifier and same_element and model_facets.get(identifier) is not None:
+                link = frame_element_link(viewer_name, [identifier], "Frame element")
+        rows.append((f"<tr><td>{status}</td>" + "".join(cells), link))
+    if any(link for _, link in rows):
+        head += "<th>Model</th>"
+        body = "".join(f"{row}<td>{link}</td></tr>" for row, link in rows)
+    else:
+        body = "".join(f"{row}</tr>" for row, _ in rows)
     warnings = preview.get("warnings", [])
     notes = "".join(f"<li>{_e(n)}</li>" for n in preview.get("notes", []))
     warns = "".join(
@@ -321,7 +335,7 @@ def render_preview(preview: Dict[str, Any]) -> str:
         gate = "Preview only. Approve or discard the change in Revit (Keep/Discard)."
     return (
         f"<h3>{_e(preview.get('title', 'Change preview'))}</h3>"
-        f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+        f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
         f"<ul>{notes}</ul><ul>{warns}</ul>"
         f"<p class='gate'>{gate}</p>"
     )
@@ -363,6 +377,11 @@ def issue_element_id(value):
             or len(value) > 19 or value.startswith("0") or int(value) > 2**63 - 1):
         return None
     return value
+
+
+def frame_element_link(viewer_name, identifiers, label):
+    href = f"{viewer_name}#elements={','.join(identifiers)}"
+    return f"<a href='{_e(href)}'>{_e(label)}</a>"
 
 
 def model_issue_facets(model):
@@ -443,9 +462,8 @@ def render_board(board, model_facets=None, viewer_name=None):
                     options[name].add(value)
         link = ""
         if viewer_name and matches:
-            href = f"{viewer_name}#elements={','.join(issue_ids)}"
             label = "Frame issue elements" if len(matches) == len(issue_ids) else f"Frame {len(matches)} of {len(issue_ids)} issue elements"
-            link = f"<p><a href='{_e(href)}'>{label}</a></p>"
+            link = "<p>" + frame_element_link(viewer_name, issue_ids, label) + "</p>"
         data = json.dumps({"severity": severity, "elements": matches}, ensure_ascii=True)
         rendered.append(f"<details data-facets='{_e(data)}'><summary>{_e(summary)}</summary>{link}<dl>{details}</dl></details>")
     notices = "".join(f"<li>{_e(warning)}</li>" for warning in warnings)
@@ -498,7 +516,7 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
         f"{model_link}<div class='cards'>{cards}</div>"
         f"{render_model_health(model_health)}"
         f"<h2>Audit findings</h2>{render_findings(findings)}"
-        f"<h2>Change preview</h2>{render_preview(preview)}"
+        f"<h2>Change preview</h2>{render_preview(preview, viewer_name, model_facets)}"
         f"{board_html}{script}"
         "</body></html>"
     )
@@ -511,7 +529,7 @@ def write_project_with_model(output, model, title, findings, preview, board, mod
         built = staging / "viewer.html"
         source = model.resolve()
         facets = None
-        if board is not None:
+        if board is not None or preview:
             data = load_json(source)
             facets = model_issue_facets(data)
             # Keep exact native IDs when the viewer reads JSON with JavaScript numbers.
