@@ -65,16 +65,25 @@ def check_layer_standards(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             })
             continue
 
-        if len(parts) > 1:
-            major = parts[1].upper()
-            if major not in STANDARD_AIA_MAJOR_GROUPS and not re.match(r"^[A-Z0-9]{3,4}$", major):
-                findings.append({
-                    "ruleId": "CAD-LAY-01",
-                    "severity": "info",
-                    "category": "CAD Layer",
-                    "target": name,
-                    "message": f"Layer '{name}' uses non-standard major group '{major}'.",
-                })
+        if len(parts) < 2 or any(not part.strip() for part in parts[1:]):
+            findings.append({
+                "ruleId": "CAD-LAY-01",
+                "severity": "warning",
+                "category": "CAD Layer",
+                "target": name,
+                "message": f"Layer '{name}' needs a major group and a value after each hyphen.",
+            })
+            continue
+
+        major = parts[1].upper()
+        if major not in STANDARD_AIA_MAJOR_GROUPS and not re.match(r"^[A-Z0-9]{3,4}$", major):
+            findings.append({
+                "ruleId": "CAD-LAY-01",
+                "severity": "info",
+                "category": "CAD Layer",
+                "target": name,
+                "message": f"Layer '{name}' uses non-standard major group '{major}'.",
+            })
 
     return findings
 
