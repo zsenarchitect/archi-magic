@@ -1,6 +1,8 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace as NS
 
@@ -49,6 +51,7 @@ def model(monkeypatch):
         IsFamilyDocument=False, IsLinked=False, IsReadOnly=False, IsWorkshared=False, IsModifiable=False,
         PathName="synthetic.rvt", ProjectInformation=NS(UniqueId="project"),
         ActiveProjectLocation=NS(UniqueId="location"),
+        Application=NS(VersionNumber="2026", VersionBuild="fixture-build"),
         base=NS(UniqueId="base", Position=xyz(100)), elements={1: lower, 2: upper},
     )
     doc.GetElement = lambda element_id: doc.elements.get(element_id.Value)
@@ -219,7 +222,7 @@ Vector.BasisZ = Vector(0, 0, 1)
 def probe(model, monkeypatch):
     query, doc, _, _ = model
     event = Changes()
-    doc.Application = NS(DocumentChanged=event)
+    doc.Application.DocumentChanged = event
     doc.Regenerate = lambda: None
     log = []
     mode = NS(extra=False, rollback_failure=False, fail_target=None)
@@ -377,3 +380,73 @@ def test_wrong_elevation_with_correct_level_and_offset_cannot_commit(probe):
     assert result["rollback_verified"] is True
     assert log == []
     assert read(query, **request) == baseline
+
+
+def saved_run(run_id, mode, result):
+    return {
+        "run_id": run_id, "mode": mode, "status": "ok", "decision": "no_changes",
+        "exit_code": 0, "result_truncated": False, "error": None, "approval": None,
+        "warnings": [], "dialogs": [], "failures": [], "blocked": [],
+        "engine": {"requested": "cpython"},
+        "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
+        "result": result,
+    }
+
+
+def test_saved_probe_requires_three_independent_runs_and_exact_effects(probe, tmp_path):
+    query, _, run, _, _ = probe
+    request = {"operation": "rotation", "target_ids": ["101"], "reference_id": "102"}
+    original = saved_run("a00000000001", "query", query(**request))
+    plan = probe_plan(json.loads(original["result"]["snapshot_json"]))
+    receipt = run(plan)
+    assert receipt["status"] == "trial_rolled_back"
+    dry = saved_run("b00000000002", "dry_run", receipt)
+    fresh = saved_run("c00000000003", "query", query(**request))
+
+    paths = [tmp_path / name for name in ("plan.json", "original.json", "trial.json", "fresh.json")]
+    cmd = [sys.executable, str(SCRIPTS / "verify_level_alignment_probe.py"), *map(str, paths)]
+
+    def verify(*records):
+        for path, value in zip(paths, records):
+            path.write_text(json.dumps(value))
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    accepted = verify(plan, {"response": original}, dry, fresh)
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout) == {
+        "status": "level_alignment_rollback_verified",
+        "basis_sha256": plan["basis_sha256"],
+        "revit": {"version": "2026", "build": "fixture-build"},
+        "modified_ids": ["101"],
+        "original_run_id": "a00000000001",
+        "trial_run_id": "b00000000002",
+        "fresh_run_id": "c00000000003",
+    }
+
+    outer_effects = deepcopy(dry)
+    outer_effects["decision"] = "rolled_back"
+    outer_effects["changes"].update(
+        modified_count=1, modified=[{"id": 101}], transactions=[receipt["transaction"]], by_category={"Fixtures": 1},
+    )
+    assert verify(plan, original, outer_effects, fresh).returncode == 0
+
+    wrong_id = deepcopy(outer_effects)
+    wrong_id["changes"]["modified"][0]["id"] = 102
+    wrong_transaction = deepcopy(outer_effects)
+    wrong_transaction["changes"]["transactions"] = ["Different trial"]
+    wrong_measurement = deepcopy(dry)
+    wrong_measurement["result"]["measurements"]["101"]["point"][2] += 0.1
+    wrong_build = deepcopy(dry)
+    wrong_build["result"]["revit"]["build"] = "different-build"
+    unrelated_rollback = deepcopy(dry)
+    unrelated_rollback["result"]["rollback_events"] = [{"operation": "TransactionGroupRolledBack", "modified": ["102"]}]
+    for invalid in (wrong_id, wrong_transaction, wrong_measurement, wrong_build, unrelated_rollback):
+        assert verify(plan, original, invalid, fresh).returncode == 2
+
+    assert verify(plan, original, dry, dict(fresh, run_id=original["run_id"])).returncode == 2
+    assert verify(plan, original, dict(dry, result_truncated=True), fresh).returncode == 2
+    drifted = deepcopy(fresh)
+    snapshot = json.loads(drifted["result"]["snapshot_json"])
+    snapshot["reference"]["rotation_rad"] += 0.1
+    drifted["result"]["snapshot_json"] = json.dumps(snapshot)
+    assert verify(plan, original, dry, drifted).returncode == 2

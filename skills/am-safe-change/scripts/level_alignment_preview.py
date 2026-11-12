@@ -10,6 +10,7 @@ import sys
 POSITION_TOLERANCE = 0.001
 ROTATION_TOLERANCE = 0.00001
 MAX_INPUT = 1024 * 1024
+TRANSACTION_NAME = "Trial Revit level alignment"
 OPERATIONS = {"rotation", "offset", "nearest_level"}
 COLUMNS = ["Element ID", "X ft", "Y ft", "Z ft", "Rotation rad", "Level UID", "Offset ft"]
 

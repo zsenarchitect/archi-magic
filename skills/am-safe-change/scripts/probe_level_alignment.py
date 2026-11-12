@@ -1,12 +1,15 @@
 """Qualify a reviewed level-alignment change with mandatory rollback in Revit 2026."""
 
+from uuid import uuid4
+
 from Autodesk.Revit.Exceptions import RegenerationFailedException
 from pyrevit.api import DB
 
-from level_alignment_preview import POSITION_TOLERANCE, ROTATION_TOLERANCE, probe_plan, read_state, rotation_delta
+from level_alignment_preview import (
+    POSITION_TOLERANCE, ROTATION_TOLERANCE, TRANSACTION_NAME, probe_plan, read_state, rotation_delta,
+)
 from read_level_alignment import get, key, read_snapshot
 
-TRANSACTION_NAME = "Trial Revit level alignment"
 PHYSICAL_FIELDS = {"point", "rotation_rad", "level_id", "level_uid", "level_parameter_uid", "level_z_ft", "offset_ft"}
 
 
@@ -96,6 +99,7 @@ def trial(document, args):
         raise ValueError("The project, reference, targets, or level evidence changed after review.")
     changes = computed["changes"]
     levels = {row["uid"]: row for row in before.get("levels", [])}
+    transaction_name = TRANSACTION_NAME + " " + uuid4().hex
     events = []
     rollback_events = []
     closing = False
@@ -119,7 +123,7 @@ def trial(document, args):
                     invalid = True
                 else:
                     rollback_events.append({"operation": operation, "modified": ids})
-            elif events or operation != "TransactionCommitted" or list(event.GetTransactionNames()) != [TRANSACTION_NAME]:
+            elif events or operation != "TransactionCommitted" or list(event.GetTransactionNames()) != [transaction_name]:
                 invalid = True
             else:
                 events.append(ids)
@@ -127,8 +131,8 @@ def trial(document, args):
             invalid = True
 
     status = DB.TransactionStatus
-    group = DB.TransactionGroup(document, TRANSACTION_NAME)
-    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    group = DB.TransactionGroup(document, transaction_name)
+    transaction = DB.Transaction(document, transaction_name)
     application = document.Application
     failure = None
     measured = None
@@ -181,6 +185,8 @@ def trial(document, args):
         "status": "trial_rolled_back",
         "basis_sha256": computed["basis_sha256"],
         "modified_ids": events[0],
+        "transaction": transaction_name,
+        "revit": before["revit"],
         "measurements": measured,
         "rollback_events": rollback_events,
         "rollback_verified": True,

@@ -186,8 +186,13 @@ def read_snapshot(document, request):
         raise ValueError("Supply one reference ID outside the target list.")
 
     frame = frame_evidence(document) if operation != "rotation" else None
+    application = document.Application
+    revit = {"version": str(application.VersionNumber), "build": str(application.VersionBuild)}
+    if not all(map(uid, revit.values())):
+        raise ValueError("Revit did not report a version and build.")
     snapshot = {
         "kind": "level-alignment-snapshot",
+        "revit": revit,
         "version": 1,
         "project": project,
         "operation": operation,
