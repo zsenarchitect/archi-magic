@@ -6,6 +6,8 @@ host plan, versioned per-family types and templates, ordered finish sources,
 footprint, bottom/top elevations, and explicit view requests. An elevation
 request has a zero-based side index. A section request has a cut and look.
 The native reader must establish the snapshot evidence before any model write.
+The command accepts the raw snapshot or the query result from
+read_room_finish_boundaries.py with inputs.room_views.
 """
 
 import argparse
@@ -21,6 +23,7 @@ import room_view_geometry as geometry  # noqa: E402
 
 
 MAX_BYTES = 2 * 1024 * 1024
+MAX_BRIDGE_BYTES = 6 * MAX_BYTES + 64 * 1024
 MAX_ROOMS = 20
 MAX_ROOM_VIEWS = 12
 MAX_VIEWS = 80
@@ -226,10 +229,23 @@ def main(argv=None):
         if args.snapshot.resolve() == args.out.resolve():
             raise ValueError("Choose a different output path from the source snapshot.")
         with args.snapshot.open("rb") as source:
-            raw = source.read(MAX_BYTES + 1)
-        if len(raw) > MAX_BYTES:
+            raw = source.read(MAX_BRIDGE_BYTES + 1)
+        if len(raw) > MAX_BRIDGE_BYTES:
+            raise ValueError("The native query file exceeds the byte limit.")
+        snapshot = json.loads(raw.decode("utf-8-sig"))
+        if isinstance(snapshot, dict) and "result" in snapshot:
+            snapshot = snapshot["result"]
+        if isinstance(snapshot, dict) and "status" in snapshot:
+            if snapshot["status"] != "reported" or not isinstance(snapshot.get("payload"), str):
+                raise ValueError("The native room view query did not return a complete snapshot. %s"
+                                 % snapshot.get("reason", ""))
+            payload = snapshot["payload"]
+            if len(payload.encode("utf-8")) > MAX_BYTES:
+                raise ValueError("Snapshot exceeds the byte limit.")
+            snapshot = json.loads(payload)
+        elif len(raw) > MAX_BYTES:
             raise ValueError("Snapshot exceeds the byte limit.")
-        preview = compute(json.loads(raw.decode("utf-8-sig")))
+        preview = compute(snapshot)
         with args.out.open("wb") as output:
             output.write(encode(preview))
             output.write(b"\n")
