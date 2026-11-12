@@ -399,6 +399,23 @@ def test_nested_xrefs_keep_cycle_findings_with_unchecked_edges(tmp_path):
     assert run(root / "native.dwg", "--xref-root", root).returncode == 2
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_nested_xrefs_distinguish_scope_escape_from_a_missing_in_scope_path(tmp_path):
+    root = tmp_path.resolve()
+    source = root / "source.dxf"
+    xref_fixture(source, [("Escape", "missing/../../outside.dxf", False),
+                          ("Inside", "missing/../inside.dxf", False)])
+    result = run(source, "--xref-root", root)
+    assert result.returncode == 3, result.stderr
+    report = json.loads(result.stdout)
+    edges = {edge["name"]: edge for edge in report["inventory"]["xref_graph"]}
+    assert edges["Escape"]["status"] == "unchecked"
+    assert edges["Escape"]["reason"] == "unsupported_or_unsafe_saved_path"
+    assert edges["Inside"]["status"] == "missing"
+    assert report["inventory"]["coverage"]["xref_scope"] == "nested_incomplete"
+    assert [finding["target"] for finding in report["findings"] if finding["ruleId"] == "CAD-XREF-01"] == ["Inside"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Process-group cleanup requires POSIX.")
 def test_decoder_deadline_includes_descendants_holding_output(tmp_path):
     from time import monotonic
