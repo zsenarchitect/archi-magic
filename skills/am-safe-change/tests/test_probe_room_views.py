@@ -1,11 +1,15 @@
+from copy import deepcopy
 import json
 import math
+import re
 from pathlib import Path
 import runpy
 import sys
 from types import SimpleNamespace as NS
 
 import pytest
+
+from test_room_views_preview import snapshot
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "probe_room_views.py"
@@ -119,6 +123,9 @@ def fixture(monkeypatch):
                                 "proposal_json": json.dumps({"views": views})},
         "room_views": {}, "unrelated_control": unrelated,
         "fixture_settings": {"scale": 50, "far_clip_mode": 1},
+        "baseline_audit": {
+            "audit_token": "b" * 32, "snapshot_sha256": "snapshot", "inventory_sha256": "inventory",
+        },
     }
 
     db = NS(Transaction=Transaction, TransactionGroup=Group, TransactionStatus=NS(
@@ -133,6 +140,10 @@ def fixture(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "read_room_finish_boundaries", reader)
+    monkeypatch.setitem(sys.modules, "read_room_view_audit", NS(
+        TOKEN=re.compile(r"^[0-9a-f]{32}$"), encode=lambda _: "snapshot",
+        digest=lambda value: value, inventory=lambda *_: "inventory",
+    ))
     run = runpy.run_path(str(SCRIPT))
     namespace = run["trial"].__globals__
 
@@ -201,6 +212,20 @@ def test_trial_requires_disposable_fixture_and_reviewed_digest(fixture):
     assert fixture.document.log == []
 
 
+def test_fresh_native_absence_checks_both_id_and_uid(fixture):
+    absence = runpy.run_path(str(SCRIPT.with_name("read_room_view_audit.py")))["absence"]
+    identity = {"id": "45", "uid": "fixture-added-uid"}
+    fixture.document.GetElement = lambda _: None
+    assert absence(fixture.document, [identity]) == [identity]
+    fixture.document.GetElement = lambda uid: object() if uid == identity["uid"] else None
+    with pytest.raises(ValueError, match="still resolves"):
+        absence(fixture.document, [identity])
+    fixture.document.GetElement = lambda _: None
+    fixture.document.elements["45"] = object()
+    with pytest.raises(ValueError, match="still resolves"):
+        absence(fixture.document, [identity])
+
+
 def test_elevation_rotation_is_signed(fixture):
     east, north = NS(X=1, Y=0, Z=0), NS(X=0, Y=1, Z=0)
     assert fixture.angle(east, north) == pytest.approx(math.pi / 2)
@@ -233,3 +258,98 @@ def test_section_box_uses_right_handed_basis_and_positive_depth(fixture):
     assert box.Min == (-3, -4, 0)
     assert box.Max == (2, 4, 8)
     assert box.Enabled and minima == maxima == {0: True, 1: True, 2: True}
+
+
+@pytest.fixture
+def audit_records(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    import verify_room_view_trial as verifier
+
+    source = snapshot()
+    preview = verifier.planner.compute(source)
+    name = "Archi Magic room view trial " + "a" * 32
+    settings = {"scale": 50, "far_clip_mode": 1}
+    baseline = {
+        "status": "ok", "audit_token": "b" * 32, "trial_transaction": None, "confirmed_absent": [],
+        "snapshot_json": json.dumps(source, sort_keys=True),
+        "inventory_json": json.dumps({
+            "views": [{"id": "22", "uid": "fixture-existing", "version": "v1", "name": "Existing View"}],
+            "control": {"element": {"id": "23", "uid": "fixture-control", "version": "v1"},
+                        "parameter_id": "-234", "storage": "String", "value": "measured"},
+        }),
+    }
+    views = []
+    additions = []
+    for index, spec in enumerate(preview["proposal"]["views"]):
+        corners = [[x, y] for x in (spec["crop_min"][0], spec["crop_max"][0])
+                   for y in (spec["crop_min"][1], spec["crop_max"][1])]
+        identity = {"id": str(30 + index), "uid": "fixture-view-%d" % index}
+        additions.append(identity)
+        row = dict(
+            {key: spec[key] for key in ("name", "kind", "room_id", "template", "far_extent")},
+            **settings, type_id=spec["type"]["id"], phase=source["rooms"][0]["phase"],
+            view=identity, view_origin=spec["origin"], direction=[-value for value in spec["look"]],
+            crop=corners, crop_world=[
+                [origin + right * x + up * y for origin, right, up in zip(spec["origin"], spec["right"], (0, 0, 1))]
+                for x, y in corners
+            ],
+        )
+        if spec["kind"] == "elevation":
+            marker = {"id": str(40 + index), "uid": "fixture-marker-%d" % index}
+            row.update(marker=marker, marker_point=spec["origin"], slot=0)
+            additions.append(marker)
+        views.append(row)
+    additions.sort(key=lambda item: int(item["id"]))
+    ids = [item["id"] for item in additions]
+    receipt = {
+        "status": "trial_rolled_back", "transaction": name, "fixture_settings": settings,
+        "proposal_sha256": preview["proposal_sha256"], "views": views,
+        "baseline_audit": {
+            "audit_token": baseline["audit_token"],
+            "snapshot_sha256": verifier.digest(baseline["snapshot_json"]),
+            "inventory_sha256": verifier.digest(baseline["inventory_json"]),
+        },
+        "effects": [
+            {"operation": "TransactionCommitted", "added": ids, "modified": [], "deleted": []},
+            {"operation": "TransactionGroupRolledBack", "added": [], "modified": [], "deleted": ids},
+        ],
+    }
+
+    def record(mode, run_id, result):
+        changes = {key: [] for key in verifier.EFFECTS}
+        changes.update({key + "_count": 0 for key in verifier.EFFECTS})
+        changes.update(by_category={}, transactions=[] if mode == "query" else [name])
+        return {"mode": mode, "status": "ok", "decision": "no_changes", "run_id": run_id, "exit_code": 0,
+                "result_truncated": False, "result": result, "changes": changes}
+
+    before = record("query", "before", baseline)
+    after = record("query", "after", dict(baseline, audit_token="c" * 32, trial_transaction=name,
+                                         confirmed_absent=deepcopy(additions)))
+    trial = record("dry_run", "trial", {"status": "trial_rolled_back"})
+
+    def verify():
+        trial["result"]["trial_json"] = json.dumps(receipt)
+        return verifier.verify(before, trial, after, preview["proposal_sha256"])
+
+    return NS(verify=verify, before=before, trial=trial, after=after, receipt=receipt, additions=additions)
+
+
+def test_independent_verifier_proves_exact_rollback(audit_records):
+    result = audit_records.verify()
+    assert result["status"] == "verified_room_view_trial_rollback"
+    assert result["confirmed_absent"] == audit_records.additions
+    assert result["run_ids"] == ["before", "trial", "after"]
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (lambda data: data.after.update(run_id="before"), "three separate runs"),
+    (lambda data: data.after["result"].update(inventory_json="{}"), "same reviewed fixture"),
+    (lambda data: data.after["result"]["confirmed_absent"][0].update(uid="wrong"), "exact trial additions"),
+    (lambda data: data.trial["changes"].update(added_count=1), "empty net effect set"),
+    (lambda data: data.receipt["effects"][1]["deleted"].pop(), "native effects"),
+    (lambda data: data.receipt["views"][0]["crop_world"][0].__setitem__(2, 999), "displaced"),
+])
+def test_independent_verifier_rejects_inconsistent_evidence(audit_records, change, reason):
+    change(audit_records)
+    with pytest.raises(ValueError, match=reason):
+        audit_records.verify()

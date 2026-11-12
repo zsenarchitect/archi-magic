@@ -12,6 +12,7 @@ from uuid import uuid4
 from pyrevit.api import DB
 
 import read_room_finish_boundaries as reader
+import read_room_view_audit as audit
 
 
 TOLERANCE = 1e-5
@@ -229,12 +230,15 @@ def verify_view(view, marker, slot, spec, room, template, scale, phase, clip_mod
     offset = parameter(view, "VIEWER_BOUND_OFFSET_FAR", DB.StorageType.Double).AsDouble()
     if mode != clip_mode or math.isnan(offset) or math.isinf(offset) or abs(offset - spec["far_extent"]) > TOLERANCE:
         raise ValueError("The created view does not match the reviewed far clip.")
-    _, lower, upper = frame_bounds(view, spec)
+    box, lower, upper = frame_bounds(view, spec)
+    crop = read_crop(view, lower, upper)
+    crop_world = [reader.xyz(box.Transform.OfPoint(DB.XYZ(x, y, 0))) for x, y in crop]
     result = {"name": view.Name, "view": reader.element_identity(view), "kind": spec["kind"],
               "room_id": spec["room_id"], "template": reader.element_identity(template, True),
+              "type_id": str(view.GetTypeId().Value),
               "scale": scale, "phase": reader.element_identity(phase), "far_clip_mode": mode,
               "far_extent": offset, "view_origin": reader.xyz(view.Origin),
-              "direction": reader.xyz(view.ViewDirection), "crop": read_crop(view, lower, upper)}
+              "direction": reader.xyz(view.ViewDirection), "crop": crop, "crop_world": crop_world}
     if marker is not None:
         if marker.CurrentViewCount != 1 or marker.GetViewId(slot).Value != view.Id.Value:
             raise ValueError("The created elevation is not alone in its reviewed marker slot.")
@@ -262,13 +266,18 @@ def trial(document, args):
         raise ValueError("Approve the exact room view proposal digest before trial.")
     checked = reader.native_preflight(document, args["room_views"], preflight)
     control = args["unrelated_control"]
-    control_element = resolve(document, control)
-    baseline = reader.element_identity(control_element, True)
+    baseline = args["baseline_audit"]
+    token = baseline["audit_token"]
+    snapshot = json.loads(preflight["snapshot_json"])
+    if (not hasattr(token, "strip") or audit.TOKEN.match(token) is None
+            or baseline["snapshot_sha256"] != audit.digest(audit.encode(snapshot))
+            or baseline["inventory_sha256"] != audit.digest(audit.inventory(document, control))):
+        raise ValueError("The independent baseline audit does not match the current fixture.")
     settings = args["fixture_settings"]
     scale, clip_mode = settings["scale"], settings["far_clip_mode"]
     if type(scale) is not int or not 1 <= scale <= 24000 or type(clip_mode) is not int or clip_mode not in (1, 2):
         raise ValueError("Use the fixture's verified scale and finite far clip mode.")
-    rooms = {item["id"]: item for item in json.loads(preflight["snapshot_json"])["rooms"]}
+    rooms = {item["id"]: item for item in snapshot["rooms"]}
     views = json.loads(preflight["proposal_json"])["views"]
     related = set()
     for data in rooms.values():
@@ -350,10 +359,10 @@ def trial(document, args):
     try:
         if any(reader.native_element(document, item) is not None for item in observed):
             raise ValueError("A trial element remains after rollback.")
-        if reader.element_identity(resolve(document, control), True) != baseline:
-            raise ValueError("The unrelated fixture control changed during trial.")
+        if audit.digest(audit.inventory(document, control)) != baseline["inventory_sha256"]:
+            raise ValueError("The existing view inventory or unrelated control changed during trial.")
         restored, _ = reader.read_room_view_snapshot(document, args["room_views"])
-        if restored != json.loads(preflight["snapshot_json"]):
+        if restored != snapshot:
             raise ValueError("The original room view evidence differs after rollback.")
     except Exception as exc:
         return {"status": "transaction_unresolved", "reason": str(exc), "effects": effects}
@@ -368,7 +377,8 @@ def trial(document, args):
     if failure is not None:
         return {"status": "stopped_and_rolled_back", "reason": failure, "effects": effects}
     receipt = {"status": "trial_rolled_back", "transaction": name, "effects": effects,
-               "proposal_sha256": checked["proposal_sha256"], "views": measurements}
+               "proposal_sha256": checked["proposal_sha256"], "views": measurements,
+               "baseline_audit": baseline, "fixture_settings": {"scale": scale, "far_clip_mode": clip_mode}}
     payload = json.dumps(receipt, ensure_ascii=True, allow_nan=False)
     if len(payload) > reader.MAX_BYTES:
         return {"status": "stopped_and_rolled_back", "reason": "The trial receipt exceeds the byte limit."}
