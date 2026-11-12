@@ -49,6 +49,7 @@ def transform(offset):
         Origin=point(offset, 0, 0), BasisX=point(1, 0, 0),
         BasisY=point(0, 1, 0), BasisZ=point(0, 0, 1),
         OfPoint=lambda p: point(p.X + offset, p.Y, p.Z),
+        OfVector=lambda p: point(p.X, p.Y, p.Z),
     )
 
 
@@ -158,6 +159,73 @@ def execute(document, **request):
 def connector(identifier, *, connected, system):
     return NS(Id=identifier, ConnectorType="End", Shape="Round", Domain="DomainHvac",
               IsConnected=connected, Origin=point(identifier, 2, 3), MEPSystem=system)
+
+
+@pytest.mark.parametrize("scenario", [
+    "host", "rotated_link", "connected", "duplicate", "wrong_uid", "invalid_frame", "moved_endpoint", "oval",
+])
+def test_read_reviewed_route_endpoints(runtime, scenario):
+    first = connector(1, connected=scenario == "connected", system=None)
+    second = connector(2, connected=False, system=None)
+    for item in (first, second):
+        item.CoordinateSystem = transform(0)
+        item.CoordinateSystem.Origin = item.Origin
+        item.Radius = 0.25
+    second.Shape = "Oval" if scenario == "oval" else "Rectangular"
+    second.Width, second.Height = 0.75, 0.5
+    if scenario == "invalid_frame":
+        second.CoordinateSystem.BasisY = point(1, 0, 0)
+    source_doc = model("source", {42: Duct([first]), 43: Duct([second])})
+    host, link_request = source_doc, {}
+    if scenario == "rotated_link":
+        link = Link(source_doc, 10)
+        link.GetTotalTransform = lambda: NS(
+            Origin=point(10, 20, 30), BasisX=point(0, 1, 0), BasisY=point(-1, 0, 0),
+            BasisZ=point(0, 0, 1), OfVector=lambda value: point(-value.Y, value.X, value.Z),
+            OfPoint=lambda value: point(10 - value.Y, 20 + value.X, 30 + value.Z),
+        )
+        host = model("host", {41: link})
+        link_request = {"link_instance_id": "41", "link_instance_uid": link.UniqueId}
+    endpoints = [
+        {"element_id": "42", "element_uid": "duct-uid", "connector_id": 1},
+        {"element_id": "43", "element_uid": "missing" if scenario == "wrong_uid" else "duct-uid",
+         "connector_id": 2},
+    ]
+    if scenario == "duplicate":
+        endpoints[1] = dict(endpoints[0])
+    if scenario == "moved_endpoint":
+        original = source_doc.GetElement
+        reads = iter([2, 3])
+
+        def moved(identifier):
+            if identifier.Value == 43:
+                second.Origin = point(next(reads), 2, 3)
+                second.CoordinateSystem.Origin = second.Origin
+            return original(identifier)
+
+        source_doc.GetElement = moved
+    identity = execute(host, describe=True, **link_request)["source"]
+    observed = execute(host, source=identity, route_endpoints=endpoints, **link_request)
+    failures = {
+        "connected": "not a physical end", "duplicate": "two distinct",
+        "wrong_uid": "missing or changed", "invalid_frame": "invalid coordinate frame",
+        "moved_endpoint": "changed while being read",
+    }
+    if scenario in failures:
+        assert observed["status"] == "incomplete" and failures[scenario] in observed["message"]
+        assert "endpoints_json" not in observed
+        return
+    assert observed["status"] == "ok" and "snapshot_json" not in observed
+    result = json.loads(observed["endpoints_json"])
+    assert (result["kind"], result["version"], result["source"]) == ("mep-route-endpoints", 1, identity)
+    a, b = result["endpoints"]
+    assert a["dimensions_ft"] == [0.5] and a["domain"] == "DomainHvac"
+    assert b["dimensions_ft"] == (None if scenario == "oval" else [0.75, 0.5])
+    if scenario == "rotated_link":
+        assert (a["origin_ft"], b["origin_ft"]) == ([8.0, 21.0, 33.0], [8.0, 22.0, 33.0])
+        assert a["axes"] == [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    else:
+        assert a["origin_ft"] == [1.0, 2.0, 3.0] and a["axes"][2] == [0.0, 0.0, 1.0]
 
 
 def test_link_query_uses_source_ids_transforms_and_native_flow(runtime):

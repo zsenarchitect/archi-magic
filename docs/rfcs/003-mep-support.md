@@ -63,3 +63,9 @@ The example uses synthetic values. Each rule matches service, profile, system, d
 ```
 
 Supported services are `duct`, `pipe`, `conduit` and `cable_tray`. A preview with blocked rows returns exit 1. Invalid input returns exit 2 and emits no preview. The preview carries no model-write steps. Revit type availability, routing, clearances and Keep/Discard still require native qualification.
+
+### Read reviewed route endpoints
+
+Use `read_mep.py` with `describe: true` to obtain the saved source identity. Send the returned identity back under `source` with `route_endpoints`, a list of two objects with `element_id` (decimal string), `element_uid` and `connector_id` (integer). Use one project or one reviewed link instance per query. The result returns the two open physical ends in `endpoints_json` with their owner identities, native category, domain, profile, position in host internal feet, and three host-space axes. The connector normal is the third axis. Round and rectangular endpoints include nominal dimensions in feet when the native read succeeds. Other profiles retain their native names with unavailable dimensions. The query rereads the endpoints and source before returning. [Autodesk connector coordinate system](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/cb6d725d-654a-f6f3-fed0-96cc618a42f1.htm) · [Autodesk vector transform](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/4d5b7075-1b79-639d-5da2-eb23372bc888.htm)
+
+The endpoint record is separate from the MEP audit snapshot. It provides geometry for subsequent routing review. Route generation, collision and fitting checks, and live Revit qualification are pending.

@@ -132,13 +132,16 @@ def system_record(source, system):
     }
 
 
+def connector_collection(element):
+    if isinstance(element, DB.MEPCurve):
+        return element.ConnectorManager.Connectors
+    return element.MEPModel.ConnectorManager.Connectors
+
+
 def read_connectors(source, element, transform, clock, coverage):
     rows, systems = [], {}
     unsupported, unknown_assignments = 0, 0
-    if isinstance(element, DB.MEPCurve):
-        connectors = read_value(lambda: element.ConnectorManager.Connectors)
-    else:
-        connectors = read_value(lambda: element.MEPModel.ConnectorManager.Connectors)
+    connectors = read_value(lambda: connector_collection(element))
     if connectors is None:
         return rows, [], {"inventory": "unavailable", "unsupported": 0, "assignments_unknown": 0}
 
@@ -253,6 +256,58 @@ def read_element(source, identifier, categories, transform, clearance, clock, co
     }
 
 
+def read_route_endpoints(source, transform, requested, clock, coverage):
+    if not isinstance(requested, list) or len(requested) != 2:
+        raise ReadError("Supply exactly two reviewed connector endpoints.")
+    rows = []
+    for selected in requested:
+        if set(selected) != {"element_id", "element_uid", "connector_id"}:
+            raise ReadError("Each endpoint needs an element ID, element UID and connector ID.")
+        owner = source.GetElement(element_id(selected["element_id"]))
+        connector_id = selected["connector_id"]
+        if (owner is None or isinstance(owner, DB.ElementType) or owner.Category is None
+                or not isinstance(selected["element_uid"], TEXT) or not 1 <= len(selected["element_uid"]) <= 160
+                or str(owner.UniqueId) != selected["element_uid"]
+                or type(connector_id) is not int or not 0 <= connector_id <= 2**31 - 1):
+            raise ReadError("A reviewed connector owner or connector ID is missing or changed.")
+        matches = []
+        for candidate in connector_collection(owner):
+            check_time(clock)
+            coverage["connectors_visited"] += 1
+            if coverage["connectors_visited"] > CONNECTOR_VISIT_LIMIT:
+                raise ReadError("The MEP connector visit limit was reached.")
+            if int(candidate.Id) == connector_id:
+                matches.append(candidate)
+        if len(matches) != 1:
+            raise ReadError("A reviewed connector is missing or ambiguous.")
+        connector = matches[0]
+        if str(connector.ConnectorType) != "End" or connector.IsConnected:
+            raise ReadError("A reviewed connector is connected or is not a physical end.")
+        frame = connector.CoordinateSystem
+        axes = [xyz(transform.OfVector(axis)) for axis in (frame.BasisX, frame.BasisY, frame.BasisZ)]
+        if any(abs(sum(a * b for a, b in zip(first, second)) - (1 if i == j else 0)) > 1e-6
+               for i, first in enumerate(axes) for j, second in enumerate(axes)):
+            raise ReadError("A reviewed connector has an invalid coordinate frame.")
+        origin = xyz(transform.OfPoint(connector.Origin))
+        if any(abs(a - b) > 1e-6 for a, b in zip(origin, xyz(transform.OfPoint(frame.Origin)))):
+            raise ReadError("A reviewed connector origin disagrees with its coordinate frame.")
+        shape = str(connector.Shape)
+        if shape == "Round":
+            dimensions = [float(connector.Radius) * 2]
+        elif shape == "Rectangular":
+            dimensions = [float(connector.Width), float(connector.Height)]
+        else:
+            dimensions = None
+        if dimensions and any(value <= 0 or math.isnan(value) or math.isinf(value) for value in dimensions):
+            raise ReadError("A reviewed connector has invalid dimensions.")
+        rows.append(dict(selected, category_id=str(owner.Category.Id.Value), domain=str(connector.Domain),
+                         shape=shape, origin_ft=origin, axes=axes, dimensions_ft=dimensions))
+    if ((rows[0]["element_id"], rows[0]["connector_id"])
+            == (rows[1]["element_id"], rows[1]["connector_id"])):
+        raise ReadError("Select two distinct connector endpoints.")
+    return rows
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -263,6 +318,17 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
+        if "route_endpoints" in request:
+            if "element_ids" in request or "clearance" in request:
+                raise ReadError("Use a separate query for route endpoints and audit scope.")
+            endpoints = read_route_endpoints(source, transform, request["route_endpoints"], clock, coverage)
+            current_source, current_transform, current_identity = resolve_source(host, link_id, link_uid)
+            if (current_identity != identity or read_route_endpoints(
+                    current_source, current_transform, request["route_endpoints"], clock, coverage) != endpoints):
+                raise ReadError("The source or connector endpoints changed while being read.")
+            check_time(clock)
+            payload = {"kind": "mep-route-endpoints", "version": 1, "source": identity, "endpoints": endpoints}
+            return {"status": "ok", "endpoints_json": json.dumps(payload, ensure_ascii=True, allow_nan=False)}
         clearance = None
         if request.get("clearance") is not None:
             config = request["clearance"]

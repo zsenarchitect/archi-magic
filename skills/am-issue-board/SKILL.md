@@ -173,6 +173,8 @@ The native reader still needs qualification in Revit. In a disposable project, r
 
 Recover the complete `snapshot_json` if the result was paged and save its contents locally. Run the same `mep_qa.py` command with that file. The native report retains the source and separates evidence diagnostics from violations. Exit 3 indicates unavailable applicable evidence alongside any confirmed findings. Exit 2 means the input or inventory was incomplete. A complete empty scope is labeled `empty_scope`. Native reports require the guarded board handoff, which is pending.
 
+For routing review, use the separate [connector endpoint query](../../docs/rfcs/003-mep-support.md#read-reviewed-route-endpoints).
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.
