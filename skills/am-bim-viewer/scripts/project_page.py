@@ -40,6 +40,80 @@ def load_json(path: str) -> Any:
         return json.load(f)
 
 
+def run_response(value, modes, error):
+    if isinstance(value, dict) and "response" in value:
+        value = value["response"]
+    if (not isinstance(value, dict) or value.get("status") != "ok"
+            or value.get("mode") not in (*modes, None)
+            or value.get("decision") not in ("rolled_back", "no_changes", None)
+            or value.get("error") or value.get("approval")
+            or any(value.get(field) for field in ("failures", "dialogs", "blocked", "warnings", "unclosed_documents"))
+            or value.get("exit_code", 0) != 0):
+        raise ValueError(error)
+    changes = value.get("changes")
+    if changes is not None:
+        if not isinstance(changes, dict) or changes.get("other_documents"):
+            raise ValueError(error)
+        if value.get("mode") != "dry_run" and any(changes.get(field) for field in (
+                "added", "modified", "deleted", "added_ids", "modified_ids", "deleted_ids",
+                "added_count", "modified_count", "deleted_count", "by_category")):
+            raise ValueError(error)
+    return value
+
+
+def read_result_pages(records, modes, error):
+    run = None
+    total = None
+    parts = {}
+    for item in records:
+        record = run_response(item, modes, error)
+        page = record.get("result_page")
+        identifier = record.get("run_id")
+        if (not isinstance(page, dict) or record.get("result_truncated") is not True
+                or not isinstance(identifier, str) or not identifier.strip()
+                or not isinstance(page.get("text"), str)
+                or any(type(page.get(field)) is not int for field in ("offset", "length", "total_length"))):
+            raise ValueError(error)
+        start, length, reported_total = (page[field] for field in ("offset", "length", "total_length"))
+        # pyRevit offsets count UTF-16 code units, including split surrogate pairs.
+        chunk = page["text"].encode("utf-16-le", errors="surrogatepass")
+        identity = (identifier, record.get("mode"), record.get("decision"))
+        if run is None:
+            run, total = identity, reported_total
+        if (identity != run or total != reported_total or start < 0 or length < 1
+                or start in parts or len(chunk) != length * 2 or start + length > total):
+            raise ValueError(error)
+        parts[start] = chunk
+    cursor = 0
+    result = bytearray()
+    for start, chunk in sorted(parts.items()):
+        if start != cursor:
+            raise ValueError(error)
+        result.extend(chunk)
+        cursor += len(chunk) // 2
+    if not cursor or cursor != total:
+        raise ValueError(error)
+    try:
+        return json.loads(result.decode("utf-16-le"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(error) from exc
+
+
+def read_saved_result(value, modes, error):
+    if isinstance(value, list):
+        return read_result_pages(value, modes, error)
+    if not isinstance(value, dict):
+        raise ValueError(error)
+    if not any(field in value for field in ("response", "result", "result_page", "result_truncated")):
+        return value
+    response = run_response(value, modes, error)
+    if response.get("result_truncated") is True:
+        return read_result_pages([response], modes, error)
+    if response.get("result_truncated", False) is not False or not isinstance(response.get("result"), dict):
+        raise ValueError(error)
+    return response["result"]
+
+
 def model_health_findings(audit):
     metrics = audit.get("metrics")
     if (not isinstance(metrics, list) or not metrics
@@ -179,12 +253,7 @@ def pair_preview_rows(preview):
 
 def read_change_preview(value):
     error = "Use a complete change-preview result from a supported recipe."
-    if not isinstance(value, dict):
-        raise ValueError(error)
-    if "result" in value:
-        if value.get("status") != "ok" or value.get("result_truncated") or value.get("error"):
-            raise ValueError(error)
-        value = value["result"]
+    value = read_saved_result(value, ("query", "dry_run"), error)
     if isinstance(value, dict) and "payload" in value:
         if not isinstance(value["payload"], str):
             raise ValueError(error)
@@ -497,7 +566,8 @@ def main() -> int:
             return 1
 
     try:
-        audits = [load_json(a) for a in args.audit]
+        audits = [read_saved_result(load_json(a), ("query",), "Use a complete read-only audit result.")
+                  for a in args.audit]
         findings = collect_findings(audits)
         model_health = model_health_runs(audits)
         preview = read_change_preview(load_json(args.preview)) if args.preview else {}

@@ -252,6 +252,48 @@ def test_failed_health_audit_cannot_be_rendered_as_clean(tmp_path):
     assert out.read_text() == "Existing project page"
 
 
+def test_project_page_reads_completed_audit_envelopes_and_reassembled_preview(tmp_path):
+    audit = tmp_path / "audit.json"
+    preview = tmp_path / "preview.json"
+    out = tmp_path / "project.html"
+    complete_audit = {"mode": "query", "decision": "rolled_back", "status": "ok", "exit_code": 0,
+                      "result_truncated": False, "result": AUDIT,
+                      "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0}}
+    audit.write_text(json.dumps({"response": complete_audit}))
+    raw = json.dumps({"preview": dict(PREVIEW, title="Preview \U0001f4d0"), "plan": {"hidden": "plan-sentinel"}},
+                     ensure_ascii=False).encode("utf-16-le")
+    # A Get Run page can end between the two UTF-16 code units of a non-BMP character.
+    split = raw.index("\U0001f4d0".encode("utf-16-le")) + 2
+    response = {"mode": "query", "decision": "rolled_back", "status": "ok", "run_id": "preview-run",
+                "result": None, "result_truncated": True}
+    pages = []
+    for offset, chunk in ((split, raw[split:]), (0, raw[:split])):
+        pages.append(dict(response, result_page={"offset": offset // 2, "length": len(chunk) // 2,
+                                                  "total_length": len(raw) // 2,
+                                                  "text": chunk.decode("utf-16-le", errors="surrogatepass")}))
+    preview.write_text(json.dumps(pages))
+    command = [sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", audit, "--preview", preview, "--out", out]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    generated = out.read_text()
+    assert "<td>R2</td>" in generated and "Preview \U0001f4d0" in generated
+    assert "<del>A1</del>" in generated and "plan-sentinel" not in generated
+
+    bad_pages = [pages[:1], [pages[0], dict(pages[1], run_id="other-run")], [*pages, pages[0]]]
+    for bad in bad_pages:
+        preview.write_text(json.dumps(bad))
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 1 and "complete change-preview" in result.stderr
+        assert out.read_text() == generated
+    preview.write_text(json.dumps(pages))
+    for bad in (dict(complete_audit, status="failed"), dict(complete_audit, decision="committed"),
+                dict(complete_audit, changes={"modified_count": 1})):
+        audit.write_text(json.dumps(bad))
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 1 and "complete read-only audit" in result.stderr
+        assert out.read_text() == generated
+
+
 def test_project_page_lists_clean_model_health_runs_newest_first(tmp_path):
     older = tmp_path / "old.json"
     newer = tmp_path / "new.json"
