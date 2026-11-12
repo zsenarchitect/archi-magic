@@ -70,7 +70,7 @@ def specification(text, digest):
                 or len(matching) != 1 or matching[0]["value"] != value or matching[0]["unit"] != "mm"):
             raise ValueError("The reviewed {} dimension or its source row is invalid.".format(axis))
         dimensions.append(float(Decimal(value) / Decimal("304.8")))
-    return dimensions
+    return dimensions, spec
 
 
 def measure_box(extrusion):
@@ -102,17 +102,19 @@ def probe(document, args):
         raise ValueError("Supply the approved family baseline and confirmed specification bytes and digest.")
     if before != args["baseline"]:
         raise ValueError("The active family differs from the reviewed disposable fixture.")
-    dimensions = specification(args["specification_json"], args["specification_sha256"])
+    dimensions, spec = specification(args["specification_json"], args["specification_sha256"])
     if min(dimensions) <= document.Application.ShortCurveTolerance:
         raise ValueError("A reviewed box dimension is below Revit's short-curve limit.")
     view = original_parameters = None
     if "constraint_view" in args:
         from spec_family_box_constraints import add_plan_constraints, family_parameters, plan_view
+        from spec_family_source_parameters import read_source_values, set_source_values, source_values
         view = plan_view(document, args["constraint_view"])
         original_parameters = family_parameters(document)
+        metadata = source_values(spec)
     width, depth, height = dimensions
     transaction = DB.Transaction(document, "Try reviewed equipment extrusion and roll back")
-    created, failure, bounds, flexed = [], None, None, {}
+    created, failure, bounds, flexed, verified_metadata = [], None, None, {}, {}
     try:
         if transaction.Start() != DB.TransactionStatus.Started:
             raise ValueError("Revit did not confirm the family fixture transaction started.")
@@ -132,6 +134,7 @@ def probe(document, args):
             parameters = add_plan_constraints(document, view, extrusion, dimensions, created)
             verify_box(extrusion, dimensions)
             manager = document.FamilyManager
+            source_parameters = set_source_values(manager, metadata)
             for index, (axis, parameter) in enumerate(zip(AXES, parameters)):
                 trial = list(dimensions)
                 trial[index] *= 1.1
@@ -141,6 +144,7 @@ def probe(document, args):
                 manager.Set(parameter, dimensions[index])
                 document.Regenerate()
                 verify_box(extrusion, dimensions)
+            verified_metadata = read_source_values(manager, source_parameters, metadata)
     except ValueError as error:
         failure = {"message": str(error)}
     except Exception as error:
@@ -163,6 +167,7 @@ def probe(document, args):
         return dict(failure, status="stopped", rollback_verified=True)
     return {"status": "measured", "rollback_verified": True, "geometry": bounds,
             "reviewed_dimensions_ft": dict(zip(AXES, dimensions)), "flexed_geometry": flexed, "fixture": before,
+            "source_parameters": verified_metadata,
             "specification_sha256": args["specification_sha256"],
             "revit_build": str(document.Application.VersionBuild), "python_engine": platform.python_implementation()}
 

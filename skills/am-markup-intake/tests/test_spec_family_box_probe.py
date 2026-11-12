@@ -40,7 +40,7 @@ def setup(monkeypatch, fault=None):
     XYZ.BasisZ, XYZ.Zero = XYZ(0, 0, 1), XYZ(0, 0, 0)
     elements, calls = {}, []
     manager = NS(Parameters=[], Types=[], CurrentType=None)
-    geometry = []
+    geometry, strings = [], {}
     view = ViewPlan(Id=NS(Value=20), UniqueId="plan-uid", IsTemplate=False, GenLevel=NS(ProjectElevation=0))
     states = NS(Uninitialized="new", Started="started", RolledBack="rolled_back")
 
@@ -108,16 +108,20 @@ def setup(monkeypatch, fault=None):
         return extrusion
 
     def new_type(name):
-        manager.CurrentType = NS(Name=name)
+        manager.CurrentType = NS(Name=name, AsString=lambda parameter: (
+            "wrong" if fault == "source_readback" else strings[parameter.Definition.Name]))
         manager.Types.append(manager.CurrentType)
 
     def add_parameter(name, group, storage, instance):
-        assert (group, storage, instance) == ("geometry", "length", False)
+        assert (group, storage, instance) in (("geometry", "length", False), ("identity", "text", False))
         parameter = NS(Id=NS(Value=30 + len(manager.Parameters)), Definition=NS(Name=name))
         manager.Parameters.append(parameter)
         return parameter
 
     def set_parameter(parameter, value):
+        if isinstance(value, str):
+            strings[parameter.Definition.Name] = value
+            return
         axis = manager.Parameters.index(parameter)
         if fault != "flex_inert" or axis != 0:
             geometry[axis] = value
@@ -155,13 +159,15 @@ def setup(monkeypatch, fault=None):
         FamilyPlacementType=NS(OneLevelBased=1), BuiltInCategory=NS(OST_GenericModel=category),
         ElementId=lambda value: NS(Value=value), FilteredElementCollector=Collector,
         Transaction=Transaction, TransactionStatus=states, ViewPlan=ViewPlan, Solid=Solid, PlanarFace=Face,
-        Options=NS, ReferenceArray=Array, GroupTypeId=NS(Geometry="geometry"), SpecTypeId=NS(Length="length"),
+        Options=NS, ReferenceArray=Array, GroupTypeId=NS(Geometry="geometry", IdentityData="identity"),
+        SpecTypeId=NS(Length="length", String=NS(Text="text")),
         BuiltInParameter=NS(EXTRUSION_END_PARAM=1),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
     monkeypatch.syspath_prepend(str(SCRIPT.parent))
-    monkeypatch.delitem(sys.modules, "spec_family_box_constraints", raising=False)
+    for name in ("spec_family_box_constraints", "spec_family_source_parameters"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
     document = NS(
         PathName="fixture.rfa", IsFamilyDocument=True, IsReadOnly=False, IsWorkshared=False, IsModelInCloud=False,
         OwnerFamily=NS(UniqueId="fixture", FamilyPlacementType=2 if fault == "hosted" else 1,
@@ -177,7 +183,15 @@ def setup(monkeypatch, fault=None):
     spec = json.dumps({
         "kind": "confirmed-family-specification", "model_write_approved": False,
         "dimensions_mm": dimensions,
-        "source_rows": [{"name": name, "value": value, "unit": "mm"} for name, value in dimensions.items()],
+        "source_rows": [{"name": name, "value": value, "unit": "mm", "source": {"page": 1}}
+                        for name, value in dimensions.items()] + [
+            {"name": "connector_service", "value": "Supply", "source": {"page": 4}},
+            {"name": "parameter_model", "value": "AB-12", "source": {"page": 2}},
+        ],
+        "pdf": {"file": "Equipment.pdf" if fault != "source_path" else "../Equipment.pdf", "sha256": "a" * 64},
+        "product": "Equipment", "variant": "AB",
+        "connectors": {"connector_service": "Supply" if fault != "source_drift" else "Return"},
+        "parameters": {"parameter_model": "AB-12"},
     })
     digest = hashlib.sha256(spec.encode("utf-8")).hexdigest()
     args = {"baseline": {"family_uid": "fixture", "sketch_plane_ids": [],
@@ -227,7 +241,8 @@ def run_constrained(monkeypatch, fault=None):
     try:
         result = runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": args})["result"]
     finally:
-        sys.modules.pop("spec_family_box_constraints", None)
+        for name in ("spec_family_box_constraints", "spec_family_source_parameters"):
+            sys.modules.pop(name, None)
     return result, calls, elements, document.FamilyManager
 
 
@@ -242,6 +257,11 @@ def test_probe_flexes_each_dimension_separately_and_restores_original_family(mon
     ]
     assert sum(1 for call in calls if isinstance(call, tuple) and call[0] == "dimension") == 2
     assert ("height", "end") in calls and calls[-1] == "rollback"
+    assert result["source_parameters"] == {
+        "PDF Source File": "Equipment.pdf", "PDF Source Pages": "1, 2, 4",
+        "PDF Source SHA256": "a" * 64, "PDF Product": "Equipment", "PDF Variant": "AB",
+        "PDF Connector service": "Supply", "PDF Value model": "AB-12",
+    }
     assert not elements and not manager.Parameters and not manager.Types
 
 
@@ -249,4 +269,20 @@ def test_probe_flexes_each_dimension_separately_and_restores_original_family(mon
 def test_probe_requires_actual_independent_axis_geometry_changes(monkeypatch, fault):
     result, calls, elements, _ = run_constrained(monkeypatch, fault)
     assert result["status"] == "stopped" and "extrusion bounds differ" in result["message"]
+    assert result["rollback_verified"] and calls[-1] == "rollback" and not elements
+
+
+
+@pytest.mark.parametrize(("fault", "reason"), [
+    ("source_path", "PDF basename"), ("source_drift", "disagree with their PDF source rows"),
+])
+def test_probe_rejects_unreviewed_source_values_before_mutation(monkeypatch, fault, reason):
+    result, calls, elements, _ = run_constrained(monkeypatch, fault)
+    assert result["status"] == "stopped" and reason in result["message"]
+    assert not calls and not elements
+
+
+def test_probe_rolls_back_if_revit_does_not_report_exact_source_text(monkeypatch):
+    result, calls, elements, _ = run_constrained(monkeypatch, "source_readback")
+    assert result["status"] == "stopped" and "PDF provenance differs" in result["message"]
     assert result["rollback_verified"] and calls[-1] == "rollback" and not elements
