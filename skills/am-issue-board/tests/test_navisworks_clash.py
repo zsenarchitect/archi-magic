@@ -187,6 +187,60 @@ def test_html_ids_require_an_exact_numeric_value_in_the_element_column(tmp_path)
     assert [side["element_id"] for side in json.loads(result.stdout)["clashes"][0]["objects"]] == [None, None]
 
 
+def grouped_tabular_report(rows):
+    return """<html><body><table class="mainTable">
+<tr class="headerRow"><td class="generalHeader" colspan="3"></td>
+<td class="item1HeaderGroup">Item 1</td><td class="item2HeaderGroup">Item 2</td>
+<td class="generalHeader"></td></tr>
+<tr class="headerRow"><td class="generalHeader">Clash Group</td>
+<td class="generalHeader">Clash Name</td><td class="generalHeader">Status</td>
+<td class="item1Header">Item ID</td><td class="item2Header">Item ID</td>
+<td class="generalHeader">Comments</td></tr>
+""" + "".join(rows) + "</table></body></html>"
+
+
+def grouped_tabular_row(kind, name, group="", left="Element ID: 42", right="42"):
+    css = "clashGroupCell" if kind == "clashGroupRow" else "contentCell"
+    second = f'<td class="item2Content">{right}</td>' if right is not None else ""
+    return (f'<tr class="{kind}"><td class="{css}">{group}</td><td class="{css}">{name}</td>'
+            f'<td class="{css}">Active</td><td class="item1Content">{left}</td>'
+            f'{second}<td class="{css}">Fixture comment</td></tr>')
+
+
+def test_grouped_tabular_reads_children_and_preserves_missing_item_scope(tmp_path):
+    source = tmp_path / "grouped.html"
+    source.write_text(grouped_tabular_report([
+        grouped_tabular_row("clashGroupRow", "Group A"),
+        grouped_tabular_row("childRow", "First", "Group A"),
+        grouped_tabular_row("childRowLast", "Second", "Group A", right="Element ID: 43"),
+        grouped_tabular_row("contentRow", "Standalone", right=None),
+        grouped_tabular_row("clashGroupRow", "Group B"),
+    ]), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert [(row["name"], [item["element_id"] for item in row["objects"]]) for row in data["clashes"]] == [
+        ("First", ["42", None]), ("Second", ["42", "43"]), ("Standalone", ["42", None]),
+    ]
+    assert data["warnings"][:2] == [
+        "Skipped 2 group summary rows.",
+        "Some groups have no individual rows. Export Everything to review all clashes.",
+    ]
+    assert data["plan"] is None
+
+
+@pytest.mark.parametrize("rows", [
+    [grouped_tabular_row("childRowLast", "Orphan", "Group A")],
+    [grouped_tabular_row("clashGroupRow", "Group A"), grouped_tabular_row("childRow", "Truncated", "Group A")],
+    [grouped_tabular_row("clashGroupRow", "Group A"), grouped_tabular_row("childRowLast", "Wrong group", "Group B")],
+])
+def test_grouped_tabular_rejects_orphaned_or_incomplete_children(tmp_path, rows):
+    source = tmp_path / "grouped.html"
+    source.write_text(grouped_tabular_report(rows), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout
+
+
 @pytest.mark.parametrize("bad_layout", ["grouped", "wrong_side", "extra_header", "script"])
 def test_unsupported_html_layout_does_not_return_partial_results(tmp_path, bad_layout):
     source = tmp_path / "unrecognized.html"
