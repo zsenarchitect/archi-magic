@@ -223,7 +223,12 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 
 ## Validate a batch family type table (issue #165)
 
-Use `python scripts/batch_family_type_table.py --table types.csv --manifest discovery.json` to validate the input. Start the CSV with `source_path,seed_type,type`. Add size columns with explicit units, such as `Width[mm]` or `Ratio[1]`. Use exact library paths and type names. This step binds the table to the reviewed source files. Project classification and native type creation require separate qualification.
+Use `python scripts/batch_family_type_table.py --table types.csv --manifest discovery.json` to validate the input. Start the CSV with `source_path,seed_type,type`. Add size columns with explicit units, such as `Width[mm]` or `Ratio[1]`. Use exact library paths and type names. This step binds the table to the reviewed source files.
+
+1. Prepare one family worker for each source. Pass every size parameter name from the table to the worker. Save the full receipts.
+2. Run `python scripts/batch_family_type_preview.py prepare --request request.json --worker <worker-directory>`. Repeat `--worker` for each source. Save the lookup.
+3. Call `get_context`. Run `read_batch_family_types.py` in CPython query mode in the saved project. Pass the lookup object as `lookup`. Save the full project read.
+4. Run `python scripts/batch_family_type_preview.py preview --lookup lookup.json --project-read project.json`. Review the skipped, blocked, and ready rows. A ready row still needs a derivation preview and native qualification.
 
 ## Preview a CAD layout (issue #166)
 

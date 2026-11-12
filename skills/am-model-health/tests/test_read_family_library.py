@@ -29,7 +29,8 @@ class FamilyType:
 def parameter(name, number, storage, value, instance=False):
     definition = SimpleNamespace(Name=name, GetDataType=lambda: SimpleNamespace(TypeId=storage))
     return SimpleNamespace(Definition=definition, Id=SimpleNamespace(Value=number), IsShared=False,
-                           IsInstance=instance, StorageType=storage, value=value)
+                           IsInstance=instance, StorageType=storage, value=value,
+                           IsReadOnly=False, IsDeterminedByFormula=False, IsReporting=False)
 
 
 class Worker:

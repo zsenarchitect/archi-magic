@@ -127,6 +127,8 @@ def family_metadata(document, parameter_names):
             "shared_guid": str(parameter.GUID) if parameter.IsShared else None,
             "storage": str(parameter.StorageType),
             "data_type": bounded_text(definition.GetDataType().TypeId),
+            "read_only": bool(parameter.IsReadOnly), "formula_driven": bool(parameter.IsDeterminedByFormula),
+            "reporting": bool(parameter.IsReporting),
         }))
     parameters.sort(key=lambda item: (item[1]["name"], item[1]["id"]))
     if len({record["id"] for _, record in parameters}) != len(parameters):
