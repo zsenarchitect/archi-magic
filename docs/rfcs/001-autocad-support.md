@@ -37,3 +37,12 @@ archi-magic currently interfaces with Revit and Rhino. Many architectural office
 ### Phase 3: CAD-to-BIM Hand-off (Issue #166)
 - Map approved DWG layers to native Revit elements (walls from `A-WALL`, doors from `A-DOOR`, rooms from boundary polylines).
 - Export verified Revit schedules and sheet views back to clean, standardized DWG backgrounds.
+
+#### Qualify a Revit-to-DWG handoff
+
+1. Use a disposable Revit project with a known sheet, a placed schedule with independently checked values, a model view with a measured dimension, and a linked drawing. Record the sheet number, expected schedule headings and values, dimension, source units, and expected layers.
+2. In Revit, open **File > Export > CAD Formats > DWG**. Select the approved DWG export setup and only the reviewed sheet. Record the setup name, layer mapping, units, DWG version, and whether views and links are separate Xrefs. Export into an empty private folder. For this fixture, export once with Xrefs and once without, using separate folders. [Revit DWG export](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-DocumentPresent/files/GUID-42C75024-4D71-4831-8910-2747168624A3.htm) · [Layer mapping](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-DocumentPresent/files/GUID-3541F82B-9E25-47C5-BE52-3F6C6F40DA02.htm)
+3. Use the [DWG audit recipe](../../skills/am-model-health/SKILL.md) on the host DWG and any companions. Compare the reported layers and insertion units with the recorded setup. Inspect unresolved references and incomplete audit coverage before packaging. Keep all required companion DWGs together.
+4. Open each exported host in AutoCAD. Verify the sheet and placed schedule are legible, compare the recorded schedule values, measure the known dimension, and check that the linked geometry is present and the Xrefs match the selected export mode. A standalone schedule exported as delimited text does not qualify the DWG deliverable. [Revit schedule export API](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/8ba18e73-6daf-81b6-d15b-e4aa90bc8c22.htm)
+
+Record both application builds, the export options, the audited file list, and the measured results. Native execution is pending.
