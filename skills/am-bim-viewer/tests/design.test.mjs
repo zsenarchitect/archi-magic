@@ -2,7 +2,9 @@
 // blocks, value-only category colors, and the per-theme scene palette.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { core } from './load-core.mjs';
@@ -91,4 +93,30 @@ test('architectural visualization: explode, ghost context, and pins are present 
   assert.ok(TEMPLATE.includes('id="hud-pin"'));
   assert.ok(TEMPLATE.includes('id="pin-svg"'));
   assert.ok(TEMPLATE.includes('id="pin-dom"'));
+});
+
+
+test('offline viewer build embeds the pinned Three.js module and removes network dependencies', () => {
+  const work = mkdtempSync(resolve(tmpdir(), 'archi-offline-viewer-'));
+  try {
+    const build = resolve(here, '../scripts/build-viewer.mjs');
+    const model = resolve(here, '../viewer/demo.json');
+    const output = resolve(work, 'demo.viewer.html');
+    execFileSync(process.execPath, [build, '--offline', model, output]);
+    const page = readFileSync(output, 'utf8');
+    const [, mapJson] = page.match(/<script type="importmap">([\s\S]*?)<\/script>/);
+    const moduleUrl = JSON.parse(mapJson).imports.three;
+    assert.match(moduleUrl, /^data:text\/javascript;base64,/);
+    const module = Buffer.from(moduleUrl.split(',')[1], 'base64');
+    assert.deepEqual(module, readFileSync(new URL(import.meta.resolve('three'))));
+    assert.doesNotMatch(page, /<link[^>]*href="https?:/i);
+    assert.match(page, /default-src 'none'/);
+    assert.match(page, /MIT License/);
+
+    execFileSync(process.execPath, [build, model, output]);
+    const online = readFileSync(output, 'utf8');
+    assert.match(online, /https:\/\/cdn\.jsdelivr\.net\/npm\/three@0\.160\.0/);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
 });

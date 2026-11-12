@@ -44,7 +44,9 @@ Show Revit geometry as an interactive 3D page next to the conversation.
 2. **Build the page.** Use `/bim-view <path.json>` (the mod), or with node: `node "<this skill dir>\scripts\build-viewer.mjs" <path.json>`. With no path, both build the demo model. The mod cannot read files over 4 MiB (about 80,000 triangles). Use the node script for larger models.
 3. **Open it from the project folder.** The exporter writes to the temp folder. The Browser pane shows a local file outside the project folder (the session's working folder) as a static snapshot: page scripts do not run, so the viewer looks empty, with no error in the console. So first copy the `.viewer.html` into the working folder (for example `.\bim-viewer-out\`). Then open the `file:///...viewer.html` URL of that copy in the Browser pane (`preview_start` with `url`). If no Browser pane is available, give the user the path, or run `/bim-view <path> --open` to use the default browser. The copy is a snapshot. Export again after the Revit model changes.
 
-   **The viewer is empty?** The page is probably outside the project folder. Copy it into the working folder and open that copy. If it is still empty, read the console for errors (the page loads three.js from a CDN, so it needs internet access).
+   **Build for offline use.** Run `npm ci` in the skill folder once to install the pinned Three.js dependency. Then run `node scripts/build-viewer.mjs --offline <model.json> <model.viewer.html>`. Open the generated HTML directly. It embeds Three.js and uses local font fallbacks.
+
+   **The viewer is empty?** The page is probably outside the project folder. Copy it into the working folder and open that copy. If it is still empty, read the console for errors. The default build needs internet access to load Three.js from the CDN.
 
 ## Viewer controls (Rhino defaults)
 
@@ -157,12 +159,66 @@ From this skill's folder: `npm install`, then `npm test` (orientation, camera ma
 
 ## Local project page (issue #187 Phase 1)
 
-Build one read-only HTML page that shows the latest audit results and a change preview. The page runs from local files. It makes no network call and cannot change a model. The Revit Keep/Discard step stays the only approval.
+Build one read-only HTML page that shows audit results, a change preview, and an optional issue board. The page runs from local files. It makes no network call and cannot change a model. The Revit Keep/Discard step stays the only approval.
 
-`python skills/am-bim-viewer/scripts/project_page.py --title "Project A" --audit <audit.json> [--audit <more.json>] [--preview <preview.json>] --out project.html`
+`python skills/am-bim-viewer/scripts/project_page.py --title "Project A" --audit <audit.json> [--audit <more.json>] [--preview <preview.json>] [--board <board.json>] [--model <model.json>] --out project.html`
 
-- Audit inputs: output of `mep_qa.py`, `dwg_cad_audit.py`, or other audits with a `findings` list.
+- Pass the saved `model_health.py` result, the output of `mep_qa.py` or `dwg_cad_audit.py`, or another audit with a `findings` list. The page lists model health runs by recorded time, including runs with no warnings or errors.
+- Supply a complete change preview under `--preview`. The page accepts plain change previews and recipes that return a preview with a separate execution plan. Review-only previews retain that status. A truncated Revit result needs recovery with `get_run` before rendering.
+- Pass a complete saved Revit run record directly to `--audit` or `--preview`. For a paged `get_run` result, save all responses for the same run in one JSON array.
+- To include the issue board, save the output of `board_cli.py parse <read.json>` as `board.json`. Filter its entries by severity.
+- Use a BIM export from the same project to filter by category and level. These filters use exact element IDs from the board.
+- Pass a BIM JSON export with `--model` to include a link to the offline 3D viewer. Install the locked viewer dependency with `npm ci` first. Keep the generated viewer HTML beside the project page when moving the report.
+- Open **Frame issue elements** to fit the camera to the matched elements. The page shows when only part of an issue is in the export.
+- Open **Frame element** on a changed or removed preview row to inspect its current geometry. The link uses the exact element ID.
 - The page escapes all model text. It sets a strict content policy.
+
+## Office review API (issue #187 Phase 2)
+
+Install the optional dependencies from `requirements-workspace.txt`. For model slots, install Node.js and run `npm ci` from this skill folder to install the locked offline viewer dependency. Use Python 3.10 or later on POSIX. Run `python scripts/workspace_server.py <private-config.json> --port 8765` from this skill folder.
+
+Configure `origin` as the canonical office HTTPS origin. Under `accounts`, map account names to SHA-256 digests of individual random tokens. Under `projects`, map slugs to `root`, `members`, and `targets`. Use absolute physical directories. Map project members to `viewer` or `editor`. Set `targets` to the exact review target keys allowed in the project.
+
+Preserve the canonical Host at the office HTTPS proxy. Disable caching of private responses. Keep the configuration outside project directories and protect it with operator-only permissions. The service listens only on `127.0.0.1`.
+
+Send `POST /session` with the token in a JSON body to start a browser session. Read state with `GET /projects/<project>/review`. Editors can send `PATCH` to the same route with `target`, `operation_id`, and `patch`. Send the current `ETag` as `If-Match`. Send `DELETE /session` to sign out.
+
+Open the configured HTTPS origin, enter the project slug and sign in with your access token. The browser shows each publication’s freshness and review history. Editors can comment, assign a project member, or change the review status on current items. Revit board status is shown separately.
+
+Configure a slot with `"kind": "model"` and a relative JSON path to publish an `am-bim-viewer/1` export. Reviewers open the model from the workspace. The service builds and serves a sandboxed offline viewer with a 256 MiB limit on the model publication and generated HTML.
+
+API clients can fetch the current review revision and display rows together from `/projects/<project>/workspace`. Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Refresh the review state and configured artifacts after connecting and after each revision notice.
+
+To publish a completed audit, preview, board, or model locally, configure an `artifacts` entry under the project. Each slot has a `kind` and a relative JSON `path`. Board slots also have a `board` identity with `lineage`, `host_identity`, and `note_uid`. Read the original Revit note with `include_identity` before publishing a board.
+
+Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot> <generation> <saved-result.json>`. Use the source run's increasing generation. An exact repeat keeps the current file. An older run or conflicting repeat stops with an error.
+
+Read published data through `GET /projects/<project>/artifacts/<slot>`. Use its target keys to annotate current findings, preview rows, or issues. A stale response retains the last good data for reading. An unavailable response after restart requires a valid publication before editing resumes.
+
+### Project documents
+
+Use the local `project_document_cli.py extract` or `compare` workflow in am-markup-intake. For comparisons, exit 1 produces a valid report with differences. Publish the resulting JSON to a project artifact slot with `"kind": "document"` using the publication command above. To include a DWG reference, publish JSON with `format` set to `dwg`, a display `file` name and a `revision`.
+
+The workspace shows the original sheet, page, table and row references when present. Reviewers can page through the table or browse mismatches, missing schedule entries and schedule-only entries separately. Original documents stay with the extraction operator. DWG references show their recorded revision and unverified availability.
+
+### Saved recipes
+
+Configure an artifact slot with `"kind": "recipe"` and publish an explicitly selected `.recipe.json` saved by the team recipe library. Use the same publisher and a new generation when the saved file changes. The workspace shows the recipe name, version, owner, description and declared Revit years. Catalog entries are references. Use the existing native preview and approval workflow to run the recipe.
+
+### Audit reports
+
+Open **Audit reports** in the office workspace to print the current report or download self-contained HTML. Use the browser’s Print dialog and select Save as PDF for a PDF copy. The report includes accepted audit generations, freshness, model-health totals and rule IDs. Its descriptions come from installed checks. Set `audit_reports` to `false` in a project’s configuration to disable its report route and links.
+
+### Review state backup and restore
+
+Stop the workspace service before backing up or restoring a project. Use the same project slug and the absolute physical root from the configuration. Keep the snapshot outside the project root in an operator-controlled directory.
+
+```text
+python scripts/workspace_maintenance.py export <project> <absolute-root> <new-private-snapshot.json>
+python scripts/workspace_maintenance.py import <project> <absolute-restore-root> <private-snapshot.json>
+```
+
+Export creates a private snapshot at a new path. Import validates the snapshot and creates `.am-issues.json` in a root with no existing sidecar. Keep the matching published artifacts separately and configure the intended roster and slots before starting the workspace again. The snapshot includes review comments, assignments, operation receipts and artifact generations. Keep it in private storage if you use Git for the transfer.
 
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)
 
