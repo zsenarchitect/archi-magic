@@ -195,6 +195,17 @@ Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot
 
 Read published data through `GET /projects/<project>/artifacts/<slot>`. Use its target keys to annotate current findings, preview rows, or issues. A stale response retains the last good data for reading. An unavailable response after restart requires a valid publication before editing resumes.
 
+### Review state backup and restore
+
+Stop the workspace service before backing up or restoring a project. Use the same project slug and the absolute physical root from the configuration. Keep the snapshot outside the project root in an operator-controlled directory.
+
+```text
+python scripts/workspace_maintenance.py export <project> <absolute-root> <new-private-snapshot.json>
+python scripts/workspace_maintenance.py import <project> <absolute-restore-root> <private-snapshot.json>
+```
+
+Export creates a private snapshot at a new path. Import validates the snapshot and creates `.am-issues.json` in a root with no existing sidecar. Keep the matching published artifacts separately and configure the intended roster and slots before starting the workspace again. The snapshot includes review comments, assignments, operation receipts and artifact generations. Keep it in private storage if you use Git for the transfer.
+
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)
 
 - **Rhino navigation in custom three.js viewers**: `am-bim-viewer` uses Rhino mouse controls by default. When configuring a custom three.js `OrbitControls` viewer, set `controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }` (right-drag orbits, `Shift` + right-drag pans automatically, left-click selects, wheel zooms).

@@ -12,40 +12,23 @@ archi-magic functions today as a conversational agent inside the Revit session a
 | Option | Architecture | Data Boundary | Operational Overhead | Decision |
 |---|---|---|---|---|
 | **A. Pure Cloud SaaS** | Central multi-tenant web application and database | Model data and findings upload to external servers | High compliance friction for enterprise architectural firms | **Rejected** (Breaches zero-data-leak policy) |
-| **B. Local-First Sidecar (Default)** | Lightweight local HTTP / WebSocket server on `127.0.0.1` | Zero data leaves the local machine; reads directly from workspace | Zero infrastructure cost; operates offline | **Adopted for Phase 1** |
+| **B. Offline Project Page (Default)** | Self-contained HTML generated from saved workspace artifacts | Files and geometry stay on the workstation | Zero infrastructure cost; operates offline | **Adopted for Phase 1** |
 | **C. Private Office Intranet Server** | Self-hosted Node.js / Python daemon within firm LAN or VPN | All model data stays behind firm firewall on internal storage | Moderate IT coordination; role-based team access | **Adopted for Phase 2 & 3 Team Mode** |
 
 ### Data Confidentiality and Governance
-- **Local Boundary Guarantee**: By default, the web workspace runs strictly on localhost (`127.0.0.1:<port>`). No geometry, parameters, or project notes leave the workstation.
+- **Local Boundary Guarantee**: The default project page opens from disk. It and its model viewer load their data and dependencies locally.
 - **Office Network Mode**: When enabled for team collaboration, an office HTTPS reverse proxy serves the LAN or VPN. One aiohttp service listens on loopback behind that proxy. Team members exchange individual tokens for browser sessions. Models remain on firm-managed file shares.
 - **Model Change Safety**: The web workspace is strictly informational and collaborative. It cannot write directly to the active Revit database. The native Revit Keep/Discard prompt remains the single mandatory gate for model transactions.
 
 ## 3. System Architecture
 
-```
-+-----------------------------------------------------------+
-|                      Browser UI                          |
-|  [Project Dashboard] [Audit Findings] [Change Previews]   |
-|  [3D BIM Viewer (Three.js)] [Issue Board] [Recipe Runner] |
-+-----------------------------------------------------------+
-                             ^
-                             | HTTP / WebSocket (JSON)
-                             v
-+-----------------------------------------------------------+
-|          Local Web Workspace Daemon (Python / FastAPI)    |
-|  - Workspace State Manager                                |
-|  - Check Pack & Audit Aggregator                          |
-|  - Safe Change Diff Formatter                             |
-|  - Local Artifact Cache                                   |
-+-----------------------------------------------------------+
-        |                                        |
-        v                                        v
-+------------------------+             +--------------------+
-| Revit Agent Connector  |             | Local Project Dir  |
-| (PyRevit / py-revit-cli)             | (Issues, Recipes,  |
-+------------------------+             |  Snapshots, Logs)  |
-                                       +--------------------+
-```
+Individual review opens the local project page and offline model viewer generated from saved exports.
+
+Team review uses an office HTTPS proxy on the LAN or VPN. The proxy forwards the configured Host and WebSocket upgrades to the aiohttp service on `127.0.0.1`. aiohttp provides HTTP and WebSocket handling in one process, with bounded request bodies, a WebSocket heartbeat and secure session cookies. Configure the proxy to reject other hosts, disable response caching and allow an idle upstream read of at least 75 seconds. The service verifies the Host on every request and the Origin on session changes, edits and WebSocket upgrades.
+
+The service reads explicit publication slots for each project and persists annotations in `.am-issues.json` under an exclusive project lock. Revit workflows publish completed exports through the local publisher. Team browsers receive revision notices over WebSocket and retrieve the authorized review state and viewer over HTTPS. Review comments, assignments and status stay in the sidecar.
+
+During maintenance, stop the service before exporting the sidecar to a private snapshot. Restore the snapshot under the same project slug in a physical root with no existing sidecar, then start the service with the intended roster and artifact slots. Restore matching project publications separately. The snapshot preserves annotation history, operation receipts and the last accepted artifact generations.
 
 ## 4. Phased Implementation Roadmap
 

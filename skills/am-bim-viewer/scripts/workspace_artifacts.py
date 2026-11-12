@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from project_page import collect_findings, pair_preview_rows, read_change_preview, read_saved_result, render_board
 from workspace_model import MAX_MODEL_BYTES, validate_model
-from workspace_review_state import canonical
+from workspace_review_state import canonical, unique_object
 
 
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
@@ -22,15 +22,6 @@ ARTIFACT_KINDS = ("audit", "preview", "board", "model")
 
 def slot_limit(slot):
     return MAX_MODEL_BYTES if slot["kind"] == "model" else MAX_ARTIFACT_BYTES
-
-
-def unique_object(items):
-    result = {}
-    for key, value in items:
-        if key in result:
-            raise ValueError("The workspace JSON has duplicate fields.")
-        result[key] = value
-    return result
 
 
 @contextmanager
