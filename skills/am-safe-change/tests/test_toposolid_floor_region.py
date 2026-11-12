@@ -34,6 +34,8 @@ class Line:
 
 
 class Arc(Line):
+    Center = point(5, 5.25, 5)
+
     def Evaluate(self, parameter, normalized):
         assert parameter == 0.5 and normalized
         return point(5, -2, 5)
@@ -146,7 +148,9 @@ def test_read_region_preserves_profile_hole_arc_and_selected_grade(monkeypatch, 
     assert snapshot["level_project_elevation_ft"] == 23
     assert snapshot["floor_type"]["uid"] == "uid-31"
     assert len(snapshot["profile_loops"]) == 2
-    assert snapshot["profile_loops"][0][0] == {"kind": "arc", "points_ft": [[0, 0, 5], [5, -2, 5], [10, 0, 5]]}
+    assert snapshot["profile_loops"][0][0] == {
+        "kind": "arc", "points_ft": [[0, 0, 5], [5, -2, 5], [10, 0, 5]], "center_ft": [5, 5.25, 5],
+    }
     assert snapshot["profile_loops"][1][0]["points_ft"] == [[4, 4, 5], [4, 6, 5]]
     assert snapshot["top_faces"] == [
         {"reference": "face-a", "triangles_ft": [[[0, 0, 12], [0, 2, 12], [2, 0, 14]]]},

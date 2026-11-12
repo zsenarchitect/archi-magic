@@ -55,18 +55,19 @@ def read_profile(sketch, clock):
                 raise ValueError("The floor profile needs bounded straight lines or circular arcs.")
             start, end = (checked_point(curve.GetEndPoint(i)) for i in (0, 1))
             points = [start, end]
-            kind = "line"
+            segment = {"kind": "line", "points_ft": points}
             if isinstance(curve, DB.Arc):
                 points.insert(1, checked_point(curve.Evaluate(0.5, True)))
-                kind = "arc"
+                segment.update(kind="arc", center_ft=checked_point(curve.Center))
             if elevation is None:
                 elevation = start[2]
             if (distance(start, end) <= GEOMETRY_EPSILON_FT
-                    or any(abs(point[2] - elevation) > GEOMETRY_EPSILON_FT for point in points)):
+                    or any(abs(point[2] - elevation) > GEOMETRY_EPSILON_FT for point in points)
+                    or ("center_ft" in segment and abs(segment["center_ft"][2] - elevation) > GEOMETRY_EPSILON_FT)):
                 raise ValueError("The selected region needs nondegenerate horizontal sketch curves.")
             if segments and distance(segments[-1]["points_ft"][-1], start) > GEOMETRY_EPSILON_FT:
                 raise ValueError("A floor profile loop is disconnected.")
-            segments.append({"kind": kind, "points_ft": points})
+            segments.append(segment)
         if not segments or distance(segments[-1]["points_ft"][-1], segments[0]["points_ft"][0]) > GEOMETRY_EPSILON_FT:
             raise ValueError("A floor profile loop is empty or open.")
         loops.append(segments)

@@ -150,6 +150,34 @@ def compare(source, floor, area_tolerance_sqft, elevation_tolerance_ft):
     }
 
 
+def compare_conversion(source, floor, area_tolerance_sqft, elevation_tolerance_ft,
+                       xy_tolerance_ft, expected_floor_offset_ft):
+    from toposolid_profile_check import profiles_match
+
+    if not finite(expected_floor_offset_ft):
+        raise ValueError("Supply the reviewed floor offset in internal feet.")
+    if not source["region"]["uid"] or not floor["floor"]["uid"] or source["region"]["uid"] == floor["floor"]["uid"]:
+        raise ValueError("Supply distinct native terrain and floor readbacks.")
+    if not source["document"]["uid"] or not source["document"]["path_sha256"]:
+        raise ValueError("Supply a saved project identity.")
+    same_document = source["document"] == floor["document"]
+    same_type = bool(source["floor_type"]["uid"]) and source["floor_type"] == floor["floor_type"]
+    same_level = bool(source["level"]["uid"]) and source["level"] == floor["level"]
+    source_elevation, floor_elevation = source["level_project_elevation_ft"], floor["level_project_elevation_ft"]
+    if not all(finite(value) for value in (source_elevation, floor_elevation, floor["floor_offset_ft"])):
+        raise ValueError("Supply finite project level elevations and a measured floor offset.")
+    report = compare(source, floor, area_tolerance_sqft, elevation_tolerance_ft)
+    report["matches_profile"] = profiles_match(source["profile_loops"], floor["profile_loops"], xy_tolerance_ft)
+    report["matches_document"] = same_document
+    report["matches_floor_type"] = same_type
+    report["matches_level"] = same_level and abs(source_elevation - floor_elevation) <= elevation_tolerance_ft
+    report["floor_offset_error_ft"] = abs(expected_floor_offset_ft - floor["floor_offset_ft"])
+    report["matches_floor"] = (all(report[name] for name in (
+        "matches_meshes", "matches_profile", "matches_document", "matches_floor_type", "matches_level",
+    )) and report["floor_offset_error_ft"] <= elevation_tolerance_ft)
+    return report
+
+
 def load(path):
     with io.open(path, "r", encoding="utf-8") as stream:
         payload = stream.read(MAX_INPUT_BYTES + 1)
@@ -170,14 +198,24 @@ def main():
     parser.add_argument("floor")
     parser.add_argument("--area-tolerance-sqft", required=True, type=float)
     parser.add_argument("--elevation-tolerance-ft", required=True, type=float)
+    parser.add_argument("--xy-tolerance-ft", type=float)
+    parser.add_argument("--expected-floor-offset-ft", type=float)
     args = parser.parse_args()
     try:
-        result = compare(load(args.source), load(args.floor), args.area_tolerance_sqft, args.elevation_tolerance_ft)
+        source, floor = load(args.source), load(args.floor)
+        limits = (args.area_tolerance_sqft, args.elevation_tolerance_ft)
+        if args.xy_tolerance_ft is None and args.expected_floor_offset_ft is None:
+            result = compare(source, floor, *limits)
+        elif args.xy_tolerance_ft is None or args.expected_floor_offset_ft is None:
+            raise ValueError("Floor verification needs both the XY tolerance and reviewed floor offset.")
+        else:
+            result = compare_conversion(source, floor, limits[0], limits[1],
+                                        args.xy_tolerance_ft, args.expected_floor_offset_ft)
     except (IOError, KeyError, TypeError, ValueError, AttributeError) as error:
         print(json.dumps({"status": "stopped", "message": str(error)}))
         return 2
     print(json.dumps(result, sort_keys=True))
-    return 0 if result["matches_meshes"] else 1
+    return 0 if result.get("matches_floor", result["matches_meshes"]) else 1
 
 
 if __name__ == "__main__":
