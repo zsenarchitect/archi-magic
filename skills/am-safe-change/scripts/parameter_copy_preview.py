@@ -212,7 +212,10 @@ def compute(snapshot):
 
 
 def read_basis(data):
-    result = data.get("result", data)
+    envelope = data.get("response", data)
+    if envelope.get("status", "ok") != "ok" or envelope.get("error") or envelope.get("result_truncated"):
+        raise ValueError("Read the complete successful parameter snapshot.")
+    result = envelope.get("result", envelope)
     if not isinstance(result, dict) or result.get("status") != "ok":
         raise ValueError("Read the complete successful parameter snapshot.")
     return json.loads(result["snapshot_json"])
@@ -236,7 +239,17 @@ def compare_kept(plan, basis):
             raise ValueError("The kept parameter values differ from the approved result.")
 
 
-def verify_dry_run(plan, envelope):
+def verify_dry_run(plan, saved):
+    envelope = saved.get("response", saved)
+    run_id = envelope.get("run_id")
+    exit_code = envelope.get("exit_code")
+    if (envelope.get("mode") != "dry_run" or envelope.get("status") != "ok"
+            or envelope.get("decision") != "rolled_back" or envelope.get("approval") is not None
+            or not isinstance(run_id, TEXT) or not run_id.strip()
+            or type(exit_code) not in INTEGER or exit_code != 0 or envelope.get("result_truncated") is not False
+            or any(envelope.get(key) for key in (
+                "error", "blocked", "failures", "dialogs", "warnings", "closed_documents", "unclosed_documents"))):
+        raise ValueError("Save the complete successful rolled-back dry run.")
     actual = envelope.get("result", {})
     if actual.get("status") != "ok" or json.loads(actual["rows_json"]) != plan["steps"]:
         raise ValueError("The dry-run values differ from the reviewed changes.")

@@ -37,7 +37,9 @@ def test_copy_combine_and_type_mismatch_through_cli(tmp_path):
 
     def preview(operation):
         basis = {"request": {**request, **operation}, "rows": [row]}
-        snapshot.write_text(json.dumps({"result": {"status": "ok", "snapshot_json": json.dumps(basis)}}))
+        snapshot.write_text(json.dumps({"response": {"status": "ok", "result": {
+            "status": "ok", "snapshot_json": json.dumps(basis),
+        }}}))
         subprocess.run([sys.executable, SCRIPT, "compute", snapshot, artifact], check=True, capture_output=True)
         return json.loads(artifact.read_text())
 
@@ -181,9 +183,16 @@ def test_native_entry_preflight_and_rollback(monkeypatch):
     assert not events
 
     compare_kept(artifact["plan"], json.loads(run({"mode": "read", "request": request})["snapshot_json"]))
-    dry = {"result": kept, "changes": {"added_count": 0, "deleted_count": 0,
+    dry = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "run_id": "dry-copy",
+           "exit_code": 0, "result_truncated": False,
+           "result": kept, "changes": {"added_count": 0, "deleted_count": 0,
            "modified_count": 2, "modified": [{"id": 1}, {"id": 2}], "by_category": {"Doors": 2}}}
-    verify_dry_run(artifact["plan"], dry)
+    for invalid in (dict(dry, mode="modify", decision="committed", approval="user"),
+                    dict(dry, status="error"), dict(dry, result_truncated=True),
+                    dict(dry, run_id=""), dict(dry, exit_code=1)):
+        with pytest.raises(ValueError, match="successful rolled-back dry run"):
+            verify_dry_run(artifact["plan"], invalid)
+    verify_dry_run(artifact["plan"], {"response": dry})
     dry["changes"].update(modified_count=3, modified=[{"id": 1}, {"id": 2}, {"id": 3}],
                           by_category={"Doors": 3})
     with pytest.raises(ValueError, match="additional modified elements: 3"):
