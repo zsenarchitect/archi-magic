@@ -360,6 +360,14 @@ def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch,
         wrong_pose["result"]["pose"]["xyz_ft"][2] += 1
         with pytest.raises(ValueError, match="retained instance"):
             verify_decision(preview, original, trial, fresh, kept_run, wrong_pose)
+        drifted_run = copy.deepcopy(kept_run)
+        drifted_read = copy.deepcopy(checked)
+        tolerance = probe.POSITION_TOLERANCE_FT
+        drifted_run["result"]["placement"]["xyz_ft"][2] += 0.75 * tolerance
+        drifted_read["result"]["pose"]["xyz_ft"][2] += 1.5 * tolerance
+        with pytest.raises(ValueError, match="reviewed location"):
+            verify_decision(preview, original, trial, fresh, drifted_run, drifted_read)
+
         unrelated = copy.deepcopy(checked)
         unrelated["result"]["preserved_inventory"]["sha256"] = "0" * 64
         with pytest.raises(ValueError, match="preserved project scope"):

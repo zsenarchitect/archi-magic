@@ -25,6 +25,7 @@ def kept_state(review, baseline, snapshot, result, fresh):
             or any(pose[key] != measured[key] for key in ("id", "uid", "level_id", "symbol_id"))
             or pose["level_uid"] != review["level"]["uid"] or pose["symbol_uid"] != symbol_uid):
         raise ValueError("The retained instance identity, type, level, or pose differs from the handoff.")
+    verify_pose(review, dict(result, placement=pose))
     expected = dict(baseline)
     if review["action"] == "reuse":
         expected["exact_symbols"] = [dict(review["symbol"], active=True)]
