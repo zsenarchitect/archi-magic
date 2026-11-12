@@ -40,6 +40,7 @@ class ReviewState:
         self.project = project
         self.members = dict(members)
         self.targets = frozenset(targets)
+        self._artifacts = {}
         self._thread_lock = RLock()
         self._file_lock = None
 
@@ -75,7 +76,8 @@ class ReviewState:
         try:
             descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
-            return {"version": 1, "project": self.project, "revision": 0, "annotations": {}, "operations": {}}
+            return {"version": 1, "project": self.project, "revision": 0, "annotations": {}, "operations": {},
+                    "artifacts": {}}
         with os.fdopen(descriptor, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError("The project sidecar must be a regular file.")
@@ -83,11 +85,19 @@ class ReviewState:
         if len(raw) > MAX_STATE_BYTES:
             raise ValueError("The project sidecar exceeds its storage limit.")
         data = json.loads(raw)
-        if (not isinstance(data, dict) or set(data) != {"version", "project", "revision", "annotations", "operations"}
+        if isinstance(data, dict):
+            data.setdefault("artifacts", {})
+        if (not isinstance(data, dict) or set(data) != {
+                "version", "project", "revision", "annotations", "operations", "artifacts"}
                 or type(data["version"]) is not int or data["version"] != 1 or data["project"] != self.project
                 or type(data["revision"]) is not int or data["revision"] < 0
-                or not isinstance(data["annotations"], dict) or not isinstance(data["operations"], dict)):
+                or any(not isinstance(data[field], dict) for field in ("annotations", "operations", "artifacts"))):
             raise ValueError("The project sidecar has an invalid identity or format.")
+        if any(not isinstance(entry, dict) or set(entry) != {"generation", "digest"}
+               or type(entry["generation"]) is not int or not 1 <= entry["generation"] <= 2**53 - 1
+               or not isinstance(entry["digest"], str) or re.fullmatch(r"[0-9a-f]{64}", entry["digest"]) is None
+               for entry in data["artifacts"].values()):
+            raise ValueError("The project sidecar has invalid artifact generations.")
         return data
 
     def _store(self, state):
@@ -118,6 +128,41 @@ class ReviewState:
             state = self._load()
             return {"etag": self._etag(state), "annotations": state["annotations"]}
 
+    def read_artifact(self, actor, slot):
+        with self._thread_lock:
+            self._authorize(actor)
+            return self._artifacts.get(slot, {"freshness": "unavailable"})
+
+    def refresh_artifacts(self, slots, read_slot):
+        """Commit new generations and their review targets in one project operation."""
+        with self._thread_lock:
+            if self._file_lock is None:
+                raise RuntimeError("Open the project state before use.")
+            state = self._load()
+            updated = {}
+            for name, slot in slots.items():
+                artifact, targets = read_slot(self.root, name, slot)
+                previous = state["artifacts"].get(name)
+                current = self._artifacts.get(name, {"freshness": "unavailable"})
+                if artifact is not None:
+                    generation, digest = artifact["generation"], artifact["digest"]
+                    if previous is not None and (generation < previous["generation"] or (
+                            generation == previous["generation"] and digest != previous["digest"])):
+                        artifact = None
+                if artifact is None:
+                    updated[name] = dict(current, freshness="stale") if "data" in current else current
+                    continue
+                state["artifacts"][name] = {"generation": generation, "digest": digest}
+                updated[name] = {"freshness": "ready", "kind": artifact["kind"], "generation": generation,
+                                 "digest": digest, "data": artifact["data"], "targets": targets}
+            changed = any(updated[name] != self._artifacts.get(name, {"freshness": "unavailable"}) for name in updated)
+            if not changed:
+                return None
+            state["revision"] += 1
+            self._store(state)
+            self._artifacts = updated
+            return self._etag(state)
+
     def update(self, actor, target, operation_id, if_match, patch):
         result, _ = self.update_with_outcome(actor, target, operation_id, if_match, patch)
         return result
@@ -140,7 +185,9 @@ class ReviewState:
                 return prior["result"], False
             if if_match != self._etag(state):
                 raise RevisionConflict("The project review changed. Refresh before editing.")
-            if target not in self.targets:
+            if target not in self.targets and not any(
+                    artifact["freshness"] == "ready" and target in artifact["targets"]
+                    for artifact in self._artifacts.values()):
                 raise ValueError("The review target is unavailable or retired.")
 
             status, assignee, comment = (patch.get(key) for key in ("status", "assignee", "comment"))

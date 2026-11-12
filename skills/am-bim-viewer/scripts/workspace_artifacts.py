@@ -11,7 +11,7 @@ import stat
 import sys
 from uuid import uuid4
 
-from project_page import collect_findings, read_change_preview, read_saved_result, render_board
+from project_page import collect_findings, pair_preview_rows, read_change_preview, read_saved_result, render_board
 from workspace_review_state import canonical
 
 
@@ -119,6 +119,10 @@ def make_artifact(slot, generation, raw):
     kind = slot["kind"]
     if kind == "audit":
         data = read_saved_result(raw, ("query",), "Use a complete read-only audit result.")
+        if not isinstance(data, dict) or data.get("error"):
+            raise ValueError("Use a complete read-only audit result.")
+        keys = ("model", "timestamp", "revit_year", "metrics", "findings", "drawing_name", "source")
+        data = {key: data[key] for key in keys if key in data}
     elif kind == "preview":
         preview = read_change_preview(raw)
         keys = ("kind", "title", "keyColumn", "columns", "changedColumns", "before", "after", "notes", "warnings",
@@ -150,6 +154,16 @@ def read_slot(directory, name, slot):
 def read_published(root, slot):
     with slot_directory(root, slot) as (directory, name):
         return read_slot(directory, name, slot)
+
+
+def review_targets(slot_name, artifact):
+    kind, data = artifact["kind"], artifact["data"]
+    if kind == "board":
+        lineage = artifact["board"]["lineage"]
+        return [f"board:{lineage}:{issue['number']}" for issue in data["issues"]]
+    prefix = f"{kind}:{slot_name}:{artifact['digest']}"
+    rows = collect_findings([data]) if kind == "audit" else pair_preview_rows(data)
+    return [f"{prefix}:{index}" for index, _ in enumerate(rows)]
 
 
 def publish(root, slot, generation, raw):

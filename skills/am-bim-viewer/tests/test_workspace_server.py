@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import workspace_server as server
+from workspace_artifacts import publish
 from workspace_server import COOKIE, create_app
 
 
@@ -114,6 +115,10 @@ def test_workspace_rejects_nested_or_aliased_project_roots(tmp_path):
     alias.symlink_to(projects["other"]["root"], target_is_directory=True)
     with pytest.raises(ValueError, match="without symbolic links"):
         create_app(ORIGIN, accounts, {**projects, "other": dict(projects["other"], root=alias)})
+    collision = dict(projects["sample"], artifacts={"audit": {"kind": "audit", "path": "audit.json"}},
+                     targets=["audit:audit:retired:0"])
+    with pytest.raises(ValueError, match="target namespace"):
+        create_app(ORIGIN, accounts, {**projects, "sample": collision})
 
 
 def test_cancelled_request_keeps_worker_slot_until_storage_finishes(tmp_path, monkeypatch):
@@ -202,5 +207,79 @@ def test_project_events_only_publish_committed_revisions_to_members(tmp_path, mo
                 logout = await client.delete("/session", headers=HEADERS, cookies=editor)
                 assert logout.status == 204
                 assert (await editor_ws.receive(timeout=1)).type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
+
+    asyncio.run(exercise())
+
+
+def test_workspace_audit_updates_recover_and_cannot_regress_after_restart(tmp_path, monkeypatch):
+    accounts, projects = settings(tmp_path)
+    monkeypatch.setattr(server, "ARTIFACT_POLL_SECONDS", 0.02)
+    slot = {"kind": "audit", "path": "audit.json"}
+    root = projects["sample"]["root"]
+    projects["sample"]["artifacts"] = {"audit": slot}
+    artifact_path = root / slot["path"]
+    artifact_url = "/projects/sample/artifacts/audit"
+    first_audit = {"findings": [{"severity": "warning", "message": "Old audit"}]}
+    latest_audit = {"findings": [{"severity": "warning", "message": "Latest audit"}]}
+
+    async def login(client, actor):
+        response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+        assert response.status == 200
+        return {COOKIE: response.cookies[COOKIE].value}
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            editor, outsider = [await login(client, actor) for actor in ("editor", "outsider")]
+            denied = await client.get(artifact_url, headers=HEADERS, cookies=outsider)
+            assert denied.status == 404
+            cookie = f"{COOKIE}={editor[COOKIE]}"
+            async with client.ws_connect("/projects/sample/events", headers=dict(HEADERS, Cookie=cookie)) as socket:
+                await asyncio.to_thread(publish, root, slot, 1, first_audit)
+                assert (await socket.receive_json(timeout=2))["type"] == "artifacts"
+                first = await client.get(artifact_url, headers=HEADERS, cookies=editor)
+                first_data = await first.json()
+                assert first.status == 200 and first_data["freshness"] == "ready"
+                original_bytes = artifact_path.read_bytes()
+
+                artifact_path.write_bytes(b"{")
+                notice = await socket.receive_json(timeout=2)
+                assert notice["type"] == "artifacts"
+                stale = await client.get(artifact_url, headers=HEADERS, cookies=editor)
+                assert await stale.json() == dict(first_data, freshness="stale")
+                blocked = await client.patch(REVIEW, headers=dict(HEADERS, **{"If-Match": notice["etag"]}), cookies=editor,
+                                             json={"target": first_data["targets"][0], "operation_id": "operation-0000001",
+                                                   "patch": {"comment": "Outdated"}})
+                assert blocked.status == 400
+
+                artifact_path.write_bytes(original_bytes)
+                assert (await socket.receive_json(timeout=2))["type"] == "artifacts"
+                recovered = await client.get(artifact_url, headers=HEADERS, cookies=editor)
+                assert await recovered.json() == first_data
+                await asyncio.to_thread(publish, root, slot, 2, latest_audit)
+                notice = await socket.receive_json(timeout=2)
+                newest = await client.get(artifact_url, headers=HEADERS, cookies=editor)
+                newest_data = await newest.json()
+                assert newest_data["generation"] == 2 and newest_data["data"] == latest_audit
+                assert newest_data["targets"] != first_data["targets"]
+                change = await client.patch(REVIEW, headers=dict(HEADERS, **{"If-Match": notice["etag"]}), cookies=editor,
+                                            json={"target": newest_data["targets"][0], "operation_id": "operation-0000002",
+                                                  "patch": {"comment": "Review this result."}})
+                assert change.status == 200
+                latest_bytes = artifact_path.read_bytes()
+
+        for invalid in (b"{", original_bytes):
+            artifact_path.write_bytes(invalid)
+            async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as restarted:
+                editor = await login(restarted, "editor")
+                unavailable = await restarted.get(artifact_url, headers=HEADERS, cookies=editor)
+                assert unavailable.status == 503 and await unavailable.json() == {"freshness": "unavailable"}
+                review = await restarted.get(REVIEW, headers=HEADERS, cookies=editor)
+                notes = (await review.json())["annotations"][newest_data["targets"][0]]["comments"]
+                assert notes[0]["text"] == "Review this result."
+        artifact_path.write_bytes(latest_bytes)
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as restarted:
+            editor = await login(restarted, "editor")
+            restored = await restarted.get(artifact_url, headers=HEADERS, cookies=editor)
+            assert restored.status == 200 and await restored.json() == newest_data
 
     asyncio.run(exercise())

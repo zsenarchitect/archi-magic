@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
+from workspace_artifacts import board_binding, read_published, review_targets, slot_path
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
 
 
@@ -30,6 +31,7 @@ MAX_PROJECT_SOCKETS = 10
 MAX_SOCKET_BYTES = 1024
 SOCKET_HEARTBEAT = 20
 SOCKET_WRITE_TIMEOUT = 2
+ARTIFACT_POLL_SECONDS = 2
 SECURITY_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
                     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"}
 LOG = logging.getLogger(__name__)
@@ -72,6 +74,7 @@ class Workspace:
             raise ValueError("Configure at least one project.")
         self.account_by_digest = {digest: actor for actor, digest in accounts.items()}
         self.projects = {}
+        self.artifact_slots = {}
         roots = []
         for slug, config in projects.items():
             path = Path(config["root"])
@@ -82,12 +85,30 @@ class Workspace:
             if set(config["members"]) - set(accounts):
                 raise ValueError("Project membership requires a configured account.")
             roots.append(root)
-            self.projects[slug] = ReviewState(root, slug, config["members"], config["targets"])
+            self.projects[slug] = ReviewState(root, slug, config["members"], config.get("targets", []))
+            slots = config.get("artifacts", {})
+            if not isinstance(slots, dict) or any(
+                    not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None
+                    or not isinstance(slot, dict) or slot.get("kind") not in ("audit", "preview", "board")
+                    for name, slot in slots.items()):
+                raise ValueError("Configure named audit, preview or board artifact slots.")
+            paths = [slot_path(slot) for slot in slots.values()]
+            if len(set(paths)) != len(paths):
+                raise ValueError("Each artifact slot requires a different file.")
+            lineages = [board_binding(slot)["lineage"] for slot in slots.values() if slot["kind"] == "board"]
+            if len(set(lineages)) != len(lineages):
+                raise ValueError("Each board slot requires a separate lineage.")
+            namespaces = tuple([f"board:{lineage}:" for lineage in lineages] + [
+                f"{slot['kind']}:{name}:" for name, slot in slots.items() if slot["kind"] != "board"])
+            if any(not isinstance(target, str) or target.startswith(namespaces) for target in self.projects[slug].targets):
+                raise ValueError("Explicit targets cannot overlap a published artifact's target namespace.")
+            self.artifact_slots[slug] = slots
         self.sessions = {}
         self.login_attempts = deque()
         self.workers = set()
         self.sockets = {}
         self.last_notified = {}
+        self.watchers = {}
 
     async def lifecycle(self, _app):
         with ExitStack() as states:
@@ -204,16 +225,56 @@ class Workspace:
 
     def notify_review(self, project, outcome):
         receipt, committed = outcome
-        if not committed:
+        if committed:
+            self.notify(project, "review", receipt["etag"])
+
+    def notify(self, project, kind, etag):
+        if etag is None:
             return
-        etag = receipt["etag"]
         revision = int(etag[:-1].rsplit("-", 1)[1])
         if revision <= self.last_notified.get(project, 0):
             return
         self.last_notified[project] = revision
         for subscriber in self.sockets.values():
             if subscriber.project == project:
-                subscriber.replace_pending({"type": "review", "etag": etag})
+                subscriber.replace_pending({"type": kind, "etag": etag})
+
+    @staticmethod
+    def load_artifact(root, name, slot):
+        try:
+            artifact = read_published(root, slot)
+            return artifact, review_targets(name, artifact)
+        except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError):
+            return None, []
+
+    async def refresh_artifacts(self, project):
+        slots = self.artifact_slots[project.project]
+        if slots:
+            await self.storage(project.refresh_artifacts, slots, self.load_artifact,
+                               on_success=lambda etag: self.notify(project.project, "artifacts", etag))
+
+    async def watch_artifacts(self, project):
+        while True:
+            try:
+                await self.refresh_artifacts(project)
+            except web.HTTPServiceUnavailable:
+                pass  # The worker pool is busy. The next poll retries.
+            except (OSError, ValueError) as error:
+                LOG.warning("Workspace artifacts could not be refreshed (%s)", type(error).__name__)
+            await asyncio.sleep(ARTIFACT_POLL_SECONDS)
+
+    async def read_artifact(self, request):
+        actor, project = self.project_member(request)
+        slot = request.match_info["slot"]
+        if slot not in self.artifact_slots[project.project]:
+            raise web.HTTPNotFound(text="Artifact unavailable.")
+        try:
+            await self.refresh_artifacts(project)
+            data = await self.storage(project.read_artifact, actor, slot)
+        except (OSError, ValueError) as error:
+            LOG.warning("Workspace artifact could not be read (%s)", type(error).__name__)
+            raise web.HTTPServiceUnavailable(text="Project artifact is unavailable.") from error
+        return web.json_response(data, status=503 if data["freshness"] == "unavailable" else 200)
 
     def subscription_lifetime(self, subscriber):
         session = self.sessions.get(subscriber.session)
@@ -255,6 +316,8 @@ class Workspace:
         sender = None
         try:
             await ws.prepare(request)
+            if self.artifact_slots[project.project] and project.project not in self.watchers:
+                self.watchers[project.project] = asyncio.create_task(self.watch_artifacts(project))
             sender = asyncio.create_task(self.send_updates(ws, subscriber))
             async for message in ws:
                 if message.type in (WSMsgType.TEXT, WSMsgType.BINARY):
@@ -262,12 +325,22 @@ class Workspace:
                     break
         finally:
             self.sockets.pop(ws, None)
+            if not any(item.project == project.project for item in self.sockets.values()):
+                watcher = self.watchers.pop(project.project, None)
+                if watcher is not None:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
             if sender is not None:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
         return ws
 
     async def shutdown(self, _app):
+        watchers = tuple(self.watchers.values())
+        self.watchers.clear()
+        for watcher in watchers:
+            watcher.cancel()
+        await asyncio.gather(*watchers, return_exceptions=True)
         await asyncio.gather(*(ws.close(code=WSCloseCode.GOING_AWAY) for ws in tuple(self.sockets)),
                              return_exceptions=True)
 
@@ -310,6 +383,7 @@ def create_app(origin, accounts, projects):
         web.get("/projects/{project}/review", workspace.read_review),
         web.patch("/projects/{project}/review", workspace.update_review),
         web.get("/projects/{project}/events", workspace.subscribe, allow_head=False),
+        web.get("/projects/{project}/artifacts/{slot}", workspace.read_artifact),
     ])
     return app
 
