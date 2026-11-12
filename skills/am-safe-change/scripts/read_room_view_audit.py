@@ -10,7 +10,7 @@ from pyrevit.api import DB
 import read_room_finish_boundaries as reader
 
 
-TRANSACTION = re.compile(r"\AArchi Magic room view trial [0-9a-f]{32}\Z")
+TRANSACTION = re.compile(r"\AArchi Magic room view (?:trial|replay) [0-9a-f]{32}\Z")
 TOKEN = re.compile(r"\A[0-9a-f]{32}\Z")
 MAX_ADDITIONS = 160
 MAX_CONTROL_PARAMETERS = 512

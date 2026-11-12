@@ -331,7 +331,8 @@ def audit_records(monkeypatch):
         trial["result"]["trial_json"] = json.dumps(receipt)
         return verifier.verify(before, trial, after, preview["proposal_sha256"])
 
-    return NS(verify=verify, before=before, trial=trial, after=after, receipt=receipt, additions=additions)
+    return NS(verify=verify, before=before, trial=trial, after=after, receipt=receipt, additions=additions,
+              approved=preview["proposal_sha256"])
 
 
 def test_independent_verifier_proves_exact_rollback(audit_records):
@@ -436,3 +437,77 @@ def test_kept_readback_blocks_changes_outside_reviewed_scope(kept_reader, change
     change(kept_reader)
     with pytest.raises(ValueError, match=reason):
         kept_reader.run()
+
+
+@pytest.fixture
+def replay_records(audit_records):
+    from verify_room_view_decision import verify
+
+    audit_records.verify()
+    replay = deepcopy(audit_records.receipt)
+    name = "Archi Magic room view replay " + "d" * 32
+    replay.update(status="awaiting_bridge_decision", transaction=name)
+    additions = []
+    for row in replay["views"]:
+        for key in ("view", "marker"):
+            if key in row:
+                identity = row[key]
+                identity["id"] = str(int(identity["id"]) + 100)
+                identity["uid"] += "-replayed"
+                additions.append(identity)
+    additions.sort(key=lambda item: int(item["id"]))
+    ids = [item["id"] for item in additions]
+    replay["effects"] = [{"operation": "TransactionCommitted", "added": ids, "modified": [], "deleted": []}]
+    modify = deepcopy(audit_records.trial)
+    modify.update(mode="modify", run_id="modify", approval="user", decision="committed",
+                  result={"status": "awaiting_bridge_decision"})
+    modify["changes"].update(transactions=[name], added=[{"id": int(item)} for item in ids],
+                             added_count=len(ids), by_category={"Views": len(ids)})
+    fresh = deepcopy(audit_records.before)
+    fresh["run_id"] = "fresh"
+    kept = {"status": "kept_room_views_read", "audit_token": "e" * 32,
+            "proposal_sha256": audit_records.approved, "fixture_settings": replay["fixture_settings"],
+            "baseline_inventory_sha256": replay["baseline_audit"]["inventory_sha256"],
+            "persisted_inventory_sha256": "f" * 64,
+            "views": deepcopy(replay["views"])}
+    discard = dict(audit_records.before["result"], audit_token="e" * 32,
+                   trial_transaction=name, confirmed_absent=deepcopy(additions))
+
+    def execute(keep=True):
+        modify["result"]["replay_json"] = json.dumps(replay)
+        if keep:
+            fresh["result"] = {"status": kept["status"], "kept_json": json.dumps(kept)}
+        else:
+            modify.update(decision="discarded", status="rejected")
+            fresh["result"] = discard
+        return verify(audit_records.before, audit_records.trial, audit_records.after,
+                      modify, fresh, audit_records.approved)
+
+    return NS(run=execute, modify=modify, fresh=fresh, replay=replay, kept=kept, discard=discard)
+
+
+@pytest.mark.parametrize(("keep", "decision"), [(True, "committed"), (False, "discarded")])
+def test_replay_verifies_user_decision_and_independent_state(replay_records, keep, decision):
+    result = replay_records.run(keep)
+    assert result["status"] == "verified_room_view_" + decision
+    assert result["replay_run_id"] == "modify"
+    assert result["readback_run_id"] == "fresh"
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (lambda data: data.modify.update(approval="auto"), "native user Keep or Discard"),
+    (lambda data: data.modify["changes"]["added"].pop(), "every addition"),
+    (lambda data: data.fresh.update(run_id="after"), "must be independent"),
+    (lambda data: data.replay["views"][0].update(marker_point=[5, 3, 5]), "marker_point"),
+    (lambda data: data.kept["views"][0]["view"].update(uid="other"), "all replay additions persisted"),
+])
+def test_replay_rejects_mismatched_or_unapproved_results(replay_records, change, reason):
+    change(replay_records)
+    with pytest.raises(ValueError, match=reason):
+        replay_records.run()
+
+
+def test_replay_discard_needs_exact_absence_and_restoration(replay_records):
+    replay_records.discard["confirmed_absent"].pop()
+    with pytest.raises(ValueError, match="does not prove the reviewed model was restored"):
+        replay_records.run(keep=False)
