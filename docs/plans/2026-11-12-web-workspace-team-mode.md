@@ -25,4 +25,9 @@ The workspace files at `c5944755de6a9ea9ee4939d1e5fc50073d0cc254` passed a local
 
 Two authenticated clients concurrently downloaded the same 166,245,765-byte sandboxed viewer from a synthetic publication of 5,000 elements and 1,500,000 triangles. Both responses had the same SHA-256, `b6db199f4106dd30eb02deb8890895f8f5b976f68944a5ea71cd7ed060760285`, and included the private no-store and offline viewer CSP headers. After warming the route, the proxy and app refused anonymous access, access by an authenticated member of the other project, and a forged Host. WebSocket upgrades were refused for anonymous and cross-project clients and a member using the wrong Origin. Two authorized sockets received the same new publication after 78.2 seconds without an application event. The BIM viewer Python suite passed 42 tests.
 
-The proxy run used two independent HTTP clients and synthetic data. Native Revit audit and preview evidence, office-host configuration and readback, and the exact 256 MiB capacity boundary remain pending.
+The proxy run used two independent HTTP clients and synthetic data. Native Revit audit and preview evidence and office-host configuration and readback remain pending.
+
+
+### Exact publication and viewer byte limits
+
+Using the same workspace code and loopback Apache configuration, a valid small model with synthetic ASCII padding exercised the exact limits. The normal publisher accepted a 268,435,456-byte publication. It rejected a 268,435,457-byte replacement and the normal publication reader confirmed that the prior generation and digest were still current. The offline builder rejected a 268,435,457-byte viewer. Two concurrent authorized requests each streamed the exact 268,435,456-byte viewer through Apache, both with SHA-256 `bba2b8ef54445329aebe58cdc0958f73b58bff3e0793f8bfd919026e12806c28`. Protected HTTP and WebSocket routes continued to reject unauthenticated clients, cross-project clients and invalid Host or Origin values as applicable. These are byte-boundary tests. The separate 5,000-element fixture above exercises geometry capacity.
