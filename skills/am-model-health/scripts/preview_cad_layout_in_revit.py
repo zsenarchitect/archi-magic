@@ -51,11 +51,16 @@ def placement_choices(proposal, request):
             raise ValueError("Choose whether each proposed wall bounds rooms.")
         height = number(entry["height_mm"], 0.1, 30000 * MM_PER_FOOT)
         walls[identifier] = {"height_mm": height, "room_bounding": entry["room_bounding"]}
+    hosts = {door["source_ids"][0]: door["host"] for door in proposal["doors"]}
     for identifier, entry in door_choices.items():
-        fields(entry, "hand_flipped facing_flipped")
-        if any(type(value) is not bool for value in entry.values()):
+        fields(entry, "hand_flipped facing_flipped cut_probe_height_mm")
+        if any(type(entry[key]) is not bool for key in ("hand_flipped", "facing_flipped")):
             raise ValueError("Supply explicit Boolean door hand and facing flip states.")
-        doors[identifier] = dict(entry)
+        height = number(entry["cut_probe_height_mm"], 0, walls[hosts[identifier]]["height_mm"])
+        tolerance = proposal["tolerance_mm"]
+        if not tolerance < height < walls[hosts[identifier]]["height_mm"] - tolerance:
+            raise ValueError("The door cut probe height must be inside the host wall height.")
+        doors[identifier] = {**entry, "cut_probe_height_mm": height}
     return walls, doors
 
 

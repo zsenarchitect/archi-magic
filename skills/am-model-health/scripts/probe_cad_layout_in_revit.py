@@ -8,6 +8,7 @@ from uuid import uuid4
 from pyrevit.api import DB
 
 from cad_layout_preview import edges, fields, inside, point_distance
+from measure_cad_wall_openings import measure_walls_and_doors
 from preview_cad_layout_in_revit import read_preview
 from read_cad_room_boundaries import read_room, xyz_mm
 from read_linked_cad_layout import MM_PER_FOOT, element_id
@@ -241,7 +242,9 @@ def create_probe_geometry(document, preview, created):
     walls = wall_and_door_probe(document, preview, level, phase, created, deadline)
     if preview["proposal"]["rooms"]:
         room_probe(document, preview["proposal"], walls, level, phase, created, deadline)
+    measurements = measure_walls_and_doors(preview, walls, deadline)
     check_time(deadline)
+    return measurements
 
 
 def probe(document, request):
@@ -267,7 +270,7 @@ def probe(document, request):
         guard = install_failure_guard(transaction)
         if guard is None:
             raise ValueError("The rollback failure guard is unavailable.")
-        create_probe_geometry(document, preview, created)
+        measurements = create_probe_geometry(document, preview, created)
     except Exception as error:
         failure = {"error_type": type(error).__name__}
         if type(error) is ValueError:
@@ -288,7 +291,8 @@ def probe(document, request):
     if failure:
         return {"status": "stopped", "rollback_verified": True, **failure}
     return {"status": "probe_rolled_back", "rollback_verified": True,
-            "preview_sha256": baseline["preview_sha256"], "transient_element_count": len(created)}
+            "preview_sha256": baseline["preview_sha256"], "transient_element_count": len(created),
+            "measurements": measurements}
 
 
 if "inputs" in globals():

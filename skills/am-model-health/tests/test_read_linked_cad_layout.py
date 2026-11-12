@@ -245,6 +245,7 @@ def linked_dwg(monkeypatch):
     monkeypatch.delitem(sys.modules, "cad_layout_provenance", raising=False)
     monkeypatch.delitem(sys.modules, "preview_cad_layout_in_revit", raising=False)
     monkeypatch.delitem(sys.modules, "probe_cad_layout_in_revit", raising=False)
+    monkeypatch.delitem(sys.modules, "measure_cad_wall_openings", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
@@ -286,7 +287,7 @@ def placement_request(linked_dwg, room_edge_y=200):
     source["expected_evidence_sha256"] = read(document, source)["evidence_sha256"]
     return {"source": source, "view_id": "93", "phase_id": "95",
             "walls": {"wall-1": {"height_mm": 3000, "room_bounding": True}},
-            "doors": {"dwg-1.1.3": {"hand_flipped": True, "facing_flipped": False}}}
+            "doors": {"dwg-1.1.3": {"hand_flipped": True, "facing_flipped": False, "cut_probe_height_mm": 1000}}}
 
 
 def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_dwg):
@@ -299,7 +300,8 @@ def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_d
     assert preview["model_write_approved"] is False
     assert preview["view"]["phase_uid"] == "phase-id"
     assert preview["wall_choices"]["wall-1"]["height_mm"] == 3000
-    assert preview["door_choices"]["dwg-1.1.3"] == {"hand_flipped": True, "facing_flipped": False}
+    assert preview["door_choices"]["dwg-1.1.3"] == {
+        "hand_flipped": True, "facing_flipped": False, "cut_probe_height_mm": 1000}
     room, = preview["proposal"]["rooms"]
     assert [item["kind"] for item in room["boundary_edges"]].count("wall_face") == 1
     assert preview.pop("existing_model_scan")["status"] == "none_found"
@@ -637,6 +639,53 @@ def test_native_wall_and_door_probe_passes_exact_types_host_and_choices(linked_d
     assert walls["wall-1"] is calls[0] and [item.Value for item in created] == [110, 111]
     assert calls[0].values["WALL_ATTR_ROOM_BOUNDING"] == 1 and calls[0].joins == [False, False]
     assert calls[1].HandFlipped and not calls[1].FacingFlipped
+
+
+def test_probe_measures_wall_faces_and_rejects_shifted_plane(linked_dwg):
+    document = linked_dwg[0]
+    db = document.db
+    measure = import_module("measure_cad_wall_openings")
+
+    class PlanarFace(Record):
+        pass
+
+    db.PlanarFace = PlanarFace
+    db.ShellLayerType = Record(Interior="inside", Exterior="outside")
+    db.HostObjectUtils = Record(GetSideFaces=lambda wall, side: [side])
+    faces = {"inside": PlanarFace(Origin=db.XYZ(0, 100 / 304.8, 0), FaceNormal=db.XYZ(0, 1, 0)),
+             "outside": PlanarFace(Origin=db.XYZ(0, -100 / 304.8, 0), FaceNormal=db.XYZ(0, -1, 0))}
+    wall = Record(GetGeometryObjectFromReference=faces.__getitem__)
+    axis = [(0, 0), (4000, 0)]
+    assert measure.wall_faces(wall, axis, 200, 3000, 3000, 1) == [[-100], [100]]
+    faces["inside"].Origin = db.XYZ(0, 105 / 304.8, 0)
+    with pytest.raises(ValueError, match="wall width or axis"):
+        measure.wall_faces(wall, axis, 200, 3000, 3000, 1)
+
+
+def test_probe_requires_a_physical_door_cut_at_three_wall_depths(linked_dwg):
+    document = linked_dwg[0]
+    db = document.db
+    measure = import_module("measure_cad_wall_openings")
+    wall = {"axis": [(0, 0), (4000, 0)], "width_mm": 200}
+    door = {"span_mm": (1500, 2400)}
+    laterals = []
+    cut = True
+
+    def intersections(line, _options):
+        assert line.start.Z * 304.8 == pytest.approx(4000)
+        laterals.append(line.start.Y * 304.8)
+        spans = [(1450, 1500), (2400, 2450)] if cut else [(1450, 2450)]
+        segments = [Record(GetEndPoint=lambda end, span=span: db.XYZ(
+            span[end] / 304.8, line.start.Y, line.start.Z), Dispose=lambda: None) for span in spans]
+        return Record(SegmentCount=len(segments), GetCurveSegment=segments.__getitem__, Dispose=lambda: None)
+
+    solid = Record(IntersectWithCurve=intersections)
+    samples = measure.door_cut(wall, [solid], door, [door], 4000, 1, None, monotonic() + 5, [10])
+    assert [row["span_mm"] for row in samples] == [[1500, 2400]] * 3
+    assert laterals == pytest.approx([-75, 0, 75])
+    cut = False
+    with pytest.raises(ValueError, match="does not have the reviewed door cut"):
+        measure.door_cut(wall, [solid], door, [door], 4000, 1, None, monotonic() + 5, [10])
 
 
 @pytest.mark.parametrize("change,reason", [
