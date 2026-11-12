@@ -7,19 +7,20 @@
   Exit 0 = all cases pass.
 #>
 $ErrorActionPreference = 'Stop'
+$HostExe = (Get-Process -Id $PID).Path
 $Hook = (Resolve-Path (Join-Path $PSScriptRoot '..\session-end-feedback.ps1')).Path
 $Root = Join-Path ([IO.Path]::GetTempPath()) ("am-session-end-feedback-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $script:Fail = 0; $script:Asserts = 0
 
 function Invoke-Hook([string]$transcript, [string]$feedback, [string[]]$extra = @()) {
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Hook -TranscriptPath $transcript -FeedbackFile $feedback @extra 2>&1 | Out-String
+    $out = & $HostExe -NoProfile -ExecutionPolicy Bypass -File $Hook -TranscriptPath $transcript -FeedbackFile $feedback @extra 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 function Invoke-HookJson([string]$json, [string]$feedback) {
     # Call the hook the way hooks/hooks.json does: hook JSON on stdin, script called in-process.
     # Passing the JSON as a native argument loses its double quotes under Windows PowerShell 5.1 (#67).
     $cmd = "`$in = [Console]::In.ReadToEnd(); & '$Hook' -HookInputJson `$in -FeedbackFile '$feedback'; exit `$LASTEXITCODE"
-    $out = $json | & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
+    $out = $json | & $HostExe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 function Assert-True([string]$name, [bool]$ok, [string]$detail) {
@@ -138,6 +139,22 @@ try {
     $r = Invoke-Hook $t $f @('-TailBytes', '100')
     $n = Read-Note $f
     Assert-True 'tail window: tail signal seen' ($n -and $n.signals -contains 'pipe_error') ''
+
+    $t = Write-Transcript 'activity.jsonl' @(
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"mcp__pyrevit__run_modify","input":{"model":"Private project"}}]}}',
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","is_error":true,"content":"revit_busy"}]}}'
+    )
+    $f = Join-Path $Root 'activity.json'
+    $r = Invoke-Hook $t $f
+    $n = Read-Note $f
+    Assert-True 'activity: failing tool is captured without its input' (
+        $n.activity -eq 'revit_modify' -and $n.body -notmatch 'Private project'
+    ) $r.Out
+
+    $t = Write-Transcript 'prior-note.jsonl' @('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"note_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, revit_busy"}]}}')
+    $f = Join-Path $Root 'prior-note.json'
+    $r = Invoke-Hook $t $f
+    Assert-True 'reading saved feedback does not create a new note' (-not (Test-Path -LiteralPath $f)) $r.Out
 
     # 12. A note is logged.
     Assert-True 'note saved: logged' ((Get-LogText) -match '"step":"session-end-feedback","level":"info"') (Get-LogText)
