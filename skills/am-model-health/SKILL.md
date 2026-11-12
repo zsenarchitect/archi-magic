@@ -253,7 +253,14 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 1. Use `batch_family_export.py reserve --derivation derivation.json --decision decision.json --destination <private-parent>`. Save the returned workspace and exact Save As path.
 2. After all transactions and groups close, use Revit Save As outside the guarded script. Save only to the reserved path. Close the exported file.
 3. Set `ARCHI_MAGIC_FAMILY_EXPORT_DIR` to the reserved workspace. Run `pyrevit run scripts/batch_family_export.py --revit=2026` in the qualified disposable CPython worker with no model arguments. Wait for the host to exit.
-4. Run `batch_family_export.py collect --workspace <workspace> --staging staging.json`. The receipt verifies the reopened types, exact RFA bytes, and companion absence. Project loading still requires a separate reviewed workflow.
+4. Run `batch_family_export.py collect --workspace <workspace> --staging staging.json`. The receipt verifies the reopened types, exact RFA bytes, and companion absence.
+
+### Review and trial the project batch load
+
+1. Run `batch_family_load_preview.py --lookup lookup.json --project-read project.json --staging staging.json`. Pass each verified workspace with `--export`. Review the exact export hashes, requested types, and skipped types.
+2. Call `get_context`. Confirm the same saved disposable project and loaded build. Obtain approval for the rollback-only trial.
+3. Run `probe_batch_family_load.py` in guarded CPython dry-run mode. Pass `disposable_fixture: true`, `lookup`, `staging`, `preview`, and its `preview_sha256`. Save the full bridge record.
+4. Check the exact new family and type IDs, preserved existing elements, and rollback result. Keep remains unavailable until the native trial and final approval path are qualified.
 
 ## Preview a CAD layout (issue #166)
 

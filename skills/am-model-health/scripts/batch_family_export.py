@@ -118,7 +118,8 @@ def reopen_export(ui, raw_workspace, runtime):
     return receipt
 
 
-def collect_export(raw_workspace, staging):
+@contextmanager
+def verified_export(raw_workspace, staging):
     workspace = root_path(raw_workspace)
     with pinned_root(workspace) as parent:
         request = read_request(parent)
@@ -143,10 +144,15 @@ def collect_export(raw_workspace, staging):
         if (live["root_identity"] != plan["root_identity"]
                 or [row for row in live["files"] if row["path"] == source["path"]] != [source]):
             raise ValueError("The reviewed original family or catalog changed.")
-        with staged_pair(staging, source["path"]) as (_, pair), pinned_export(parent, workspace, request) as (_, rfa):
+        with staged_pair(staging, source["path"]) as (_, pair), pinned_export(parent, workspace, request) as (path, rfa):
             if (pair["rfa"], pair["catalog"]) != (source["rfa"], source["catalog"]) or rfa != receipt["rfa"]:
                 raise ValueError("The staged inputs or derived RFA changed after verification.")
-    return receipt
+            yield path, receipt, plan
+
+
+def collect_export(raw_workspace, staging):
+    with verified_export(raw_workspace, staging) as (_, receipt, _):
+        return receipt
 
 
 def main():

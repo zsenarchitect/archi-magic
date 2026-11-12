@@ -89,9 +89,9 @@ def classify_row(row, matches, build, DB):
     return result
 
 
-def read_project(document, DB, lookup):
+def read_project(document, DB, lookup, *, require_unmodified=True):
     validate_record(lookup, "batch-family-type-lookup", "lookup_sha256")
-    project = saved_project_identity(document)
+    project = saved_project_identity(document, require_unmodified)
     year = str(document.Application.VersionNumber)
     if year != "2026":
         raise ValueError("Use a saved project in the qualified Revit 2026 build.")

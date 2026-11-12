@@ -475,6 +475,16 @@ def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, f
         receipt = exporter.reopen_export(ui, export["workspace"], "pyrevit-fixture")
         assert documents == []
         assert exporter.collect_export(export["workspace"], staging) == receipt
+
+        from batch_family_load_preview import build_load_preview
+        lookup, project_read, _, _, _, _ = derivation_input
+        load_preview = build_load_preview(lookup, project_read, staging, [export["workspace"]])
+        assert load_preview["review"]["exports"][0]["receipt"] == receipt
+        assert load_preview["after"][0][5] == "Load exact new type"
+        project_read["rows"][0]["existing"] = {"family_id": "40", "symbol_id": "41"}
+        skip_preview = build_load_preview(lookup, project_read, staging, [])
+        assert skip_preview["review"]["exports"] == [] and skip_preview["blocked"] is False
+        assert skip_preview["review"]["skipped"][0]["existing"]["symbol_id"] == "41"
         file.with_suffix(".txt").write_bytes(b"unexpected companion")
         with pytest.raises(ValueError, match="unexpected files"):
             exporter.collect_export(export["workspace"], staging)
