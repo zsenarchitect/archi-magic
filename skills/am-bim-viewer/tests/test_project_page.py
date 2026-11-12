@@ -84,6 +84,25 @@ def test_page_has_no_network_and_cli_works(tmp_path):
     assert "default-src 'none'" in page
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
+def test_project_page_accepts_windows_json_exports(tmp_path, encoding):
+    audit = tmp_path / "audit.json"
+    preview = tmp_path / "preview.json"
+    output = tmp_path / "project.html"
+    audit.write_text(json.dumps(AUDIT), encoding=encoding)
+    preview.write_text(json.dumps(PREVIEW), encoding=encoding)
+
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"),
+        "--audit", audit, "--preview", preview, "--out", output,
+    ], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    page = output.read_text(encoding="utf-8")
+    assert "<td>R2</td>" in page
+    assert "<del>A1</del>" in page
+
+
 def test_preview_pairs_reordered_rows_and_shows_additions_and_removals():
     preview = {
         "columns": ["Description", "ElementId"],
