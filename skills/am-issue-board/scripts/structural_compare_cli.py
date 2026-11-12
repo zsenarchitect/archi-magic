@@ -216,8 +216,9 @@ def board_preview(path, archive, snapshot, compared):
                 description = "Sampled envelope center shift %.3f mm." % item["center_shift_mm"]
             elif finding == "envelope_extent":
                 description = "Sampled envelope extent deltas %.3f, %.3f, %.3f mm." % tuple(item["extent_delta_mm"])
+            elements = "Host element %s. Linked element %s." % (item["host"] or "missing", item["link"] or "missing")
             issue = {"title": "Structural " + item["category"] + " " + titles[finding],
-                     "status": "OPEN", "findings": [MARKER + key, description]}
+                     "status": "OPEN", "findings": [MARKER + key, description, elements]}
             ops.append({"op": "add", "issue": issue})
     if not ops:
         return None, skipped
