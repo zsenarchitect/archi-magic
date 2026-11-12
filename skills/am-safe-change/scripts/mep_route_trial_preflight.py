@@ -121,6 +121,29 @@ def prepare(document, args, reader=None):
     }
 
 
+def expected_bridge_changes(changes, rollback_events):
+    """Apply the inspected pyRevit change recorder's set operations to the native events."""
+    if not isinstance(rollback_events, list) or len(rollback_events) > 8:
+        raise ValueError("The rollback event inventory is incomplete or outside its bound.")
+    added = set(changes["added"])
+    original_modified = set(changes["modified"])
+    modified = set(original_modified)
+    for event in rollback_events:
+        if (set(event) != {"operation", "transactions", "added", "modified", "deleted"}
+                or event["operation"] not in ("TransactionRolledBack", "TransactionGroupRolledBack")
+                or event["transactions"] not in ([], [TRANSACTION_NAME]) or event["added"] != []):
+            raise ValueError("The route rollback reported an unexpected event.")
+        removed, touched = set(event["deleted"]), set(event["modified"])
+        if (event["deleted"] != sorted(removed, key=int) or event["modified"] != sorted(touched, key=int)
+                or not removed.issubset(added) or touched & removed
+                or not touched.issubset((added - removed) | original_modified)):
+            raise ValueError("The route rollback event reported unexpected element identities.")
+        added.difference_update(removed)
+        modified.difference_update(removed)
+        modified.update(touched - added)
+    return {"added": sorted(added, key=int), "modified": sorted(modified, key=int), "deleted": []}
+
+
 def verify_trial(original_record, trial_record, fresh_record):
     original = checked_record(original_record, "query")
     trial = checked_record(trial_record, "dry_run")
@@ -145,8 +168,10 @@ def verify_trial(original_record, trial_record, fresh_record):
             or changes["modified"] != baseline["owner_ids"] or changes["deleted"]
             or fresh["result"].get("confirmed_absent_ids") != expected):
         raise ValueError("The complete change list and independent absence check disagree.")
-    checked_changes(trial, changes["modified"], changes["added"], TRANSACTION_NAME)
+    bridge = expected_bridge_changes(changes, receipt["rollback_events"])
+    checked_changes(trial, bridge["modified"], bridge["added"], TRANSACTION_NAME)
     return {"status": "verified_mep_route_trial_rollback", "preflight": baseline, "changes": changes,
+            "bridge_changes": bridge,
             "original_run_id": original["run_id"], "trial_run_id": trial["run_id"], "fresh_run_id": fresh["run_id"]}
 
 

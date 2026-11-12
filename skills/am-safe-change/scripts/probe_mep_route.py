@@ -252,7 +252,7 @@ def run(document, args, reader=None):
     types = args["types_record"]["types"]
     clock = Stopwatch.StartNew()
     budget = {"connectors_visited": 0}
-    created, observed, events = set(), set(), []
+    created, observed, events, rollback_events = set(), set(), [], []
     untrusted = False
     rolling_back = False
 
@@ -271,8 +271,13 @@ def run(document, args, reader=None):
                     break
                 observed.add(str(item.Value))
             if rolling_back and op in ("TransactionRolledBack", "TransactionGroupRolledBack"):
-                if added.Count:
+                modified, deleted = event.GetModifiedElementIds(), event.GetDeletedElementIds()
+                if added.Count or modified.Count > MAX_ADDITIONS + 2 or deleted.Count > MAX_ADDITIONS or len(rollback_events) >= 8:
                     untrusted = True
+                    return
+                rollback_events.append({"operation": op, "transactions": list(event.GetTransactionNames()),
+                                        "added": [], "modified": sorted((str(item.Value) for item in modified), key=int),
+                                        "deleted": sorted((str(item.Value) for item in deleted), key=int)})
                 return
             modified, deleted = event.GetModifiedElementIds(), event.GetDeletedElementIds()
             if modified.Count > 2 or deleted.Count:
@@ -303,10 +308,6 @@ def run(document, args, reader=None):
             raise ValueError("Revit changed elements outside the reviewed route.")
         measurements = verify_route(document, reader, route, types, original, data, placed, created, clock, budget)
         receipt = {"preflight": accepted, "changes": changes, "measurements": measurements}
-        encoded = json.dumps(receipt, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-        envelope = json.dumps({"status": "mep_route_trial_rolled_back", "receipt": receipt}, ensure_ascii=True)
-        if len(encoded) > 512 * 1024 or len(envelope) > 1024 * 1024:
-            raise ValueError("The measured route receipt exceeds its size limit.")
     except RegenerationFailedException:
         regeneration_failed = True
         failure = "Revit regeneration failed. Independently reconcile the fixture before retrying."
@@ -337,6 +338,13 @@ def run(document, args, reader=None):
             raise ValueError("Revit still resolves a trial addition after rollback.")
         if preflight.prepare(document, args, reader) != accepted:
             raise ValueError("The route baseline differs after rollback.")
+        if receipt is not None:
+            receipt["rollback_events"] = rollback_events
+            preflight.expected_bridge_changes(receipt["changes"], rollback_events)
+            encoded = json.dumps(receipt, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            envelope = json.dumps({"status": "mep_route_trial_rolled_back", "receipt": receipt}, ensure_ascii=True)
+            if len(encoded) > 512 * 1024 or len(envelope) > 1024 * 1024:
+                raise ValueError("The measured route receipt exceeds its size limit.")
     except Exception as error:
         return {"status": "transaction_unresolved", "observed_additions": ids, "message": str(error)}
     if failure is not None:

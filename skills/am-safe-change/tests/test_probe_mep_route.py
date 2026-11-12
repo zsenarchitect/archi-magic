@@ -49,7 +49,8 @@ def native(monkeypatch):
 
 
 @pytest.mark.parametrize("fault, expected", [
-    (None, "mep_route_trial_rolled_back"), ("wrong_review", "stopped"),
+    (None, "mep_route_trial_rolled_back"), ("netted", "mep_route_trial_rolled_back"),
+    ("wrong_review", "stopped"),
     ("added", "stopped_and_rolled_back"), ("pending", "transaction_unresolved"),
     ("regen", "transaction_unresolved"), ("envelope", "stopped_and_rolled_back"),
     ("foreign", "transaction_unresolved"), ("survives", "transaction_unresolved"),
@@ -88,6 +89,12 @@ def test_route_trial_uses_live_review_and_rolls_back(native, monkeypatch, fault,
         def RollBack(self):
             actions.append("group_rollback")
             self.state = "RolledBack"
+            if fault == "netted":
+                event = NS(Operation="TransactionGroupRolledBack", GetDocument=lambda: document,
+                           GetTransactionNames=lambda: [module["TRANSACTION_NAME"]],
+                           GetAddedElementIds=Collection, GetModifiedElementIds=Collection,
+                           GetDeletedElementIds=lambda: Collection([NS(Value=20)]))
+                document.Application.DocumentChanged.callback(None, event)
             if fault != "survives":
                 objects.clear()
             return self.state
@@ -149,6 +156,8 @@ def test_route_trial_uses_live_review_and_rolls_back(native, monkeypatch, fault,
     if fault is None:
         assert result["receipt"]["changes"] == {"added": ["20"], "modified": ["10", "11"], "deleted": []}
         assert actions[-2:] == [("resolve", "20"), "preflight"]
+    if fault == "netted":
+        assert result["receipt"]["rollback_events"][0]["deleted"] == ["20"]
     if fault == "added":
         assert result["observed_additions"] == ["20", "21"]
         assert "measure" not in actions

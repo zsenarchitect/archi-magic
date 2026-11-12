@@ -140,7 +140,7 @@ def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(revi
     query = {"status": "ok", "preflight_json": json.dumps(baseline)}
     changes = {"added": ["63"], "modified": ["41", "42"], "deleted": []}
     measured = {"status": "mep_route_trial_rolled_back", "receipt": {
-        "preflight": baseline, "changes": changes, "measurements": [{"id": "63"}],
+        "preflight": baseline, "changes": changes, "measurements": [{"id": "63"}], "rollback_events": [],
     }}
     original = fixture_record("a00000000001", "query", query)
     trial = fixture_record("a00000000002", "dry_run", measured, changes)
@@ -163,3 +163,18 @@ def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(revi
     truncated["changes"]["added"] = []
     assert verify([original, truncated, fresh]).returncode == 2
     assert verify([original, trial, dict(fresh, run_id=original["run_id"])]).returncode == 2
+
+    netted = deepcopy(measured)
+    netted["receipt"]["rollback_events"] = [{
+        "operation": "TransactionGroupRolledBack", "transactions": [TRANSACTION_NAME],
+        "added": [], "modified": ["41", "42"], "deleted": ["63"],
+    }]
+    net = dict(changes, added=[])
+    netted_trial = fixture_record("a00000000002", "dry_run", netted, net)
+    netted_trial["changes"]["transactions"] = [TRANSACTION_NAME]
+    accepted = verify([original, netted_trial, fresh])
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["bridge_changes"] == net
+    netted["receipt"]["rollback_events"][0]["deleted"] = ["64"]
+    unexpected = verify([original, netted_trial, fresh])
+    assert unexpected.returncode == 2 and "unexpected element identities" in unexpected.stderr
