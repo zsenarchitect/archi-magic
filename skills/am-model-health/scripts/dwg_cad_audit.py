@@ -138,14 +138,14 @@ def check_blocks_and_attributes(blocks: List[Dict[str, Any]]) -> List[Dict[str, 
         name = str(blk.get("name", "")).strip()
         count = blk.get("count", 0)
 
-        # Anonymous unpurged blocks
+        # Report anonymous blocks as inventory.
         if name.startswith("*U") or name.startswith("*D"):
             findings.append({
                 "ruleId": "CAD-BLK-01",
                 "severity": "info",
                 "category": "CAD Block",
                 "target": name,
-                "message": f"Anonymous block '{name}' has {count} instances. Consider purging unused anonymous blocks.",
+                "message": f"Anonymous block '{name}' has {count} recorded inserts.",
             })
 
         # Empty attributes

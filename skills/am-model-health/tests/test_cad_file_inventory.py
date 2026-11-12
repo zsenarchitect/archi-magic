@@ -128,3 +128,31 @@ def test_bounds_and_legacy_inventory(tmp_path):
     output.write_text("old")
     assert run(source, "--output", output, "--summary").returncode == 0
     assert json.loads(output.read_text())["drawing_name"] == "Legacy.dwg"
+
+
+def test_dxf_purge_review_excludes_indirect_and_protected_blocks(tmp_path):
+    source = tmp_path / "block-review.dxf"
+    doc = ezdxf.new("R2000")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    for name in ("Unused", "Nested", "Parent", "Paper", "Arrow", "ExtendedData", "ExternalDependent"):
+        doc.blocks.new(name)
+    doc.blocks.new("*U1", dxfattribs={"flags": 1})
+    doc.blocks.get("ExternalDependent").block.dxf.flags = 16
+    doc.blocks.get("Parent").add_blockref("Nested", (0, 0))
+    doc.modelspace().add_blockref("Parent", (1, 1))
+    doc.paperspace().add_blockref("Paper", (1, 1))
+    doc.header["$DIMBLK"] = "Arrow"
+    doc.appids.new("REVIEW_FIXTURE")
+    line = doc.modelspace().add_line((0, 0), (1, 0))
+    line.set_xdata("REVIEW_FIXTURE", [(1005, doc.blocks.get("ExtendedData").block_record_handle)])
+    doc.saveas(source)
+    original = source.read_bytes()
+
+    result = run(source)
+    assert result.returncode == 0, result.stderr
+    inventory = json.loads(result.stdout)["inventory"]
+    assert inventory["coverage"]["block_purge_review"] == "known_dxf_references"
+    assert inventory["coverage"]["purge_eligibility"] == "not_assessed"
+    assert inventory["purge_candidates"] == [{"kind": "block", "name": "Unused"}]
+    assert source.read_bytes() == original
