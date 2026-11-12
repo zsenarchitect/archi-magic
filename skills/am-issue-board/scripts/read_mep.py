@@ -257,6 +257,28 @@ def read_element(source, identifier, categories, transform, clearance, clock, co
     }
 
 
+def route_connector_geometry(connector, transform):
+    frame = connector.CoordinateSystem
+    axes = [xyz(transform.OfVector(axis)) for axis in (frame.BasisX, frame.BasisY, frame.BasisZ)]
+    if any(abs(sum(a * b for a, b in zip(first, second)) - (1 if i == j else 0)) > 1e-6
+           for i, first in enumerate(axes) for j, second in enumerate(axes)):
+        raise ReadError("A reviewed physical connector has an invalid coordinate frame.")
+    origin = xyz(transform.OfPoint(connector.Origin))
+    if any(abs(a - b) > 1e-6 for a, b in zip(origin, xyz(transform.OfPoint(frame.Origin)))):
+        raise ReadError("A reviewed physical connector origin disagrees with its coordinate frame.")
+    shape = str(connector.Shape)
+    if shape == "Round":
+        dimensions = [float(connector.Radius) * 2]
+    elif shape == "Rectangular":
+        dimensions = [float(connector.Width), float(connector.Height)]
+    else:
+        dimensions = None
+    if dimensions and any(value <= 0 or math.isnan(value) or math.isinf(value) for value in dimensions):
+        raise ReadError("A reviewed physical connector has invalid dimensions.")
+    return {"domain": str(connector.Domain), "shape": shape, "origin_ft": origin,
+            "axes": axes, "dimensions_ft": dimensions}
+
+
 def read_route_endpoints(source, transform, requested, clock, coverage):
     if not isinstance(requested, list) or len(requested) != 2:
         raise ReadError("Supply exactly two reviewed connector endpoints.")
@@ -284,25 +306,8 @@ def read_route_endpoints(source, transform, requested, clock, coverage):
         connector = matches[0]
         if str(connector.ConnectorType) != "End" or connector.IsConnected:
             raise ReadError("A reviewed connector is connected or is not a physical end.")
-        frame = connector.CoordinateSystem
-        axes = [xyz(transform.OfVector(axis)) for axis in (frame.BasisX, frame.BasisY, frame.BasisZ)]
-        if any(abs(sum(a * b for a, b in zip(first, second)) - (1 if i == j else 0)) > 1e-6
-               for i, first in enumerate(axes) for j, second in enumerate(axes)):
-            raise ReadError("A reviewed connector has an invalid coordinate frame.")
-        origin = xyz(transform.OfPoint(connector.Origin))
-        if any(abs(a - b) > 1e-6 for a, b in zip(origin, xyz(transform.OfPoint(frame.Origin)))):
-            raise ReadError("A reviewed connector origin disagrees with its coordinate frame.")
-        shape = str(connector.Shape)
-        if shape == "Round":
-            dimensions = [float(connector.Radius) * 2]
-        elif shape == "Rectangular":
-            dimensions = [float(connector.Width), float(connector.Height)]
-        else:
-            dimensions = None
-        if dimensions and any(value <= 0 or math.isnan(value) or math.isinf(value) for value in dimensions):
-            raise ReadError("A reviewed connector has invalid dimensions.")
-        rows.append(dict(selected, category_id=str(owner.Category.Id.Value), domain=str(connector.Domain),
-                         shape=shape, origin_ft=origin, axes=axes, dimensions_ft=dimensions))
+        rows.append(dict(selected, category_id=str(owner.Category.Id.Value),
+                         **route_connector_geometry(connector, transform)))
     if ((rows[0]["element_id"], rows[0]["connector_id"])
             == (rows[1]["element_id"], rows[1]["connector_id"])):
         raise ReadError("Select two distinct connector endpoints.")
@@ -392,6 +397,100 @@ def read_route_trial_types(source, request):
     return dict(selections, fitting=fitting)
 
 
+def route_element_identity(element):
+    if element is None or not element.UniqueId or len(str(element.UniqueId)) > 160:
+        raise ReadError("A reviewed route element has no verifiable identity.")
+    return {"id": str(element.Id.Value), "uid": str(element.UniqueId)}
+
+
+def route_visit(clock, coverage):
+    check_time(clock)
+    coverage["connectors_visited"] += 1
+    if coverage["connectors_visited"] > CONNECTOR_VISIT_LIMIT:
+        raise ReadError("The route connector and system membership visit limit was reached.")
+
+
+def route_system_snapshot(source, system, clock, coverage):
+    identity = route_element_identity(system)
+    if isinstance(system, DB.Mechanical.MechanicalSystem):
+        network = system.DuctNetwork
+    elif isinstance(system, DB.Plumbing.PipingSystem):
+        network = system.PipingNetwork
+    else:
+        raise ReadError("A reviewed owner belongs to an unsupported MEP system.")
+    system_type = source.GetElement(system.GetTypeId())
+    members = {}
+    for collection in (network, system.Elements):
+        for element in collection:
+            route_visit(clock, coverage)
+            row = route_element_identity(element)
+            if row["id"] in members and members[row["id"]] != row["uid"]:
+                raise ReadError("A reviewed MEP system has ambiguous member identities.")
+            members[row["id"]] = row["uid"]
+    base = system.BaseEquipment
+    return dict(identity, system_type=route_element_identity(system_type),
+                classification=str(system_type.SystemClassification),
+                members=[[key, members[key]] for key in sorted(members, key=int)],
+                base_equipment=route_element_identity(base) if base is not None else None)
+
+
+def read_route_trial_owners(source, transform, requested, clock, coverage):
+    endpoints = read_route_endpoints(source, transform, requested, clock, coverage)
+    selected = [{"element_id": row["element_id"], "element_uid": row["element_uid"]} for row in endpoints]
+    if selected[0]["element_id"] == selected[1]["element_id"]:
+        raise ReadError("The route trial requires two distinct endpoint owners.")
+    boxes = read_route_obstacles(source, transform, selected, clock)
+    owners, systems = [], {}
+    for reviewed, box in zip(endpoints, boxes):
+        owner = source.GetElement(element_id(reviewed["element_id"]))
+        if route_element_identity(owner)["uid"] != reviewed["element_uid"]:
+            raise ReadError("A selected endpoint owner changed while being read.")
+        owner_type = source.GetElement(owner.GetTypeId())
+        connectors = {}
+        for connector in connector_collection(owner):
+            route_visit(clock, coverage)
+            kind = str(connector.ConnectorType)
+            if kind in ("Logical", "Reference"):
+                continue
+            connector_id = int(connector.Id)
+            if (kind not in ("End", "Curve", "Physical") or connector_id in connectors
+                    or len(connectors) >= ELEMENT_CONNECTOR_LIMIT):
+                raise ReadError("An endpoint owner has unsupported or ambiguous physical connectors.")
+            refs = {}
+            for reference in connector.AllRefs:
+                route_visit(clock, coverage)
+                if str(reference.ConnectorType) in ("Logical", "Reference"):
+                    continue
+                target = route_element_identity(reference.Owner)
+                if target["id"] == reviewed["element_id"]:
+                    continue
+                if (str(reference.ConnectorType) not in ("End", "Curve", "Physical")
+                        or not connector.IsConnectedTo(reference) or not reference.IsConnectedTo(connector)):
+                    raise ReadError("An endpoint owner has an unresolved physical connection.")
+                key = (int(target["id"]), int(reference.Id))
+                if key in refs:
+                    raise ReadError("An endpoint owner has repeated physical connection evidence.")
+                refs[key] = dict(target, connector_id=int(reference.Id))
+            if bool(connector.IsConnected) != bool(refs):
+                raise ReadError("An endpoint owner's physical connection evidence is incomplete.")
+            system = connector.MEPSystem
+            system_id = str(system.Id.Value) if system is not None else None
+            if system_id is not None and system_id not in systems:
+                systems[system_id] = route_system_snapshot(source, system, clock, coverage)
+            connectors[connector_id] = dict(route_connector_geometry(connector, transform), id=connector_id,
+                                            kind=kind, system_id=system_id,
+                                            references=[refs[key] for key in sorted(refs)])
+        endpoint = connectors.get(reviewed["connector_id"])
+        geometry = ("domain", "shape", "origin_ft", "axes", "dimensions_ft")
+        if (endpoint is None or endpoint["kind"] != "End" or endpoint["references"]
+                or any(endpoint[field] != reviewed[field] for field in geometry)):
+            raise ReadError("A selected endpoint owner no longer has the reviewed open end.")
+        owners.append(dict(box, element_type=route_element_identity(owner_type),
+                           connectors=[connectors[key] for key in sorted(connectors)]))
+    return {"endpoints": endpoints, "owners": owners,
+            "systems": [systems[key] for key in sorted(systems, key=int)]}
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -402,6 +501,21 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
+        if "route_trial_owners" in request:
+            if link_id is not None or set(request) != {"source", "route_trial_owners"}:
+                raise ReadError("Use a separate host-project query for route trial owners.")
+            snapshot = read_route_trial_owners(source, transform, request["route_trial_owners"], clock, coverage)
+            current_source, current_transform, current_identity = resolve_source(host, link_id, link_uid)
+            if (current_identity != identity or read_route_trial_owners(
+                    current_source, current_transform, request["route_trial_owners"], clock, coverage) != snapshot):
+                raise ReadError("The route owner connections or systems changed while being read.")
+            check_time(clock)
+            payload = {"kind": "mep-route-trial-owners", "version": 1, "source": identity, "snapshot": snapshot}
+            encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            result = {"status": "ok", "trial_owners_json": encoded}
+            if len(encoded) > SNAPSHOT_LIMIT or len(json.dumps(result, ensure_ascii=True)) > ENVELOPE_LIMIT:
+                raise ReadError("The route trial owner snapshot exceeded its size limit.")
+            return result
         if "route_trial_types" in request:
             if link_id is not None or any(field in request for field in (
                     "route_elbow", "route_endpoints", "route_obstacles", "element_ids", "clearance")):

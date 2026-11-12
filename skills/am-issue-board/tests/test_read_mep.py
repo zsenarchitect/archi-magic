@@ -228,6 +228,80 @@ def test_read_reviewed_route_endpoints(runtime, scenario):
         assert a["origin_ft"] == [1.0, 2.0, 3.0] and a["axes"][2] == [0.0, 0.0, 1.0]
 
 
+@pytest.mark.parametrize("scenario", ["stable", "changed_system", "unpaired_neighbor", "same_owner"])
+def test_trial_owner_baseline_binds_existing_neighbors_and_system(runtime, scenario):
+    class MechanicalSystem:
+        Id = ElementId(60)
+        UniqueId = "system-instance"
+
+        def GetTypeId(self):
+            return ElementId(61)
+
+        @property
+        def DuctNetwork(self):
+            self.reads += 1
+            return [owner_a, neighbor] if self.reads == 1 or scenario != "changed_system" else [owner_a]
+
+    runtime.Mechanical = NS(MechanicalSystem=MechanicalSystem)
+    system = MechanicalSystem()
+    system.reads = 0
+    system.BaseEquipment = None
+    system.Elements = []
+    first = connector(1, connected=False, system=system)
+    sibling = connector(2, connected=True, system=system)
+    last = connector(3, connected=False, system=None)
+    for item in (first, sibling, last):
+        item.CoordinateSystem = transform(0)
+        item.CoordinateSystem.Origin = item.Origin
+        item.Radius = 0.25
+        item.AllRefs = []
+
+    owner_a, owner_b = Duct([first, sibling]), Duct([last])
+    for identifier, owner in ((42, owner_a), (43, owner_b)):
+        owner.Id, owner.UniqueId = ElementId(identifier), "owner-" + str(identifier)
+        owner.GetTypeId = lambda: ElementId(50)
+        owner.get_BoundingBox = lambda _: NS(Min=point(0, 0, 0), Max=point(1, 1, 1))
+    neighbor = NS(Id=ElementId(70), UniqueId="neighbor")
+    reference = NS(Id=8, Owner=neighbor, ConnectorType="End",
+                   IsConnectedTo=lambda item: item is sibling and scenario != "unpaired_neighbor")
+    sibling.IsConnectedTo = lambda item: item is reference
+    sibling.AllRefs = [reference]
+    source = model("host", {42: owner_a, 43: owner_b, 50: NS(Id=ElementId(50), UniqueId="curve-type"),
+                           61: NS(Id=ElementId(61), UniqueId="system-type", SystemClassification="SupplyAir")})
+    identity = execute(source, describe=True)["source"]
+    endpoints = [
+        {"element_id": "42", "element_uid": "owner-42", "connector_id": 1},
+        {"element_id": "43", "element_uid": "owner-43", "connector_id": 3},
+    ]
+    if scenario == "same_owner":
+        alternate = connector(4, connected=False, system=None)
+        alternate.CoordinateSystem = transform(0)
+        alternate.CoordinateSystem.Origin = alternate.Origin
+        alternate.Radius = 0.25
+        owner_a.ConnectorManager.Connectors.append(alternate)
+        endpoints[1] = dict(endpoints[0], connector_id=4)
+    result = execute(source, source=identity, route_trial_owners=endpoints)
+    errors = {"changed_system": "connections or systems changed", "unpaired_neighbor": "unresolved physical",
+              "same_owner": "distinct endpoint owners"}
+    if scenario in errors:
+        assert result["status"] == "incomplete" and errors[scenario] in result["message"]
+        assert "trial_owners_json" not in result
+        return
+
+    report = json.loads(result["trial_owners_json"])
+    assert (report["kind"], report["source"]) == ("mep-route-trial-owners", identity)
+    snapshot = report["snapshot"]
+    before = snapshot["owners"][0]
+    assert before["element_type"] == {"id": "50", "uid": "curve-type"}
+    assert before["connectors"][0]["references"] == []
+    assert before["connectors"][1]["references"] == [{"id": "70", "uid": "neighbor", "connector_id": 8}]
+    assert snapshot["systems"] == [{
+        "id": "60", "uid": "system-instance", "system_type": {"id": "61", "uid": "system-type"},
+        "classification": "SupplyAir", "members": [["42", "owner-42"], ["70", "neighbor"]],
+        "base_equipment": None,
+    }]
+
+
 @pytest.mark.parametrize("scenario", [
     "duct", "pipe", "no_match", "changed", "wrong_type", "missing_symbol",
     "trial_types", "wrong_system_domain", "stale_level",
