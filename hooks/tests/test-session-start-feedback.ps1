@@ -72,6 +72,31 @@ try {
     Assert-True 'read: stable incident line uses event time in UTC' (
         $incidentRead.incident_line -ceq 'Archi Magic incident: revit_busy at 2026-11-06T20:38:47.0000000+00:00'
     ) $incidentResult.Out
+    $firstIncidentClaim = Invoke-Hook $incidentFile @('-Claim', $incidentRead.note_sha256)
+    Assert-True 'first incident claim permits one offer' (
+        ($firstIncidentClaim.Out | ConvertFrom-Json).status -eq 'claimed'
+    ) $firstIncidentClaim.Out
+    $incident.ended_at = '2026-11-08T02:00:00Z'
+    [IO.File]::WriteAllText($incidentFile, ($incident | ConvertTo-Json -Compress))
+    $repeat = Invoke-Hook $incidentFile
+    Assert-True 'resumed incident does not announce another pending note' ($repeat.Out -eq '') $repeat.Out
+    $repeat = Invoke-Hook $incidentFile @('-Read')
+    Assert-True 'resumed incident does not return a second offer' ($repeat.Out -eq '') $repeat.Out
+    $resumedDigest = (Get-FileHash -LiteralPath $incidentFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $repeat = Invoke-Hook $incidentFile @('-Claim', $resumedDigest)
+    Assert-True 'a second claim consumes the duplicate without offering it' (
+        $repeat.Out -eq '' -and -not (Test-Path -LiteralPath $incidentFile)
+    ) $repeat.Out
+    $receipts = @(Get-ChildItem -LiteralPath $Root -Filter 'incident.json.seen-*')
+    Assert-True 'the one-time receipt contains no incident details' (
+        $receipts.Count -eq 1 -and $receipts[0].Length -eq 0
+    ) ($receipts | Out-String)
+    $incident.occurred_at = '2026-11-07T15:38:47-05:00'
+    [IO.File]::WriteAllText($incidentFile, ($incident | ConvertTo-Json -Compress))
+    $otherIncident = (Invoke-Hook $incidentFile @('-Read')).Out | ConvertFrom-Json
+    Assert-True 'a later event with the same signal is still eligible' (
+        $otherIncident.incident_line -ceq 'Archi Magic incident: revit_busy at 2026-11-07T20:38:47.0000000+00:00'
+    ) ($otherIncident | ConvertTo-Json -Compress)
 
     $file = Write-Note 'note.json' 'pipe_error' '2026-11-12T18:00:00Z'
     $result = Invoke-Hook $file @('-Claim', $note.note_sha256)

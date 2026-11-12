@@ -8,6 +8,7 @@
   -Read prints the sanitized note and its digest. -Claim consumes only the
   matching note, after the GitHub duplicate check and before the one offer.
   Claim uses a same-directory rename so two sessions cannot offer the same note.
+  A local receipt keeps a later note about the same timed incident quiet.
   The SessionStart path never contacts GitHub and always exits 0.
 #>
 param(
@@ -23,6 +24,30 @@ function Write-Log([string]$Level, [string]$Message, [hashtable]$Data) {
         # Write-AmLog warns on a log failure; keep stdout clean for the hook JSON.
         Write-AmLog -Skill 'hooks' -Step 'session-start-feedback' -Level $Level -Message $Message -Data $Data 3>$null
     } catch { }
+}
+
+function Get-FeedbackDigest([byte[]]$Bytes) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hash.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+}
+
+function Get-ReceiptPath([string]$Path, [string]$IncidentLine) {
+    if (-not $IncidentLine) { return }
+    $key = Get-FeedbackDigest ([Text.Encoding]::UTF8.GetBytes($IncidentLine))
+    return "$Path.seen-$key"
+}
+
+function Register-Incident([string]$ReceiptPath) {
+    if (-not $ReceiptPath) { return $true }
+    try {
+        $stream = [IO.File]::Open($ReceiptPath, [IO.FileMode]::CreateNew)
+    } catch [IO.IOException] {
+        if ([IO.File]::Exists($ReceiptPath)) { return $false }
+        throw
+    }
+    $stream.Dispose()
+    return $true
 }
 
 function Read-SavedNote([string]$Path) {
@@ -46,9 +71,6 @@ function Read-SavedNote([string]$Path) {
         $occurred = [DateTimeOffset]$note.occurred_at
         $incident = $occurred.ToUniversalTime().ToString('o')
     }
-    $hash = [Security.Cryptography.SHA256]::Create()
-    try { $digest = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
-    finally { $hash.Dispose() }
     $activity = switch -CaseSensitive ([string]$note.activity) {
         'revit_query' { 'The session tried a read-only Revit query.' }
         'revit_modify' { 'The session tried a Revit modification.' }
@@ -62,7 +84,7 @@ function Read-SavedNote([string]$Path) {
         ended_at = $date.ToUniversalTime().ToString('o')
         occurred_at = $incident
         incident_line = if ($incident) { 'Archi Magic incident: ' + $signals[0] + ' at ' + $incident }
-        note_sha256 = $digest
+        note_sha256 = Get-FeedbackDigest $bytes
     }
 }
 
@@ -88,19 +110,24 @@ try {
     if ($Claim) {
         $claimed = $FeedbackFile + '.claim-' + [Guid]::NewGuid().ToString('N')
         [IO.File]::Move($FeedbackFile, $claimed)
-        $matched = $false
+        $consumed = $false
+        $offer = $false
         try {
             $note = Read-SavedNote $claimed
-            $matched = $note.note_sha256 -ceq $Claim
+            if ($note.note_sha256 -ceq $Claim) {
+                $receipt = Get-ReceiptPath $FeedbackFile $note.incident_line
+                $offer = Register-Incident $receipt
+                $consumed = $true
+            }
         } finally {
-            if ($matched) {
+            if ($consumed) {
                 [IO.File]::Delete($claimed)
             } else {
                 try { [IO.File]::Move($claimed, $FeedbackFile) }
                 catch { Write-Log 'warn' 'Feedback claim could not be restored; retained a local recovery file' $null }
             }
         }
-        if ($matched) {
+        if ($offer) {
             Write-Json @{ status = 'claimed'; note_sha256 = $Claim }
             Write-Log 'info' 'Feedback note claimed' $null
         }
@@ -108,6 +135,8 @@ try {
     }
 
     $note = Read-SavedNote $FeedbackFile
+    $receipt = Get-ReceiptPath $FeedbackFile $note.incident_line
+    if ($receipt -and [IO.File]::Exists($receipt)) { exit 0 }
     if ($Read) {
         Write-Json $note
         exit 0
