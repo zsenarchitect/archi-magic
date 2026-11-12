@@ -99,6 +99,34 @@ def test_creation_only_preview_shows_rows_and_blocking_status():
     assert "Approve or discard" not in out
 
 
+def test_project_page_preserves_review_only_wording_preview_and_wrapper(tmp_path):
+    root = Path(HERE).parents[2]
+    notes = tmp_path / "notes.json"
+    notes.write_text(json.dumps({"notes": [{"id": 15, "text": "Dorr <tag>", "view": "Plan"}]}))
+    rules = tmp_path / "rules.json"
+    rules.write_text(json.dumps({"accepted": ["Door", "tag"], "replacements": {"Dorr": "Door"}}))
+    payload = json.loads(subprocess.check_output([
+        sys.executable, root / "skills/am-shared-text-check/scripts/shared_text_cli.py",
+        "wording-preview", notes, rules,
+    ], text=True))
+    path = tmp_path / "preview.json"
+    out = tmp_path / "project.html"
+    command = [sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--preview", path, "--out", out]
+    wrapped = {"preview": payload, "plan": {"private": "plan-sentinel"}}
+    for document in (payload, wrapped, {"status": "ok", "result": {"payload": json.dumps(wrapped)}}):
+        path.write_text(json.dumps(document))
+        completed = subprocess.run(command, capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
+        page = out.read_text()
+        assert "<del>Dorr &lt;tag&gt;</del>" in page and "<ins>Door &lt;tag&gt;</ins>" in page
+        assert "Review only" in page and "Approve or discard" not in page
+        assert "plan-sentinel" not in page
+    path.write_text(json.dumps({"status": "ok", "result_truncated": True, "result": payload}))
+    completed = subprocess.run(command, capture_output=True, text=True)
+    assert completed.returncode == 1 and "complete change-preview" in completed.stderr
+    assert out.read_text() == page
+
+
 def test_project_page_renders_parsed_issue_board(tmp_path):
     root = Path(HERE).parents[2]
     note = tmp_path / "note.json"

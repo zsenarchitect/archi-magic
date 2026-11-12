@@ -164,6 +164,7 @@ Build one read-only HTML page that shows audit results, a change preview, and an
 `python skills/am-bim-viewer/scripts/project_page.py --title "Project A" --audit <audit.json> [--audit <more.json>] [--preview <preview.json>] [--board <board.json>] [--model <model.json>] --out project.html`
 
 - Pass the saved `model_health.py` result, the output of `mep_qa.py` or `dwg_cad_audit.py`, or another audit with a `findings` list. The page lists model health runs by recorded time, including runs with no warnings or errors.
+- Supply a complete change preview under `--preview`. The page accepts plain change previews and recipes that return a preview with a separate execution plan. Review-only previews retain that status. A truncated Revit result needs recovery with `get_run` before rendering.
 - To include the issue board, save the output of `board_cli.py parse <read.json>` as `board.json`. The page displays its entries and warnings.
 - Pass a BIM JSON export with `--model` to include a link to the offline 3D viewer. Install the locked viewer dependency with `npm ci` first. Keep the generated viewer HTML beside the project page when moving the report.
 - The page escapes all model text. It sets a strict content policy.

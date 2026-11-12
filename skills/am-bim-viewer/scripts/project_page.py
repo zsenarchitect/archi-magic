@@ -176,6 +176,41 @@ def pair_preview_rows(preview):
     return ((left.get(key), right.get(key)) for key in dict.fromkeys((*left, *right)))
 
 
+def read_change_preview(value):
+    error = "Use a complete change-preview result from a supported recipe."
+    if not isinstance(value, dict):
+        raise ValueError(error)
+    if "result" in value:
+        if value.get("status") != "ok" or value.get("result_truncated") or value.get("error"):
+            raise ValueError(error)
+        value = value["result"]
+    if isinstance(value, dict) and "payload" in value:
+        if not isinstance(value["payload"], str):
+            raise ValueError(error)
+        value = json.loads(value["payload"])
+    if isinstance(value, dict) and "preview" in value:
+        value = value["preview"]
+    if not isinstance(value, dict) or value.get("kind", "change-preview") != "change-preview":
+        raise ValueError(error)
+    columns = value.get("columns")
+    if (not isinstance(columns, list) or not columns or any(not isinstance(name, str) for name in columns)
+            or len(set(columns)) != len(columns)):
+        raise ValueError(error)
+    for name in ("before", "after"):
+        rows = value.get(name)
+        if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) > len(columns) for row in rows):
+            raise ValueError(error)
+    changed = value.get("changedColumns", [])
+    warnings = value.get("warnings", [])
+    if (not isinstance(changed, list) or any(column not in columns for column in changed)
+            or not isinstance(warnings, list) or any(not isinstance(warning, dict)
+                or not isinstance(warning.get("text"), str) for warning in warnings)
+            or not isinstance(value.get("notes", []), list)
+            or any(type(value.get(flag, False)) is not bool for flag in ("review_only", "blocked"))):
+        raise ValueError(error)
+    return value
+
+
 def render_preview(preview: Dict[str, Any]) -> str:
     if not preview:
         return "<p>No change preview supplied.</p>"
@@ -203,10 +238,17 @@ def render_preview(preview: Dict[str, Any]) -> str:
         body.append(f"<tr><td>{status}</td>" + "".join(cells) + "</tr>")
     warnings = preview.get("warnings", [])
     notes = "".join(f"<li>{_e(n)}</li>" for n in preview.get("notes", []))
-    warns = "".join(f"<li class='warn'>{_e(w.get('text'))}</li>" for w in warnings)
+    warns = "".join(
+        f"<li class='warn'>{_e(w['row']) + ' · ' if w.get('row') is not None else ''}{_e(w['text'])}</li>"
+        for w in warnings
+    )
     blocked = preview.get("blocked") or any(w.get("blocking") for w in warnings)
-    gate = ("Preview blocked. Resolve the blocking items before continuing." if blocked
-            else "Preview only. Approve or discard the change in Revit (Keep/Discard).")
+    if blocked:
+        gate = "Preview blocked. Resolve the blocking items before continuing."
+    elif preview.get("review_only") is True:
+        gate = "Review only. Use the recipe’s model change workflow to continue."
+    else:
+        gate = "Preview only. Approve or discard the change in Revit (Keep/Discard)."
     return (
         f"<h3>{_e(preview.get('title', 'Change preview'))}</h3>"
         f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
@@ -356,7 +398,7 @@ def main() -> int:
         audits = [load_json(a) for a in args.audit]
         findings = collect_findings(audits)
         model_health = model_health_runs(audits)
-        preview = load_json(args.preview) if args.preview else {}
+        preview = read_change_preview(load_json(args.preview)) if args.preview else {}
         board = load_json(args.board) if args.board else None
         if args.board and board is None:
             raise ValueError("Use the JSON output of board_cli.py parse for the issue board.")
