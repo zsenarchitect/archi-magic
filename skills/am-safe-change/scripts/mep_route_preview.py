@@ -82,10 +82,10 @@ def intersects(a, b, box):
     return True
 
 
-def candidates(start, end, first_axis, last_axis, setback, boxes):
-    first = along(start, first_axis, setback)
-    last = along(end, last_axis, setback)
+def candidates(start, end, first, last, boxes):
     yield [start, end]
+    if first is None or last is None:
+        return
     for order in permutations(range(3)):
         yield [start, first, *axis_path(first, last, order), end]
     for low, high in boxes:
@@ -101,17 +101,22 @@ def inside(point, bounds):
     return bounds is None or all(low <= value <= high for value, low, high in zip(point, *bounds))
 
 
+def endpoint_approach(origin, axis, minimum, boxes, bounds):
+    if not inside(origin, bounds):
+        return None
+    for distance in (2 * minimum, minimum):
+        approach = along(origin, axis, distance)
+        if inside(approach, bounds) and not any(intersects(origin, approach, box) for box in boxes):
+            return approach
+    return None
+
+
 def compatible_turn(incoming, outgoing):
     cosine = dot(incoming, outgoing)
     return cosine >= 1 - EPSILON or abs(cosine) <= EPSILON or abs(cosine - DIAGONAL_COSINE) <= EPSILON
 
 
-def multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds):
-    first = along(start, first_axis, 2 * minimum)
-    last = along(end, last_axis, 2 * minimum)
-    if (not all(inside(point, bounds) for point in (start, first, last, end))
-            or any(intersects(a, b, box) for a, b in ((start, first), (last, end)) for box in boxes)):
-        return None, False
+def multi_detour(first, last, first_axis, last_axis, minimum, boxes, bounds):
     planes = [{first[axis], last[axis]} for axis in range(3)]
     for axis, values in enumerate(planes):
         for low, high in boxes:
@@ -137,7 +142,7 @@ def multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds):
             while state in parents:
                 state = parents[state]
                 route.append(state[0])
-            return [start, *reversed(route), end], False
+            return list(reversed(route)), False
         for axis, values in enumerate(ordered_planes):
             for sign in (-1, 1):
                 heading = tuple(sign if index == axis else 0 for index in range(3))
@@ -296,13 +301,15 @@ def preview(data):
                 if best is None or candidate < best:
                     best = candidate
 
-    for raw in candidates(start, end, first_axis, last_axis, 2 * minimum, boxes):
+    approach_start = endpoint_approach(start, first_axis, minimum, boxes, bounds)
+    approach_end = endpoint_approach(end, last_axis, minimum, boxes, bounds)
+    for raw in candidates(start, end, approach_start, approach_end, boxes):
         consider(raw)
     exhausted = False
-    if best is None and not missing_elbow:
-        detour, exhausted = multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds)
+    if best is None and not missing_elbow and approach_start is not None and approach_end is not None:
+        detour, exhausted = multi_detour(approach_start, approach_end, first_axis, last_axis, minimum, boxes, bounds)
         if detour is not None:
-            consider(detour)
+            consider([start, *detour, end])
 
     before = [["candidate", None, None, None]]
     warnings = []

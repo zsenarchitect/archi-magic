@@ -128,6 +128,31 @@ def test_alternating_obstacles_require_multiple_detours_inside_routing_area(tmp_
     assert json.loads(blocked.stdout)["route"] is None
 
 
+@pytest.mark.parametrize("alternating", [False, True])
+def test_detour_can_turn_after_one_minimum_length_when_endpoint_space_is_tight(tmp_path, alternating):
+    data = fixture()
+    data["minimum_segment_ft"] = 1
+    data["routing_bounds_ft"] = {"min_ft": [-1, -3, -1], "max_ft": [11, 3, 1]}
+    data["obstacles"] = [
+        {"min_ft": [1.9, -3, -1], "max_ft": [3, 0.5, 1]},
+        {"min_ft": [7, -0.5, -1], "max_ft": [8.1, 3 if alternating else 0.5, 1]},
+    ]
+    result = run(tmp_path, data)
+    assert result.returncode == 0, result.stdout or result.stderr
+    points = json.loads(result.stdout)["route"]["points_ft"]
+    assert points[:2] == [[0, 0, 0], [1, 0, 0]]
+    assert points[-2:] == [[9, 0, 0], [10, 0, 0]]
+    for station, side in ((2.5, 1), (7.5, -1 if alternating else 1)):
+        crossings = [a[1] + (station - a[0]) / (b[0] - a[0]) * (b[1] - a[1])
+                     for a, b in zip(points, points[1:]) if min(a[0], b[0]) < station < max(a[0], b[0])]
+        assert crossings and all(side * y > 1.25 for y in crossings)
+
+    data["obstacles"][0]["min_ft"][0] = 1.7
+    blocked = run(tmp_path, data)
+    assert blocked.returncode == 1, blocked.stderr
+    assert json.loads(blocked.stdout)["route"] is None
+
+
 def test_native_obstacle_record_is_used_and_bound_to_the_endpoint_host(tmp_path):
     data = fixture()
     del data["obstacles"]
