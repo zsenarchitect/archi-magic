@@ -4,14 +4,14 @@
 import json
 import re
 
-from System import Int64
-from System.Collections.Generic import List
+from System import Double, Int32, Int64
+from System.Collections.Generic import HashSet, List
 from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 from duplicate_views import bounded, document_identity, identifier, key
-from read_view_filter_graphics import native_number
-from view_duplicate_preview import MAX_BYTES, TEXT
+from read_view_filter_graphics import native_number, rule_signature
+from view_duplicate_preview import MAX_BYTES, TEXT, snapshot_digest
 
 SIGNED_ID = re.compile(r"^-?[1-9][0-9]{0,18}\Z")
 STORAGE_TYPES = ("String", "Integer", "Double", "ElementId")
@@ -95,8 +95,129 @@ def element_row(document, element, parameter_id, types, clock):
             "type_id": type_key, "instance": instance, "source": source}
 
 
+def value_groups(rows, types, epsilon):
+    definitions, groups, expected = set(), {}, {}
+    for row in rows:
+        type_value = types.get(row["type_id"], {}).get("parameter")
+        state = type_value if row["source"] == "type" else (row["instance"] or type_value)
+        definitions.add((state["guid"], state["storage"], state["spec"]))
+        value = state["value"]
+        # IEEE signed zeros have one numeric equality value in Revit.
+        if state["storage"] == "Double" and value == 0.0:
+            value = 0.0
+        typed = {"storage": state["storage"], "has_value": row["source"] != "unset", "value": value}
+        group_id = snapshot_digest(typed)
+        group = groups.setdefault(group_id, dict(typed, key=group_id, count=0, labels=set()))
+        if typed["storage"] == "Double" and typed["has_value"]:
+            group["epsilon"] = epsilon
+        group["count"] += 1
+        if state["label"] is not None:
+            group["labels"].add(state["label"])
+        expected[row["id"]] = group_id
+        if len(groups) > 24:
+            raise ValueError("The view contains more than 24 distinct parameter values.")
+    if len(definitions) != 1:
+        raise ValueError("The selected elements do not share one compatible parameter definition.")
+    result = [groups[group_id] for group_id in sorted(groups)]
+    for group in result:
+        group["labels"] = sorted(group["labels"])
+    return result, expected
+
+
+def rule_for_value(parameter, group, strategy, resources):
+    factory = DB.ParameterFilterRuleFactory
+    if strategy == "no_value":
+        return factory.CreateHasNoValueParameterRule(parameter)
+    if strategy == "inverse_has_value":
+        inner = factory.CreateHasValueParameterRule(parameter)
+        resources.append(inner)
+        return DB.FilterInverseRule(inner)
+    storage, value = group["storage"], group["value"]
+    if storage == "String":
+        return factory.CreateEqualsRule(parameter, value)
+    if storage == "Integer":
+        return factory.CreateEqualsRule(parameter, Int32(value))
+    if storage == "Double":
+        return factory.CreateEqualsRule(parameter, Double(value), Double(group["epsilon"]))
+    return factory.CreateEqualsRule(parameter, DB.ElementId(Int64(int(value))))
+
+
+def attachable_expression(document, parameter, categories, category_set, group, retained, clock):
+    strategies = ("equals",) if group["has_value"] else ("no_value", "inverse_has_value")
+    api = DB.ParameterFilterElement
+    for strategy in strategies:
+        resources = []
+        accepted = False
+        try:
+            rule = rule_for_value(parameter, group, strategy, resources)
+            resources.append(rule)
+            expression = DB.ElementParameterFilter(rule)
+            resources.append(expression)
+            if (api.ElementFilterIsAcceptableForParameterFilterElement(document, category_set, expression)
+                    and api.AllRuleParametersApplicable(document, categories, expression)):
+                group["strategy"] = strategy
+                group["expression"] = {"type": "ElementParameterFilter", "inverted": bool(expression.Inverted),
+                                       "rules": [rule_signature(item, 0, [64], clock)
+                                                 for item in bounded(expression.GetRules(), 16, "value rule", clock)]}
+                retained.extend(resources)
+                accepted = True
+                return expression
+        finally:
+            if not accepted:
+                for item in reversed(resources):
+                    item.Dispose()
+    return None
+
+
+def qualify_rules(document, parameter_id, category_ids, rows, types, missing, epsilon, clock):
+    if not rows or missing:
+        return {"status": "blocked", "reason": "missing_parameter" if missing else "empty_scope",
+                "groups": [], "mismatch_count": 0, "mismatches": []}
+    groups, expected = value_groups(rows, types, epsilon)
+    category_set = HashSet[DB.ElementId]()
+    for item in category_ids:
+        category_set.Add(item)
+    parameter = signed_identifier(parameter_id)
+    expressions, unattached, retained = {}, [], []
+    mismatches, mismatch_count = [], 0
+    try:
+        for group in groups:
+            expression = attachable_expression(document, parameter, category_ids, category_set, group, retained, clock)
+            if expression is None:
+                unattached.append(group["key"])
+            else:
+                expressions[group["key"]] = expression
+        if unattached:
+            return {"status": "blocked", "reason": "unattachable_rule", "unattachable_keys": unattached,
+                    "groups": groups, "mismatch_count": 0, "mismatches": []}
+
+        predicates = [(group["key"], expressions[group["key"]]) for group in groups]
+        for row in bounded(rows, 5000, "native rule candidate", clock):
+            element = document.GetElement(identifier(row["id"]))
+            if element is None or str(element.UniqueId) != row["uid"]:
+                raise ValueError("A view element changed while verifying the proposed rules.")
+            matched = [group_id for group_id, expression in predicates if expression.PassesFilter(element)]
+            intended = expected[row["id"]]
+            if matched != [intended]:
+                mismatch_count += 1
+                if len(mismatches) < 50:
+                    mismatches.append({"id": row["id"], "expected": intended, "matches": matched})
+    finally:
+        for item in reversed(retained):
+            item.Dispose()
+    return {"status": "blocked" if mismatch_count else "verified_host_partition",
+            "reason": "native_rule_overlap_or_gap" if mismatch_count else None, "groups": groups,
+            "mismatch_count": mismatch_count, "mismatches": mismatches}
+
+
 def main(document, args):
     project = document_identity(document)
+    check_rules = args.get("check_rules", False)
+    if type(check_rules) is not bool:
+        raise ValueError("The native rule check flag must be true or false.")
+    epsilon = args.get("double_epsilon", 1e-9)
+    if type(epsilon) not in (int, float) or not 0 < epsilon <= 1e-4:
+        raise ValueError("Use a positive numeric double tolerance up to 0.0001 in Revit internal units.")
     view_id = identifier(args["view_id"])
     view = document.GetElement(view_id)
     if (not isinstance(view, DB.View) or view.IsTemplate or not view.AreGraphicsOverridesAllowed()
@@ -135,6 +256,9 @@ def main(document, args):
             "category_ids": sorted(selected, key=int), "scope": "potentially_visible_host_elements",
             "rows": sorted(rows, key=lambda row: int(row["id"])), "types": types, "missing_parameter_ids": sorted(missing, key=int),
             "link_candidate_ids": sorted(link_ids, key=int)}
+    if check_rules:
+        data["native_rules"] = qualify_rules(document, parameter_id, category_ids, data["rows"], types, missing,
+                                             float(epsilon), clock)
     payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(payload) > MAX_BYTES or clock.ElapsedMilliseconds > 10000:
         raise ValueError("The parameter inventory exceeds its size or time budget.")

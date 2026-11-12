@@ -24,6 +24,9 @@ class NativeList:
     def Add(self, item):
         self.values.append(item.Value)
 
+    def __iter__(self):
+        return (ElementId(value) for value in self.values)
+
 
 class View:
     Id = ElementId(31)
@@ -74,8 +77,8 @@ def reader(monkeypatch):
             yield value
 
     monkeypatch.syspath_prepend(str(SCRIPTS))
-    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
-    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=NativeList))
+    monkeypatch.setitem(sys.modules, "System", NS(Double=float, Int32=int, Int64=int))
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(HashSet=NativeList, List=NativeList))
     monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(Stopwatch=NS(StartNew=lambda: NS(ElapsedMilliseconds=1))))
     db = NS(ElementId=ElementId, View=View, RevitLinkInstance=Link, FilteredElementCollector=Collector,
             ElementMulticategoryFilter=lambda ids: NS(ids=ids.values, Dispose=lambda: None),
@@ -84,7 +87,7 @@ def reader(monkeypatch):
     monkeypatch.setitem(sys.modules, "duplicate_views", NS(
         bounded=bounded, document_identity=lambda _doc: {"project_uid": "project-1"},
         identifier=ElementId, key=lambda value: str(value.Value)))
-    monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(native_number=float))
+    monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(native_number=float, rule_signature=lambda rule, *_: dict(rule.signature)))
     return runpy.run_path(str(SCRIPTS / "read_color_parameter_values.py"))
 
 
@@ -134,3 +137,111 @@ def test_reader_rejects_ambiguous_parameter_id_and_unfilterable_selection(reader
     with pytest.raises(ValueError, match="not filterable"):
         reader["main"](document, {"view_id": "31", "parameter_id": "-56", "category_ids": ["-200"]})
     assert document.collectors_closed == 1
+
+
+def mock_rules(reader, *, direct_unset=False, inverse_unset=True, applicable=True):
+    checked = []
+    released = []
+
+    class Rule:
+        def __init__(self, strategy, value=None, epsilon=None):
+            self.signature = {"strategy": strategy, "value": value, "epsilon": epsilon}
+
+        def Dispose(self):
+            pass
+
+    class Expression:
+        Inverted = False
+
+        def __init__(self, rule):
+            self.rule = rule
+
+        def GetRules(self):
+            return [self.rule]
+
+        def PassesFilter(self, element):
+            value = element.native_value
+            rule = self.rule.signature
+            if rule["strategy"] != "equals":
+                return value is None
+            intended = rule["value"]
+            if isinstance(value, str) and isinstance(intended, str):
+                return value.lower() == intended.lower()
+            if rule["epsilon"] is not None:
+                return value is not None and abs(value - intended) <= rule["epsilon"]
+            return value == intended
+
+        def Dispose(self):
+            released.append(self.rule.signature["strategy"])
+
+    def make_equals(parameter, value, epsilon=None):
+        assert parameter.Value == -55
+        return Rule("equals", value.Value if isinstance(value, ElementId) else value, epsilon)
+
+    def eligible(_document, categories, expression):
+        assert categories.values == [-200]
+        strategy = expression.rule.signature["strategy"]
+        checked.append(strategy)
+        return {"equals": True, "no_value": direct_unset, "inverse_has_value": inverse_unset}[strategy]
+
+    db = reader["DB"]
+    db.ParameterFilterRuleFactory = NS(
+        CreateEqualsRule=make_equals, CreateHasNoValueParameterRule=lambda _parameter: Rule("no_value"),
+        CreateHasValueParameterRule=lambda _parameter: Rule("has_value"),
+    )
+    db.FilterInverseRule = lambda _inner: Rule("inverse_has_value")
+    db.ElementParameterFilter = Expression
+    db.ParameterFilterElement = NS(ElementFilterIsAcceptableForParameterFilterElement=eligible,
+                                   AllRuleParametersApplicable=lambda *_: applicable)
+    return checked, released
+
+
+def qualifying_inventory(reader, candidates, types=(), epsilon=1e-9):
+    values = {31: View()}
+    values.update({row.Id.Value: row for row in [*candidates, *types]})
+    document = NS(GetElement=lambda identifier: values.get(identifier.Value), collectors_closed=0,
+                  candidates=candidates)
+    result = reader["main"](document, {"view_id": "31", "parameter_id": "-55", "category_ids": ["-200"],
+                                       "check_rules": True, "double_epsilon": epsilon})
+    return json.loads(result["inventory_json"])
+
+
+def candidate(identifier, stored, native, type_id=-1):
+    row = element(identifier, [stored] if stored is not None else [], type_id)
+    row.native_value = native
+    return row
+
+
+def test_qualifies_attachable_exact_partition_and_unset_fallback(reader):
+    checked, released = mock_rules(reader)
+    inventory = qualifying_inventory(reader, [
+        candidate(101, parameter("String", None, False), "type value", 501),
+        candidate(102, parameter("String", ""), ""),
+        candidate(103, parameter("String", None, False), None),
+    ], [element(501, [parameter("String", "type value")])])
+    result = inventory["native_rules"]
+    assert result["status"] == "verified_host_partition" and result["mismatch_count"] == 0
+    assert {group["value"]: (group["count"], group["strategy"]) for group in result["groups"]} == {
+        None: (1, "inverse_has_value"), "": (1, "equals"), "type value": (1, "equals"),
+    }
+    assert sorted(checked) == sorted(released) == ["equals", "equals", "inverse_has_value", "no_value"]
+    assert inventory["link_candidate_ids"] == ["99"]
+
+
+@pytest.mark.parametrize("storage,values", [("String", ("North", "NORTH")), ("Double", (1.0, 1.0 + 5e-10))])
+def test_native_case_and_double_overlap_block_partition(reader, storage, values):
+    mock_rules(reader)
+    rows = [candidate(index, parameter(storage, value), value) for index, value in enumerate(values, 101)]
+    result = qualifying_inventory(reader, rows)["native_rules"]
+    assert result["status"] == "blocked" and result["reason"] == "native_rule_overlap_or_gap"
+    assert [item["id"] for item in result["mismatches"]] == ["101", "102"]
+    assert all(len(item["matches"]) == 2 for item in result["mismatches"])
+
+
+def test_native_applicability_and_missing_values_block_rule_qualification(reader):
+    checked, released = mock_rules(reader, applicable=False)
+    result = qualifying_inventory(reader, [candidate(101, parameter("ElementId", -2000000), -2000000)])["native_rules"]
+    assert result["reason"] == "unattachable_rule" and len(result["unattachable_keys"]) == 1
+    assert checked == released == ["equals"]
+    result = qualifying_inventory(reader, [candidate(101, None, None)])["native_rules"]
+    assert result["reason"] == "missing_parameter" and checked == ["equals"]
