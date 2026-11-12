@@ -736,7 +736,7 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
     repeated = {**fresh, "run_id": before["run_id"]}
     with pytest.raises(ValueError, match="separate Revit runs"):
         verify(before, dry, repeated)
-    with pytest.raises(ValueError, match="complete successful Revit record"):
+    with pytest.raises(ValueError, match="required status and approval"):
         verify(before, {**dry, "result_truncated": True}, fresh)
     with pytest.raises(ValueError, match="unexpected model changes"):
         verify(before, {**dry, "changes": {**dry["changes"], "deleted_count": 1}}, fresh)
