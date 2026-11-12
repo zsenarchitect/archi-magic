@@ -167,6 +167,12 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 - Run `python skills/am-issue-board/scripts/board_cli.py mep-ops findings.json MEP-0001 > ops.json`.
 - Pass `ops.json` to the board batch planner with a fresh note read. Review the plan, run the dry run, and use Keep/Discard in Revit.
 
+### Native Revit snapshot verification
+
+The native reader still needs qualification in Revit. In a disposable project, run `read_mep.py` through `run_query` with `describe: true`. For a link, include its reviewed decimal `link_instance_id` and `link_instance_uid` in both calls. Review the returned source identity, then send it back under `source`. Supply `element_ids` to restrict the query to reviewed decimal IDs. A clearance check requires a reviewed Yes/No shared parameter GUID and an `absent_value` of 0 or 1.
+
+Recover the complete `snapshot_json` if the result was paged and save its contents locally. Run the same `mep_qa.py` command with that file. The native report retains the source and separates evidence diagnostics from violations. Exit 3 indicates unavailable applicable evidence alongside any confirmed findings. Exit 2 means the input or inventory was incomplete. A complete empty scope is labeled `empty_scope`. Native reports require the guarded board handoff, which is pending.
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.

@@ -282,6 +282,7 @@ def run_query(host, request):
         payload = {"kind": "mep-native-snapshot", "version": 1, "snapshot": {
             "status": "complete", "source": identity, "coverage": coverage,
             "revit_year": str(host.Application.VersionNumber), "elements": elements,
+            "clearance": {"guid": str(clearance[0]), "absent_value": clearance[1]} if clearance else None,
         }}
         encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         result = {"status": "ok", "snapshot_json": encoded}

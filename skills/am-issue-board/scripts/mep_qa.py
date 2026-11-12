@@ -17,6 +17,7 @@ import math
 import re
 import sys
 from typing import Any, Dict, List
+from uuid import UUID
 
 
 VALID_SYSTEM_PREFIXES = (
@@ -24,6 +25,11 @@ VALID_SYSTEM_PREFIXES = (
     "CW", "HW", "CHW", "HHW", "SAN",  # Piping
     "VENT", "STORM", "FIRE", "GAS",   # Plumbing & Fire
 )
+
+
+def system_prefix(name):
+    name = name.strip()
+    return name.split("-")[0].strip().upper() if "-" in name else name.split(" ")[0].upper()
 
 
 def check_mep_system(element: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -52,7 +58,7 @@ def check_mep_system(element: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     elif sys_name:
         s_name = str(sys_name).strip()
-        prefix = s_name.split("-")[0].strip().upper() if "-" in s_name else s_name.split(" ")[0].strip().upper()
+        prefix = system_prefix(s_name)
         if prefix not in VALID_SYSTEM_PREFIXES:
             findings.append({
                 "ruleId": "MEP-SYS-01",
@@ -253,20 +259,22 @@ def run_mep_audit(elements: List[Dict[str, Any]]) -> Dict[str, Any]:
             finding_id += 1
             all_findings.append(f)
 
-    errors = sum(1 for f in all_findings if f["severity"] == "error")
-    warnings = sum(1 for f in all_findings if f["severity"] == "warning")
-    infos = sum(1 for f in all_findings if f["severity"] == "info")
-
     return {
         "total_elements_audited": len(elements),
         "total_findings": len(all_findings),
-        "summary": {
-            "errors": errors,
-            "warnings": warnings,
-            "infos": infos,
-        },
+        "summary": summarize_findings(all_findings),
         "findings": all_findings,
     }
+
+
+def summarize_findings(findings):
+    return {severity + "s": sum(row["severity"] == severity for row in findings)
+            for severity in ("error", "warning", "info")}
+
+
+def positive_id(value):
+    return (isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,18}", value) is not None
+            and int(value) <= 2**63 - 1)
 
 
 def audit_input(data):
@@ -280,11 +288,208 @@ def audit_input(data):
             raise ValueError("Each element needs a category and a valid parameter map.")
         value = row.get("id")
         identifier = str(value) if type(value) is int else value
-        if (not isinstance(identifier, str) or re.fullmatch(r"[1-9][0-9]{0,18}", identifier) is None
-                or int(identifier) > 2**63 - 1 or identifier in seen):
+        if not positive_id(identifier) or identifier in seen:
             raise ValueError("Each element needs a distinct positive Revit ID.")
         seen.add(identifier)
     return elements
+
+
+SYSTEM_CATEGORIES = {
+    "Ducts", "Flex Ducts", "Duct Fittings", "Air Terminals",
+    "Pipes", "Flex Pipes", "Pipe Fittings", "Mechanical Equipment",
+}
+SIZE_CATEGORIES = {"Ducts", "Flex Ducts", "Pipes", "Flex Pipes", "Conduits", "Cable Trays"}
+DUCT_CATEGORIES = {"Ducts", "Flex Ducts"}
+NATIVE_CHECKS = ("system", "connectivity", "size", "airflow", "clearance")
+
+
+def finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def model_identity(identity):
+    return (isinstance(identity, dict) and set(identity) == {"project_uid", "path_sha256"}
+            and isinstance(identity["project_uid"], str) and 0 < len(identity["project_uid"]) <= 160
+            and isinstance(identity["path_sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", identity["path_sha256"]) is not None)
+
+
+def validate_native_source(source):
+    if (not isinstance(source, dict)
+            or set(source) != {"host_identity", "document_identity", "link_instance_id", "link_instance_uid", "transform"}
+            or not model_identity(source["host_identity"]) or not model_identity(source["document_identity"])
+            or not isinstance(source["transform"], list) or len(source["transform"]) != 12
+            or not all(finite_number(value) for value in source["transform"])):
+        raise ValueError("The native MEP snapshot has an invalid Revit source.")
+    if source["link_instance_id"] is None:
+        if (source["link_instance_uid"] is not None or source["document_identity"] != source["host_identity"]
+                or source["transform"] != [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]):
+            raise ValueError("The native MEP host identity or transform is inconsistent.")
+    elif (not positive_id(source["link_instance_id"]) or not isinstance(source["link_instance_uid"], str)
+          or not 0 < len(source["link_instance_uid"]) <= 160):
+        raise ValueError("The native MEP snapshot needs an exact link instance identity.")
+
+
+def evidence_state(evidence, *, allow_inapplicable=False):
+    if isinstance(evidence, dict):
+        state = evidence.get("state")
+        if state == "observed" and set(evidence) == {"state", "value"} and finite_number(evidence["value"]):
+            return state
+        if set(evidence) == {"state"} and (
+            state in ("absent", "unavailable") or (allow_inapplicable and state == "not_applicable")
+        ):
+            return state
+    raise ValueError("The native MEP snapshot contains invalid numeric evidence.")
+
+
+def native_element_findings(row):
+    category = row["category"]
+    checks = dict.fromkeys(NATIVE_CHECKS, "not_applicable")
+    findings = []
+
+    def finding(rule, severity, message, **details):
+        findings.append({"ruleId": rule, "severity": severity, "elementId": row["id"],
+                         "category": category, "message": message, **details})
+
+    connectors = row["connectors"]
+    connector_evidence = row["connector_evidence"]
+    if (not isinstance(connectors, list) or len(connectors) > 32
+            or connector_evidence["inventory"] not in ("complete", "unavailable")
+            or any(type(connector_evidence[key]) is not int or not 0 <= connector_evidence[key] <= 4000
+                   for key in ("unsupported", "assignments_unknown"))
+            or connector_evidence["assignments_unknown"] > len(connectors)
+            or (connector_evidence["inventory"] == "unavailable" and connectors)):
+        raise ValueError("The native MEP connector inventory is invalid.")
+    seen = set()
+    for connector in connectors:
+        connector_id, connected, point = connector["id"], connector["isConnected"], connector["origin"]
+        if (type(connector_id) is not int or connector_id < 0 or connector_id in seen
+                or connector["type"] not in ("End", "Curve", "Physical")
+                or (connected is not None and type(connected) is not bool)
+                or (point is not None and (set(point) != set("xyz") or not all(
+                    finite_number(value) for value in point.values())))):
+            raise ValueError("The native MEP snapshot contains an invalid physical connector.")
+        seen.add(connector_id)
+        if connected is False:
+            severity = "error" if any(word in category for word in ("Duct", "Pipe", "Fitting")) else "warning"
+            finding("MEP-CON-01", severity, f"Open physical connector {connector_id} on {category}.",
+                    connectorId=connector_id, location=point)
+    connector_complete = bool(connectors) and connector_evidence["inventory"] == "complete" and not (
+        connector_evidence["unsupported"] or any(item["isConnected"] is None for item in connectors))
+    checks["connectivity"] = "evaluated" if connector_complete else "unavailable"
+
+    systems = row["systems"]
+    if (not isinstance(systems, list) or len(systems) > len(connectors)
+            or any(not positive_id(system["id"]) or any(
+                system[key] is not None and (not isinstance(system[key], str) or len(system[key]) > 160)
+                for key in ("name", "classification", "calculation")) for system in systems)
+            or len({system["id"] for system in systems}) != len(systems)):
+        raise ValueError("The native MEP assigned-system inventory is invalid.")
+    if category in SYSTEM_CATEGORIES:
+        assignment_complete = bool(connectors) and connector_evidence["inventory"] == "complete" and not (
+            connector_evidence["unsupported"] or connector_evidence["assignments_unknown"])
+        system_complete = assignment_complete and all(
+            system["name"] and system["classification"] and not system["classification"].startswith("Undefined")
+            for system in systems)
+        checks["system"] = "evaluated" if system_complete else "unavailable"
+        if assignment_complete and not systems:
+            finding("MEP-SYS-01", "error", f"{category} has no assigned MEP system.")
+        for system in systems:
+            name = system["name"]
+            if name and system_prefix(name) not in VALID_SYSTEM_PREFIXES:
+                finding("MEP-SYS-01", "warning", f"System name {name!r} has a nonstandard prefix.",
+                        systemId=system["id"])
+
+    if category in SIZE_CATEGORIES:
+        sizes = row["sizes"]
+        if sizes is not None:
+            expected_fields = ({"Diameter"}, {"Width", "Height"}) if category in DUCT_CATEGORIES else (
+                ({"Width", "Height"},) if category == "Cable Trays" else ({"Diameter"},))
+            if not isinstance(sizes, dict) or set(sizes) not in expected_fields:
+                raise ValueError("The native MEP dimensions do not match the audited category.")
+            states = {field: evidence_state(value) for field, value in sizes.items()}
+            for field, state in states.items():
+                if state == "absent" or (state == "observed" and sizes[field]["value"] <= 0):
+                    finding("MEP-FLOW-01", "error", f"{category} needs a positive {field.lower()}.")
+        else:
+            states = {"shape": "unavailable"}
+        checks["size"] = "unavailable" if "unavailable" in states.values() else "evaluated"
+
+    if category in DUCT_CATEGORIES:
+        airflow = row["airflow"]
+        state = evidence_state(airflow, allow_inapplicable=True)
+        checks["airflow"] = "evaluated" if state in ("observed", "absent") else state
+        if state == "absent":
+            finding("MEP-FLOW-01", "warning", f"{category} has no calculated airflow.")
+        elif state == "observed" and airflow["value"] <= 0:
+            finding("MEP-FLOW-01", "warning", f"{category} has zero or negative calculated airflow.")
+
+    if category == "Mechanical Equipment":
+        state = row["clearance"]
+        if state not in ("documented", "absent", "unavailable"):
+            raise ValueError("The native MEP snapshot contains invalid clearance evidence.")
+        checks["clearance"] = "unavailable" if state == "unavailable" else "evaluated"
+        if state == "absent":
+            finding("MEP-CLR-01", "warning", "Mechanical equipment has no documented service clearance.")
+    return findings, checks
+
+
+def run_native_audit(data):
+    if (set(data) != {"kind", "version", "snapshot"} or data["kind"] != "mep-native-snapshot"
+            or type(data["version"]) is not int or data["version"] != 1):
+        raise ValueError("Unsupported or mixed native MEP snapshot format.")
+    snapshot = data["snapshot"]
+    if snapshot["status"] != "complete" or not re.fullmatch(r"20[0-9]{2}", snapshot["revit_year"]):
+        raise ValueError("The native MEP scope was incomplete or its Revit version was missing.")
+    validate_native_source(snapshot["source"])
+    clearance = snapshot["clearance"]
+    if clearance is not None and (set(clearance) != {"guid", "absent_value"}
+                                  or str(UUID(clearance["guid"])) != clearance["guid"]
+                                  or type(clearance["absent_value"]) is not int
+                                  or clearance["absent_value"] not in (0, 1)):
+        raise ValueError("The native MEP clearance mapping is invalid.")
+    rows = snapshot["elements"]
+    inventory = snapshot["coverage"]
+    if (not isinstance(rows, list) or len(rows) > 500
+            or set(inventory) != {"elements", "connectors_visited", "connectors_retained"}
+            or any(type(value) is not int or value < 0 for value in inventory.values())
+            or len(rows) != inventory["elements"]
+            or not 0 <= inventory["connectors_retained"] <= inventory["connectors_visited"] <= 4000
+            or inventory["connectors_retained"] > 2000):
+        raise ValueError("The native MEP snapshot does not have complete inventory counts.")
+    seen, findings, targets, diagnostics = set(), [], {}, []
+    coverage = {key: dict.fromkeys(("evaluated", "unavailable", "not_applicable"), 0) for key in NATIVE_CHECKS}
+    for row in rows:
+        if (not positive_id(row["id"]) or row["id"] in seen
+                or not isinstance(row["uid"], str) or not 0 < len(row["uid"]) <= 160
+                or row["category"] not in SYSTEM_CATEGORIES | DISTRIBUTION_CATEGORIES
+                or (clearance is None and row["category"] == "Mechanical Equipment"
+                    and row["clearance"] != "unavailable")):
+            raise ValueError("The native MEP snapshot contains an invalid element identity or category.")
+        seen.add(row["id"])
+        violations, checks = native_element_findings(row)
+        for check, state in checks.items():
+            coverage[check][state] += 1
+        unavailable = [check for check, state in checks.items() if state == "unavailable"]
+        if unavailable:
+            diagnostics.append({"elementId": row["id"], "unavailable": unavailable})
+        if violations:
+            targets[row["id"]] = row
+            findings.extend(violations)
+    retained = sum(len(row["connectors"]) for row in rows)
+    unsupported = sum(row["connector_evidence"]["unsupported"] for row in rows)
+    if (inventory["connectors_retained"] != retained or inventory["connectors_visited"] < retained + unsupported
+            or (not rows and inventory["connectors_visited"])):
+        raise ValueError("The native MEP snapshot connector counts do not agree.")
+    for index, row in enumerate(findings, 1):
+        row["id"] = f"MEP-{index:04d}"
+    return {
+        "status": "incomplete_evaluation" if diagnostics else ("audited" if rows else "empty_scope"),
+        "source": snapshot["source"], "revit_year": snapshot["revit_year"], "clearance": clearance,
+        "inventory": inventory, "coverage": coverage, "diagnostics": diagnostics, "targets": targets,
+        "total_elements_audited": len(rows), "total_findings": len(findings),
+        "summary": summarize_findings(findings), "findings": findings,
+    }
 
 
 def main() -> int:
@@ -297,20 +502,27 @@ def main() -> int:
 
     try:
         with open(args.input, "r", encoding="utf-8") as stream:
-            elements = audit_input(json.load(stream))
-        result = run_mep_audit(elements)
-    except (OSError, ValueError, RecursionError) as error:
+            data = json.load(stream)
+            native = isinstance(data, dict) and (
+                "snapshot" in data or str(data.get("kind", "")).startswith("mep-native-"))
+            if native and stream.tell() > 512 * 1024:
+                raise ValueError("The native MEP snapshot exceeds 512 KiB.")
+        result = run_native_audit(data) if native else run_mep_audit(audit_input(data))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError) as error:
         print(f"MEP audit could not read the input. {error}", file=sys.stderr)
         return 2
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
+            payload = {"kind": "mep-native-report", "version": 1, "report": result} if native else result
+            json.dump(payload, f, indent=2)
         print(f"Wrote {result['total_findings']} findings to {args.output}")
 
     summary = result["summary"]
     print(f"MEP QA Audit: {result['total_elements_audited']} elements audited.")
     print(f"Results: {summary['errors']} errors, {summary['warnings']} warnings, {summary['infos']} infos.")
+    if native:
+        print(f"Native evaluation: {result['status']}.")
 
     if not args.summary and result["findings"]:
         print("\nFindings detail:")
@@ -319,6 +531,8 @@ def main() -> int:
         if len(result["findings"]) > 10:
             print(f"  ... and {len(result['findings']) - 10} more findings")
 
+    if native and result["status"] == "incomplete_evaluation":
+        return 3
     return 0 if summary["errors"] == 0 else 1
 
 

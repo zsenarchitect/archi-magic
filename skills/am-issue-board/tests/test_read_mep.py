@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 from types import SimpleNamespace as NS
 
@@ -244,3 +245,57 @@ def test_category_discovery_is_bounded_and_distinguishes_complete_empty(runtime)
     capped = execute(host, source=source)
     assert capped["status"] == "incomplete" and "exceeds 500 elements" in capped["message"]
     assert len(visits) == 501 and "snapshot_json" not in capped
+
+
+@pytest.mark.parametrize("scenario,exit_code,status,rules", [
+    ("clean", 0, "audited", []),
+    ("seeded", 1, "audited", ["MEP-CON-01", "MEP-SYS-01", "MEP-FLOW-01"]),
+    ("partial", 3, "incomplete_evaluation", ["MEP-CON-01", "MEP-SYS-01"]),
+    ("empty", 0, "empty_scope", []),
+    ("mixed", 2, None, []),
+    ("wrong_count", 2, None, []),
+    ("incomplete_inventory", 2, None, []),
+])
+def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, status, rules):
+    system = NS(Id=ElementId(9), Name="SA-01" if scenario == "clean" else "BAD-01",
+                GetTypeId=lambda: ElementId(10))
+    connectors = [connector(4, connected=scenario == "clean", system=system)]
+    if scenario == "partial":
+        connectors.append(NS(ConnectorType="EndSurface"))
+    host = model("host", {
+        10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow"),
+        42: Duct(connectors, flow=120 if scenario == "clean" else 0),
+    })
+    if scenario == "empty":
+        host.ids = []
+    source = execute(host, describe=True)["source"]
+    request = {} if scenario == "empty" else {"element_ids": ["42"]}
+    snapshot = json.loads(execute(host, source=source, **request)["snapshot_json"])
+    if scenario == "mixed":
+        snapshot["elements"] = snapshot["snapshot"]["elements"]
+    elif scenario == "wrong_count":
+        snapshot["snapshot"]["coverage"]["connectors_retained"] += 1
+    elif scenario == "incomplete_inventory":
+        snapshot["snapshot"]["status"] = "incomplete"
+    source_path, report_path = tmp_path / "snapshot.json", tmp_path / "report.json"
+    source_path.write_text(json.dumps(snapshot))
+    result = subprocess.run([sys.executable, str(SCRIPT.with_name("mep_qa.py")), str(source_path),
+                             "--output", str(report_path)], capture_output=True, text=True)
+    assert result.returncode == exit_code, result.stderr
+    if exit_code == 2:
+        assert not report_path.exists()
+        return
+    output = json.loads(report_path.read_text())
+    assert set(output) == {"kind", "version", "report"} and output["kind"] == "mep-native-report"
+    report = output["report"]
+    assert (report["source"], report["status"]) == (source, status)
+    assert [item["ruleId"] for item in report["findings"]] == rules
+    assert report["targets"] == ({"42": snapshot["snapshot"]["elements"][0]} if rules else {})
+    if scenario == "partial":
+        assert report["diagnostics"] == [
+            {"elementId": "42", "unavailable": ["system", "connectivity", "airflow"]},
+        ]
+        assert report["summary"] == {"errors": 1, "warnings": 1, "infos": 0}
+    if scenario == "clean":
+        assert all(report["coverage"][check]["evaluated"] == 1
+                   for check in ("system", "connectivity", "size", "airflow"))
