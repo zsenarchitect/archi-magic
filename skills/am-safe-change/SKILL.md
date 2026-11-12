@@ -217,11 +217,15 @@ This query does not create finishes. Do not use its result as approval to change
 
 Use `python scripts/element_split_preview.py evidence.json > split-preview.json` for geometry review from prepared local evidence. Open the result with the existing change-preview renderer. The preview includes the input SHA-256 and reports proposed extents and exact-source cut identities. Keep the prepared evidence private. [Native qualification plan](../../docs/plans/2026-11-12-split-walls-columns-floors.md)
 
+For a disposable Revit 2026 qualification project, run `scripts/read_element_split_evidence.py` using the CPython bridge in query mode. Call it with `{"describe": true}` first. Pass the returned `host_identity` and a `scope` array. Each scope item has `source` with an `id` and `uid`, and `cuts` with one or more objects with those same identity fields. Use the exact reviewed host model element and native Level, Grid, ModelLine, or DetailLine IDs. The query requires a saved, unchanged, non-workshared project.
+
+Save the exact decoded UTF-8 contents of `snapshot_json` as the CLI input, with no extra newline. Save `inventory_json` separately. It binds to the snapshot digest and contains typed parameter values and observed dependencies and joins. A blocked or incomplete query returns no snapshot. Recover a paged result through the bridge before saving either string. Use private fixture paths and keep both files local. A successful query remains a geometry and source inventory, with native split and parameter preservation subject to separate verification.
+
 The evidence object has `kind: element-split-evidence`, `frame: revit_host_internal_feet`, `host_identity` with `project_uid` and `path_sha256`, a positive `minimum_piece_ft`, and `elements`. Each element has `id`, `uid`, `type_id`, `type_uid`, `category`, `geometry`, and `cuts`. Use decimal strings for Revit IDs.
 
 - For `wall`, `architectural_column` and `structural_column`, give `base_ft` and `top_ft` in geometry. Each cut has `id`, `uid`, `kind: level`, and `elevation_ft` in the same project frame.
 - For `floor`, give `elevation_ft` and a simple convex `boundary_xy_ft` with the first vertex listed once. Each cut has `id`, `uid`, `kind` of `grid` or `line`, and `start_xy_ft` and `end_xy_ft`. A finite line must span each seam it intersects. Grid lines are extended through the supplied profile.
-- Exit 1 reports blocked rows. Exit 2 means the input or report exceeded a limit or had an invalid shape. Read the output as a geometry review. The native reader, dependency checks, instance parameter comparison, and the Keep/Discard workflow still require Revit qualification.
+- Exit 1 reports blocked rows. Exit 2 means the input or report exceeded a limit or had an invalid shape. Read the output as a geometry review. The query, dependency checks, result parameter comparison, and Keep/Discard workflow still require native qualification.
 
 ## House rules (all am-* skills)
 
