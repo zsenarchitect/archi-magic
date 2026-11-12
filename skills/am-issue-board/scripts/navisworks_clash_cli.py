@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+from html.parser import HTMLParser
 import io
 import json
 import math
@@ -136,6 +137,158 @@ def parse_report(data):
     if not tests:
         raise ValueError("No Clash Detective test found in this exchange file.")
     return units, report
+
+
+class TabularReport(HTMLParser):
+    """Read the default Navisworks tabular table as inert text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self.table = None
+        self.row = None
+        self.cell = None
+        self.nodes = 0
+
+    def handle_decl(self, declaration):
+        if declaration.lower().strip() != "doctype html":
+            raise ValueError("Unexpected HTML declaration.")
+
+    def handle_starttag(self, tag, attrs):
+        self.nodes += 1
+        if self.nodes > 20000 or tag in ("script", "iframe", "object", "embed"):
+            raise ValueError("Unsupported HTML content or structure limit.")
+        fields = dict(attrs)
+        css = fields.get("class", "")
+        if tag == "table":
+            if self.table is not None:
+                raise ValueError("Unexpected nested Navisworks table.")
+            if css == "mainTable":
+                if len(self.tables) >= 100:
+                    raise ValueError("Too many Navisworks tables.")
+                self.table = []
+        elif self.table is not None and tag == "tr":
+            if self.row is not None or css not in ("headerRow", "contentRow"):
+                raise ValueError("Unexpected Navisworks row layout.")
+            if len(self.table) >= 302:
+                raise ValueError("Too many Navisworks table rows.")
+            self.row = (css, [])
+        elif self.table is not None and tag in ("td", "th"):
+            if self.row is None or self.cell is not None or len(self.row[1]) >= 50:
+                raise ValueError("Unexpected Navisworks cell layout.")
+            if fields.get("rowspan", "1") != "1":
+                raise ValueError("Unexpected Navisworks cell span.")
+            raw_span = fields.get("colspan", "1")
+            if not re.fullmatch(r"[1-9][0-9]?", raw_span) or int(raw_span) > 50:
+                raise ValueError("Unexpected Navisworks cell span.")
+            self.cell = (css, int(raw_span), [])
+        elif self.cell is not None and tag == "br":
+            self.cell[2].append(" ")
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell[2].append(data)
+
+    def handle_endtag(self, tag):
+        if self.table is None:
+            return
+        if tag in ("td", "th"):
+            if self.cell is None:
+                raise ValueError("Unexpected Navisworks cell closing tag.")
+            css, span, parts = self.cell
+            self.row[1].append((css, span, " ".join("".join(parts).split())))
+            self.cell = None
+        elif tag == "tr":
+            if self.cell is not None or self.row is None:
+                raise ValueError("Incomplete Navisworks row.")
+            self.table.append(self.row)
+            self.row = None
+        elif tag == "table":
+            if self.row is not None:
+                raise ValueError("Incomplete Navisworks table.")
+            self.tables.append(self.table)
+            self.table = None
+
+
+HTML_LABELS = {
+    "name": {"clash name", "nom de conflit"},
+    "status": {"status", "etat", "état"},
+    "element": {"element id", "id d'élément"},
+}
+HTML_ITEM_CLASSES = ({"item1Content", "élément1Contenu"}, {"item2Content", "élément2Contenu"})
+
+
+def html_element_id(value):
+    # An explicitly labelled Element ID column may repeat the label before the value.
+    candidate = re.sub(r"^(?:element id|id d'élément)\s*:\s*", "", value, flags=re.I)
+    return candidate if re.fullmatch(r"[1-9][0-9]{0,18}", candidate) and int(candidate) <= 2**63 - 1 else None
+
+
+def tabular_columns(rows):
+    if len(rows) < 2 or [row[0] for row in rows[:2]] != ["headerRow", "headerRow"]:
+        raise ValueError("Expected the default two-level Navisworks table header.")
+    group, columns = rows[0][1], rows[1][1]
+    if sum(cell[1] for cell in group) != sum(cell[1] for cell in columns):
+        raise ValueError("Navisworks header spans disagree.")
+    group_width = {css: span for css, span, _ in group if css in ("item1HeaderGroup", "item2HeaderGroup")}
+    if len(group_width) != 2 or len([cell for cell in group if cell[0] in group_width]) != 2:
+        raise ValueError("The report must identify both Navisworks item groups.")
+    keys = {}
+    expected_cells = []
+    position = 0
+    group_slots = [css for css, span, _ in group for _ in range(span)]
+    for index, (css, span, heading) in enumerate(columns):
+        field = None
+        if css == "generalHeader":
+            if any(slot in group_width for slot in group_slots[position:position + span]):
+                raise ValueError("General and item columns overlap.")
+            expected_cells.append(({"contentCell"}, span))
+            field = next((name for name in ("name", "status") if heading.casefold() in HTML_LABELS[name]), None)
+        elif css in ("item1Header", "item2Header"):
+            side = int(css[4]) - 1
+            if group_slots[position:position + span] != [css + "Group"] * span:
+                raise ValueError("A Navisworks item column is outside its group.")
+            expected_cells.append((HTML_ITEM_CLASSES[side], span))
+            if heading.casefold() in HTML_LABELS["element"]:
+                field = "element%d" % side
+        else:
+            raise ValueError("Unknown Navisworks table column.")
+        if field is not None:
+            if field in keys:
+                raise ValueError("The report repeats a Navisworks field.")
+            keys[field] = index
+        position += span
+    if "name" not in keys:
+        raise ValueError("The report does not identify individual clash rows.")
+    return keys, expected_cells
+
+
+def parse_tabular_report(data):
+    decoded = data.decode("utf-8-sig")
+    if "\0" in decoded or re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", decoded, re.I):
+        raise ValueError("Unexpected HTML declaration.")
+    reader = TabularReport()
+    reader.feed(decoded)
+    reader.close()
+    if reader.table is not None or not reader.tables:
+        raise ValueError("The report is not a complete default Navisworks tabular export.")
+    report = []
+    for rows in reader.tables:
+        keys, expected = tabular_columns(rows)
+        for css, cells in rows[2:]:
+            if css != "contentRow" or len(cells) != len(expected) or len(report) >= 300:
+                raise ValueError("Unsupported tabular clash row or report size.")
+            if any(actual[0] not in layout[0] or actual[1] != layout[1]
+                   for actual, layout in zip(cells, expected)):
+                raise ValueError("Clash row does not match its Navisworks headers.")
+            selected = {field: text(cells[index][2]) for field, index in keys.items()}
+            if not selected["name"]:
+                raise ValueError("A clash row does not have a name.")
+            report.append({"guid": None, "name": selected["name"],
+                           "source_status": selected.get("status", "").casefold(), "source_point": None,
+                           "objects": [{"element_id": html_element_id(selected.get("element%d" % side, "")),
+                                        "selection_path": []} for side in (0, 1)]})
+    return "", report
 
 
 def point(value):
@@ -277,15 +430,17 @@ def main(argv=None):
     parser.add_argument("--board")
     parser.add_argument("--archive")
     args = parser.parse_args(argv)
+    suffix = Path(args.report).suffix.lower()
+    is_html = suffix in (".html", ".htm")
     try:
-        if Path(args.report).suffix.lower() != ".xml":
-            raise ValueError("Export a Navisworks XML report. HTML requires a separately verified layout.")
+        if suffix != ".xml" and not is_html:
+            raise ValueError("Use a Navisworks XML or default HTML (Tabular) report.")
         if not math.isfinite(args.padding_ft) or not 0.1 <= args.padding_ft <= 20:
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
         raw = local_bytes(args.report)
-        units, clashes = parse_report(raw)
+        units, clashes = parse_tabular_report(raw) if is_html else parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
         host, index = element_snapshot(snapshot) if snapshot is not None else (None, {})
         for row in clashes:
@@ -300,12 +455,15 @@ def main(argv=None):
         plan, skipped = board_preview(args.board, args.archive, clashes) if args.board else (None, [])
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
+            "source_format": "html_tabular" if is_html else "xml",
             "report_sha256": hashlib.sha256(raw).hexdigest(), "source_units": units,
             "snapshot_sha256": hashlib.sha256(snapshot).hexdigest() if snapshot is not None else None,
             "host_id": host, "coordinate_frame": FRAME if host else None,
             "clashes": clashes, "plan": plan, "skipped_guids": skipped,
             "warnings": ["Archive note not checked for duplicates."] if args.board and not args.archive else [],
         }
+        if is_html:
+            report["warnings"].append("Tabular rows lack clash GUIDs and selection-tree paths. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)
         if len(encoded) > LIMIT:
             raise ValueError("Preview exceeds the supported size.")
@@ -316,8 +474,8 @@ def main(argv=None):
     except (ValueError, KeyError, TypeError, AttributeError, RecursionError, ET.ParseError, ib.BoardError):
         # Parser and board exceptions may include raw report or model content.
         print("Navisworks intake failed: invalid input, format, identity or limit.", file=sys.stderr)
-        if Path(args.report).suffix.lower() != ".xml":
-            print("Export a Navisworks XML report. HTML is not supported here.", file=sys.stderr)
+        if suffix != ".xml":
+            print("Use a Navisworks XML or default ungrouped HTML (Tabular) report.", file=sys.stderr)
         return 2
     return 0
 
