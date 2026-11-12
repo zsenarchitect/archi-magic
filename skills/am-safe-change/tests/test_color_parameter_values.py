@@ -558,3 +558,212 @@ def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(re
     document.patterns["74"]["solid"] = False
     with pytest.raises(ValueError, match="solid fill pattern"):
         reader["main"](document, args)
+
+
+@pytest.mark.parametrize("fault", [None, "swatch", "extra_element"])
+def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, fault):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    document, request, _, _ = native_legend_fixture(reader, monkeypatch)
+    db = reader["DB"]
+    baseline = json.loads(reader["main"](document, request)["inventory_json"])
+    baseline["link_candidate_ids"] = []
+    proposal, display = build(baseline)
+    assert not proposal["blocked"]
+    assert proposal["legend_rows"][0]["swatch_bounds_ft"] == [0, -0.015, 0.05, 0.0]
+
+    helper_module = sys.modules["duplicate_views"]
+    helpers = runpy.run_path(str(SCRIPTS / "duplicate_views.py"))
+    helper_module.capture_changes = helpers["capture_changes"]
+    helper_module.rollback = helpers["rollback"]
+    monkeypatch.setitem(sys.modules, "read_color_parameter_values",
+                        NS(main=lambda *_: {"inventory_json": json.dumps(baseline)}))
+    trial = runpy.run_path(str(SCRIPTS / "probe_color_legend.py"))
+
+    class Vec:
+        def __init__(self, x, y, z):
+            self.X, self.Y, self.Z = x, y, z
+
+        def Add(self, other):
+            return Vec(self.X + other.X, self.Y + other.Y, self.Z + other.Z)
+
+        def Multiply(self, scale):
+            return Vec(self.X * scale, self.Y * scale, self.Z * scale)
+
+        def Subtract(self, other):
+            return self.Add(other.Multiply(-1))
+
+        def DotProduct(self, other):
+            return self.X * other.X + self.Y * other.Y + self.Z * other.Z
+
+    class Line:
+        IsBound = True
+
+        def __init__(self, start, end):
+            self.ends = start, end
+
+        def GetEndPoint(self, index):
+            return self.ends[index]
+
+        CreateBound = staticmethod(lambda start, end: Line(start, end))
+
+    class Loop(list):
+        Append = list.append
+        Dispose = lambda self: None
+
+    class Boundaries:
+        def __class_getitem__(cls, _kind):
+            return cls
+
+        def Add(self, item):
+            self.loop = item
+
+    class Settings:
+        def __init__(self):
+            self.values = {}
+
+        def SetSurfaceForegroundPatternId(self, identifier):
+            self.values["SurfaceForegroundPatternId"] = {"kind": "element", "id": str(identifier.Value)}
+
+        def SetSurfaceForegroundPatternColor(self, color):
+            self.values["SurfaceForegroundPatternColor"] = list(color)
+
+        def SetSurfaceForegroundPatternVisible(self, value):
+            self.values["IsSurfaceForegroundPatternVisible"] = value
+
+        def SetSurfaceBackgroundPatternVisible(self, value):
+            self.values["IsSurfaceBackgroundPatternVisible"] = value
+
+        def Dispose(self):
+            pass
+
+    original_get = document.GetElement
+    created = {}
+    settings = {}
+    document.GetElement = lambda identifier: created.get(identifier.Value) or original_get(identifier)
+
+    class Region:
+        def __init__(self, boundaries):
+            self.Id, self.UniqueId, self.OwnerViewId = ElementId(501), "region-501", ElementId(41)
+            self.loops = [list(boundaries.loop)]
+
+        def GetType(self):
+            return NS(Name="FilledRegion")
+
+        def GetTypeId(self):
+            return ElementId(72)
+
+        def GetBoundaries(self):
+            return self.loops
+
+        @staticmethod
+        def Create(doc, type_id, view_id, boundaries):
+            assert doc is document and (type_id.Value, view_id.Value) == (72, 41)
+            result = Region(boundaries)
+            created[501] = result
+            document.legend_contents.append(result)
+            return result
+
+    class Note:
+        def __init__(self, position, text):
+            self.Id, self.UniqueId, self.OwnerViewId = ElementId(502), "note-502", ElementId(41)
+            self.Coord, self.Text = position, text
+
+        def GetType(self):
+            return NS(Name="TextNote")
+
+        def GetTypeId(self):
+            return ElementId(73)
+
+        def GetLeaders(self):
+            return []
+
+        def get_BoundingBox(self, _view):
+            return NS(Min=self.Coord.Add(Vec(0, -0.01, 0)), Max=self.Coord.Add(Vec(0.1, 0, 0)),
+                      Transform=NS(OfPoint=lambda value: value))
+
+        @staticmethod
+        def Create(doc, view_id, position, text, type_id):
+            assert doc is document and (view_id.Value, type_id.Value) == (41, 73)
+            result = Note(position, text)
+            created[502] = result
+            document.legend_contents.append(result)
+            return result
+
+    def create_view(doc, type_id):
+        assert doc is document and type_id.Value == 71
+        view = db.ViewDrafting()
+        view.Origin, view.RightDirection, view.UpDirection = Vec(0, 0, 0), Vec(1, 0, 0), Vec(0, 1, 0)
+        view.SetElementOverrides = lambda identifier, override: settings.__setitem__(identifier.Value, override)
+        view.GetElementOverrides = lambda identifier: settings[identifier.Value]
+        created[41] = view
+        return view
+
+    class Handlers:
+        def __iadd__(self, callback):
+            self.callback = callback
+            return self
+
+        def __isub__(self, callback):
+            assert self.callback is callback
+            self.callback = None
+            return self
+
+    class Collection(list):
+        Count = property(len)
+
+    class Group:
+        def __init__(self, *_):
+            self.status = "Uninitialized"
+
+        def Start(self):
+            self.status = "Started"
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def RollBack(self):
+            created.clear()
+            document.legend_contents.clear()
+            self.status = "RolledBack"
+            return self.status
+
+    class Transaction(Group):
+        def Commit(self):
+            self.status = "Committed"
+            if fault == "swatch":
+                settings[501].values["SurfaceForegroundPatternColor"] = [0, 0, 0]
+            if fault == "extra_element":
+                created[999] = NS()
+            event = NS(GetDocument=lambda: document, GetTransactionNames=lambda: [trial["TRANSACTION_NAME"]],
+                       GetAddedElementIds=lambda: Collection(ElementId(value) for value in created),
+                       GetDeletedElementIds=Collection, GetModifiedElementIds=Collection)
+            document.Application.DocumentChanged.callback(None, event)
+            return self.status
+
+    document.legend_contents = []
+    document.IsWorkshared = False
+    document.Application = NS(DocumentChanged=Handlers())
+    document.Equals = lambda other: other is document
+    document.Regenerate = lambda: None
+    db.ViewDrafting.Create = staticmethod(create_view)
+    db.XYZ, db.Line, db.CurveLoop, db.FilledRegion, db.TextNote = Vec, Line, Loop, Region, Note
+    db.OverrideGraphicSettings, db.Color = Settings, lambda *rgb: rgb
+    db.TransactionGroup, db.Transaction = Group, Transaction
+    db.TransactionStatus = NS(Started="Started", Pending="Pending", RolledBack="RolledBack", Committed="Committed")
+    trial["probe"].__globals__["List"] = Boundaries
+
+    result = trial["probe"](document, {"disposable_fixture": True, "request": request,
+                                       "proposal": proposal, "preview": display})
+    if fault:
+        assert result["status"] == "stopped_and_rolled_back", result
+        expected = "reviewed color" if fault == "swatch" else "complete transaction change record"
+        assert expected in result["message"]
+    else:
+        assert result["status"] == "legend_trial_rolled_back", result
+        assert result["receipt"]["changes"] == {"added": ["41", "501", "502"], "modified": [], "deleted": []}
+        assert result["receipt"]["rows"][0]["rgb"] == proposal["legend_rows"][0]["rgb"]
+        assert result["receipt"]["rows"][0]["region_uid"] == "region-501"
+    assert not created and not document.legend_contents

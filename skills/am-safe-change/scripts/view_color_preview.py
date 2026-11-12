@@ -91,6 +91,18 @@ def proposed_filter_name(workflow, group_id, label):
     return "Parameter color - %s - %s" % (readable, fingerprint[:12])
 
 
+def legend_layout(rows, resources):
+    size = resources["text"]["text_size_ft"]
+    if type(size) not in (int, float) or not 0 < size < 1:
+        raise ValueError("The selected legend text size is outside the drafting layout bounds.")
+    result = []
+    for row in rows:
+        top = -4 * size * row["slot"]
+        result.append(dict(row, swatch_bounds_ft=[0, top - 1.5 * size, 5 * size, top],
+                           label_origin_ft=[7 * size, top]))
+    return result
+
+
 def build(inventory):
     rules = inventory["native_rules"]
     if inventory["kind"] != "view-color-parameter-inventory" or rules["status"] != "verified_host_partition":
@@ -169,6 +181,7 @@ def build(inventory):
             warnings.append({"row": groups[0]["key"], "blocking": True,
                              "text": "Resolve the native legend preflight state before using this proposal: "
                                      + native_legend["state"] + "."})
+        legend = legend_layout(legend, native_legend["resources"])
     proposal = {"kind": "view-color-proposal", "basis_sha256": basis, "workflow_sha256": workflow,
                 "document": inventory["document"], "view": inventory["view"],
                 "legend_name": legend_name(workflow), "legend_rows": legend, "legend_preflight": native_legend,

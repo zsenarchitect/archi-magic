@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+"""Create and verify color swatches in a disposable Revit legend, then roll back."""
+
+from itertools import product
+import json
+
+from System.Collections.Generic import List
+from System.Diagnostics import Stopwatch
+from pyrevit.api import DB
+
+from duplicate_views import capture_changes, identifier, key, rollback
+from read_color_legend import name_of, point, read_contents
+from read_color_parameter_values import main as read_inventory
+from read_view_filter_graphics import native_number
+from view_color_preview import build
+
+TRANSACTION_NAME = "Test parameter color drafting legend"
+POSITION_TOLERANCE = 1e-7
+
+
+def world(view, x, y):
+    return view.Origin.Add(view.RightDirection.Multiply(x)).Add(view.UpDirection.Multiply(y))
+
+
+def corners(view, bounds):
+    left, bottom, right, top = bounds
+    return [world(view, x, y) for x, y in ((left, bottom), (right, bottom), (right, top), (left, top))]
+
+
+def validate_view(view, proposal):
+    if (not isinstance(view, DB.ViewDrafting) or view.IsTemplate or int(view.Scale) != 1
+            or key(view.ViewTemplateId) != "-1" or view.IsTemporaryViewPropertiesModeEnabled()
+            or name_of(view) != proposal["legend_name"]
+            or key(view.GetTypeId()) != proposal["legend_preflight"]["resources"]["drafting"]["id"]):
+        raise ValueError("Revit did not create the reviewed untemplated drafting view.")
+
+
+def create_rows(document, view, proposal):
+    resources = proposal["legend_preflight"]["resources"]
+    region_type = identifier(resources["region"]["id"])
+    text_type = identifier(resources["text"]["id"])
+    solid = identifier(resources["solid"]["id"])
+    created = {}
+    for row in proposal["legend_rows"]:
+        vertices = corners(view, row["swatch_bounds_ft"])
+        loop = DB.CurveLoop()
+        try:
+            for start, end in zip(vertices, vertices[1:] + vertices[:1]):
+                loop.Append(DB.Line.CreateBound(start, end))
+            boundaries = List[DB.CurveLoop]()
+            boundaries.Add(loop)
+            region = DB.FilledRegion.Create(document, region_type, view.Id, boundaries)
+        finally:
+            loop.Dispose()
+        settings = DB.OverrideGraphicSettings()
+        try:
+            settings.SetSurfaceForegroundPatternId(solid)
+            settings.SetSurfaceForegroundPatternColor(DB.Color(*row["rgb"]))
+            settings.SetSurfaceForegroundPatternVisible(True)
+            settings.SetSurfaceBackgroundPatternVisible(False)
+            view.SetElementOverrides(region.Id, settings)
+        finally:
+            settings.Dispose()
+        note = DB.TextNote.Create(document, view.Id, world(view, *row["label_origin_ft"]), row["label"], text_type)
+        created[row["value_key"]] = {"region": key(region.Id), "note": key(note.Id)}
+    return created
+
+
+def close_points(actual, expected):
+    if isinstance(expected, list):
+        return (isinstance(actual, list) and len(actual) == len(expected)
+                and all(close_points(a, b) for a, b in zip(actual, expected)))
+    return isinstance(actual, (int, float)) and abs(actual - expected) <= POSITION_TOLERANCE
+
+
+def note_bounds(view, note):
+    box = note.get_BoundingBox(view)
+    if box is None:
+        raise ValueError("A drafted legend note has no measurable bounds.")
+    points = []
+    for coords in product((box.Min.X, box.Max.X), (box.Min.Y, box.Max.Y), (box.Min.Z, box.Max.Z)):
+        offset = box.Transform.OfPoint(DB.XYZ(*coords)).Subtract(view.Origin)
+        points.append((native_number(offset.DotProduct(view.RightDirection)),
+                       native_number(offset.DotProduct(view.UpDirection))))
+    xs, ys = zip(*points)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def verify_rows(document, view, proposal, created):
+    validate_view(view, proposal)
+    resources = proposal["legend_preflight"]["resources"]
+    contents = {row["id"]: row for row in read_contents(document, view, Stopwatch.StartNew())}
+    if set(contents) != {item for pair in created.values() for item in pair.values()}:
+        raise ValueError("Revit added unreviewed legend contents or omitted a swatch or note.")
+    verified = []
+    for row in proposal["legend_rows"]:
+        pair = created[row["value_key"]]
+        region, note = contents[pair["region"]], contents[pair["note"]]
+        vertices = [point(vertex) for vertex in corners(view, row["swatch_bounds_ft"])]
+        edges = sorted(sorted([start, end]) for start, end in zip(vertices, vertices[1:] + vertices[:1]))
+        graphics = region["graphics"]
+        if (region["owner_id"] != key(view.Id) or region["kind"] != "region"
+                or region["type_id"] != resources["region"]["id"] or not region["lines"]
+                or not close_points(region["lines"], [edges])
+                or graphics["SurfaceForegroundPatternId"] != {"kind": "element", "id": resources["solid"]["id"]}
+                or graphics["SurfaceForegroundPatternColor"] != row["rgb"]
+                or not graphics["IsSurfaceForegroundPatternVisible"] or graphics["IsSurfaceBackgroundPatternVisible"]):
+            raise ValueError("A native swatch differs from the reviewed color or geometry.")
+        if (note["owner_id"] != key(view.Id) or note["kind"] != "note"
+                or note["type_id"] != resources["text"]["id"] or note["text"] != row["label"] or note["leaders"]
+                or not close_points(note["position"], point(world(view, *row["label_origin_ft"])))):
+            raise ValueError("A native legend note differs from the reviewed text or placement.")
+        bounds = note_bounds(view, document.GetElement(identifier(note["id"])))
+        text_size = resources["text"]["text_size_ft"]
+        if (bounds[0] <= row["swatch_bounds_ft"][2] or bounds[1] <= row["label_origin_ft"][1] - 4 * text_size
+                or bounds[3] > row["label_origin_ft"][1] + POSITION_TOLERANCE):
+            raise ValueError("A native note overlaps the swatch or extends outside its legend row.")
+        verified.append({"value_key": row["value_key"], "rgb": row["rgb"],
+                         "region_id": region["id"], "region_uid": region["uid"],
+                         "note_id": note["id"], "note_uid": note["uid"]})
+    return verified
+
+
+def read_snapshot(document, request):
+    return json.loads(read_inventory(document, request)["inventory_json"])
+
+
+def probe(document, args):
+    if args.get("disposable_fixture") is not True or document.IsWorkshared:
+        raise ValueError("Use an explicitly confirmed standalone disposable fixture.")
+    request = args["request"]
+    baseline = read_snapshot(document, request)
+    proposal, display = build(baseline)
+    if (proposal != args["proposal"] or display != args["preview"] or proposal["blocked"]
+            or not proposal["legend_preflight"] or proposal["legend_preflight"]["state"] != "available"):
+        raise ValueError("The reviewed proposal, preview or drafting resources do not match the live fixture.")
+
+    events, foreign = [], []
+    application = document.Application
+
+    def record(_sender, event):
+        try:
+            if not event.GetDocument().Equals(document):
+                foreign[:] = [True]
+            if events or foreign or list(event.GetTransactionNames()) != [TRANSACTION_NAME]:
+                events[:] = [None]
+                return
+            added, modified, deleted = event.GetAddedElementIds(), event.GetModifiedElementIds(), event.GetDeletedElementIds()
+            if added.Count > 1 + 2 * len(proposal["legend_rows"]) or modified.Count or deleted.Count:
+                events.append(None)
+            else:
+                events.append(({key(item) for item in added}, set(), set()))
+        except Exception:
+            events[:] = [None]
+
+    group = DB.TransactionGroup(document, TRANSACTION_NAME)
+    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    if group.Start() != DB.TransactionStatus.Started:
+        return {"status": "transaction_unresolved", "message": "Revit did not start the legend rollback group."}
+    failure, receipt = None, None
+    try:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise ValueError("Revit did not start the legend trial transaction.")
+        application.DocumentChanged += record
+        try:
+            view = DB.ViewDrafting.Create(document, identifier(proposal["legend_preflight"]["resources"]["drafting"]["id"]))
+            view.Name, view.Scale = proposal["legend_name"], 1
+            validate_view(view, proposal)
+            pairs = create_rows(document, view, proposal)
+            document.Regenerate()
+            state = transaction.Commit()
+        finally:
+            application.DocumentChanged -= record
+        if state != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not finish the legend trial transaction.")
+        changes = capture_changes(events)
+        expected = {key(view.Id)} | {item for pair in pairs.values() for item in pair.values()}
+        if set(changes["added"]) != expected:
+            raise ValueError("Revit reported additions outside the reviewed legend.")
+        receipt = {"basis_sha256": proposal["basis_sha256"], "legend_id": key(view.Id),
+                   "legend_uid": str(view.UniqueId), "rows": verify_rows(document, view, proposal, pairs),
+                   "changes": changes}
+    except Exception as error:
+        failure = str(error)
+    if not rollback(transaction, group) or foreign:
+        return {"status": "transaction_unresolved", "message": "Revit did not confirm a clean legend rollback."}
+    try:
+        if read_snapshot(document, request) != baseline:
+            raise ValueError("The fresh color and legend inventory differs after rollback.")
+        if receipt and any(document.GetElement(identifier(item)) is not None for item in receipt["changes"]["added"]):
+            raise ValueError("Revit still resolves a trial legend element after rollback.")
+    except Exception as error:
+        return {"status": "transaction_unresolved", "message": str(error)}
+    if failure is not None:
+        return {"status": "stopped_and_rolled_back", "message": failure}
+    return {"status": "legend_trial_rolled_back", "receipt": receipt}
+
+
+if "inputs" in globals():
+    try:
+        result = probe(doc, inputs)  # noqa: F821
+    except (KeyError, TypeError, ValueError) as error:
+        result = {"status": "stopped", "message": str(error)}
+    except Exception:
+        result = {"status": "transaction_unresolved", "message": "Revit could not verify the legend trial."}
