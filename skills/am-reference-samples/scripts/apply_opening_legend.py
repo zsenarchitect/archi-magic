@@ -17,18 +17,6 @@ def snapshot_request(basis):
             "seed_component_id": layout["seed"]["id"], "text_type_id": layout["text_type"]["id"]}
 
 
-def approved_plan(plan, current):
-    if plan.get("blocked") is not False or any(row.get("blocking") for row in plan.get("warnings", [])):
-        raise ValueError("Resolve the blocking legend warnings first.")
-    if plan["basis"] != current:
-        raise ValueError("The opening types or legend changed after preview. Read and preview again.")
-    checked = preview.build_preview(current, plan["intent"])
-    keys = ("kind", "recipe", "keyColumn", "columns", "changedColumns", "before", "after", "steps", "ownership_ids")
-    if checked["blocked"] or not checked["steps"] or any(plan.get(key) != checked[key] for key in keys):
-        raise ValueError("Use the approved legend preview with a real change.")
-    return checked
-
-
 def verify_ownership(document, ids):
     if not document.IsWorkshared:
         return
@@ -143,7 +131,7 @@ def apply(document, plan):
         raise ValueError("Open the reviewed writable host project.")
     request = snapshot_request(plan["basis"])
     current = reader.project_snapshot(document, request)
-    checked = approved_plan(plan, current)
+    checked = preview.approved_plan(plan, current)
     verify_ownership(document, checked["ownership_ids"])
     legend = current["legend"]
     target, source = [document.GetElement(reader.positive_id(request[key]))

@@ -334,6 +334,18 @@ def verify_sheet_fit(legend_before, legend, intent):
     return sorted(changed_viewports, key=int)
 
 
+def approved_plan(plan, current):
+    if plan.get("blocked") is not False or any(row.get("blocking") for row in plan.get("warnings", [])):
+        raise ValueError("Resolve the blocking legend warnings first.")
+    if plan["basis"] != current:
+        raise ValueError("The opening types or legend changed after preview. Read and preview again.")
+    checked = build_preview(current, plan["intent"])
+    keys = ("kind", "recipe", "keyColumn", "columns", "changedColumns", "before", "after", "steps", "ownership_ids")
+    if checked["blocked"] or not checked["steps"] or any(plan.get(key) != checked[key] for key in keys):
+        raise ValueError("Use the approved legend preview with a real change.")
+    return checked
+
+
 def verify_result(plan, result, pair_ids):
     basis = plan["basis"]
     before, legend = basis["legend"], result["legend"]
@@ -342,7 +354,8 @@ def verify_result(plan, result, pair_ids):
     for key in ("id", "uid", "scale", "origin_ft", "right", "up", "revit_year"):
         if legend[key] != before[key]:
             raise ValueError("The target legend changed during the update.")
-    for key in ("source_legend_uid", "source_legend_id", "source_scale", "source_frame", "seed", "text_type"):
+    for key in ("source_legend_uid", "source_legend_id", "source_scale", "source_frame", "seed", "text_type",
+                "title_block_category_id"):
         if legend["layout"][key] != before["layout"][key]:
             raise ValueError("The source seed or reviewed text type changed.")
     coverage = legend["layout"]["front_elevation_coverage"]
@@ -359,8 +372,8 @@ def verify_result(plan, result, pair_ids):
     prior_pairs = index(prior, "type_uid")
     plan_steps = index(plan["steps"], "type_uid")
     old_managed = {pair[kind]["id"] for pair in prior for kind in ("component", "note")}
-    final_ids = set()
-    pairs = []
+    final_ids, modified = set(), []
+    pairs, measures = [], []
     for uid, identities in pair_ids.items():
         component_id, note_id = identities["component_id"], identities["note_id"]
         if component_id == note_id or {component_id, note_id} & final_ids:
@@ -373,9 +386,13 @@ def verify_result(plan, result, pair_ids):
         if old and (component_id != old["component"]["id"] or note_id != old["note"]["id"]
                     or component["uid"] != old["component"]["uid"] or note["uid"] != old["note"]["uid"]):
             raise ValueError("A refresh replaced a reviewed element.")
-        if step is None and (component != old_components[component_id] or note != old_notes[note_id]
-                             or any(graphics[key] != old_graphics[key] for key in (component_id, note_id))):
-            raise ValueError("A legend pair marked unchanged was modified.")
+        if old:
+            differences = [key for key, current, original in (
+                (component_id, component, old_components[component_id]), (note_id, note, old_notes[note_id])
+            ) if current != original or graphics[key] != old_graphics[key]]
+            if step is None and differences:
+                raise ValueError("A legend pair marked unchanged was modified.")
+            modified.extend(differences)
         expected_label = step["label"] if step else old["note"]["text"]
         slot = step["slot"] if step else old["slot"]
         if (component["type_uid"] != uid or component["type_id"] != expected_type["id"]
@@ -394,6 +411,7 @@ def verify_result(plan, result, pair_ids):
         for identifier in (component_id, note_id):
             if graphics[identifier]["owner_id"] != legend["id"]:
                 raise ValueError("A result element is outside the target legend.")
+        measures.append({"type_uid": uid, "slot": slot, "component_uv_ft": component_rect, "note_uv_ft": note_rect})
         pairs.append({"type_uid": uid, "slot": slot, "component": paired_state(component, graphics[component_id], "component"),
                       "note": paired_state(note, graphics[note_id], "note")})
     for before_rows, after_rows in ((before["layout"]["target_graphics"], graphics.values()),
@@ -406,7 +424,153 @@ def verify_result(plan, result, pair_ids):
             raise ValueError("Unmanaged graphics changed during the legend update.")
     viewports = verify_sheet_fit(before, legend, plan["intent"])
     return {"host_identity": result["host_identity"], "legend_uid": legend["uid"], "grid": plan["intent"]["grid"],
-            "pairs": sorted(pairs, key=lambda pair: pair["slot"]), "changed_viewport_ids": viewports}
+            "pairs": sorted(pairs, key=lambda pair: pair["slot"]),
+            "measured_cells": sorted(measures, key=lambda row: row["slot"]),
+            "sheet_placements": legend["layout"]["sheet_placements"],
+            "modified_pair_ids": sorted(modified, key=int), "changed_viewport_ids": viewports}
+
+
+RUNTIME_OUTCOMES = {
+    "dry-run": ("dry_run", "ok", "rolled_back", (None,)),
+    "keep": ("modify", "ok", "committed", ("user", "auto")),
+    "discard": ("modify", "rejected", "discarded", ("user",)),
+}
+
+
+def runtime_envelope(record):
+    return record.get("response", record)
+
+
+def check_run_record(record, outcome):
+    envelope = runtime_envelope(record)
+    mode, status, decision, approvals = RUNTIME_OUTCOMES[outcome]
+    if ((envelope.get("mode"), envelope.get("status"), envelope.get("decision")) != (mode, status, decision)
+            or envelope.get("approval") not in approvals or not envelope.get("run_id")
+            or any(envelope.get(key) for key in ("reckless", "error", "failures", "dialogs", "blocked",
+                                                 "warnings", "closed_documents", "unclosed_documents"))):
+        raise ValueError("The pyRevit record does not confirm the requested legend outcome.")
+    return envelope
+
+
+def evidence_ids(changes, field):
+    rows = changes.get(field)
+    count = changes.get(field + "_count")
+    if type(count) is not int or not isinstance(rows, list) or count != len(rows):
+        raise ValueError("The runtime element change list is incomplete.")
+    ids = [str(row["id"]) for row in rows]
+    if not all(valid_id(key) for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError("The runtime change list contains invalid or repeated IDs.")
+    return set(ids)
+
+
+def evidence_changes(plan, envelope, receipt):
+    changes = envelope["changes"]
+    if changes.get("other_documents"):
+        raise ValueError("The runtime reports edits in another document.")
+    added = evidence_ids(changes, "added")
+    modified = evidence_ids(changes, "modified")
+    deleted = evidence_ids(changes, "deleted")
+    expected_pairs = index(receipt["pairs"], "type_uid")
+    steps = plan["steps"]
+    expected_added = {expected_pairs[step["type_uid"]][kind]["id"] for step in steps
+                      if step["operation"] == "add" for kind in ("component", "note")}
+    expected_deleted = {value for step in steps if step["operation"] == "retire" for value in step["existing_ids"]}
+    approved_modified = {value for step in steps if step["operation"] == "refresh" for value in step["existing_ids"]}
+    modified_pairs = set(receipt["modified_pair_ids"])
+    viewports = set(receipt["changed_viewport_ids"])
+    reviewed = {value for sheet in plan["basis"]["legend"]["layout"]["sheet_placements"]
+                for value in sheet["legend_viewport_ids"]}
+    if (added != expected_added or deleted != expected_deleted or not modified_pairs <= approved_modified
+            or not viewports <= reviewed or modified != modified_pairs | viewports
+            or (added & deleted) or (added & modified) or (deleted & modified)):
+        raise ValueError("Runtime add, edit or delete IDs differ from the reviewed legend scope.")
+    return {"added": len(added), "modified": len(modified_pairs), "deleted": len(deleted),
+            "regenerated_viewports": len(viewports)}
+
+
+def check_reported_pairs(plan, observed):
+    pairs = index(observed["pairs"], "type_uid")
+    prior = index((plan["intent"].get("receipt") or {}).get("pairs", []), "type_uid")
+    steps = index(plan["steps"], "type_uid")
+    measures = index(observed["measured_cells"], "type_uid")
+    types = index(plan["basis"]["types"], "uid")
+    if set(pairs) != set(types) or set(measures) != set(types):
+        raise ValueError("The writer did not report a measured pair for every placed type.")
+    seen = set()
+    legend = plan["basis"]["legend"]
+    clearance = legend["scale"] / 96.0
+    for uid, pair in pairs.items():
+        component, note = pair["component"], pair["note"]
+        step, previous = steps.get(uid), prior.get(uid)
+        slot = step["slot"] if step else previous["slot"]
+        expected_label = step["label"] if step else previous["note"]["text"]
+        identities = {component["id"], note["id"]}
+        if (len(identities) != 2 or seen & identities or not all(valid_id(value) for value in identities)
+                or component["type_uid"] != uid or component["type_id"] != types[uid]["id"]
+                or component["direction_raw"] != -7 or note["text"] != expected_label
+                or note["type_id"] != legend["layout"]["text_type"]["id"]
+                or component["owner_id"] != legend["id"] or note["owner_id"] != legend["id"]
+                or pair["slot"] != slot or measures[uid]["slot"] != slot):
+            raise ValueError("A reported elevation or label differs from the reviewed pair.")
+        if previous and any(pair[kind][field] != previous[kind][field]
+                            for kind in ("component", "note") for field in ("id", "uid")):
+            raise ValueError("A reported refresh replaced a reviewed element.")
+        seen.update(identities)
+        cell = cell_bounds(plan["intent"]["grid"], slot)
+        component_rect = vector(measures[uid]["component_uv_ft"], 4)
+        note_rect = vector(measures[uid]["note_uv_ft"], 4)
+        if (not fits(component_rect, cell, clearance) or not fits(note_rect, cell, clearance)
+                or overlaps(component_rect, note_rect, clearance - EPSILON)
+                or not 0 < component_rect[2] - component_rect[0] <= 50
+                or not 0 < component_rect[3] - component_rect[1] <= 50):
+            raise ValueError("A reported elevation or label does not fit its reviewed cell.")
+
+
+def read_snapshot(record):
+    envelope = runtime_envelope(record)
+    result = envelope.get("result", envelope)
+    if envelope.get("status") != "ok" or envelope.get("error") or result.get("status") != "ok":
+        raise ValueError("The Revit opening query did not complete.")
+    return json.loads(result["snapshot_json"])
+
+
+def verify_run(plan, record, fresh, outcome):
+    run = check_run_record(record, outcome)
+    query = runtime_envelope(fresh)
+    if query.get("mode") != "query" or not query.get("run_id") or query["run_id"] == run["run_id"]:
+        raise ValueError("Use a separate Revit query for legend readback.")
+    current = read_snapshot(fresh)
+    approved = approved_plan(plan, plan["basis"])
+    if outcome != "keep" and current != approved["basis"]:
+        raise ValueError("The fresh legend read did not match the rolled-back baseline.")
+    if outcome == "discard":
+        return {"status": "verified_discard", "run_id": run["run_id"], "readback_run_id": query["run_id"]}
+    result = run["result"]
+    if result.get("status") != "ok":
+        raise ValueError("The legend transaction did not return verified element pairs.")
+    observed = json.loads(result["receipt_json"])
+    if (observed["host_identity"] != approved["basis"]["host_identity"]
+            or observed["legend_uid"] != approved["basis"]["legend"]["uid"]
+            or observed["grid"] != approved["intent"]["grid"]
+            or {pair["type_uid"] for pair in observed["pairs"]} != {row["uid"] for row in approved["basis"]["types"]}):
+        raise ValueError("The legend writer result belongs to another preview.")
+    check_reported_pairs(approved, observed)
+    legend = approved["basis"]["legend"]
+    measured = dict(legend, layout=dict(legend["layout"], sheet_placements=observed["sheet_placements"]))
+    if verify_sheet_fit(legend, measured, approved["intent"]) != observed["changed_viewport_ids"]:
+        raise ValueError("The measured sheet changes differ from the runtime receipt.")
+    counts = evidence_changes(approved, run, observed)
+    if outcome == "dry-run":
+        return {"status": "verified_dry_run", "run_id": run["run_id"], "readback_run_id": query["run_id"],
+                "changes": counts}
+    pairs = {row["type_uid"]: {"component_id": row["component"]["id"], "note_id": row["note"]["id"]}
+             for row in observed["pairs"]}
+    if verify_result(approved, current, pairs) != observed:
+        raise ValueError("The kept legend differs from the independent readback.")
+    return {"kind": "opening-legend-receipt", "status": "verified_keep", "decision": "committed",
+            "approval": run["approval"], "run_id": run["run_id"], "readback_run_id": query["run_id"],
+            "host_identity": observed["host_identity"], "legend_uid": observed["legend_uid"],
+            "grid": observed["grid"], "pairs": observed["pairs"], "changes": counts}
 
 
 def load(path):
@@ -421,21 +585,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("read")
     parser.add_argument("intent")
+    parser.add_argument("--verify", choices=sorted(RUNTIME_OUTCOMES))
+    parser.add_argument("--run")
     args = parser.parse_args(argv)
     try:
-        response = load(args.read)
-        response = response.get("response", response)
-        if response.get("status") != "ok":
-            raise ValueError("The Revit opening query did not complete.")
-        response = response.get("result", response)
-        if response.get("status") != "ok":
-            raise ValueError("The Revit opening inventory is unavailable.")
-        preview = build_preview(json.loads(response["snapshot_json"]), load(args.intent))
+        read, supplied = load(args.read), load(args.intent)
+        if bool(args.verify) != bool(args.run):
+            raise ValueError("Supply both the requested runtime outcome and the complete run record.")
+        preview = (verify_run(supplied, load(args.run), read, args.verify) if args.verify
+                   else build_preview(read_snapshot(read), supplied))
         encoded = json.dumps(preview, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         if len(encoded) > LIMIT:
             raise ValueError("The legend preview exceeds 2 MiB.")
         print(encoded)
-        return 1 if preview["blocked"] else 0
+        return 1 if preview.get("blocked") else 0
     except (ValueError, IOError, TypeError, KeyError, AttributeError) as error:
         print("Opening legend preview stopped: " + str(error), file=sys.stderr)
         return 2

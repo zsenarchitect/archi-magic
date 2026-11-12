@@ -29,6 +29,15 @@ In Revit 2026, add `source_legend_id`, `seed_component_id`, and `text_type_id` t
 
 Save the full layout query as `read.json`. Set `grid` in `intent.json` with `origin_uv_ft`, `columns`, `cell_width_ft`, and `cell_height_ft`. Run `python scripts/opening_legend_preview.py read.json intent.json > preview.json`. Pass explicit single-line `labels` keyed by type UID for unresolved mark or size data. A refresh also needs the previous kept-run `receipt`. Render the change preview and check adds, refreshes, and retirements. Revit must verify the actual graphics and sheet fit before any update. For a legend on sheets, include `sheet_rectangles_ft` keyed by sheet ID. Give each available rectangle as `[min_x,min_y,max_x,max_y]` in paper-space feet.
 
+Use a disposable Revit 2026 project to qualify the writer. Follow am-safe-change for the preview, ownership check and approval.
+
+1. Run `scripts/apply_opening_legend.py` with `run_modify` and `dry_run: true`. Set `workspace` to this skill's scripts folder. Pass the full approved JSON as `{"preview": {...}}`.
+2. Recover the full run and save it as `dry.json`. Repeat the original layout query and save it as `fresh.json`. Run `python scripts/opening_legend_preview.py fresh.json preview.json --verify dry-run --run dry.json`. Stop if it fails. Show the added, edited, deleted and regenerated viewport counts.
+3. Recheck the Revit context, approval policy and ownership. Run the same preview. Use Keep or Discard under `ask`. Under `auto`, get approval again after the dry run. Save the complete run as `real.json`.
+4. Run the original layout query again. Verify the new `fresh.json` with `--verify discard --run real.json` after Discard. After Keep, use `--verify keep --run real.json` and save the returned receipt for the next update. Use Undo if the kept read differs.
+5. Inspect the actual elevation, label and sheet layout in Revit. Use the kept receipt in the next intent only after confirming the result.
+
+
 
 
 

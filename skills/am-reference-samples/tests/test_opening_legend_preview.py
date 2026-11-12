@@ -196,12 +196,12 @@ def test_writer_rolls_back_if_retiring_pair_deletes_an_extra_element(monkeypatch
     assert [transaction.state for transaction in transactions] == ["rolled_back"]
 
 
-def test_readback_accepts_verified_refresh_and_preserves_manual_notes():
+def test_readback_accepts_verified_refresh_and_preserves_manual_notes(tmp_path):
     state, receipt = managed_snapshot()
     legend = state["legend"]
     legend["revit_year"] = "2026"
     legend["layout"].update(source_legend_id="26", source_legend_uid="fixture-source", source_scale=20,
-                            source_frame={"origin_ft": [0, 0, 0]}, seed={"id": "60"},
+                            source_frame={"origin_ft": [0, 0, 0]}, seed={"id": "60"}, title_block_category_id="-9",
                             front_elevation_coverage={"missing_type_ids": [], "duplicate_elevation_type_ids": [],
                                                       "unplaced_elevation_type_ids": [], "unresolved_type_ids": []})
     legend["text_notes"].append({"id": "35", "uid": "manual-note", "text": "Manual"})
@@ -218,6 +218,38 @@ def test_readback_accepts_verified_refresh_and_preserves_manual_notes():
              "window": {"component_id": "33", "note_id": "34"}}
     result = PLANNER["verify_result"](plan, actual, pairs)
     assert [pair["note"]["text"] for pair in result["pairs"]] == ["A02 | 3 ft × 7 ft", "A01 | 3 ft × 7 ft"]
+    assert result["modified_pair_ids"] == ["32"]
+    def query(snapshot, run_id):
+        return {"mode": "query", "status": "ok", "run_id": run_id,
+                "result": {"status": "ok", "snapshot_json": json.dumps(snapshot)}}
+    changes = {"added_count": 0, "added": [], "deleted_count": 0, "deleted": [],
+               "modified_count": 1, "modified": [{"id": 32}]}
+    dry = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "run_id": "dry",
+           "changes": changes, "result": {"status": "ok", "receipt_json": json.dumps(result)}}
+    verified_dry = PLANNER["verify_run"](plan, dry, query(state, "baseline"), "dry-run")
+    assert verified_dry["status"] == "verified_dry_run"
+    assert verified_dry["changes"] == {"added": 0, "modified": 1, "deleted": 0, "regenerated_viewports": 0}
+    discard = {"mode": "modify", "status": "rejected", "decision": "discarded", "approval": "user", "run_id": "discard"}
+    assert PLANNER["verify_run"](plan, discard, query(state, "discarded-read"), "discard")["status"] == "verified_discard"
+    kept = dict(dry, mode="modify", decision="committed", approval="user", run_id="keep")
+    receipt = PLANNER["verify_run"](plan, kept, query(actual, "read"), "keep")
+    assert receipt["status"] == "verified_keep" and receipt["pairs"] == result["pairs"]
+    paths = [tmp_path / name for name in ("fresh.json", "preview.json", "run.json")]
+    for path, data in zip(paths, (query(actual, "read"), plan, kept)):
+        path.write_text(json.dumps(data))
+    cli = subprocess.run([sys.executable, str(SCRIPT), str(paths[0]), str(paths[1]),
+                          "--verify", "keep", "--run", str(paths[2])], capture_output=True, text=True)
+    assert cli.returncode == 0, cli.stderr
+    assert json.loads(cli.stdout) == receipt
+
+    with pytest.raises(ValueError, match="separate Revit query"):
+        PLANNER["verify_run"](plan, kept, query(actual, "keep"), "keep")
+    with pytest.raises(ValueError, match="rolled-back baseline"):
+        PLANNER["verify_run"](plan, dry, query(actual, "not-rolled-back"), "dry-run")
+    invalid = dict(kept, changes=dict(changes, modified=[{"id": 35}]))
+    with pytest.raises(ValueError, match="differ from the reviewed legend scope"):
+        PLANNER["verify_run"](plan, invalid, query(actual, "read"), "keep")
+
     actual["legend"]["text_notes"][2]["text"] = "Unexpected edit"
     with pytest.raises(ValueError, match="Unmanaged graphics changed"):
         PLANNER["verify_result"](plan, actual, pairs)
