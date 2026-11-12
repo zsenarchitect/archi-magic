@@ -10,6 +10,7 @@ from family_parameter_transfer_effects import verify_element_effects, verify_fam
 from family_parameter_transfer_preview import preview, reviewed_snapshot
 from family_placement_preview import load_json
 from probe_family_parameter_transfer import TRANSACTION_NAME
+from probe_family_formula_binding import qualification_cases
 from revit_probe_record import require_no_changes, require_run
 from verify_family_placement_probe import bridge_effects, unique_ids
 
@@ -112,23 +113,45 @@ def verify_decision(transfer, before, trial, after, modify_record, fresh_record)
     return dict(receipt, decision_sha256=manifest_digest(receipt))
 
 
+def verify_formula_observations(plan, baseline, trial, requested):
+    state = baseline["state"]
+    definitions = dict(state["definitions"])
+    types = {name: dict(values) for name, values in state["types"].items()}
+    for name, identifier in trial["added_ids"].items():
+        definitions[identifier] = dict(plan["operations"][name]["definition"], id=identifier, read_only=False)
+        for type_name, values in types.items():
+            values[identifier] = trial["values"][type_name][name]
+    cases, _ = qualification_cases(plan, {"definitions": definitions, "types": types}, requested)
+    expected_observations = [dict(case, observed=case["expected"]) for case in cases]
+    expected = {"case_count": len(cases), "observations_sha256": manifest_digest(expected_observations)}
+    if trial.get("formula_qualification") != expected:
+        raise ValueError("Native observations differ from the reviewed formula cases.")
+    return expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("transfer", "before", "trial", "after"):
         parser.add_argument(name)
     parser.add_argument("--modify")
     parser.add_argument("--fresh")
+    parser.add_argument("--formula-cases")
     args = parser.parse_args()
     try:
         inputs = [load_json(getattr(args, name)) for name in ("transfer", "before", "trial", "after")]
         if bool(args.modify) != bool(args.fresh):
             raise ValueError("Supply both the native decision and its fresh audit.")
+        if args.modify and args.formula_cases:
+            raise ValueError("Verify the disposable formula trial separately from a final decision.")
         if args.modify:
             result = verify_decision(*inputs, load_json(args.modify), load_json(args.fresh))
         else:
             plan, baseline, trial, run_ids = verify(*inputs)
             result = {"status": "family_transfer_rollback_verified", "preview_sha256": plan["preview_sha256"],
                       "audit_sha256": manifest_digest(baseline), "values": trial["values"], "run_ids": run_ids}
+            if args.formula_cases:
+                result["formula_qualification"] = verify_formula_observations(
+                    plan, baseline, trial, load_json(args.formula_cases))
     except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:
         print(f"Family transfer verification blocked. {error}", file=sys.stderr)
         return 2

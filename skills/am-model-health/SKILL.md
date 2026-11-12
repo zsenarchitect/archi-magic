@@ -320,7 +320,7 @@ Run `scripts/probe_family_formula_binding.py` in guarded CPython dry-run mode. P
 
 Set `type` and `parameter` to the exact names. Set `value` to the new typed value record. Set `expected` to independently calculated typed value records keyed by each affected formula name. Use `{"state": "value", "value": 12.0}` for a numeric record.
 
-Save the full trial and the independent post-rollback family audit. Record the case count and observation digest in the qualification evidence. The trial rolls back each input change before it tests the next input.
+Save the full trial, the exact cases list as `cases.json`, and the independent post-rollback family audit. Run `python scripts/verify_family_parameter_transfer.py transfer.json before.json trial.json after.json --formula-cases cases.json`. Record the verified case count and observation digest. The trial rolls back each input change before it tests the next input.
 
 ### Seal the private family export
 

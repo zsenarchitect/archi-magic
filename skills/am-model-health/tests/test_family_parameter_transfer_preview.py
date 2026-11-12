@@ -719,3 +719,35 @@ def test_native_formula_binding_trial_restores_each_perturbation(trial_states, m
         assert [list(event) for event in events] == [["10"], ["19"], ["10"], ["19"]]
     assert not changed
     assert manager.CurrentType is types[0]
+
+
+def test_formula_verifier_checks_observations_against_reviewed_cases(decision_records, tmp_path):
+    trial_records, _, _ = decision_records
+
+    def value(raw):
+        return {"state": "value", "value": raw}
+
+    cases = [
+        {"type": "Target A", "parameter": "Base Width", "value": value(4.0),
+         "expected": {"Panel Width": value(8.0), "Total Width": value(9.0)}},
+        {"type": "Target B", "parameter": "Base Width", "value": value(5.0),
+         "expected": {"Panel Width": value(10.0), "Total Width": value(11.0)}},
+    ]
+    observations = [dict(case, observed=case["expected"]) for case in cases]
+    qualification = {"case_count": 2, "observations_sha256": manifest_digest(observations)}
+    trial_records[2]["result"]["formula_qualification"] = qualification
+    paths = [tmp_path / f"artifact-{index}.json" for index in range(5)]
+    for path, record in zip(paths, (*trial_records, cases)):
+        path.write_text(json.dumps(record))
+
+    command = [sys.executable, str(SCRIPTS / "verify_family_parameter_transfer.py"),
+               *map(str, paths[:4]), "--formula-cases", str(paths[4])]
+    verified = subprocess.run(command, capture_output=True, text=True)
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["formula_qualification"] == qualification
+
+    cases[1]["expected"]["Total Width"] = value(12.0)
+    paths[4].write_text(json.dumps(cases))
+    refused = subprocess.run(command, capture_output=True, text=True)
+    assert refused.returncode == 2 and not refused.stdout
+    assert "observations differ from the reviewed formula cases" in refused.stderr
