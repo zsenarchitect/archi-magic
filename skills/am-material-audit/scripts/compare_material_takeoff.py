@@ -35,16 +35,16 @@ def read_payload(path):
         report = report["response"]
         if not isinstance(report, dict):
             raise ValueError("expected a saved runtime response")
-    if {"result", "mode", "result_truncated", "changes"}.intersection(report):
+    if {"result", "mode", "run_id", "result_truncated", "changes"}.intersection(report):
         exit_code = report.get("exit_code", 0)
         if (report.get("status", "ok") not in ("ok", "success", "succeeded", "completed")
                 or type(exit_code) is not int or exit_code != 0
                 or report.get("error") or report.get("mode", "query") != "query"
                 or report.get("result_truncated", False) is not False or report.get("failures") or report.get("blocked")
-                or report.get("unclosed_documents")):
+                or any(report.get(key) for key in ("warnings", "dialogs", "closed_documents", "unclosed_documents"))):
             raise Incomplete("save the complete successful read-only query response")
-        if "changes" in report:
-            changes = report["changes"]
+        if {"changes", "mode", "run_id"}.intersection(report):
+            changes = report.get("changes")
             if (not isinstance(changes, dict)
                     or any(type(changes.get(key)) is not int or changes[key] != 0
                            for key in ("added_count", "modified_count", "deleted_count"))
