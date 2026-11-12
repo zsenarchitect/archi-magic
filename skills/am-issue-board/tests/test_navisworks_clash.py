@@ -202,3 +202,51 @@ def test_unsupported_html_layout_does_not_return_partial_results(tmp_path, bad_l
     source.write_text(html, encoding="utf-8")
     result = invoke(source)
     assert result.returncode == 2 and not result.stdout
+
+
+def sequential_pair(name, value):
+    return (f'<span class="namevaluepair"><span class="name">{name}</span>'
+            f'<span class="value">{value}</span></span>')
+
+
+def sequential_report(left=None, right=None, side="Item 2"):
+    left = sequential_pair("Element ID", "42") if left is None else left
+    right = sequential_pair("Element ID", "9007199254740993") if right is None else right
+    return ('<html><head><meta charset="utf-8"></head><body><div class="animation">'
+            f'{sequential_pair("Status", "OK")}<div class="viewpoint"><a href="ignored"><img src="ignored"></a>'
+            f'{sequential_pair("Name", "Wall &amp; pipe")}{sequential_pair("Status", "New")}'
+            f'<h4 class="clashobject">Item 1</h4>{left}'
+            f'<h4 class="clashobject">{side}</h4>{right}</div></div></body></html>')
+
+
+def test_sequential_html_reads_item_scoped_ids_without_creating_a_board_plan(inputs, tmp_path):
+    _, snapshot, board = inputs
+    source = tmp_path / "sequential.html"
+    source.write_text(sequential_report(), encoding="utf-8")
+    result = invoke(source, "--snapshot", snapshot, "--board", board)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    row, = data["clashes"]
+    assert data["source_format"] == "html_sequential"
+    assert row["name"] == "Wall & pipe" and row["source_status"] == "new"
+    assert row["objects"] == [{"element_id": "42", "selection_path": []},
+                              {"element_id": "9007199254740993", "selection_path": []}]
+    assert row["guid"] is None and row["section_box"] is None and data["plan"] is None
+    source.write_text(sequential_report(left="", right=sequential_pair("Item ID", "42")), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    row, = json.loads(result.stdout)["clashes"]
+    assert [item["element_id"] for item in row["objects"]] == [None, None]
+
+
+@pytest.mark.parametrize("html", [
+    sequential_report(side="Item 1"),
+    sequential_report().replace("</body>", ""),
+    sequential_report().replace('<div class="viewpoint">', '<div class="group"><div class="viewpoint">'),
+    sequential_report().replace("</body>", tabular_report() + "</body>"),
+])
+def test_sequential_html_refuses_unsupported_or_incomplete_markup(tmp_path, html):
+    source = tmp_path / "unrecognized.html"
+    source.write_text(html, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout

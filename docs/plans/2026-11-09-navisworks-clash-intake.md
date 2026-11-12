@@ -24,4 +24,9 @@ Baseline e0df05c097aef9b39cc97f6720fb1883fad34e01. Filed gap confirmed: the issu
 ## Tabular HTML evidence
 
 - A later compatibility check used a public [French tabular Navisworks export](https://github.com/yormantbt-tech/Navisworks-BIM-4D-Report/blob/cd6544e8a20089e19e07a1ea5c4c232ae3389b1f/Sols%20Vs%20Ossature0.html), Git blob `a8e514b4ad7dd2559eb8496ddfcc696119fb7b6a`. The CLI read all 16 individual rows and 32 explicitly labelled element IDs. The checked export contains no clash GUIDs or selection-tree paths, so it yields a review report with no section-box or issue-board proposal. Its export version was unavailable.
-- The adapter checks the two header levels, item groups and cell spans. It rejects unsupported group rows and custom layouts. Sequential HTML, grouped tabular HTML, and the end-to-end Revit workflow still need fixtures and verification.
+- The tabular adapter checks both header levels, item groups, and cell spans. Grouped tabular HTML and the live Revit workflow still need verification.
+
+## Sequential HTML evidence
+
+- The default English layout uses one viewpoint block per individual result. The adapter reads the named properties within that block and its two ordered item sections. Only an explicit Element ID property can supply an ID. HTML review returns no mapped clash identity or issue-board plan.
+- A CLI run against [pi.html](https://github.com/Katravathu9/Room-of-Clash-Detection-in-Navisworks/blob/321867d1052bdaf0e0556ddfa9bd4fbb619c9981/pi.html) (blob `846954d58427c29bca58caf52293786a4649fb03`) returned 25 clashes with 50 explicit IDs. A run against [Test 1.html](https://github.com/Katravathu9/Room-of-Clash-Detection-in-Navisworks/blob/321867d1052bdaf0e0556ddfa9bd4fbb619c9981/Test%201.html) (blob `e56ce1265292225a120858d73dfc8a5a19657b12`) returned 233 clashes with 464 explicit IDs and two unresolved sides. An independent HTML parse matched the CLI's ordered names, statuses, and both item IDs in every row. The export versions were unavailable. Grouped sequential HTML needs its own fixture.

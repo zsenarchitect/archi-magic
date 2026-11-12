@@ -149,6 +149,7 @@ class TabularReport(HTMLParser):
         self.row = None
         self.cell = None
         self.nodes = 0
+        self.sequential = False
 
     def handle_decl(self, declaration):
         if declaration.lower().strip() != "doctype html":
@@ -160,6 +161,8 @@ class TabularReport(HTMLParser):
             raise ValueError("Unsupported HTML content or structure limit.")
         fields = dict(attrs)
         css = fields.get("class", "")
+        if tag == "div" and css == "animation":
+            self.sequential = True
         if tag == "table":
             if self.table is not None:
                 raise ValueError("Unexpected nested Navisworks table.")
@@ -263,13 +266,7 @@ def tabular_columns(rows):
     return keys, expected_cells
 
 
-def parse_tabular_report(data):
-    decoded = data.decode("utf-8-sig")
-    if "\0" in decoded or re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", decoded, re.I):
-        raise ValueError("Unexpected HTML declaration.")
-    reader = TabularReport()
-    reader.feed(decoded)
-    reader.close()
+def tabular_clashes(reader):
     if reader.table is not None or not reader.tables:
         raise ValueError("The report is not a complete default Navisworks tabular export.")
     report = []
@@ -288,7 +285,115 @@ def parse_tabular_report(data):
                            "source_status": selected.get("status", "").casefold(), "source_point": None,
                            "objects": [{"element_id": html_element_id(selected.get("element%d" % side, "")),
                                         "selection_path": []} for side in (0, 1)]})
-    return "", report
+    return report
+
+
+class SequentialReport(HTMLParser):
+    """Read one viewpoint at a time from the default sequential layout."""
+
+    CONTAINER = (("html", ""), ("body", ""), ("div", "animation"))
+    VIEWPOINT = ("div", "viewpoint")
+    PAIR = ("span", "namevaluepair")
+    SIDE = ("h4", "clashobject")
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                 "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.clashes = []
+        self.fields = None
+        self.items = []
+        self.pair = None
+        self.parts = None
+
+    def handle_starttag(self, tag, attrs):
+        css = dict(attrs).get("class", "")
+        node = (tag, css)
+        parent = tuple(self.stack)
+        viewpoint = self.CONTAINER + (self.VIEWPOINT,)
+        if len(parent) >= 24 or self.parts is not None:
+            raise ValueError("Unsupported nested sequential clash field.")
+        if node == self.VIEWPOINT:
+            if parent != self.CONTAINER or len(self.clashes) >= 300:
+                raise ValueError("Unexpected clash viewpoint or report size.")
+            self.fields, self.items = {}, []
+        if parent == viewpoint and node == self.SIDE:
+            self.parts = []
+        if parent == viewpoint and node == self.PAIR:
+            self.pair = []
+        if parent == viewpoint + (self.PAIR,):
+            if len(self.pair) >= 2 or node != ("span", ("name", "value")[len(self.pair)]):
+                raise ValueError("Unexpected sequential property field.")
+            self.parts = []
+        if tag not in self.VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_data(self, data):
+        if self.parts is not None:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1][0] != tag:
+            raise ValueError("Incomplete sequential clash markup.")
+        node = self.stack.pop()
+        parent = tuple(self.stack)
+        viewpoint = self.CONTAINER + (self.VIEWPOINT,)
+        if parent == viewpoint + (self.PAIR,):
+            self.pair.append(" ".join("".join(self.parts).split()))
+            self.parts = None
+        elif parent == viewpoint and node == self.PAIR:
+            if len(self.pair) != 2:
+                raise ValueError("Incomplete sequential clash property.")
+            label, value = self.pair
+            label = label.casefold()
+            if not self.items and label in ("name", "status"):
+                if label in self.fields:
+                    raise ValueError("The viewpoint repeats a clash field.")
+                self.fields[label] = text(value)
+            if self.items and label in HTML_LABELS["element"]:
+                if "element_id" in self.items[-1]:
+                    raise ValueError("The item repeats an Element ID.")
+                self.items[-1]["element_id"] = html_element_id(text(value))
+            self.pair = None
+        elif parent == viewpoint and node == self.SIDE:
+            label = " ".join("".join(self.parts).split()).casefold()
+            if len(self.items) >= 2 or label != "item %d" % (len(self.items) + 1):
+                raise ValueError("Expected ordered Item 1 and Item 2 sections.")
+            self.items.append({"selection_path": []})
+            self.parts = None
+        elif parent == self.CONTAINER and node == self.VIEWPOINT:
+            if len(self.items) != 2 or not self.fields.get("name"):
+                raise ValueError("The sequential clash lacks a name or two item sections.")
+            for item in self.items:
+                item.setdefault("element_id", None)
+            self.clashes.append({"guid": None, "name": self.fields["name"],
+                                 "source_status": self.fields.get("status", "").casefold(),
+                                 "source_point": None, "objects": self.items})
+
+
+def parse_html_report(data):
+    decoded = data.decode("utf-8-sig")
+    if "\0" in decoded or re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", decoded, re.I):
+        raise ValueError("Unexpected HTML declaration.")
+    layout = TabularReport()
+    layout.feed(decoded)
+    layout.close()
+    if not layout.sequential:
+        return "html_tabular", tabular_clashes(layout)
+    if layout.tables or layout.table is not None:
+        raise ValueError("The HTML mixes tabular and sequential layouts.")
+    reader = SequentialReport()
+    reader.feed(decoded)
+    reader.close()
+    if reader.stack or not reader.clashes:
+        raise ValueError("The report is not a complete default sequential Navisworks export.")
+    return "html_sequential", reader.clashes
 
 
 def point(value):
@@ -434,13 +539,18 @@ def main(argv=None):
     is_html = suffix in (".html", ".htm")
     try:
         if suffix != ".xml" and not is_html:
-            raise ValueError("Use a Navisworks XML or default HTML (Tabular) report.")
+            raise ValueError("Use a Navisworks XML or default HTML report.")
         if not math.isfinite(args.padding_ft) or not 0.1 <= args.padding_ft <= 20:
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
         raw = local_bytes(args.report)
-        units, clashes = parse_tabular_report(raw) if is_html else parse_report(raw)
+        if is_html:
+            source_format, clashes = parse_html_report(raw)
+            units = ""
+        else:
+            source_format = "xml"
+            units, clashes = parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
         host, index = element_snapshot(snapshot) if snapshot is not None else (None, {})
         for row in clashes:
@@ -455,7 +565,7 @@ def main(argv=None):
         plan, skipped = board_preview(args.board, args.archive, clashes) if args.board else (None, [])
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
-            "source_format": "html_tabular" if is_html else "xml",
+            "source_format": source_format,
             "report_sha256": hashlib.sha256(raw).hexdigest(), "source_units": units,
             "snapshot_sha256": hashlib.sha256(snapshot).hexdigest() if snapshot is not None else None,
             "host_id": host, "coordinate_frame": FRAME if host else None,
@@ -463,7 +573,7 @@ def main(argv=None):
             "warnings": ["Archive note not checked for duplicates."] if args.board and not args.archive else [],
         }
         if is_html:
-            report["warnings"].append("Tabular rows lack clash GUIDs and selection-tree paths. Export XML for model mapping and board import.")
+            report["warnings"].append("HTML review has no mapped clash identity. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)
         if len(encoded) > LIMIT:
             raise ValueError("Preview exceeds the supported size.")
@@ -475,7 +585,7 @@ def main(argv=None):
         # Parser and board exceptions may include raw report or model content.
         print("Navisworks intake failed: invalid input, format, identity or limit.", file=sys.stderr)
         if suffix != ".xml":
-            print("Use a Navisworks XML or default ungrouped HTML (Tabular) report.", file=sys.stderr)
+            print("Use a Navisworks XML or a supported default ungrouped HTML report.", file=sys.stderr)
         return 2
     return 0
 
