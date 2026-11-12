@@ -39,6 +39,8 @@ Recipes (the task-specific parts):
 
 - Match rotation, offset, or level: [recipes/level-alignment.md](recipes/level-alignment.md). Review the selected instances and any elevation changes before qualifying a native write.
 
+- Plan dimensions: [recipes/plan-dimensions.md](recipes/plan-dimensions.md). Review grid, overall wall, and opening dimensions and report unresolved references.
+
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
 ## The 8 steps (do all of them, in this order)
