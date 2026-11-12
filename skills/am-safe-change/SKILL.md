@@ -15,6 +15,8 @@ Recipes (the task-specific parts):
 - Texture image repathing: [recipes/repath-texture-images.md](recipes/repath-texture-images.md). Use it to find materials with missing texture images and repath what the project folder covers ("repath the missing textures from the ACC folder").
 - Detail views: [recipes/detail-views.md](recipes/detail-views.md). Use it to add section detail views to a sheet and match the existing viewports: copy the reference viewport's label settings and type, center each box with `SetBoxCenter`, propose detail numbers in the sheet's pattern, and verify with a fresh read ("add two section details to A401 and match the existing viewports").
 
+- [Create named levels and grids](recipes/create-datums.md). Review project elevations, grid spacings and existing names before creating new datums.
+
 - Focus a view: [recipes/focus-view.md](recipes/focus-view.md). Use it to add a padded section box or crop a plan around the selection.
 
 - Clear visibility hides: [recipes/hidden-elements.md](recipes/hidden-elements.md). Use it to diagnose hide sources and review an unhide.
