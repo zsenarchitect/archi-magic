@@ -1,0 +1,1057 @@
+from hashlib import sha256
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+from types import SimpleNamespace as NS
+
+import pytest
+
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+
+
+class Id(int):
+    Value = property(int)
+
+
+Id.InvalidElementId = Id(-1)
+
+
+class Line:
+    IsBound = True
+
+    def __init__(self, a, b):
+        self.ends = [point(*p) for p in (a, b)]
+
+    def GetEndPoint(self, index):
+        return self.ends[index]
+
+
+class LocationCurve(NS):
+    def get_ElementsAtJoin(self, end):
+        return self.neighbors[end]
+
+
+class LocationPoint(NS):
+    pass
+
+
+class Level(NS):
+    pass
+
+
+class Wall(NS):
+    pass
+
+
+class FamilyInstance(NS):
+    pass
+
+
+class Floor(NS):
+    pass
+
+
+class Sketch(NS):
+    pass
+
+
+class PlanarFace(NS):
+    pass
+
+
+class Grid(NS):
+    pass
+
+
+class ModelLine(NS):
+    pass
+
+
+class DetailLine(NS):
+    pass
+
+
+def point(x, y, z):
+    return NS(X=x, Y=y, Z=z)
+
+
+def loop(vertices, z):
+    return [Line((*a, z), (*b, z)) for a, b in zip(vertices, vertices[1:] + vertices[:1])]
+
+
+def native(kind, identifier, **values):
+    return kind(Id=Id(identifier), UniqueId=f"uid-{identifier}", **values)
+
+
+def parameter(identifier, storage, value, **extra):
+    return NS(Id=Id(identifier), StorageType=storage, Definition=NS(), HasValue=value is not None, IsReadOnly=False,
+              IsShared="GUID" in extra, AsString=lambda: value, AsDouble=lambda: value,
+              AsInteger=lambda: value, AsElementId=lambda: value, **extra)
+
+
+@pytest.fixture
+def model(monkeypatch):
+    names = ("WALL_BASE_CONSTRAINT", "WALL_BASE_OFFSET", "WALL_HEIGHT_TYPE", "WALL_TOP_OFFSET",
+             "WALL_USER_HEIGHT_PARAM", "WALL_TOP_IS_ATTACHED", "WALL_BOTTOM_IS_ATTACHED", "FAMILY_BASE_LEVEL_PARAM",
+             "FAMILY_BASE_LEVEL_OFFSET_PARAM", "FAMILY_TOP_LEVEL_PARAM", "FAMILY_TOP_LEVEL_OFFSET_PARAM")
+    bip = NS(**{name: name for name in names})
+    db = NS(ElementId=Id, Line=Line, Level=Level, Wall=Wall, FamilyInstance=FamilyInstance, Floor=Floor,
+            Sketch=Sketch, PlanarFace=PlanarFace, Grid=Grid, ModelLine=ModelLine, DetailLine=DetailLine,
+            LocationCurve=LocationCurve, LocationPoint=LocationPoint,
+            WallKind=NS(Basic="basic"), WallCrossSection=NS(Vertical="vertical"),
+            BuiltInCategory=NS(OST_Columns=-5, OST_StructuralColumns=-6),
+            BuiltInParameter=bip, StorageType=NS(String="s", Double="d", Integer="i", ElementId="e"),
+            HostObjectUtils=NS(GetTopFaces=lambda floor: ["top"]),
+            JoinGeometryUtils=NS(GetJoinedElements=lambda doc, element: []),
+            WallUtils=NS(IsWallJoinAllowedAtEnd=lambda wall, end: end == 0))
+    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
+    monkeypatch.setitem(sys.modules, "pyrevit", NS(api=NS(DB=db)))
+    monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+
+    params = [parameter(5, "s", "", GUID="parameter-guid"), parameter(-7, "e", Id(-8)),
+              parameter(8, "s", None), parameter(9, "d", 0.12345678901234567)]
+    get_bounds = lambda _: NS(Min=point(0, 0, 0), Max=point(1, 2, 20),
+                              Transform=NS(OfPoint=lambda value: value, IsIdentity=True))
+    source_fields = dict(ViewSpecific=False, Pinned=False, GroupId=Id(-1), DesignOption=None,
+                         Parameters=params, GetTypeId=lambda: Id(100), GetDependentElements=lambda _: [])
+    wall_values = {
+        "WALL_BASE_CONSTRAINT": parameter(-10, "e", Id(1)), "WALL_BASE_OFFSET": parameter(-11, "d", 0),
+        "WALL_HEIGHT_TYPE": parameter(-12, "e", Id(-1)), "WALL_USER_HEIGHT_PARAM": parameter(-13, "d", 20),
+        "WALL_TOP_IS_ATTACHED": parameter(-14, "i", 0), "WALL_BOTTOM_IS_ATTACHED": parameter(-15, "i", 0),
+    }
+    wall = native(Wall, 10, WallType=NS(Kind="basic"), CrossSection="vertical", SketchId=Id(-1),
+                  Orientation=point(0, -1, 0), Flipped=False, IsStackedWallMember=False,
+                  Location=LocationCurve(Curve=Line((0, 0, 0), (4, 0, 0)), neighbors=[[], []]),
+                  FindInserts=lambda *_: [], get_Parameter=wall_values.get, get_BoundingBox=get_bounds, **source_fields)
+    column_values = {name: parameter(-20 - i, kind, value) for i, (name, kind, value) in enumerate((
+        ("FAMILY_BASE_LEVEL_PARAM", "e", Id(1)), ("FAMILY_TOP_LEVEL_PARAM", "e", Id(4)),
+        ("FAMILY_BASE_LEVEL_OFFSET_PARAM", "d", 0), ("FAMILY_TOP_LEVEL_OFFSET_PARAM", "d", 0)))}
+    columns = [native(FamilyInstance, i, Category=NS(Id=Id(category)), CanSplit=True, IsSlantedColumn=False,
+                      Symbol=NS(Family=NS(IsInPlace=False)), SuperComponent=None,
+                      Location=LocationPoint(Point=point(0, 0, 0)),
+                      GetTransform=lambda: NS(Origin=point(0, 0, 0), BasisX=point(1, 0, 0), BasisY=point(0, 1, 0),
+                                              BasisZ=point(0, 0, 1)),
+                      get_Parameter=column_values.get, get_BoundingBox=get_bounds, **source_fields)
+               for i, category in ((11, -5), (12, -6))]
+    vertices = [(0, 0), (8, 0), (8, 4), (0, 4)]
+    face = PlanarFace(FaceNormal=point(0, 0, 1), GetEdgesAsCurveLoops=lambda: [loop(vertices[::-1], -0.5)])
+    floor = native(Floor, 13, SketchId=Id(20), GetSlabShapeEditor=lambda: NS(IsEnabled=False),
+                   GetGeometryObjectFromReference=lambda _: face, **source_fields)
+    sketch = native(Sketch, 20, OwnerId=Id(13), Profile=[loop(vertices, 0)])
+    floor.GetDependentElements = lambda _: [sketch.Id]
+    grid = native(Grid, 21, Curve=Line((4, 1, 0), (4, 3, 0)))
+    detail_line = native(DetailLine, 22, GeometryCurve=Line((0, 2, 0), (4, 2, 0)))
+    elements = [native(Level, i, ProjectElevation=z, Elevation=z + 100) for i, z in enumerate((0, 8, 15, 20), 1)]
+    elements.extend([wall, *columns, floor, sketch, grid, detail_line, native(NS, 100)])
+    registry = {element.Id.Value: element for element in elements}
+    document = NS(IsFamilyDocument=False, IsLinked=False, IsWorkshared=False, IsModified=False, IsModifiable=False,
+                  PathName="fixture.rvt", ProjectInformation=NS(UniqueId="fixture-project"),
+                  Application=NS(VersionNumber="2026", ShortCurveTolerance=0.0026041666666666665),
+                  GetElement=lambda identifier: registry.get(identifier.Value))
+    return document, registry, face
+
+
+def invoke(document, inputs):
+    return runpy.run_path(str(SCRIPTS / "read_element_split_evidence.py"),
+                          init_globals={"doc": document, "inputs": inputs})["result"]
+
+
+def request(document):
+    host = invoke(document, {"describe": True})["host_identity"]
+
+    def item(i):
+        return {"id": str(i), "uid": f"uid-{i}"}
+
+    return {"host_identity": host, "scope": [{"source": item(i), "cuts": [item(2), item(3)]} for i in (10, 11, 12)]
+            + [{"source": item(13), "cuts": [item(21), item(22)]}]}
+
+
+def test_query_produces_bound_typed_source_inventory_and_geometry_preview(model, tmp_path):
+    document, _, _ = model
+    result = invoke(document, request(document))
+    assert result["status"] == "ok", result
+    snapshot = result["snapshot_json"].encode()
+    inventory = json.loads(result["inventory_json"])
+    assert inventory["basis_sha256"] == sha256(snapshot).hexdigest()
+    assert inventory["elements"][0]["parameters"] == [
+        {"identity": "parameter:-7", "storage": "element_id", "has_value": True, "value": "-8", "read_only": False},
+        {"identity": "parameter:8", "storage": "string", "has_value": False, "value": None, "read_only": False},
+        {"identity": "parameter:9", "storage": "double", "has_value": True,
+         "value": 0.12345678901234567, "read_only": False},
+        {"identity": "shared:parameter-guid", "storage": "string", "has_value": True, "value": "", "read_only": False},
+    ]
+    assert inventory["elements"][-1]["dependencies"] == [{"id": "20", "uid": "uid-20"}]
+    assert inventory["elements"][0]["wall_end_joins"] == [
+        {"end": 0, "join_allowed": True, "neighbors": []}, {"end": 1, "join_allowed": False, "neighbors": []},
+    ]
+    assert "fixture.rvt" not in result["snapshot_json"] + result["inventory_json"]
+    evidence = tmp_path / "snapshot.json"
+    evidence.write_bytes(snapshot)
+    run = subprocess.run([sys.executable, str(SCRIPTS / "element_split_preview.py"), str(evidence)],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout or run.stderr
+    report = json.loads(run.stdout)
+    assert report["basis_sha256"] == inventory["basis_sha256"]
+    assert [row["category"] for row in report["findings"]] == [
+        "wall", "architectural_column", "structural_column", "floor",
+    ]
+    assert report["findings"][0]["pieces"][1] == {"base_ft": 8, "top_ft": 15}
+    assert [piece["area_sqft"] for piece in report["findings"][-1]["pieces"]] == [8, 8, 16]
+    assert report["steps"] == []
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("saved_state", "saved, unchanged"),
+    ("wrong_cut", "reviewed identity"),
+    ("inserts", "contains inserts"),
+    ("mismatched_face", "does not match"),
+    ("unreadable_parameter", "storage type"),
+])
+def test_query_blocks_the_whole_snapshot_on_incomplete_source(model, change, reason):
+    document, elements, face = model
+    args = request(document)
+    if change == "saved_state":
+        document.IsModified = True
+    elif change == "wrong_cut":
+        args["scope"][0]["cuts"][0]["uid"] = "other-cut"
+    elif change == "inserts":
+        elements[10].FindInserts = lambda *_: [Id(77)]
+    elif change == "mismatched_face":
+        face.GetEdgesAsCurveLoops = lambda: [loop([(0, 0), (9, 0), (9, 4), (0, 4)], -0.5)]
+    else:
+        elements[10].Parameters = [parameter(1, "unsupported", 1)]
+    result = invoke(document, args)
+    assert result["status"] == "blocked" and reason in result["reason"]
+    assert "snapshot_json" not in result and "inventory_json" not in result
+
+
+@pytest.fixture
+def split_readback(model, tmp_path):
+    document, elements, _ = model
+    args = request(document)
+    args["scope"] = [args["scope"][0]]
+    args["scope"][0]["cuts"] = args["scope"][0]["cuts"][:1]
+    wall = elements[10]
+    original_parameters = [*wall.Parameters, parameter(-1001105, "d", 20)]
+    wall.Parameters = original_parameters
+    source = invoke(document, args)
+    assert source["status"] == "ok", source
+    original_constraints = wall.get_Parameter
+    upper = native(Wall, 110, **{key: value for key, value in vars(wall).items() if key not in ("Id", "UniqueId")})
+    elements[110] = upper
+    for piece, low, high in ((wall, 0, 8), (upper, 8, 20)):
+        dimensions = {
+            "WALL_BASE_OFFSET": parameter(-1001108, "d", low),
+            "WALL_USER_HEIGHT_PARAM": parameter(-1001105, "d", high - low),
+        }
+        piece.get_Parameter = lambda key, dimensions=dimensions: dimensions.get(key) or original_constraints(key)
+        piece.Parameters = [*original_parameters[:-1], dimensions["WALL_USER_HEIGHT_PARAM"]]
+        piece.get_BoundingBox = lambda _, low=low, high=high: NS(
+            Min=point(0, 0, low), Max=point(1, 2, high), Transform=NS(OfPoint=lambda value: value, IsIdentity=True))
+
+    document.IsModified = True
+    result = invoke(document, {"host_identity": args["host_identity"], "readback": [
+        {"source_id": "10", "result": {"id": "110", "uid": "uid-110"}},
+        {"source_id": "10", "result": {"id": "10", "uid": "uid-10"}},
+    ]})
+    assert result["status"] == "ok", result
+    snapshot = tmp_path / "snapshot.json"
+    inventory = tmp_path / "inventory.json"
+    snapshot.write_text(source["snapshot_json"])
+    inventory.write_text(source["inventory_json"])
+    approval = {"kind": "element-split-readback-approval", "snapshot_sha256": sha256(snapshot.read_bytes()).hexdigest(),
+                "inventory_sha256": sha256(inventory.read_bytes()).hexdigest(),
+                "piece_adjustments": [
+                    {"source_id": "10", "piece": 1, "values": {"parameter:-1001105": 8}},
+                    {"source_id": "10", "piece": 2, "values": {"parameter:-1001105": 12}},
+                ]}
+    return snapshot, inventory, approval, json.loads(result["readback_json"])
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("none", None),
+    ("lost_parameter", "missing_parameter"),
+    ("new_parameter", "extra_parameter"),
+    ("changed_parameter", "parameter_changed"),
+    ("changed_type", "type_changed"),
+    ("wrong_geometry", "unmatched_or_ambiguous_geometry"),
+    ("moved_footprint", "footprint_changed"),
+    ("missing_piece", "missing_piece"),
+    ("unapproved_parameter", "adjustments"),
+    ("wrong_digest", "approval digest"),
+])
+def test_verifier_compares_fresh_pieces_against_exact_approved_source(tmp_path, split_readback, change, reason):
+    snapshot, inventory, approval, measured = split_readback
+    piece = measured["pieces"][0]
+    if change == "lost_parameter":
+        piece["parameters"].pop(0)
+    elif change == "new_parameter":
+        piece["parameters"].append({"identity": "parameter:99", "storage": "integer", "value": 2,
+                                    "has_value": True, "read_only": False})
+    elif change == "changed_parameter":
+        next(row for row in piece["parameters"] if row["identity"] == "shared:parameter-guid")["value"] = "lost"
+    elif change == "changed_type":
+        piece["type_uid"] = "different-type"
+    elif change == "wrong_geometry":
+        piece["geometry"]["base_ft"] = 9
+    elif change == "moved_footprint":
+        piece["footprint_xy_ft"] = [[10, 0], [11, 2]]
+    elif change == "missing_piece":
+        measured["pieces"].pop()
+    elif change == "unapproved_parameter":
+        approval["piece_adjustments"][0]["values"]["shared:parameter-guid"] = "overridden"
+
+    approved, readback = tmp_path / "approval.json", tmp_path / "readback.json"
+    approved.write_text(json.dumps(approval))
+    readback.write_text(json.dumps(measured))
+    digest = "f" * 64 if change == "wrong_digest" else sha256(approved.read_bytes()).hexdigest()
+    result = subprocess.run([sys.executable, str(SCRIPTS / "verify_element_split.py"),
+                             str(snapshot), str(inventory), str(approved), str(readback), "--approval-sha256", digest],
+                            capture_output=True, text=True)
+    if change in ("unapproved_parameter", "wrong_digest"):
+        assert result.returncode == 2 and result.stdout == "" and reason in result.stderr.lower()
+    else:
+        comparison = json.loads(result.stdout)
+        if change == "none":
+            assert result.returncode == 0 and comparison["status"] == "matched"
+            assert comparison["matches"] == [
+                {"source_id": "10", "piece": 2, "result_id": "110"},
+                {"source_id": "10", "piece": 1, "result_id": "10"},
+            ]
+        else:
+            assert result.returncode == 1 and comparison["status"] == "mismatch"
+            assert reason in {row["reason"] for row in comparison["differences"]}
+
+
+def test_floor_readback_checks_the_boundary_order_not_just_the_vertex_set(model):
+    from verify_element_split import matching_geometry
+
+    planned = {"elevation_ft": 0, "boundary_xy_ft": [(0, 0), (4, 0), (4, 2), (0, 2)]}
+    reversed_ring = {"elevation_ft": 0, "boundary_xy_ft": [[4, 2], [4, 0], [0, 0], [0, 2]]}
+    crossed = {"elevation_ft": 0, "boundary_xy_ft": [[4, 2], [0, 0], [4, 0], [0, 2]]}
+    assert matching_geometry("floor", planned, reversed_ring)
+    assert not matching_geometry("floor", planned, crossed)
+
+
+class Changed:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+    def emit(self, document, name, operation, added=(), modified=(), deleted=()):
+        event = NS(GetDocument=lambda: document, Operation=operation, GetTransactionNames=lambda: [name],
+                   GetAddedElementIds=lambda: list(map(Id, added)), GetModifiedElementIds=lambda: list(map(Id, modified)),
+                   GetDeletedElementIds=lambda: list(map(Id, deleted)))
+        for handler in self.handlers:
+            handler(None, event)
+
+
+def independent_baseline(document, source_request):
+    audit = {"source_request": source_request, "controls": [{"id": "11", "uid": "uid-11"}],
+             "trial_transaction": None, "absent_ids": []}
+    before = invoke(document, {"rollback_audit": audit})
+    assert before["status"] == "ok", before
+    context = {"audit_token": before["audit_token"], "controls_sha256": sha256(before["controls_json"].encode()).hexdigest(),
+               "controls": audit["controls"]}
+    return audit, before, context
+
+
+def check_independent_trial(tmp_path, document, audit, baseline, result, approval, cascade=None):
+    receipt = json.loads(result["trial_json"])
+    name = receipt["transaction"]
+    fresh = invoke(document, {"rollback_audit": dict(audit, trial_transaction=name,
+                                                    absent_ids=receipt["inner_effects"]["added"])})
+    assert fresh["status"] == "ok", fresh
+    assert fresh["audit_token"] != baseline["audit_token"]
+
+    def bridge(identifier, mode, result, added=(), modified=(), deleted=(), names=()):
+        return {"run_id": identifier, "status": "ok", "mode": mode, "decision": "rolled_back", "exit_code": 0,
+                "result_truncated": False, "engine": {"requested": "cpython"}, "result": result,
+                "changes": {"added": [{"id": int(value)} for value in added], "added_count": len(added),
+                            "modified": [{"id": int(value)} for value in modified], "modified_count": len(modified),
+                            "deleted": list(map(int, deleted)), "deleted_count": len(deleted),
+                            "transactions": list(names),
+                            "by_category": {"Fixture": len(added) + len(modified)} if added or modified else {}}}
+
+    if cascade is None:
+        saved_trial = bridge("trial-2", "dry_run", result, modified=["12"], names=[name])
+    else:
+        # Released AgentChangeSet records restored IDs as added and retains their earlier deletion IDs.
+        saved_trial = bridge("trial-2", "dry_run", result, added=["13", "20", "23"], deleted=["13", "20", "23"], names=[name])
+    saved_before = bridge("before-1", "query", baseline)
+    saved_after = bridge("after-3", "query", fresh)
+    paths = [tmp_path / name for name in ("before.json", "trial.json", "after.json", "approval.json")]
+    paths[-1].write_text(approval)
+    command = [sys.executable, str(SCRIPTS / "verify_split_trial_receipt.py"), *map(str, paths)]
+    if cascade is not None:
+        path = tmp_path / "cascade.json"
+        path.write_text(cascade)
+        command.extend(["--floor-cascade", str(path)])
+    faults = (("none", "missing_native_measurement") if cascade is not None else
+              ("none", "same_run", "changed_control", "omitted_id", "extra_bridge_effect",
+               "missing_native_measurement", "wrong_cut_elevation"))
+    for fault in faults:
+        after = json.loads(json.dumps(saved_after))
+        trial = json.loads(json.dumps(saved_trial))
+        if fault == "same_run":
+            after["run_id"] = "before-1"
+        elif fault == "changed_control":
+            after["result"]["controls_json"] = '{"11":"different"}'
+        elif fault == "omitted_id":
+            after["result"]["confirmed_absent_ids"] = fresh["confirmed_absent_ids"][:-1]
+        elif fault == "extra_bridge_effect":
+            trial["changes"]["modified"][0]["id"] = 100
+        elif fault in ("missing_native_measurement", "wrong_cut_elevation"):
+            measured = json.loads(trial["result"]["trial_json"])
+            if cascade is not None:
+                measured["floor_measurements"].pop(next(iter(measured["floor_measurements"])))
+            elif fault == "missing_native_measurement":
+                measured["column_cuts"].pop()
+            else:
+                measured["column_cuts"][0]["elevation_ft"] += 0.01
+            trial["result"]["trial_json"] = json.dumps(measured)
+        for path, record in zip(paths, (saved_before, trial, after)):
+            path.write_text(json.dumps(record))
+        checked = subprocess.run(command, capture_output=True, text=True)
+        if fault == "none":
+            assert checked.returncode == 0, checked.stderr
+            verified = json.loads(checked.stdout)
+            assert verified["status"] == "verified_split_trial_rollback"
+            assert verified["run_ids"] == ["before-1", "trial-2", "after-3"]
+            replay = json.loads(result["trial_json"])
+            replay["transaction"] = "Archi Magic element split trial " + "f" * 32
+            id_map = {value: str(int(value) + 1000) for value in replay["inner_effects"]["added"]}
+            replay["inner_effects"]["added"] = list(id_map.values())
+            for row in replay["comparison"]["matches"]:
+                row["result_id"] = id_map.get(row["result_id"], row["result_id"])
+            measured = json.loads(replay["readback_json"])
+            for row in measured["pieces"]:
+                if row["id"] in id_map:
+                    row["id"] = id_map[row["id"]]
+                    row["uid"] = f"allocated-{row['id']}"
+            replay["readback_json"] = json.dumps(measured)
+            for key in ("wall_measurements", "floor_measurements"):
+                if key in replay:
+                    replay[key] = {id_map.get(value, value): data for value, data in replay[key].items()}
+            for row in replay.get("floor_effects", []):
+                row["id"] = id_map[row["id"]]
+                row["piece_ids"] = [id_map[value] for value in row["piece_ids"]]
+            measured_path = tmp_path / "replay-measurement.json"
+            measured_path.write_text(json.dumps(replay))
+            replay_command = [*command, "--replay-measurement", str(measured_path)]
+            compared = subprocess.run(replay_command, capture_output=True, text=True)
+            assert compared.returncode == 0, compared.stderr
+            assert json.loads(compared.stdout)["replay"]["status"] == "split_replay_matched"
+            if cascade is not None:
+                member = next(row for row in replay["floor_effects"] if row["geometry"]["role"] == "profile_curve")
+                member["geometry"]["ends_ft"][0][0] += 0.01
+            else:
+                replay["column_cuts"][0]["normalized"] += 0.01
+            measured_path.write_text(json.dumps(replay))
+            different = subprocess.run(replay_command, capture_output=True, text=True)
+            assert different.returncode == 2 and not different.stdout, different
+        else:
+            assert checked.returncode == 2 and not checked.stdout, checked
+
+
+def install_trial_transactions(db, document, elements, created, changes, status, fault, original):
+    started = []
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            started.append(type(self).__name__)
+            self.state = status.Started
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def Commit(self):
+            self.state = status.Committed
+            changes.emit(document, self.name, "TransactionCommitted", added=created,
+                         modified=[original.Id, 100] if fault == "extra_edit" else [original.Id])
+            return self.state
+
+        def RollBack(self):
+            self.state = status.RolledBack
+            return self.state
+
+    class Group(Transaction):
+        def RollBack(self):
+            self.state = status.RolledBack
+            elements[original.Id] = original
+            if fault != "residual":
+                for identifier in created:
+                    del elements[identifier]
+            document.IsModified = False
+            if fault != "no_rollback_event":
+                changes.emit(document, self.name, "TransactionGroupRolledBack", modified=[original.Id], deleted=created)
+            return self.state
+
+    db.Transaction = Transaction
+    db.TransactionGroup = Group
+    return started
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "trial_rolled_back"),
+    ("digest", "stopped"),
+    ("extra_edit", "transaction_unresolved"),
+    ("no_rollback_event", "transaction_unresolved"),
+    ("residual", "transaction_unresolved"),
+    ("point_up", "trial_rolled_back"),
+    ("point_down", "trial_rolled_back"),
+    ("wrong_point_native", "stopped_and_rolled_back"),
+    ("point_twist", "stopped_and_rolled_back"),
+])
+def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, monkeypatch, tmp_path, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
+    ratios, created = [], []
+    changes = Changed()
+    document.Application.DocumentChanged = changes
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    db.XYZ = point
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
+                                       RolledBack="rolled_back")
+    original_parameters = elements[12].Parameters
+    point_based = fault in ("point_up", "point_down", "wrong_point_native", "point_twist")
+    forward = fault != "point_down"
+
+    def column(identifier, low, high):
+        original = elements[12]
+        common = {key: value for key, value in vars(original).items()
+                  if key not in ("Id", "UniqueId", "get_Parameter", "get_BoundingBox",  "Location", "Split", "Parameters", "GetTransform")}
+        segment = Line((0, 0, high), (0, 0, low))
+        segment.Project = lambda target: NS(Parameter=target.Z, Distance=0)
+        segment.ComputeNormalizedParameter = lambda z: (high - z) / (high - low)
+        parameters = {
+            "FAMILY_BASE_LEVEL_PARAM": parameter(-1001350, "e", Id(1)),
+            "FAMILY_TOP_LEVEL_PARAM": parameter(-1001351, "e", Id(4)),
+            "FAMILY_BASE_LEVEL_OFFSET_PARAM": parameter(-1001357, "d", low),
+            "FAMILY_TOP_LEVEL_OFFSET_PARAM": parameter(-1001358, "d", high - 20),
+        }
+
+        def split(normalized):
+            ratios.append(normalized)
+            cut = (low + (high - low) * normalized if point_based and forward and fault != "wrong_point_native"
+                   else high - (high - low) * normalized)
+            new = 200 + len(created)
+            created.append(new)
+            elements[identifier] = column(identifier, low, cut)
+            elements[new] = column(new, cut, high)
+            document.IsModified = True
+            return Id(new)
+
+        anchor = point(0, 0, low if forward else high)
+        location = LocationPoint(Point=anchor) if point_based else LocationCurve(Curve=segment)
+        twist = -1 if fault == "point_twist" and identifier != 12 else 1
+        return native(FamilyInstance, identifier, **common, Location=location,
+                      GetTransform=lambda: NS(Origin=anchor, BasisX=point(twist, 0, 0),
+                                              BasisY=point(0, twist, 0), BasisZ=point(0, 0, 1 if forward else -1)),
+                      Parameters=[*original_parameters, parameters["FAMILY_BASE_LEVEL_OFFSET_PARAM"],
+                                  parameters["FAMILY_TOP_LEVEL_OFFSET_PARAM"]], get_Parameter=parameters.get,
+                      get_BoundingBox=lambda _: NS(Min=point(0, 0, low), Max=point(1, 2, high),
+                                                 Transform=NS(OfPoint=lambda value: value, IsIdentity=True)),
+                      Split=split)
+
+    elements[12] = original = column(12, 0, 20)
+
+    started = install_trial_transactions(db, document, elements, created, changes, status, fault, original)
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][2]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    approval = json.dumps({"kind": "element-split-readback-approval",
+                           "snapshot_sha256": sha256(before["snapshot_json"].encode()).hexdigest(),
+                           "inventory_sha256": sha256(before["inventory_json"].encode()).hexdigest(),
+                           "piece_adjustments": [
+                               {"source_id": "12", "piece": index, "values": {
+                                   "parameter:-1001357": low, "parameter:-1001358": high - 20}}
+                               for index, (low, high) in enumerate(((0, 8), (8, 15), (15, 20)), 1)]})
+    approval_sha = sha256(approval.encode()).hexdigest()
+    audit, baseline, context = independent_baseline(document, before_request)
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
+        "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
+        "approval_json": approval, "approval_sha256": "f" * 64 if fault == "digest" else approval_sha,
+        "audit_context": context,
+    }})["result"]
+    assert result["status"] == expected, result
+    assert not changes.handlers
+    if fault == "digest":
+        assert started == []
+        return
+    normalized = [0.4] if fault in ("wrong_point_native", "point_twist") else (
+        [0.4, 7 / 12] if fault == "point_up" else [0.6, 5 / 12])
+    assert ratios == pytest.approx(normalized)
+    if fault == "wrong_point_native":
+        assert "reviewed elevation" in result["reason"] and len(created) == 1
+    if fault == "point_twist":
+        assert "insertion orientation" in result["reason"] and len(created) == 1
+    assert started == ["Group", "Transaction"]
+    assert (200 not in elements and 201 not in elements) == (fault != "residual")
+    if expected == "trial_rolled_back":
+        receipt = json.loads(result["trial_json"])
+        assert receipt["inner_effects"] == {"added": ["200", "201"], "modified": ["12"], "deleted": []}
+        assert receipt["rollback_events"][0]["deleted"] == ["200", "201"]
+        assert receipt["comparison"]["status"] == "matched"
+        assert [row["location"] for row in receipt["column_cuts"]] == ["point" if point_based else "curve"] * 2
+        assert [row["spans_ft"] for row in receipt["column_cuts"]] == [[[0, 8], [8, 20]], [[8, 15], [15, 20]]]
+        assert invoke(document, before_request) == before
+        if fault == "none":
+            check_independent_trial(tmp_path, document, audit, baseline, result, approval)
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "trial_rolled_back"),
+    ("offset_location", "stopped"),
+    ("joined_wall", "stopped_and_rolled_back"),
+    ("cannot_copy", "stopped_and_rolled_back"),
+    ("top_constrained", "trial_rolled_back"),
+    ("bad_faces", "stopped_and_rolled_back"),
+    ("bad_volume", "stopped_and_rolled_back"),
+])
+def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monkeypatch, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
+                                       RolledBack="rolled_back")
+    db.WallLocationLine = NS(WallCenterline=0)
+    db.WallUtils.IsWallJoinAllowedAtEnd = lambda wall, end: wall.join_allowed[end]
+    db.WallUtils.DisallowWallJoinAtEnd = lambda wall, end: wall.join_allowed.__setitem__(end, False)
+    db.XYZ = point
+    db.ShellLayerType = NS(Exterior="exterior", Interior="interior")
+    db.HostObjectUtils.GetSideFaces = lambda wall, layer: [layer]
+    db.Options = lambda: NS(Dispose=lambda: None)
+    db.Solid = type("Solid", (NS,), {})
+    db.BuiltInParameter.WALL_KEY_REF_PARAM = "WALL_KEY_REF_PARAM"
+    db.BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT = "WALL_STRUCTURAL_SIGNIFICANT"
+    monkeypatch.setattr(Line, "CreateBound", staticmethod(
+        lambda a, b: Line((a.X, a.Y, a.Z), (b.X, b.Y, b.Z))), raising=False)
+    changes = Changed()
+    document.Application.DocumentChanged = changes
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    created, constructor_calls = [], []
+    template = elements[10]
+
+    def mutable(identifier, storage, initial, reject=False, **details):
+        item = parameter(identifier, storage, initial, **details)
+        item.current = initial
+        item.AsDouble = item.AsString = item.AsElementId = lambda: item.current
+
+        def set_value(value):
+            if reject:
+                return False
+            item.current = value
+            document.IsModified = True
+            return True
+
+        item.Set = set_value
+        return item
+
+    def wall(identifier, native_line, base_level, height, finish, flipped=True, structural=True):
+        has_top = fault == "top_constrained" and identifier == 10
+        top_level = mutable(-1001103, "e", Id(4) if has_top else Id(-1))
+        top_offset = mutable(-1001109, "d", -1 if has_top else 0)
+        height_parameter = mutable(-1001105, "d", height)
+        base_parameter = parameter(-1001107, "e", base_level)
+        finish_parameter = mutable(50, "s", finish, reject=fault == "cannot_copy" and identifier != 10,
+                                   GUID="wall-finish")
+        values = {
+            "WALL_BASE_CONSTRAINT": base_parameter,
+            "WALL_BASE_OFFSET": parameter(-1001108, "d", 0),
+            "WALL_HEIGHT_TYPE": top_level,
+            "WALL_TOP_OFFSET": top_offset,
+            "WALL_USER_HEIGHT_PARAM": height_parameter,
+            "WALL_TOP_IS_ATTACHED": parameter(-14, "i", 0),
+            "WALL_BOTTOM_IS_ATTACHED": parameter(-15, "i", 0),
+            "WALL_KEY_REF_PARAM": parameter(-1001122, "i", int(fault == "offset_location")),
+            "WALL_STRUCTURAL_SIGNIFICANT": parameter(-1001596, "i", int(structural)),
+        }
+        base = elements[base_level].ProjectElevation
+        def top():
+            return (base + height_parameter.current if top_level.current == Id(-1)
+                    else elements[top_level.current].ProjectElevation + top_offset.current)
+
+        def side(layer):
+            exterior = layer == "exterior"
+            y = 0.5 if exterior else 0
+            span = top()
+            corners = [(0, y, base), (4, y, base), (4, y, span), (0, y, span)]
+            if fault == "bad_faces" and identifier != 10:
+                corners = [corners[i] for i in (0, 2, 1, 3)]
+            return PlanarFace(FaceNormal=point(0, 1 if exterior else -1, 0),
+                              GetEdgesAsCurveLoops=lambda: [[Line(a, b) for a, b in
+                                  zip(corners, corners[1:] + corners[:1])]])
+
+        location = LocationCurve(Curve=native_line, neighbors=[[elements[100]] if fault == "joined_wall"
+                                                                and identifier != 10 else [], []])
+        common = {key: value for key, value in vars(template).items()
+                  if key not in ("Id", "UniqueId", "get_Parameter", "get_BoundingBox", "Location",
+                                 "Parameters", "Orientation", "Flipped")}
+        return native(Wall, identifier, **common, Location=location, join_allowed=[True, identifier != 10],
+                      Orientation=point(0, 1 if flipped else -1, 0), Flipped=flipped,
+                      Parameters=[*values.values(), finish_parameter], get_Parameter=values.get,
+                      GetGeometryObjectFromReference=side,
+                      get_Geometry=lambda _: [db.Solid(Volume=2 * (top() - base) + int(
+                          fault == "bad_volume" and identifier != 10))],
+                      get_BoundingBox=lambda _: NS(
+                          Min=point(0, 0, base), Max=point(4, 0.5, top()),
+                          Transform=NS(OfPoint=lambda value: value, IsIdentity=True)))
+
+    def create(_, line, type_id, level_id, height, offset, flipped, structural):
+        identifier = 300 + len(created)
+        created.append(identifier)
+        constructor_calls.append((type_id.Value, level_id.Value, height, offset, flipped, structural,
+                                  line.GetEndPoint(0).Z))
+        elements[identifier] = wall(identifier, line, level_id, height, "Default", flipped, structural)
+        document.IsModified = True
+        return elements[identifier]
+
+    monkeypatch.setattr(Wall, "Create", staticmethod(create), raising=False)
+    original_line = Line((0, 0, 0), (4, 0, 0))
+    elements[10] = wall(10, original_line, Id(1), 20, "Reviewed")
+    original = wall(10, original_line, Id(1), 20, "Reviewed")
+    started = install_trial_transactions(db, document, elements, created, changes, status, fault, original)
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][0]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    if fault == "top_constrained":
+        adjustments = [(1, 20, 2, 0), (2, 7, 3, 0), (3, 4, 4, -1)]
+    else:
+        adjustments = [(1, 8, -1, 0), (2, 7, -1, 0), (3, 5, -1, 0)]
+    approval = json.dumps({"kind": "element-split-readback-approval",
+                           "snapshot_sha256": sha256(before["snapshot_json"].encode()).hexdigest(),
+                           "inventory_sha256": sha256(before["inventory_json"].encode()).hexdigest(),
+                           "piece_adjustments": [
+                               {"source_id": "10", "piece": index, "values": {
+                                   "parameter:-1001107": str(base_id), "parameter:-1001105": height,
+                                   "parameter:-1001103": str(top_id), "parameter:-1001109": offset}}
+                               for index, (base_id, height, top_id, offset) in enumerate(adjustments, 1)]})
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
+        "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
+        "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
+    }})["result"]
+    assert result["status"] == expected, result
+    assert invoke(document, before_request) == before
+    assert not any(identifier in elements for identifier in created)
+    if fault == "offset_location":
+        assert started == []
+    elif fault in ("none", "top_constrained"):
+        final_height = 4 if fault == "top_constrained" else 5
+        assert constructor_calls == [(100, 2, 7, 0, True, True, 8), (100, 3, final_height, 0, True, True, 15)]
+        receipt = json.loads(result["trial_json"])
+        assert receipt["inner_effects"] == {"added": ["300", "301"], "modified": ["10"], "deleted": []}
+        measured = json.loads(receipt["readback_json"])
+        assert all(any(row["identity"] == "shared:wall-finish" and row["value"] == "Reviewed"
+                       for row in item["parameters"]) for item in measured["pieces"])
+        assert [receipt["wall_measurements"][key]["solid_volume_cuft"] for key in ("10", "300", "301")] == [
+            16, 14, 2 * final_height,
+        ]
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "floor_cascade_rolled_back"),
+    ("wrong_digest", "stopped"),
+    ("external_dependency", "stopped"),
+    ("extra_delete", "transaction_unresolved"),
+    ("partial_ids", "transaction_unresolved"),
+    ("failed_restore", "transaction_unresolved"),
+])
+def test_floor_cascade_discovery_reconciles_exact_owned_ids_after_rollback(model, monkeypatch, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", RolledBack="rolled_back")
+    owned = native(ModelLine, 23, GeometryCurve=Line((0, 0, 0), (8, 0, 0)))
+    elements[23] = owned
+    floor, sketch = elements[13], elements[20]
+    floor.GetDependentElements = lambda _: [Id(20), Id(23)] + ([Id(100)] if fault == "external_dependency" else [])
+    sketch.GetAllElements = lambda: [Id(23)]
+    sketch.GetDependentElements = lambda _: [Id(23)]
+    baseline = dict(elements)
+    starts, rolled = [], []
+
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            starts.append(self.name)
+            self.state = status.Started
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def RollBack(self):
+            elements.update(baseline)
+            if fault == "failed_restore":
+                elements[23] = native(ModelLine, 999)
+            document.IsModified = document.IsModifiable = False
+            self.state = status.RolledBack
+            rolled.append(self.name)
+            return self.state
+
+    def delete(identifier):
+        assert identifier == Id(13)
+        ids = [Id(13), Id(20), Id(23)]
+        if fault == "extra_delete":
+            ids.append(Id(100))
+        for value in ids:
+            del elements[value]
+        document.IsModified = document.IsModifiable = True
+        yield ids[0]
+        if fault == "partial_ids":
+            raise RuntimeError("native ID iterator failed")
+        yield from ids[1:]
+
+    db.Transaction = Transaction
+    document.Delete = delete
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][-1]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    snapshot_sha = sha256(before["snapshot_json"].encode()).hexdigest()
+    inventory_sha = sha256(before["inventory_json"].encode()).hexdigest()
+    response = runpy.run_path(str(SCRIPTS / "probe_floor_split_cascade.py"), init_globals={
+        "doc": document, "inputs": {"mode": "floor_cascade_trial", "disposable_fixture": True,
+                                    "source_request": before_request,
+                                    "snapshot_sha256": "0" * 64 if fault == "wrong_digest" else snapshot_sha,
+                                    "inventory_sha256": inventory_sha},
+    })["result"]
+    assert response["status"] == expected, response
+    assert starts == rolled
+    if fault in ("wrong_digest", "external_dependency"):
+        assert starts == []
+    else:
+        assert len(rolled) == 1 and not document.IsModified
+    if fault == "none":
+        receipt = json.loads(response["cascade_json"])
+        assert receipt["deleted"] == [{"id": "13", "uid": "uid-13"}, {"id": "20", "uid": "uid-20"},
+                                      {"id": "23", "uid": "uid-23"}]
+        assert receipt["source"] == {"id": "13", "uid": "uid-13"}
+        assert receipt["sketch"] == {"id": "20", "uid": "uid-20"}
+        assert receipt["snapshot_sha256"] == snapshot_sha and receipt["inventory_sha256"] == inventory_sha
+        assert invoke(document, before_request) == before
+    else:
+        assert "cascade_json" not in response
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "trial_rolled_back"),
+    ("wrong_cascade_sha", "stopped"),
+    ("unexpected_deletion", "transaction_unresolved"),
+    ("extra_creation", "transaction_unresolved"),
+    ("wrong_thickness", "stopped_and_rolled_back"),
+])
+def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, monkeypatch, tmp_path, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    for name in ("read_element_split_evidence", "probe_floor_split_cascade", "floor_split_replacement"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
+                                       RolledBack="rolled_back")
+    changes = Changed()
+    document.Application.DocumentChanged = changes
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    db.XYZ = point
+    db.Options = lambda: NS(Dispose=lambda: None)
+    db.Solid = type("Solid", (NS,), {})
+    db.CurveElement = ModelLine
+    db.SketchPlane = type("SketchPlane", (NS,), {})
+    db.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM = "offset"
+    db.BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL = "structural"
+    db.HostObjectUtils.GetBottomFaces = lambda floor: ["bottom"]
+    monkeypatch.setattr(Line, "CreateBound", staticmethod(
+        lambda a, b: Line((a.X, a.Y, a.Z), (b.X, b.Y, b.Z))), raising=False)
+
+    class Collection(list):
+        Add = list.append
+        Append = list.append
+
+    class GenericList:
+        def __class_getitem__(cls, item):
+            return Collection
+
+    monkeypatch.setitem(sys.modules, "System.Collections", NS())
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=GenericList))
+    db.CurveLoop = Collection
+    db.BoundaryValidation = NS(IsValidHorizontalBoundary=lambda profiles: len(profiles) == 1 and len(profiles[0]) == 4)
+
+    class IdIterator:
+        def __init__(self):
+            self._items = iter(sorted(elements))
+
+        def MoveNext(self):
+            value = next(self._items, None)
+            if value is None:
+                return False
+            self.Current = Id(value)
+            return True
+
+        def Dispose(self):
+            pass
+
+    def collector(_):
+        return NS(WhereElementIsNotElementType=lambda: NS(GetElementIdIterator=IdIterator), Dispose=lambda: None)
+
+    db.FilteredElementCollector = collector
+    template = elements[13]
+    original_vertices = [(0, 0), (8, 0), (8, 4), (0, 4)]
+
+    def make_floor(identifier, sketch_id, member_id, vertices, height, finish):
+        offset = parameter(-1001951, "d", height)
+        offset.current = height
+        offset.AsDouble = lambda: offset.current
+        finish_parameter = parameter(50, "s", finish, GUID="floor-finish")
+        finish_parameter.current = finish
+        finish_parameter.AsString = lambda: finish_parameter.current
+
+        def change(item, value):
+            item.current = value
+            document.IsModified = True
+            return True
+
+        offset.Set = lambda value: change(offset, value)
+        finish_parameter.Set = lambda value: change(finish_parameter, value)
+        structural = parameter(-1001906, "i", 1)
+        params = {"offset": offset, "structural": structural}
+        area = abs(sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(vertices, vertices[1:] + vertices[:1]))) / 2
+        thickness = 0.4 if fault == "wrong_thickness" and identifier != 13 else 0.5
+
+        def face(ref):
+            bottom = ref == "bottom"
+            return PlanarFace(FaceNormal=point(0, 0, -1 if bottom else 1),
+                              GetEdgesAsCurveLoops=lambda: [loop(vertices, offset.current - thickness if bottom else offset.current)])
+
+        common = {key: value for key, value in vars(template).items()
+                  if key not in ("Id", "UniqueId", "Parameters", "SketchId", "GetDependentElements",
+                                 "GetGeometryObjectFromReference")}
+        floor = native(Floor, identifier, **common, LevelId=Id(1), SketchId=Id(sketch_id),
+                       Parameters=[offset, structural, finish_parameter], GetGeometryObjectFromReference=face,
+                       GetDependentElements=lambda _: [Id(sketch_id), Id(member_id)],
+                       get_Parameter=params.get, get_Geometry=lambda _: [db.Solid(Volume=area * thickness)])
+        elements[identifier] = floor
+        elements[sketch_id] = native(Sketch, sketch_id, OwnerId=Id(identifier), Profile=[loop(vertices, 0)],
+                                     GetAllElements=lambda: [Id(member_id)],
+                                     GetDependentElements=lambda _: [Id(member_id)])
+        elements[member_id] = native(ModelLine, member_id,
+                                     GeometryCurve=Line((*vertices[0], 0), (*vertices[1], 0)))
+        return floor
+
+    make_floor(13, 20, 23, original_vertices, -0.5, "Reviewed")
+    initial = dict(elements)
+    created, deleted, starts = [], [], []
+
+    def create(_, profiles, type_id, level_id, structural, slope_arrow, slope):
+        assert (type_id, level_id, structural, slope_arrow, slope) == (100, 1, True, None, 0)
+        points = [curve.GetEndPoint(0) for curve in profiles[0]]
+        identifier = 400 + len(created)
+        created.extend([identifier, identifier + 1, identifier + 2])
+        floor = make_floor(identifier, identifier + 1, identifier + 2, [(p.X, p.Y) for p in points], 0, "Default")
+        if fault == "extra_creation" and identifier == 400:
+            elements[600] = native(NS, 600)
+            created.append(600)
+        return floor
+
+    def delete(identifier):
+        assert identifier == 13
+        deleted.extend([13, 20, 23] + ([100] if fault == "unexpected_deletion" else []))
+        for value in deleted:
+            del elements[value]
+        document.IsModified = True
+        return list(map(Id, deleted))
+
+    monkeypatch.setattr(Floor, "Create", staticmethod(create), raising=False)
+    document.Delete = delete
+
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            self.state = status.Started
+            starts.append(type(self).__name__)
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def Commit(self):
+            self.state = status.Committed
+            changes.emit(document, self.name, "TransactionCommitted", added=created, deleted=deleted)
+            return self.state
+
+        def RollBack(self):
+            self.state = status.RolledBack
+            return self.state
+
+    class Group(Transaction):
+        def RollBack(self):
+            elements.clear()
+            elements.update(initial)
+            document.IsModified = False
+            self.state = status.RolledBack
+            changes.emit(document, self.name, "TransactionGroupRolledBack", added=deleted, deleted=created)
+            return self.state
+
+    db.Transaction, db.TransactionGroup = Transaction, Group
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][-1]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    snapshot_sha = sha256(before["snapshot_json"].encode()).hexdigest()
+    inventory_sha = sha256(before["inventory_json"].encode()).hexdigest()
+    approval = json.dumps({"kind": "element-split-readback-approval", "snapshot_sha256": snapshot_sha,
+                           "inventory_sha256": inventory_sha, "piece_adjustments": []})
+    cascade = json.dumps({"kind": "element-split-floor-cascade", "host_identity": before_request["host_identity"],
+                          "snapshot_sha256": snapshot_sha, "inventory_sha256": inventory_sha,
+                          "source": {"id": "13", "uid": "uid-13"}, "sketch": {"id": "20", "uid": "uid-20"},
+                          "deleted": [{"id": str(i), "uid": f"uid-{i}"} for i in (13, 20, 23)]})
+    audit, baseline, context = independent_baseline(document, before_request)
+    result = runpy.run_path(str(SCRIPTS / "probe_element_split.py"), init_globals={"doc": document, "inputs": {
+        "mode": "rollback_trial", "disposable_fixture": True, "source_request": before_request,
+        "approval_json": approval, "approval_sha256": sha256(approval.encode()).hexdigest(),
+        "audit_context": context, "floor_cascade_json": cascade,
+        "floor_cascade_sha256": "f" * 64 if fault == "wrong_cascade_sha" else sha256(cascade.encode()).hexdigest(),
+    }})["result"]
+    assert result["status"] == expected, result
+    assert elements == initial and invoke(document, before_request) == before
+    if fault == "wrong_cascade_sha":
+        assert starts == []
+    if fault == "unexpected_deletion":
+        assert created == []
+    if fault == "none":
+        receipt = json.loads(result["trial_json"])
+        assert receipt["inner_effects"] == {
+            "added": list(map(str, range(400, 409))), "modified": [], "deleted": ["13", "20", "23"],
+        }
+        assert sum(piece["solid_volume_cuft"] for piece in receipt["floor_measurements"].values()) == 16
+        assert all(piece["thickness_ft"] == 0.5 for piece in receipt["floor_measurements"].values())
+        readback = json.loads(receipt["readback_json"])
+        assert all(any(row["identity"] == "shared:floor-finish" and row["value"] == "Reviewed"
+                       for row in piece["parameters"]) for piece in readback["pieces"])
+        check_independent_trial(tmp_path, document, audit, baseline, result, approval, cascade)
