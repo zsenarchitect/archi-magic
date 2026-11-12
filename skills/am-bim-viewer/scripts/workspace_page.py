@@ -25,6 +25,9 @@ def describe_artifact(artifact):
     if freshness == "unavailable":
         return {"freshness": freshness, "rows": []}
     kind, data = artifact["kind"], artifact["data"]
+    if kind == "model":
+        return {"kind": kind, "freshness": freshness, "generation": artifact["generation"],
+                "viewer_digest": data.digest, "rows": []}
     notices = []
     if kind == "audit":
         rows = [

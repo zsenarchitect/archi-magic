@@ -336,3 +336,84 @@ def test_browser_workspace_serves_installed_shell_and_authorized_review_rows(tmp
                 }]
 
     asyncio.run(exercise())
+
+
+def test_model_viewer_is_built_offline_and_served_only_to_project_members(tmp_path):
+    accounts, projects = settings(tmp_path)
+    root = projects["sample"]["root"]
+    slot = {"kind": "model", "path": "model.json"}
+    projects["sample"]["artifacts"] = {"coordination": slot}
+    identifier = 9007199254740993
+    title = 'Title </script><img src=x> \\ \n'
+    model = {"schema": "am-bim-viewer/1", "source": {"title": title}, "elements": [{
+        "id": identifier, "name": "__TITLE__", "mesh": {
+            "vertices": [0, 0, 0, 1, 0, 0, 0, 1, 0], "indices": [0, 1, 2],
+        },
+    }]}
+    publish(root, slot, 1, model)
+    project = "/projects/sample"
+    snapshot = project + "/workspace"
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+
+            async def model_entry():
+                response = await client.get(snapshot, headers=HEADERS, cookies=viewer)
+                assert response.status == 200
+                return (await response.json())["artifacts"]["coordination"]
+
+            entry = await model_entry()
+            assert entry["freshness"] == "ready" and entry["rows"] == []
+            url = project + "/models/coordination/" + entry["viewer_digest"] + ".html"
+            assert (await client.get(url, headers=HEADERS)).status == 401
+            for method in (client.get, client.head):
+                assert (await method(url, headers=HEADERS, cookies=outsider)).status == 404
+            response = await client.get(url, headers=HEADERS, cookies=viewer)
+            assert response.status == 200 and response.content_type == "text/html"
+            assert response.headers["Cache-Control"] == "private, no-store"
+            policy = response.headers["Content-Security-Policy"]
+            assert "sandbox allow-scripts;" in policy and "connect-src 'none'" in policy
+            payload = await response.read()
+            assert hashlib.sha256(payload).hexdigest() == entry["viewer_digest"]
+            assert b'data:text/javascript;base64,' in payload
+            assert b'</script><img src=x>' not in payload
+            assert b'"name":"__TITLE__"' in payload
+            assert f'"id":"{identifier}"'.encode() in payload
+            assert (await client.head(url, headers=HEADERS, cookies=viewer)).headers["Content-Length"] == str(len(payload))
+            partial = await client.get(url, headers=dict(HEADERS, Range="bytes=0-14"), cookies=viewer)
+            assert partial.status == 206 and await partial.read() == payload[:15]
+            raw = await client.get(project + "/artifacts/coordination", headers=HEADERS, cookies=viewer)
+            assert await raw.json() == entry
+
+            path = root / "model.json"
+            original = path.read_bytes()
+            path.unlink()
+            path.symlink_to("elsewhere.json")
+            assert (await model_entry())["freshness"] == "stale"
+            assert await (await client.get(url, headers=HEADERS, cookies=viewer)).read() == payload
+            path.unlink()
+            with path.open("wb") as sparse:
+                sparse.truncate(256 * 1024 * 1024 + 1)
+            assert (await model_entry())["freshness"] == "stale"
+            path.write_bytes(original)
+            assert await model_entry() == entry
+
+            publish(root, slot, 2, dict(model, source={"title": "Replacement"}))
+            newer = await model_entry()
+            assert newer["viewer_digest"] != entry["viewer_digest"]
+            assert (await client.get(url, headers=HEADERS, cookies=viewer)).status == 404
+            path.write_bytes(original)
+
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as restarted:
+            response = await restarted.post("/session", headers=HEADERS, json={"token": TOKENS["viewer"]})
+            viewer = {COOKIE: response.cookies[COOKIE].value}
+            read = await restarted.get(snapshot, headers=HEADERS, cookies=viewer)
+            assert (await read.json())["artifacts"]["coordination"]["freshness"] == "unavailable"
+            assert (await restarted.get(url, headers=HEADERS, cookies=viewer)).status == 404
+
+    asyncio.run(exercise())

@@ -64,6 +64,7 @@ class ReviewState:
         with self._thread_lock:
             os.close(self._file_lock)
             self._file_lock = None
+            self._artifacts.clear()
 
     def _authorize(self, actor, edit=False):
         if self._file_lock is None:

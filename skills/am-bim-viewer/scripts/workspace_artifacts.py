@@ -12,10 +12,16 @@ import sys
 from uuid import uuid4
 
 from project_page import collect_findings, pair_preview_rows, read_change_preview, read_saved_result, render_board
+from workspace_model import MAX_MODEL_BYTES, validate_model
 from workspace_review_state import canonical
 
 
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+ARTIFACT_KINDS = ("audit", "preview", "board", "model")
+
+
+def slot_limit(slot):
+    return MAX_MODEL_BYTES if slot["kind"] == "model" else MAX_ARTIFACT_BYTES
 
 
 def unique_object(items):
@@ -27,16 +33,28 @@ def unique_object(items):
     return result
 
 
-def read_json_file(name, limit, directory=None):
+@contextmanager
+def open_json_file(name, limit, directory=None):
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(descriptor, "rb") as stream:
         metadata = os.fstat(stream.fileno())
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError("Use a regular JSON file without links.")
-        raw = stream.read(limit + 1)
+        if metadata.st_size > limit:
+            raise ValueError("The workspace JSON exceeds its byte limit.")
+        yield stream, metadata
+
+
+def read_json_stream(stream, limit):
+    raw = stream.read(limit + 1)
     if len(raw) > limit:
         raise ValueError("The workspace JSON exceeds its byte limit.")
     return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def read_json_file(name, limit, directory=None):
+    with open_json_file(name, limit, directory) as (stream, _):
+        return read_json_stream(stream, limit)
 
 
 def slot_path(slot):
@@ -109,8 +127,10 @@ def validate_data(kind, data):
         render_board(data)
         if len({row["number"] for row in data["issues"]}) != len(data["issues"]):
             raise ValueError("The issue board contains duplicate issue numbers.")
+    elif kind == "model":
+        validate_model(data)
     else:
-        raise ValueError("Use a configured audit, preview or board artifact slot.")
+        raise ValueError("Use a configured audit, preview, board or model artifact slot.")
 
 
 def make_artifact(slot, generation, raw):
@@ -130,15 +150,21 @@ def make_artifact(slot, generation, raw):
         data = {key: preview[key] for key in keys if key in preview}
     elif kind == "board":
         data = normalize_board(raw, slot)
+    elif kind == "model":
+        validate_model(raw, normalize=True)
+        data = raw
     else:
-        raise ValueError("Use a configured audit, preview or board artifact slot.")
+        raise ValueError("Use a configured audit, preview, board or model artifact slot.")
     validate_data(kind, data)
     content = {"kind": kind, "data": data, "board": board_binding(slot) if kind == "board" else None}
     return {**content, "generation": generation, "digest": hashlib.sha256(canonical(content)).hexdigest()}
 
 
 def read_slot(directory, name, slot):
-    result = read_json_file(name, MAX_ARTIFACT_BYTES, directory)
+    return validate_publication(read_json_file(name, slot_limit(slot), directory), slot)
+
+
+def validate_publication(result, slot):
     if (not isinstance(result, dict) or set(result) != {"kind", "data", "board", "generation", "digest"}
             or result["kind"] != slot["kind"] or type(result["generation"]) is not int
             or not 1 <= result["generation"] <= 2**53 - 1):
@@ -158,6 +184,8 @@ def read_published(root, slot):
 
 def review_targets(slot_name, artifact):
     kind, data = artifact["kind"], artifact["data"]
+    if kind == "model":
+        return []
     if kind == "board":
         lineage = artifact["board"]["lineage"]
         return [f"board:{lineage}:{issue['number']}" for issue in data["issues"]]
@@ -171,8 +199,8 @@ def publish(root, slot, generation, raw):
 
     artifact = make_artifact(slot, generation, raw)
     payload = canonical(artifact)
-    if len(payload) > MAX_ARTIFACT_BYTES:
-        raise ValueError("The workspace artifact exceeds 4 MiB.")
+    if len(payload) > slot_limit(slot):
+        raise ValueError("The workspace publication exceeds its byte limit.")
     with slot_directory(root, slot) as (directory, name):
         flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
         lock = os.open("." + name + ".publish.lock", flags, 0o600, dir_fd=directory)
@@ -220,7 +248,7 @@ def main():
         config = read_json_file(args.config, MAX_ARTIFACT_BYTES)
         project = config["projects"][args.project]
         slot = project["artifacts"][args.slot]
-        raw = read_json_file(args.input, 3 * MAX_ARTIFACT_BYTES)
+        raw = read_json_file(args.input, MAX_MODEL_BYTES if slot["kind"] == "model" else 3 * MAX_ARTIFACT_BYTES)
         print(json.dumps(publish(project["root"], slot, args.generation, raw)))
     except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
         parser.exit(2, "Workspace publication stopped ({}). Check the configured slot, source and generation.\n"

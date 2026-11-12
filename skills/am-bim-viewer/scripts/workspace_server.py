@@ -11,12 +11,18 @@ import logging
 from pathlib import Path
 import re
 import secrets
+import subprocess
+from threading import Lock
 from time import monotonic
 from urllib.parse import urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
-from workspace_artifacts import board_binding, read_published, review_targets, slot_path
+from workspace_artifacts import (
+    ARTIFACT_KINDS, board_binding, open_json_file, read_json_stream, read_published, review_targets,
+    slot_directory, slot_limit, slot_path, validate_publication,
+)
+from workspace_model import ModelViewer, VIEWER_POLICY, build_model
 from workspace_page import describe_artifact, page
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
 
@@ -36,6 +42,7 @@ ARTIFACT_POLL_SECONDS = 2
 SECURITY_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
                     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"}
 LOG = logging.getLogger(__name__)
+MODEL_RESPONSE = web.ResponseKey("model_viewer", ModelViewer)
 
 
 def canonical_origin(origin):
@@ -91,9 +98,9 @@ class Workspace:
             slots = config.get("artifacts", {})
             if not isinstance(slots, dict) or any(
                     not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None
-                    or not isinstance(slot, dict) or slot.get("kind") not in ("audit", "preview", "board")
+                    or not isinstance(slot, dict) or slot.get("kind") not in ARTIFACT_KINDS
                     for name, slot in slots.items()):
-                raise ValueError("Configure named audit, preview or board artifact slots.")
+                raise ValueError("Configure named audit, preview, board or model artifact slots.")
             paths = [slot_path(slot) for slot in slots.values()]
             if len(set(paths)) != len(paths):
                 raise ValueError("Each artifact slot requires a different file.")
@@ -105,6 +112,8 @@ class Workspace:
             if any(not isinstance(target, str) or target.startswith(namespaces) for target in self.projects[slug].targets):
                 raise ValueError("Explicit targets cannot overlap a published artifact's target namespace.")
             self.artifact_slots[slug] = slots
+        self.model_build_lock = Lock()
+        self.model_publications = {}
         self.sessions = {}
         self.login_attempts = deque()
         self.workers = set()
@@ -120,6 +129,7 @@ class Workspace:
                 yield
             finally:
                 await asyncio.gather(*self.workers, return_exceptions=True)
+                self.model_publications.clear()
 
     async def storage(self, function, *args, on_success=None):
         if len(self.workers) >= MAX_WORKERS:
@@ -273,12 +283,33 @@ class Workspace:
             if subscriber.project == project:
                 subscriber.replace_pending({"type": kind, "etag": etag})
 
-    @staticmethod
-    def load_artifact(root, name, slot):
+    def load_model(self, root, name, slot):
+        key = (root, name)
+        limit = slot_limit(slot)
+        with slot_directory(root, slot) as (directory, filename):
+            with open_json_file(filename, limit, directory) as (stream, metadata):
+                signature = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+                             metadata.st_ctime_ns)
+                prior = self.model_publications.get(key)
+                if prior is not None and prior[0] == signature:
+                    return prior[1]
+                with self.model_build_lock:
+                    publication = validate_publication(read_json_stream(stream, limit), slot)
+                    if prior is not None and publication["digest"] == prior[1]["digest"]:
+                        viewer = prior[1]["data"]
+                    else:
+                        viewer = build_model(publication["data"])
+                    publication["data"] = viewer
+                self.model_publications[key] = (signature, publication)
+                return publication
+
+    def load_artifact(self, root, name, slot):
         try:
-            artifact = read_published(root, slot)
+            artifact = self.load_model(root, name, slot) if slot["kind"] == "model" else read_published(root, slot)
             return artifact, review_targets(name, artifact)
-        except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError):
+        except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError, subprocess.SubprocessError) as error:
+            if slot["kind"] == "model" and not isinstance(error, FileNotFoundError):
+                LOG.warning("Workspace model publication could not be loaded (%s)", type(error).__name__)
             return None, []
 
     async def refresh_artifacts(self, project):
@@ -308,7 +339,31 @@ class Workspace:
         except (OSError, ValueError) as error:
             LOG.warning("Workspace artifact could not be read (%s)", type(error).__name__)
             raise web.HTTPServiceUnavailable(text="Project artifact is unavailable.") from error
+        if data.get("kind") == "model":
+            data = describe_artifact(data)
         return web.json_response(data, status=503 if data["freshness"] == "unavailable" else 200)
+
+    async def read_model(self, request):
+        actor, project = self.project_member(request)
+        slot = request.match_info["slot"]
+        config = self.artifact_slots[project.project].get(slot)
+        if config is None or config["kind"] != "model":
+            raise web.HTTPNotFound(text="Model unavailable.")
+        try:
+            await self.refresh_artifacts(project)
+            artifact = await self.storage(project.read_artifact, actor, slot)
+        except (OSError, ValueError) as error:
+            LOG.warning("Workspace model could not be read (%s)", type(error).__name__)
+            raise web.HTTPServiceUnavailable(text="Project model is unavailable.") from error
+        viewer = artifact.get("data")
+        if viewer is None or viewer.digest != request.match_info["digest"]:
+            raise web.HTTPNotFound(text="Model unavailable.")
+        response = web.FileResponse(viewer.path, headers={"Content-Type": "text/html; charset=utf-8",
+                                                           "Content-Security-Policy": VIEWER_POLICY,
+                                                           "Referrer-Policy": "no-referrer"})
+        # FileResponse opens the file after the handler returns. Retain the private build through streaming.
+        response[MODEL_RESPONSE] = viewer
+        return response
 
     def subscription_lifetime(self, subscriber):
         session = self.sessions.get(subscriber.session)
@@ -422,6 +477,7 @@ def create_app(origin, accounts, projects):
         web.patch("/projects/{project}/review", workspace.update_review),
         web.get("/projects/{project}/events", workspace.subscribe, allow_head=False),
         web.get("/projects/{project}/artifacts/{slot}", workspace.read_artifact),
+        web.get(r"/projects/{project}/models/{slot}/{digest:[0-9a-f]{64}}.html", workspace.read_model),
     ])
     return app
 

@@ -9,7 +9,7 @@ const form = byId("review-form");
 const editMessage = byId("edit-message");
 const slug = /^\/projects\/([a-z0-9][a-z0-9-]{0,62})$/.exec(location.pathname)?.[1];
 const projectPath = slug ? "/projects/" + slug : "";
-const labels = {audit: "Audit findings", preview: "Change preview", board: "Revit issue board"};
+const labels = {audit: "Audit findings", preview: "Change preview", board: "Revit issue board", model: "3D model"};
 const availability = {ready: "Current", stale: "Stale · Showing the last valid publication",
                       unavailable: "No valid publication available"};
 let snapshot;
@@ -120,8 +120,14 @@ function render(data) {
     rows = new Map();
     const sections = Object.entries(data.artifacts).map(([name, artifact]) => {
         artifact.rows.forEach(row => visible.add(row.target));
-        return section(artifact.kind ? labels[artifact.kind] + " · " + name : name, artifact.rows,
-                       artifact.freshness, availability[artifact.freshness], artifact.notices);
+        const wrapper = section(artifact.kind ? labels[artifact.kind] + " · " + name : name, artifact.rows,
+                                artifact.freshness, availability[artifact.freshness], artifact.notices);
+        if (artifact.viewer_digest) {
+            const link = element("a", "Open 3D model");
+            link.href = projectPath + "/models/" + encodeURIComponent(name) + "/" + artifact.viewer_digest + ".html";
+            wrapper.append(link);
+        }
+        return wrapper;
     });
     const manual = data.targets.map(target => ({target, title: target, details: []}));
     if (manual.length) sections.push(section("Review items", manual, "ready"));

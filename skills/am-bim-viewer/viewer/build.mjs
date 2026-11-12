@@ -45,9 +45,8 @@ export function buildViewerHtml({ template, core, data, title }) {
   if (problems.length) throw new Error('Invalid BIM JSON: ' + problems.join(' '));
   const parts = template.split('/*__CORE__*/');
   if (parts.length !== 2) throw new Error('Template must hold exactly one /*__CORE__*/ marker.');
-  let html = parts[0] + inlineCore(core) + parts[1];
-  const dataParts = html.split('/*__DATA__*/null');
+  const heading = escapeHtml(title || (data.source && data.source.title) || 'BIM viewer');
+  const dataParts = (parts[0] + inlineCore(core) + parts[1]).split('/*__DATA__*/null');
   if (dataParts.length !== 2) throw new Error('Template must hold exactly one /*__DATA__*/null marker.');
-  html = dataParts[0] + jsonForScript(data) + dataParts[1];
-  return html.split('__TITLE__').join(escapeHtml(title || (data.source && data.source.title) || 'BIM viewer'));
+  return dataParts.map(part => part.replaceAll('__TITLE__', () => heading)).join(jsonForScript(data));
 }

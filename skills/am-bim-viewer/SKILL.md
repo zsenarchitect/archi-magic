@@ -175,7 +175,7 @@ Build one read-only HTML page that shows audit results, a change preview, and an
 
 ## Office review API (issue #187 Phase 2)
 
-Install the optional dependencies from `requirements-workspace.txt`. Use Python 3.10 or later on POSIX. Run `python scripts/workspace_server.py <private-config.json> --port 8765` from this skill folder.
+Install the optional dependencies from `requirements-workspace.txt`. For model slots, install Node.js and run `npm ci` from this skill folder to install the locked offline viewer dependency. Use Python 3.10 or later on POSIX. Run `python scripts/workspace_server.py <private-config.json> --port 8765` from this skill folder.
 
 Configure `origin` as the canonical office HTTPS origin. Under `accounts`, map account names to SHA-256 digests of individual random tokens. Under `projects`, map slugs to `root`, `members`, and `targets`. Use absolute physical directories. Map project members to `viewer` or `editor`. Set `targets` to the exact review target keys allowed in the project.
 
@@ -185,9 +185,11 @@ Send `POST /session` with the token in a JSON body to start a browser session. R
 
 Open the configured HTTPS origin, enter the project slug and sign in with your access token. The browser shows each publication’s freshness and review history. Editors can comment, assign a project member, or change the review status on current items. Revit board status is shown separately.
 
+Configure a slot with `"kind": "model"` and a relative JSON path to publish an `am-bim-viewer/1` export. Reviewers open the model from the workspace. The service builds and serves a sandboxed offline viewer with a 256 MiB limit on the model publication and generated HTML.
+
 API clients can fetch the current review revision and display rows together from `/projects/<project>/workspace`. Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Refresh the review state and configured artifacts after connecting and after each revision notice.
 
-To publish a completed audit, preview, or board locally, configure an `artifacts` entry under the project. Each slot has a `kind` and a relative JSON `path`. Board slots also have a `board` identity with `lineage`, `host_identity`, and `note_uid`. Read the original Revit note with `include_identity` before publishing a board.
+To publish a completed audit, preview, board, or model locally, configure an `artifacts` entry under the project. Each slot has a `kind` and a relative JSON `path`. Board slots also have a `board` identity with `lineage`, `host_identity`, and `note_uid`. Read the original Revit note with `include_identity` before publishing a board.
 
 Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot> <generation> <saved-result.json>`. Use the source run's increasing generation. An exact repeat keeps the current file. An older run or conflicting repeat stops with an error.
 
