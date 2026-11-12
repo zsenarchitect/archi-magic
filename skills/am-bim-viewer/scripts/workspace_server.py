@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
@@ -23,6 +24,7 @@ from workspace_artifacts import (
     slot_directory, slot_limit, slot_path, validate_publication,
 )
 from workspace_audit_report import AuditReportTooLarge, build_audit_report
+from workspace_documents import copy_document
 from workspace_model import ModelViewer, VIEWER_POLICY, build_model
 from workspace_page import describe_artifact, page
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
@@ -85,6 +87,7 @@ class Workspace:
         self.account_by_digest = {digest: actor for actor, digest in accounts.items()}
         self.projects = {}
         self.artifact_slots = {}
+        self.document_slots = {}
         self.audit_slots = {}
         roots = []
         for slug, config in projects.items():
@@ -102,7 +105,7 @@ class Workspace:
                     not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None
                     or not isinstance(slot, dict) or slot.get("kind") not in ARTIFACT_KINDS
                     for name, slot in slots.items()):
-                raise ValueError("Configure named audit, preview, board or model artifact slots.")
+                raise ValueError("Configure named audit, preview, board, model or document artifact slots.")
             paths = [slot_path(slot) for slot in slots.values()]
             if len(set(paths)) != len(paths):
                 raise ValueError("Each artifact slot requires a different file.")
@@ -114,6 +117,10 @@ class Workspace:
             if any(not isinstance(target, str) or target.startswith(namespaces) for target in self.projects[slug].targets):
                 raise ValueError("Explicit targets cannot overlap a published artifact's target namespace.")
             self.artifact_slots[slug] = slots
+            documents = {name: slot for name, slot in slots.items() if slot["kind"] == "document"}
+            if len(documents) > 4 or sum(map(len, self.document_slots.values())) + len(documents) > 32:
+                raise ValueError("Configure at most four document slots per project and 32 per service.")
+            self.document_slots[slug] = documents
             audit_reports = config.get("audit_reports", True)
             if type(audit_reports) is not bool:
                 raise ValueError("Set audit_reports to true or false.")
@@ -124,6 +131,13 @@ class Workspace:
         self.sessions = {}
         self.login_attempts = deque()
         self.workers = set()
+        self.document_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="workspace-document")
+        self.document_worker = None
+        self.document_project = None
+        self.pending_documents = None
+        self.documents_stopping = False
+        self.document_request = False
+        self.document_publications = {}
         self.audit_request = False
         self.audit_worker = None
         self.sockets = {}
@@ -140,6 +154,10 @@ class Workspace:
                 await asyncio.gather(*self.workers, return_exceptions=True)
                 if self.audit_worker is not None:
                     await asyncio.gather(self.audit_worker, return_exceptions=True)
+                if self.document_worker is not None:
+                    await asyncio.gather(self.document_worker, return_exceptions=True)
+                self.document_executor.shutdown()
+                self.document_publications.clear()
                 self.model_publications.clear()
 
     async def storage(self, function, *args, on_success=None):
@@ -235,6 +253,7 @@ class Workspace:
 
     async def read_workspace(self, request):
         actor, project = self.project_member(request)
+        self.schedule_document_refresh(project)
         try:
             await self.refresh_artifacts(project)
             result = await self.storage(self.workspace_snapshot, actor, project)
@@ -324,14 +343,87 @@ class Workspace:
                 LOG.warning("Workspace model publication could not be loaded (%s)", type(error).__name__)
             return None, []
 
+    def load_document(self, project, name, slot):
+        key = (project.project, name)
+        limit = slot_limit(slot)
+        signature = None
+        try:
+            with slot_directory(project.root, slot) as (directory, filename):
+                with open_json_file(filename, limit, directory) as (stream, metadata):
+                    signature = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+                                 metadata.st_ctime_ns)
+                    prior = self.document_publications.get(key)
+                    if prior is not None and prior[0] == signature:
+                        return prior[1]
+                    publication = validate_publication(read_json_stream(stream, limit), slot)
+            if not project.accepts_document(name, publication):
+                publication = None
+            elif prior is not None and prior[1] is not None and publication["digest"] == prior[1]["digest"]:
+                publication["data"] = prior[1]["data"]
+            else:
+                publication["data"] = copy_document(publication["data"])
+        except (OSError, RecursionError, ValueError) as error:
+            if not isinstance(error, FileNotFoundError):
+                LOG.warning("Workspace document publication could not be loaded (%s)", type(error).__name__)
+            publication = None
+        if signature is not None:
+            self.document_publications[key] = (signature, publication)
+        else:
+            self.document_publications.pop(key, None)
+        return publication
+
+    def refresh_documents(self, project, slots):
+        latest = None
+        for name, slot in slots.items():
+            publication = self.load_document(project, name, slot)
+            revision = project.refresh_artifacts({name: slot}, lambda *_: (publication, []))
+            if revision is not None:
+                latest = revision
+        return latest
+
+    def start_document_worker(self, project, function, on_success):
+        self.document_project = project
+        worker = self.document_worker = asyncio.get_running_loop().run_in_executor(self.document_executor, function)
+
+        def finished(task):
+            self.document_worker = None
+            self.document_project = None
+            if not task.cancelled():
+                error = task.exception()
+                if error is None:
+                    self.notify(project.project, "artifacts", on_success(task.result()))
+                elif isinstance(error, (OSError, ValueError)):
+                    LOG.warning("Workspace document operation failed (%s)", type(error).__name__)
+            self.start_pending_documents()
+
+        worker.add_done_callback(finished)
+        return worker
+
+    def schedule_document_refresh(self, project):
+        slots = self.document_slots[project.project]
+        if not slots or self.documents_stopping:
+            return
+        if self.document_worker is not None or self.document_request:
+            if project is not self.document_project and self.pending_documents is None:
+                self.pending_documents = project
+            return
+        self.start_document_worker(project, lambda: self.refresh_documents(project, slots), lambda revision: revision)
+
+    def start_pending_documents(self):
+        if self.pending_documents is not None and self.document_worker is None and not self.document_request:
+            project, self.pending_documents = self.pending_documents, None
+            self.schedule_document_refresh(project)
+
     async def refresh_artifacts(self, project):
-        slots = self.artifact_slots[project.project]
+        slots = {name: slot for name, slot in self.artifact_slots[project.project].items()
+                 if slot["kind"] != "document"}
         if slots:
             await self.storage(project.refresh_artifacts, slots, self.load_artifact,
                                on_success=lambda etag: self.notify(project.project, "artifacts", etag))
 
     async def watch_artifacts(self, project):
         while True:
+            self.schedule_document_refresh(project)
             try:
                 await self.refresh_artifacts(project)
             except web.HTTPServiceUnavailable:
@@ -345,15 +437,88 @@ class Workspace:
         slot = request.match_info["slot"]
         if slot not in self.artifact_slots[project.project]:
             raise web.HTTPNotFound(text="Artifact unavailable.")
+        if slot in self.document_slots[project.project]:
+            self.schedule_document_refresh(project)
         try:
             await self.refresh_artifacts(project)
             data = await self.storage(project.read_artifact, actor, slot)
         except (OSError, ValueError) as error:
             LOG.warning("Workspace artifact could not be read (%s)", type(error).__name__)
             raise web.HTTPServiceUnavailable(text="Project artifact is unavailable.") from error
-        if data.get("kind") == "model":
+        if data.get("kind") in ("model", "document"):
             data = describe_artifact(data)
         return web.json_response(data, status=503 if data["freshness"] == "unavailable" else 200)
+
+    async def read_document(self, request):
+        actor, project = self.project_member(request)
+        name = request.match_info["slot"]
+        slot = self.document_slots[project.project].get(name)
+        if slot is None:
+            raise web.HTTPNotFound(text="Document unavailable.")
+        collection = request.match_info["collection"]
+        query = request.query
+        if (set(query) not in (set(), {"digest", "generation", "index"})
+                or any(len(query.getall(key)) != 1 for key in query)):
+            raise web.HTTPBadRequest(text="Use the complete document page cursor.")
+        digest = query.get("digest")
+        generation = query.get("generation", "0")
+        index = query.get("index", "0")
+        if ((digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is None)
+                or any(re.fullmatch(r"(0|[1-9][0-9]{0,15})", value) is None for value in (generation, index))):
+            raise web.HTTPBadRequest(text="Use a valid document page cursor.")
+        if self.document_request or self.document_worker is not None:
+            raise web.HTTPServiceUnavailable(text="The document worker is busy. Retry shortly.",
+                                             headers={"Retry-After": "2"})
+
+        def render():
+            revision = self.refresh_documents(project, {name: slot})
+            entry = project.read_artifact(actor, name)
+            if entry["freshness"] == "unavailable":
+                return revision, 503, None
+            current = entry["digest"], entry["generation"]
+            if digest is not None and current != (digest, int(generation)):
+                return revision, 409, None
+            try:
+                body = entry["data"].read_page(collection, int(index), entry["generation"],
+                                               entry["digest"], entry["freshness"])
+            except LookupError:
+                return revision, 404, None
+            except ValueError:
+                return revision, 400, None
+            return revision, 200, body
+
+        self.document_request = True
+        worker = self.start_document_worker(project, render, lambda result: result[0])
+        try:
+            try:
+                _, status, body = await asyncio.shield(worker)
+            except (OSError, ValueError) as error:
+                raise web.HTTPServiceUnavailable(text="Document publication unavailable.") from error
+            if status == 409:
+                raise web.HTTPConflict(text="The document changed. Open the current publication.")
+            if status == 404:
+                raise web.HTTPNotFound(text="Document collection unavailable.")
+            if status == 400:
+                raise web.HTTPBadRequest(text="The document page index is outside the collection.")
+            if status == 503:
+                raise web.HTTPServiceUnavailable(text="Document publication unavailable.")
+            response = web.StreamResponse(headers={**SECURITY_HEADERS, "Content-Type": "application/json",
+                                                   "Content-Length": str(len(body))})
+            await response.prepare(request)
+            if request.method != "HEAD":
+                for offset in range(0, len(body), 128 * 1024):
+                    await response.write(body[offset:offset + 128 * 1024])
+            await response.write_eof()
+            return response
+        finally:
+            if worker.done():
+                self.release_document_request(worker)
+            else:
+                worker.add_done_callback(self.release_document_request)
+
+    def release_document_request(self, _worker):
+        self.document_request = False
+        self.start_pending_documents()
 
     async def read_audit_report(self, request):
         actor, project = self.project_member(request)
@@ -488,6 +653,8 @@ class Workspace:
         return ws
 
     async def shutdown(self, _app):
+        self.documents_stopping = True
+        self.pending_documents = None
         watchers = tuple(self.watchers.values())
         self.watchers.clear()
         for watcher in watchers:
@@ -541,6 +708,7 @@ def create_app(origin, accounts, projects):
         web.get("/projects/{project}/events", workspace.subscribe, allow_head=False),
         web.get("/projects/{project}/artifacts/{slot}", workspace.read_artifact),
         web.get("/projects/{project}/audit-report", workspace.read_audit_report),
+        web.get("/projects/{project}/documents/{slot}/{collection}", workspace.read_document),
         web.get(r"/projects/{project}/models/{slot}/{digest:[0-9a-f]{64}}.html", workspace.read_model),
     ])
     return app

@@ -28,6 +28,9 @@ def describe_artifact(artifact):
     if kind == "model":
         return {"kind": kind, "freshness": freshness, "generation": artifact["generation"],
                 "viewer_digest": data.digest, "rows": []}
+    if kind == "document":
+        return {"kind": kind, "freshness": freshness, "generation": artifact["generation"],
+                "digest": artifact["digest"], "document": data.summary, "rows": []}
     notices = []
     if kind == "audit":
         rows = [

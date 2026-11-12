@@ -195,6 +195,12 @@ Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot
 
 Read published data through `GET /projects/<project>/artifacts/<slot>`. Use its target keys to annotate current findings, preview rows, or issues. A stale response retains the last good data for reading. An unavailable response after restart requires a valid publication before editing resumes.
 
+### Project documents
+
+Use the local `project_document_cli.py extract` or `compare` workflow in am-markup-intake. For comparisons, exit 1 produces a valid report with differences. Publish the resulting JSON to a project artifact slot with `"kind": "document"` using the publication command above. To include a DWG reference, publish JSON with `format` set to `dwg`, a display `file` name and a `revision`.
+
+The workspace shows the original sheet, page, table and row references when present. Reviewers can page through the table or browse mismatches, missing schedule entries and schedule-only entries separately. Original documents stay with the extraction operator. DWG references show their recorded revision and unverified availability.
+
 ### Audit reports
 
 Open **Audit reports** in the office workspace to print the current report or download self-contained HTML. Use the browser’s Print dialog and select Save as PDF for a PDF copy. The report includes accepted audit generations, freshness, model-health totals and rule IDs. Its descriptions come from installed checks. Set `audit_reports` to `false` in a project’s configuration to disable its report route and links.

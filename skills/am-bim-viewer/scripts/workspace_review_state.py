@@ -242,13 +242,19 @@ class ReviewState:
             self._authorize(actor)
             return self._artifacts.get(slot, {"freshness": "unavailable"})
 
+    def accepts_document(self, slot, publication):
+        with self._thread_lock:
+            previous = self._load()["artifacts"].get(slot)
+            return previous is None or publication["generation"] > previous["generation"] or (
+                publication["generation"] == previous["generation"] and publication["digest"] == previous["digest"])
+
     def refresh_artifacts(self, slots, read_slot):
         """Commit new generations and their review targets in one project operation."""
         with self._thread_lock:
             if self._file_lock is None:
                 raise RuntimeError("Open the project state before use.")
             state = self._load()
-            updated = {}
+            updated = dict(self._artifacts)
             for name, slot in slots.items():
                 artifact, targets = read_slot(self.root, name, slot)
                 previous = state["artifacts"].get(name)

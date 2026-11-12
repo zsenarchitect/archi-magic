@@ -12,16 +12,17 @@ import sys
 from uuid import uuid4
 
 from project_page import collect_findings, pair_preview_rows, read_change_preview, read_saved_result, render_board
+from workspace_documents import MAX_DOCUMENT_INPUT, MAX_DOCUMENT_PUBLICATION, normalize_document, validate_document
 from workspace_model import MAX_MODEL_BYTES, validate_model
 from workspace_review_state import canonical, unique_object
 
 
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
-ARTIFACT_KINDS = ("audit", "preview", "board", "model")
+ARTIFACT_KINDS = ("audit", "preview", "board", "model", "document")
 
 
 def slot_limit(slot):
-    return MAX_MODEL_BYTES if slot["kind"] == "model" else MAX_ARTIFACT_BYTES
+    return {"model": MAX_MODEL_BYTES, "document": MAX_DOCUMENT_PUBLICATION}.get(slot["kind"], MAX_ARTIFACT_BYTES)
 
 
 @contextmanager
@@ -120,8 +121,10 @@ def validate_data(kind, data):
             raise ValueError("The issue board contains duplicate issue numbers.")
     elif kind == "model":
         validate_model(data)
+    elif kind == "document":
+        validate_document(data)
     else:
-        raise ValueError("Use a configured audit, preview, board or model artifact slot.")
+        raise ValueError("Use a configured audit, preview, board, model or document artifact slot.")
 
 
 def make_artifact(slot, generation, raw):
@@ -144,8 +147,10 @@ def make_artifact(slot, generation, raw):
     elif kind == "model":
         validate_model(raw, normalize=True)
         data = raw
+    elif kind == "document":
+        data = normalize_document(raw)
     else:
-        raise ValueError("Use a configured audit, preview, board or model artifact slot.")
+        raise ValueError("Use a configured audit, preview, board, model or document artifact slot.")
     validate_data(kind, data)
     content = {"kind": kind, "data": data, "board": board_binding(slot) if kind == "board" else None}
     return {**content, "generation": generation, "digest": hashlib.sha256(canonical(content)).hexdigest()}
@@ -175,7 +180,7 @@ def read_published(root, slot):
 
 def review_targets(slot_name, artifact):
     kind, data = artifact["kind"], artifact["data"]
-    if kind == "model":
+    if kind in ("model", "document"):
         return []
     if kind == "board":
         lineage = artifact["board"]["lineage"]
@@ -239,7 +244,8 @@ def main():
         config = read_json_file(args.config, MAX_ARTIFACT_BYTES)
         project = config["projects"][args.project]
         slot = project["artifacts"][args.slot]
-        raw = read_json_file(args.input, MAX_MODEL_BYTES if slot["kind"] == "model" else 3 * MAX_ARTIFACT_BYTES)
+        limit = {"model": MAX_MODEL_BYTES, "document": MAX_DOCUMENT_INPUT}.get(slot["kind"], 3 * MAX_ARTIFACT_BYTES)
+        raw = read_json_file(args.input, limit)
         print(json.dumps(publish(project["root"], slot, args.generation, raw)))
     except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
         parser.exit(2, "Workspace publication stopped ({}). Check the configured slot, source and generation.\n"

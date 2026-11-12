@@ -516,3 +516,116 @@ def test_audit_report_keeps_project_provenance_and_excludes_source_text(tmp_path
                 assert (await method(report, headers=HEADERS, cookies=viewer)).status == 404
 
     asyncio.run(exercise())
+
+
+def test_document_pages_hold_provenance_and_reject_changed_cursor(tmp_path):
+    accounts, projects = settings(tmp_path)
+    project = projects["sample"]
+    slot = {"kind": "document", "path": "rooms.json"}
+    project["artifacts"] = {"rooms": slot}
+    raw = {"source": {"file": "Rooms.xlsx", "format": "xlsx", "sheet": "Room Data", "header_row": 1,
+                      "private_path": "/private/workbook.xlsx"},
+           "columns": ["Room", "Finish"], "rows": [{"source_row": index, "cells": [str(index), "<img src=x>"]}
+                                                   for index in range(2, 57)]}
+    publish(project["root"], slot, 1, raw)
+    url = "/projects/sample/documents/rooms/rows"
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+            assert (await client.get(url, headers=HEADERS)).status == 401
+            for method in (client.get, client.head):
+                assert (await method(url, headers=HEADERS, cookies=outsider)).status == 404
+            response = await client.get(url, headers=HEADERS, cookies=viewer)
+            assert response.status == 200
+            first = await response.json()
+            assert first["columns"] == raw["columns"]
+            assert first["rows"] == raw["rows"][:50]
+            cursor = {"digest": first["digest"], "generation": first["generation"], "index": first["next_index"]}
+            response = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            second = await response.json()
+            assert second["rows"] == raw["rows"][50:] and second["next_index"] is None
+
+            metadata = await client.get("/projects/sample/artifacts/rooms", headers=HEADERS, cookies=viewer)
+            entry = await metadata.json()
+            assert entry["rows"] == [] and entry["document"]["collections"] == {"rows": 55}
+            assert entry["document"]["source"] == {"file": "Rooms.xlsx", "format": "xlsx", "sheet": "Room Data",
+                                                   "header_row": 1}
+            assert "private_path" not in await metadata.text()
+            path = project["root"] / slot["path"]
+            original = path.read_bytes()
+            path.unlink()
+            path.symlink_to("elsewhere.json")
+            stale = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            assert (await stale.json())["freshness"] == "stale"
+            path.unlink()
+            path.write_bytes(original)
+            publish(project["root"], slot, 2, {**raw, "rows": raw["rows"][1:]})
+            response = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            assert response.status == 409
+            current = await client.get(url, headers=HEADERS, cookies=viewer)
+            assert (await current.json())["rows"] == raw["rows"][1:51]
+
+    asyncio.run(exercise())
+
+
+def test_document_worker_admission_survives_a_client_disconnect(tmp_path, monkeypatch):
+    accounts, projects = settings(tmp_path)
+    project = projects["sample"]
+    slot = {"kind": "document", "path": "report.json"}
+    project["artifacts"] = {"document": slot}
+    publish(project["root"], slot, 1, {"source": {"file": "Schedule.docx", "format": "docx", "table": 1, "header_row": 1},
+                                     "columns": ["Room"], "rows": [{"source_row": 2, "cells": ["001"]}]})
+    started, finish = Event(), Event()
+    copy_document = server.copy_document
+
+    def held_copy(data):
+        started.set()
+        if not finish.wait(5):
+            raise RuntimeError("Document test did not release the worker")
+        return copy_document(data)
+
+    monkeypatch.setattr(server, "copy_document", held_copy)
+
+    async def exercise():
+        disconnected = asyncio.Event()
+        read_document = server.Workspace.read_document
+
+        async def observe_disconnect(workspace, request):
+            try:
+                return await read_document(workspace, request)
+            except asyncio.CancelledError:
+                disconnected.set()
+                raise
+
+        monkeypatch.setattr(server.Workspace, "read_document", observe_disconnect)
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+            url = "/projects/sample/documents/document/rows"
+            abandoned = asyncio.create_task(client.get(url, headers=HEADERS, cookies=viewer))
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                abandoned.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await abandoned
+                await asyncio.wait_for(disconnected.wait(), 2)
+                busy = await client.get(url, headers=HEADERS, cookies=viewer)
+                assert busy.status == 503 and busy.headers["Retry-After"] == "2"
+                review = "/projects/other/review"
+                other = await client.get(review, headers=HEADERS, cookies=outsider)
+                saved = await client.patch(review, headers=dict(HEADERS, **{"If-Match": other.headers["ETag"]}),
+                                           cookies=outsider, json={"target": TARGET, "operation_id": "operation-0000001",
+                                                                  "patch": {"comment": "Review is available."}})
+                assert saved.status == 200
+            finally:
+                finish.set()
+
+    asyncio.run(exercise())

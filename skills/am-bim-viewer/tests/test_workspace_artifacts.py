@@ -97,3 +97,30 @@ def test_published_preview_excludes_model_execution_fields(tmp_path):
     artifacts.publish(tmp_path.resolve(), slot, 1, {"preview": preview, "plan": {"private": "plan"}})
     data = artifacts.read_published(tmp_path.resolve(), slot)["data"]
     assert data == {key: value for key, value in preview.items() if key != "steps"}
+
+
+def test_document_page_accepts_largest_table_and_comparison_records():
+    from workspace_documents import encode_page
+
+    text = "🧭" * 3998 + '\n"'
+    columns = [str(index) + text[len(str(index)):] for index in range(128)]
+    source = {"file": "Rooms.xlsx", "format": "xlsx", "header_row": 1, "sheet": "Room Data"}
+    slot = {"kind": "document", "path": "document.json"}
+    table = {"source": source, "columns": columns, "rows": [{"source_row": index, "cells": [text] * 128} for index in (2, 3)]}
+    comparison = {"status": "differences", "document": source,
+                  "schedule": {"file": "schedule.json", "schedule": "Room Schedule"},
+                  "counts": {"expected_rows": 1, "schedule_rows": 0, "mismatched_cells": 0,
+                             "missing_in_schedule": 1, "actual_only_rows": 0},
+                  "mismatches": [], "actual_only": [],
+                  "missing_in_schedule": [{"key": dict.fromkeys(columns, text), "source_row": 2}]}
+    for raw, collection in ((table, "rows"), (comparison, "missing_in_schedule")):
+        record = artifacts.make_artifact(slot, 1, raw)
+        encoded = encode_page(record["data"], collection, 0, 1, record["digest"], "ready")
+        assert len(encoded) < 16 * 1024 * 1024
+        page = json.loads(encoded)
+        if collection == "rows":
+            assert page["rows"] == raw[collection][:1] and page["next_index"] == 1
+            next_page = json.loads(encode_page(record["data"], collection, 1, 1, record["digest"], "ready"))
+            assert next_page["rows"] == raw[collection][1:] and next_page["next_index"] is None
+        else:
+            assert page["rows"] == raw[collection] and page["next_index"] is None

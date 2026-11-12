@@ -9,13 +9,14 @@ const form = byId("review-form");
 const editMessage = byId("edit-message");
 const slug = /^\/projects\/([a-z0-9][a-z0-9-]{0,62})$/.exec(location.pathname)?.[1];
 const projectPath = slug ? "/projects/" + slug : "";
-const labels = {audit: "Audit findings", preview: "Change preview", board: "Revit issue board", model: "3D model"};
+const labels = {audit: "Audit findings", preview: "Change preview", board: "Revit issue board", model: "3D model", document: "Project document"};
 const availability = {ready: "Current", stale: "Stale · Showing the last valid publication",
                       unavailable: "No valid publication available"};
 let snapshot;
 let selected;
 let selectedRevision;
 let rows = new Map();
+const documentSections = new Map();
 let socket;
 let closed = false;
 let refreshing = false;
@@ -113,6 +114,108 @@ function section(title, entries, freshness, summary, notices = []) {
     return wrapper;
 }
 
+const collectionLabels = {rows: "Table rows", mismatches: "Mismatched cells",
+                          missing_in_schedule: "Missing in schedule", actual_only: "Only in schedule"};
+
+function documentTable(collection, page) {
+    const headers = {
+        rows: ["Source row", ...(page.columns ?? [])],
+        mismatches: ["Key", "Source row", "Schedule row", "Document column", "Schedule column", "Expected", "Actual"],
+        missing_in_schedule: ["Key", "Source row"],
+        actual_only: ["Key", "Schedule row"],
+    };
+    const table = document.createElement("table");
+    const heading = table.createTHead().insertRow();
+    for (const label of headers[collection]) {
+        const cell = element("th", label);
+        cell.scope = "col";
+        heading.append(cell);
+    }
+    const body = table.createTBody();
+    for (const row of page.rows) {
+        let values = [row.source_row, ...(row.cells ?? [])];
+        if (collection !== "rows") {
+            const key = Object.entries(row.key).map(([field, value]) => field + " = " + value).join(" · ");
+            if (collection === "mismatches") {
+                values = [key, row.source_row, row.snapshot_row, row.document_column, row.schedule_column,
+                          row.expected, row.actual];
+            } else {
+                values = [key, row.source_row ?? row.snapshot_row];
+            }
+        }
+        const line = body.insertRow();
+        for (const value of values) line.insertCell().textContent = value;
+    }
+    const wrapper = document.createElement("div");
+    wrapper.className = "document-table";
+    wrapper.append(table);
+    return wrapper;
+}
+
+function documentCollection(name, artifact, collection, total) {
+    const panel = document.createElement("section");
+    const status = element("p", "");
+    status.setAttribute("role", "status");
+    const content = document.createElement("div");
+    const first = element("button", "Open " + collectionLabels[collection].toLowerCase() + " (" + total + ")");
+    const next = element("button", "Next page");
+    next.hidden = true;
+    let index = 0;
+    let nextIndex;
+    async function load(start) {
+        first.disabled = next.disabled = true;
+        const query = new URLSearchParams({digest: artifact.digest, generation: artifact.generation, index: start});
+        const path = projectPath + "/documents/" + encodeURIComponent(name) + "/" + collection + "?" + query;
+        try {
+            const page = await (await request(path)).json();
+            index = start;
+            nextIndex = page.next_index;
+            content.replaceChildren(documentTable(collection, page));
+            status.textContent = "Showing " + (index + 1) + "–" + (index + page.rows.length) + " of " + page.total;
+            first.textContent = "First page";
+            next.hidden = nextIndex === null;
+        } catch (error) {
+            if (error.status === 401) returnToSignIn();
+            status.textContent = error.status ? error.message : "Could not load document records. Try again.";
+            if (error.status === 409) refresh();
+        } finally {
+            first.disabled = next.disabled = false;
+        }
+    }
+    if (total) {
+        first.addEventListener("click", () => load(0));
+        next.addEventListener("click", () => load(nextIndex));
+        panel.append(first, status, content, next);
+    } else {
+        panel.append(element("p", collectionLabels[collection] + " · 0"));
+    }
+    return panel;
+}
+
+function documentSection(name, artifact) {
+    const signature = artifact.digest + ":" + artifact.generation + ":" + artifact.freshness;
+    const cached = documentSections.get(name);
+    if (cached?.signature === signature) return cached.node;
+    const info = artifact.document;
+    const node = section("Project document · " + name, [], artifact.freshness, availability[artifact.freshness]);
+    const source = info.source;
+    const location = [source.file, source.sheet, source.page && "Page " + source.page, source.table && "Table " + source.table,
+                      source.header_row && "Header row " + source.header_row].filter(Boolean).join(" · ");
+    node.append(element("p", location));
+    if (info.type === "reference") {
+        node.append(element("p", "Revision " + source.revision + " · Reference availability unverified"));
+    }
+    if (info.type === "comparison") {
+        node.append(element("p", info.schedule.file + " · " + info.schedule.schedule + " · " +
+                            info.counts.expected_rows + " source rows · " + info.counts.schedule_rows + " schedule rows"));
+    }
+    for (const [collection, total] of Object.entries(info.collections)) {
+        node.append(documentCollection(name, artifact, collection, total));
+    }
+    documentSections.set(name, {signature, node});
+    return node;
+}
+
 function render(data) {
     snapshot = data;
     const visible = new Set();
@@ -120,6 +223,8 @@ function render(data) {
     rows = new Map();
     const sections = Object.entries(data.artifacts).map(([name, artifact]) => {
         artifact.rows.forEach(row => visible.add(row.target));
+        if (artifact.kind === "document") return documentSection(name, artifact);
+        documentSections.delete(name);
         const wrapper = section(artifact.kind ? labels[artifact.kind] + " · " + name : name, artifact.rows,
                                 artifact.freshness, availability[artifact.freshness], artifact.notices);
         if (artifact.viewer_digest) {
