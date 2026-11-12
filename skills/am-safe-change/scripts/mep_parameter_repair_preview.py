@@ -10,6 +10,7 @@ from view_duplicate_preview import element_id, read_payload, read_record, snapsh
 from view_filter_transfer_preview import MAX_SAVED_RECORD, checked_changes, checked_record
 
 
+TRANSACTION_NAME = "Test reviewed MEP text fill"
 COLUMNS = ["ElementId", "Instance UID", "Category ID", "Parameter ID", "Current state", "Text"]
 BLOCKED = {
     "missing_parameter": "The shared parameter is missing.",
@@ -100,18 +101,55 @@ def preview(saved, request):
     }
 
 
+def verify_trial(original_saved, fill, trial_saved, fresh_saved):
+    display = preview(original_saved, fill)
+    original = checked_record(original_saved, "query")
+    trial = checked_record(trial_saved, "dry_run")
+    fresh = checked_record(fresh_saved, "query")
+    if len({original["run_id"], trial["run_id"], fresh["run_id"]}) != 3:
+        raise ValueError("Supply three independent Revit run records.")
+    if trial.get("closed_documents") or fresh.get("closed_documents"):
+        raise ValueError("The trial or readback closed another document.")
+    modified = sorted(display["ownership_ids"], key=int)
+    result = trial["result"]
+    if (display["blocked"] or result["status"] != "mep_text_fill_trial_rolled_back"
+            or result["basis_sha256"] != display["basis_sha256"]
+            or result["source_run_id"] != original["run_id"]
+            or result["trial_changes"] != {"added": [], "modified": modified, "deleted": []}):
+        raise ValueError("The text-fill trial does not match the reviewed preview and effects.")
+    checked_changes(trial, modified, transaction_name=TRANSACTION_NAME)
+    checked_changes(fresh, [])
+    if read_payload(fresh, "repair_parameters_json") != read_payload(original, "repair_parameters_json"):
+        raise ValueError("The independent Revit readback differs from the original parameters.")
+    return {
+        "status": "verified_mep_text_fill_trial_rollback", "basis_sha256": display["basis_sha256"],
+        "original_run_id": original["run_id"], "trial_run_id": trial["run_id"], "fresh_run_id": fresh["run_id"],
+        "modified_ids": modified,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("query", help="Complete pyRevit response or result pages from one query")
     parser.add_argument("fill", help='JSON file with the approved proposal, for example {"text": "Ventilation"}')
+    parser.add_argument("--trial", help="Complete dry-run response from the disposable text-fill trial")
+    parser.add_argument("--fresh", help="Complete response from a separate post-trial read-only query")
     args = parser.parse_args()
     try:
-        result = preview(read_record(args.query, MAX_SAVED_RECORD), read_record(args.fill, 65536))
+        original = read_record(args.query, MAX_SAVED_RECORD)
+        fill = read_record(args.fill, 65536)
+        if bool(args.trial) != bool(args.fresh):
+            raise ValueError("Supply both the trial response and the independent readback.")
+        if args.trial:
+            result = verify_trial(original, fill, read_record(args.trial, MAX_SAVED_RECORD),
+                                  read_record(args.fresh, MAX_SAVED_RECORD))
+        else:
+            result = preview(original, fill)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as error:
         print(f"MEP repair preview stopped. {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=True, indent=2))
-    return int(result["blocked"])
+    return int(result.get("blocked", False))
 
 
 if __name__ == "__main__":

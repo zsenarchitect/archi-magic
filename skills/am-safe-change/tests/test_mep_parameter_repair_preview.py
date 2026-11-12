@@ -203,3 +203,50 @@ def test_native_fill_trial_measures_effects_and_always_rolls_back(inputs, tmp_pa
         assert current == original
     if fault is None:
         assert result["trial_changes"] == {"added": [], "modified": [LARGE_ID], "deleted": []}
+
+
+@pytest.mark.parametrize("fault", [None, "reused_run", "changed_readback", "extra_effect", "wrong_preview"])
+def test_independent_trial_verifier_requires_exact_effects_and_restoration(inputs, tmp_path, fault):
+    evidence, run = inputs
+    before = run()
+    assert before.returncode == 0, before.stderr
+    display = json.loads(before.stdout)
+    query = tmp_path / "query.json"
+    fill = tmp_path / "fill.json"
+    original = json.loads(query.read_text())["response"]
+    trial = dict(original, run_id="123456789abc", mode="dry_run", result={
+        "status": "mep_text_fill_trial_rolled_back", "basis_sha256": display["basis_sha256"],
+        "source_run_id": original["run_id"], "trial_changes": {"added": [], "modified": [LARGE_ID], "deleted": []},
+    }, changes=dict(original["changes"], modified=[{"id": int(LARGE_ID)}], modified_count=1,
+                    by_category={"Ducts": 1}, transactions=["Test reviewed MEP text fill"]))
+    fresh = dict(original, run_id="23456789abcd", result=dict(original["result"]))
+    if fault == "reused_run":
+        fresh["run_id"] = original["run_id"]
+    elif fault == "changed_readback":
+        evidence["elements"][0]["value"] = "Not restored"
+        fresh["result"]["repair_parameters_json"] = json.dumps(evidence)
+    elif fault == "extra_effect":
+        trial["changes"]["modified"] = [{"id": 23}]
+    elif fault == "wrong_preview":
+        trial["result"]["basis_sha256"] = "f" * 64
+    trial_path, fresh_path = tmp_path / "trial.json", tmp_path / "fresh.json"
+    trial_path.write_text(json.dumps(trial))
+    fresh_path.write_text(json.dumps(fresh))
+
+    result = subprocess.run([sys.executable, SCRIPT, query, fill, "--trial", trial_path, "--fresh", fresh_path],
+                            capture_output=True, text=True)
+    if fault is not None:
+        assert result.returncode == 2 and not result.stdout
+        assert {
+            "reused_run": "three independent Revit run records",
+            "changed_readback": "independent Revit readback differs",
+            "extra_effect": "bridge change record disagrees",
+            "wrong_preview": "does not match the reviewed preview",
+        }[fault] in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "status": "verified_mep_text_fill_trial_rollback", "basis_sha256": display["basis_sha256"],
+            "original_run_id": original["run_id"], "trial_run_id": trial["run_id"], "fresh_run_id": fresh["run_id"],
+            "modified_ids": [LARGE_ID],
+        }

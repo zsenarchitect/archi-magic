@@ -7,13 +7,10 @@ from pyrevit.api import DB
 from System.Diagnostics import Stopwatch
 
 from duplicate_views import capture_changes, rollback
-from mep_parameter_repair_preview import preview
+from mep_parameter_repair_preview import TRANSACTION_NAME, preview
 from mep_route_trial_preflight import installed_reader
 from view_duplicate_preview import read_payload
 from view_filter_transfer_preview import checked_record
-
-
-TRANSACTION_NAME = "Test reviewed MEP text fill"
 
 
 def trial(document, args, reader=None):
