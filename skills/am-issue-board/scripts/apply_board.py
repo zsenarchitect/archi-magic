@@ -75,8 +75,11 @@ def verify_board_target(guard, note_id):
             raise ValueError("The verified clash section box changed. Read it again before updating the board.")
 
 
-if "structural_target" in plan:
-    verify_board_target(plan["structural_target"], inputs["note_id"])  # noqa: F821
+target_keys = [key for key in ("structural_target", "mep_penetration_target") if key in plan]
+if len(target_keys) > 1:
+    raise ValueError("Use one reviewed board target.")
+if target_keys:
+    verify_board_target(plan[target_keys[0]], inputs["note_id"])  # noqa: F821
 if "board_target" in plan:
     if plan["board_target"] is None:
         raise ValueError("Read the board and any archive with include_identity enabled, then rebuild the plan.")

@@ -161,6 +161,75 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
 
+## Check spacing for linked MEP openings (issue #152)
+
+Run `python scripts/mep_penetration_spacing.py measured-outlines.json` to review the material left between openings in one host.
+
+Set `kind` to `mep-penetration-host-spacing` and `frame` to `host_face_internal_feet`. Set the exact `host_uid` and the approved `minimum_web_ft`. Set `complete` to true only when the prepared evidence covers every existing cut in the reviewed host.
+
+Supply `proposed` and `existing` arrays. Give each outline a unique `key` and two `center` coordinates. Use `shape: "round"` with `diameter`. Use `shape: "rectangular"` with `width`, `height`, and `angle_rad`.
+
+Exit 1 lists conflicts. Exit 2 means the spacing check stopped. This command uses prepared measurements.
+
+### Preview crossings and check tracked openings
+
+Run `python scripts/mep_penetration_preview.py evidence.json`. Keep the evidence and report private. The command does not write to Revit or the issue board.
+
+- Use `kind: "mep-penetration-evidence"` and `frame: "revit_host_internal_feet"`. Provide `host_identity` and `link_identity` with `project_uid` and `path_sha256`. Provide `link_instance_uid`, `clearance_ft`, and `tolerance_ft`.
+- Provide `hosts` with each host's `id`, `uid`, `kind`, `depth_ft`, unit `normal`, and `gross_sha256`. Set the normal from the first principal face toward the opposite face. Include `cuts_complete`, `minimum_web_ft`, and `existing` outlines from the same face frame.
+- Provide `runs` with each linked run's `id`, `uid`, `system`, and measured exterior `profile`. Use `shape` and `diameter` for round runs. Use `shape`, `width`, and `height` for rectangular runs.
+- Provide one `pairs` row per host and run. Use `host_uid`, `run_uid`, and `status`. Use `solid_crossing` only for a verified full crossing through material. Use `gross_crossing` for an independently measured gross host crossing. Use `no_crossing` for a measured miss and `unresolved` when evidence is missing.
+- For a crossing, supply `entry_ft` and `exit_ft` on the two principal faces, `center_uv_ft` in the host face frame, and the shortest `edge_distance_ft` from the crossing centers to any trim boundary. Confirm both centers are inside the trimmed faces. For a rectangular run, supply `angle_rad` in the face frame. Set `gross_verified` for a separately measured gross-host result. Set `existing_cut_verified` only when an existing cut has independent evidence.
+- Use an empty `tracked` array for a first pass. For each kept opening, include the pair UIDs, `crossing_key`, saved `geometry`, and `geometry_sha256`. Include `opening_uid`, `observed_uid`, `observed_host_uid`, `cut_verified`, and the saved and current opening digests as `opening_sha256` and `observed_opening_sha256`.
+
+Set `complete` to true only after the entire selected scope was measured. A complete miss can mark a tracked opening out of date. An unavailable link or missing cut proof leaves it unresolved.
+
+### Read linked runs and host crossings in Revit
+
+Save the host project and call `get_context`. Run `scripts/read_mep_penetrations.py` with the CPython bridge in query mode. Use the skill's scripts folder as the workspace.
+
+Pass `link_instance_id`, `host_ids`, and `run_ids` as exact decimal strings. Use one loaded link and up to 100 selected IDs per model. Pass `clearance_ft`, `tolerance_ft`, and `minimum_web_ft` from the reviewed scope.
+
+Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The reader covers rectangular host solids and finite straight runs with measured exterior profiles. It checks round and rectangular cuts against both face outlines and the full host depth. It reports an existing cut without a tracking record as untracked. Unsupported or ambiguous geometry stays unresolved.
+
+The query reads versioned tracking records on existing opening instances. It checks the recorded opening and host IDs, the actual cut, and the measured opening shape. A copied tag or a missing cut cannot establish a current opening. A damaged record blocks proposals for that scan.
+
+Verify this reader on a disposable Revit fixture before use.
+
+### Trial placement and tracking
+
+Add `symbol_ids` to the Revit query for the reviewed opening types. Prepare a choices file with exact `crossing_keys` and a `symbols` map keyed by host and shape, for example `wall:rectangular`. For each symbol, include its `id`, `uid`, and `parameters`. Map `width`, `height`, and `depth` or `diameter` and `depth` to exact instance parameter IDs.
+
+Run `python scripts/probe_mep_penetration_placement.py evidence.json choices.json`. Save the preview and its digest. Show the before and after rows. Use am-safe-change to check ownership and review the exact host and symbol IDs.
+
+In the disposable project, call `get_context` and confirm ask policy. Repeat the reviewed query with `audit: {}`. Save the full result as `before.json`. Confirm that its snapshot matches the reviewed preview.
+
+Obtain approval for the rollback trial. Run the placement script in guarded CPython dry-run mode. Pass `read`, `choices`, `preview_sha256`, and `disposable_fixture: true`. Copy the baseline query's `audit_token` and `inventory_sha256` into `baseline_audit_token` and `baseline_inventory_sha256`.
+
+The trial measures the host before and after each cut. It attaches tracking only after the cut matches the preview. It rolls back every opening, host cut, and record together. Save the full run as `trial.json`. Stop on an unresolved result.
+
+Repeat the project query with `audit`. Set `trial_transaction` to the trial's transaction name. Set `absent_opening_uids` to every trial opening UID. Save the full result as `after.json`.
+
+Run `python scripts/verify_mep_penetration_trial.py choices.json before.json trial.json after.json`. Check the measured cuts, exact element effects, and restored project inventory.
+
+### Qualify ask policy and verify the native decision
+
+Use a separate saved disposable Revit project for the approval control. Set its Project Information name to `Archi Magic approval fixture`. Confirm ask policy with `get_context`.
+
+Run `scripts/apply_mep_penetration_placement.py` in guarded CPython modify mode for the control. Pass `runtime_control` with `disposable_fixture: true` and `project` containing the exact saved document identity. Choose Discard on the first run and check that the original name remains. Choose Keep on the second run and check the name `Archi Magic approval control`. Save both full run records. Restore or close the control fixture without saving.
+
+Return to the exact placement fixture. Confirm ask policy and obtain approval to replay the verified trial. Run the same script in guarded modify mode. Pass `placement` with the original trial inputs. Pass the full `before`, `trial`, and `after` records, plus `runtime_controls` with the saved `keep` and `discard` controls.
+
+Save the full placement decision as `modify.json`. Run an independent query with the same geometry inputs and `audit.trial_transaction` set to the replay transaction. After Keep, pass `audit.kept: true`. After Discard, pass the replay opening UIDs as `audit.absent_opening_uids`. Save the complete result as `fresh.json`.
+
+Run `python scripts/verify_mep_penetration_decision.py choices.json before.json trial.json after.json modify.json fresh.json`. Stop and identify the named Undo entry if Keep fails verification. Verify the workflow on the installed Revit bridge before using project data.
+
+### Preview MEP findings on the issue board
+
+Read the active board and any existing archive from the same saved host project. Run `python scripts/mep_penetration_board.py --evidence evidence.json --board board.json --crossing <key>`. Repeat `--crossing` for each reviewed finding and pass `--archive archive.json` if the board has an archive.
+
+The preview lists matching issue numbers on the active board or archive. A new entry includes the host ID, linked run ID, system, crossing location in host internal feet, and any fire rating read from Revit. Existing entries require an explicit board edit. Review the preview through the board's own safe-change flow before applying a new entry.
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.

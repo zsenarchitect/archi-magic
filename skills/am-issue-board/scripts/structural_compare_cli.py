@@ -160,7 +160,7 @@ def compare(snapshot, review):
     return compared
 
 
-def read_board(path, snapshot, archive):
+def read_board(path, snapshot, archive, marker=MARKER):
     source, _ = read_input(path)
     host = source["host_identity"]
     if identity(host) != identity(snapshot["host_identity"]):
@@ -185,10 +185,10 @@ def read_board(path, snapshot, archive):
     seen = set()
     for row in rows:
         for finding in row["findings"]:
-            if finding.startswith(MARKER):
-                key = digest(finding[len(MARKER):])
+            if finding.startswith(marker):
+                key = digest(finding[len(marker):])
                 if key in seen:
-                    raise ValueError("Duplicate structural provenance.")
+                    raise ValueError("Duplicate board finding provenance.")
                 seen.add(key)
     return body, formats, rows, seen, target
 
