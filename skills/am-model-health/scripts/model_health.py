@@ -309,6 +309,17 @@ def link_path_kind(path, local=None):
     return None
 
 
+def standalone_relative_link_kind(path, local):
+    if (not path or path.startswith(("\\", "/")) or ntpath.isabs(path) or ":" in path
+            or link_read(lambda: bool(doc.IsWorkshared or doc.IsModelInCloud)) is not False):
+        return None
+    host = link_read(lambda: windows_classification_path(doc.PathName))
+    if not host or not ntpath.isabs(host) or not ntpath.splitdrive(host)[0]:
+        return None
+    resolved = ntpath.normpath(ntpath.join(ntpath.dirname(host), path))
+    return link_path_kind(resolved, local)
+
+
 def link_enum(value, accepted):
     label = str(value)
     return label if label in accepted else None
@@ -325,6 +336,7 @@ def link_type_details(link_type):
             and not link_read(lambda: bool(absolute.ServerPath))):
         model_path = saved
         path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
+    saved_relative_path = path if model_path is saved else None
     if not path:
         path = link_read(lambda: link_type.GetExternalResourceReference(
             DB.ExternalResourceTypes.BuiltInExternalResourceTypes.RevitLink).InSessionPath)
@@ -339,6 +351,8 @@ def link_type_details(link_type):
     path_type = link_read(lambda: link_type.PathType)
     if path_type is None:
         path_type = link_read(lambda: ref.PathType)
+    if model_kind is None and str(path_type) == "Relative":
+        model_kind = standalone_relative_link_kind(saved_relative_path, local)
 
     ifc_ref = link_read(lambda: link_type.GetExternalResourceReference(
         DB.ExternalResourceTypes.BuiltInExternalResourceTypes.IFCLink))
@@ -354,8 +368,12 @@ def link_type_details(link_type):
             locations.update([model_kind] if model_kind else [])
         source_kind = next(iter(locations)) if len(locations) == 1 else None
     else:
-        source_kind = None if cache_hint else model_kind
-        locations = {source_kind} if source_kind else set()
+        locations = {model_kind} if model_kind and not cache_hint else set()
+        if kind == "RVT" and str(path_type) == "Absolute" and model_kind not in ("cloud", "revit_server"):
+            saved_path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
+            if personal_path_kind(saved_path)[0]:
+                locations.add("personal")
+        source_kind = next(iter(locations)) if len(locations) == 1 else None
     path_risk = next((risk for risk in ("personal", "local", "drive_letter") if risk in locations), None)
 
     status = link_read(lambda: link_type.GetLinkedFileStatus())
