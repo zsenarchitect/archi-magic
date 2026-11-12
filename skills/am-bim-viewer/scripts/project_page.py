@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from datetime import datetime
 import hashlib
 import html
 import math
@@ -95,9 +96,39 @@ def summarize(findings: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def model_health_runs(audits):
+    runs = []
+    for audit in audits:
+        if "metrics" not in audit:
+            continue
+        try:
+            recorded = datetime.strptime(audit["timestamp"], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            recorded = datetime.min
+        runs.append((recorded, audit))
+    return [audit for _, audit in sorted(runs, key=lambda entry: entry[0], reverse=True)]
+
+
 def _e(value: Any) -> str:
     """Escape any value for HTML. Model text is data, never markup."""
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def render_model_health(audits):
+    if not audits:
+        return ""
+    rows = []
+    for audit in audits:
+        counts = Counter(metric["status"] for metric in audit["metrics"])
+        rows.append(
+            f"<tr><th scope='row'>{_e(audit['model'])}</th><td>{_e(audit['timestamp'])}</td>"
+            f"<td>{len(audit['metrics'])}</td><td>{counts['bad']}</td><td>{counts['warn']}</td></tr>"
+        )
+    return (
+        "<h2>Model health audits</h2><table>"
+        "<thead><tr><th>Model</th><th>Recorded time</th><th>Checks</th>"
+        "<th>Errors</th><th>Warnings</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
 
 
 def render_findings(findings: List[Dict[str, Any]]) -> str:
@@ -249,7 +280,8 @@ STYLE = (
 )
 
 
-def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *, board=None, viewer_name=None) -> str:
+def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *,
+               board=None, viewer_name=None, model_health=()) -> str:
     s = summarize(findings)
     cards = "".join(
         f"<div class='card'><strong>{s[k]}</strong><br>{label}</div>"
@@ -262,6 +294,7 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
         f"<title>{_e(title)}</title><style>{STYLE}</style></head><body>"
         f"<h1>{_e(title)}</h1><p>Read-only local report. No data leaves this computer.</p>"
         f"{model_link}<div class='cards'>{cards}</div>"
+        f"{render_model_health(model_health)}"
         f"<h2>Audit findings</h2>{render_findings(findings)}"
         f"<h2>Change preview</h2>{render_preview(preview)}"
         f"{render_board(board) if board is not None else ''}"
@@ -269,7 +302,7 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
     )
 
 
-def write_project_with_model(output, model, title, findings, preview, board):
+def write_project_with_model(output, model, title, findings, preview, board, model_health):
     builder = Path(__file__).resolve().with_name("build-viewer.mjs")
     with TemporaryDirectory(prefix=".project-viewer-", dir=output.parent) as temporary:
         staging = Path(temporary)
@@ -293,7 +326,8 @@ def write_project_with_model(output, model, title, findings, preview, board):
             raise ValueError("The model viewer output name is already in use by another file.")
 
         page = staging / "report.html"
-        page.write_text(build_page(title, findings, preview, board=board, viewer_name=viewer.name), encoding="utf-8")
+        page.write_text(build_page(title, findings, preview, board=board, viewer_name=viewer.name,
+                                   model_health=model_health), encoding="utf-8")
         if not viewer.exists():
             os.replace(built, viewer)
         os.replace(page, output)
@@ -319,16 +353,19 @@ def main() -> int:
             return 1
 
     try:
-        findings = collect_findings([load_json(a) for a in args.audit])
+        audits = [load_json(a) for a in args.audit]
+        findings = collect_findings(audits)
+        model_health = model_health_runs(audits)
         preview = load_json(args.preview) if args.preview else {}
         board = load_json(args.board) if args.board else None
         if args.board and board is None:
             raise ValueError("Use the JSON output of board_cli.py parse for the issue board.")
         output = Path(args.out).absolute()
         if args.model:
-            write_project_with_model(output, Path(args.model), args.title, findings, preview, board)
+            write_project_with_model(output, Path(args.model), args.title, findings, preview, board, model_health)
         else:
-            output.write_text(build_page(args.title, findings, preview, board=board), encoding="utf-8")
+            output.write_text(build_page(args.title, findings, preview, board=board, model_health=model_health),
+                              encoding="utf-8")
     except (ValueError, OSError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

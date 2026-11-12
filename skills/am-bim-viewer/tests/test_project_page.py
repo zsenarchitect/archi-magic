@@ -187,6 +187,27 @@ def test_failed_health_audit_cannot_be_rendered_as_clean(tmp_path):
     assert out.read_text() == "Existing project page"
 
 
+def test_project_page_lists_clean_model_health_runs_newest_first(tmp_path):
+    older = tmp_path / "old.json"
+    newer = tmp_path / "new.json"
+    clean = {"model": "Coordination <East>", "timestamp": "2026-11-11T12:00:00",
+             "metrics": [{"id": "links", "label": "Links", "status": "ok",
+                          "value": 1, "unit": "", "hint": ""}]}
+    older.write_text(json.dumps(clean))
+    newer.write_text(json.dumps({**clean, "timestamp": "2026-11-11T15:00:00"}))
+    out = tmp_path / "project.html"
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", older,
+        "--audit", newer, "--out", out,
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    page = out.read_text()
+    assert "<h2>Model health audits</h2>" in page
+    assert "<p>No findings.</p>" in page
+    assert page.index("2026-11-11T15:00:00") < page.index("2026-11-11T12:00:00")
+    assert "<th scope='row'>Coordination &lt;East&gt;</th><td>2026-11-11T15:00:00</td><td>1</td><td>0</td><td>0</td>" in page
+
+
 def test_project_page_builds_and_links_local_model(tmp_path, monkeypatch):
     model = tmp_path / "model.json"
     model.write_text('{"elements": []}')
