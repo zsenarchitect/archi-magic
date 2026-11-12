@@ -128,6 +128,9 @@ def read_snapshot(document, request):
 def probe(document, args):
     if args.get("disposable_fixture") is not True or document.IsWorkshared:
         raise ValueError("Use an explicitly confirmed standalone disposable fixture.")
+    exercise_filters = args.get("exercise_filters", False)
+    if type(exercise_filters) is not bool:
+        raise ValueError("The filter trial flag must be true or false.")
     request = args["request"]
     baseline = read_snapshot(document, request)
     proposal, display = build(baseline)
@@ -135,6 +138,11 @@ def probe(document, args):
             or not proposal["legend_preflight"] or proposal["legend_preflight"]["state"] != "available"):
         raise ValueError("The reviewed proposal, preview or drafting resources do not match the live fixture.")
 
+    model_view, order, filter_trial = None, [], None
+    if exercise_filters:
+        from color_filter_trial import apply_filters, fixture_view, verify_filters
+
+        model_view, order = fixture_view(document, baseline, proposal)
     events, foreign = [], []
     application = document.Application
 
@@ -146,10 +154,11 @@ def probe(document, args):
                 events[:] = [None]
                 return
             added, modified, deleted = event.GetAddedElementIds(), event.GetModifiedElementIds(), event.GetDeletedElementIds()
-            if added.Count > 1 + 2 * len(proposal["legend_rows"]) or modified.Count or deleted.Count:
+            limit = 1 + (3 if exercise_filters else 2) * len(proposal["legend_rows"])
+            if added.Count > limit or modified.Count > int(exercise_filters) or deleted.Count:
                 events.append(None)
             else:
-                events.append(({key(item) for item in added}, set(), set()))
+                events.append(({key(item) for item in added}, {key(item) for item in modified}, set()))
         except Exception:
             events[:] = [None]
 
@@ -163,6 +172,8 @@ def probe(document, args):
             raise ValueError("Revit did not start the legend trial transaction.")
         application.DocumentChanged += record
         try:
+            if exercise_filters:
+                filter_trial = apply_filters(document, model_view, order, baseline, proposal)
             view = DB.ViewDrafting.Create(document, identifier(proposal["legend_preflight"]["resources"]["drafting"]["id"]))
             view.Name, view.Scale = proposal["legend_name"], 1
             validate_view(view, proposal)
@@ -175,11 +186,22 @@ def probe(document, args):
             raise ValueError("Revit did not finish the legend trial transaction.")
         changes = capture_changes(events)
         expected = {key(view.Id)} | {item for pair in pairs.values() for item in pair.values()}
-        if set(changes["added"]) != expected:
-            raise ValueError("Revit reported additions outside the reviewed legend.")
+        expected_modified = set()
+        if filter_trial is not None:
+            expected.update(filter_trial["added"])
+            if filter_trial["changed"]:
+                expected_modified.add(key(model_view.Id))
+        if set(changes["added"]) != expected or set(changes["modified"]) != expected_modified:
+            raise ValueError("Revit reported changes outside the reviewed legend or filter scope.")
         receipt = {"basis_sha256": proposal["basis_sha256"], "legend_id": key(view.Id),
                    "legend_uid": str(view.UniqueId), "rows": verify_rows(document, view, proposal, pairs),
                    "changes": changes}
+        if filter_trial is not None:
+            receipt["filters"] = verify_filters(document, model_view, baseline, filter_trial)
+            fresh = read_snapshot(document, request)
+            for field in ("rows", "types", "link_candidate_ids", "native_rules"):
+                if fresh[field] != baseline[field]:
+                    raise ValueError("The source values or native rule matches changed during the color trial.")
     except Exception as error:
         failure = str(error)
     if not rollback(transaction, group) or foreign:
@@ -193,7 +215,8 @@ def probe(document, args):
         return {"status": "transaction_unresolved", "message": str(error)}
     if failure is not None:
         return {"status": "stopped_and_rolled_back", "message": failure}
-    return {"status": "legend_trial_rolled_back", "receipt": receipt}
+    return {"status": "color_trial_rolled_back" if exercise_filters else "legend_trial_rolled_back",
+            "receipt": receipt}
 
 
 if "inputs" in globals():

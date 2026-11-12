@@ -117,7 +117,8 @@ def reader(monkeypatch):
                                                       graphics=lambda settings, _solid: settings.values,
                                                       color=lambda value: value,
                                                       pattern_definition=lambda doc, pattern_id, *_: doc.patterns[pattern_id],
-                                                      filter_definition=lambda item, *_: {"tree": item.tree}))
+                                                      filter_definition=lambda item, *_: {"tree": item.tree,
+                                                          "categories": [str(cat.Value) for cat in item.GetCategories()]}))
     return runpy.run_path(str(SCRIPTS / "read_color_parameter_values.py"))
 
 
@@ -560,7 +561,7 @@ def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(re
         reader["main"](document, args)
 
 
-@pytest.mark.parametrize("fault", [None, "swatch", "extra_element"])
+@pytest.mark.parametrize("fault", [None, "swatch", "extra_element", "combined", "competing_filter"])
 def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, fault):
     from view_color_preview import build
 
@@ -577,8 +578,9 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
     helpers = runpy.run_path(str(SCRIPTS / "duplicate_views.py"))
     helper_module.capture_changes = helpers["capture_changes"]
     helper_module.rollback = helpers["rollback"]
-    monkeypatch.setitem(sys.modules, "read_color_parameter_values",
-                        NS(main=lambda *_: {"inventory_json": json.dumps(baseline)}))
+    reader_module = NS(**reader)
+    reader_module.main = lambda *_: {"inventory_json": json.dumps(baseline)}
+    monkeypatch.setitem(sys.modules, "read_color_parameter_values", reader_module)
     trial = runpy.run_path(str(SCRIPTS / "probe_color_legend.py"))
 
     class Vec:
@@ -713,6 +715,7 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
     class Collection(list):
         Count = property(len)
 
+    model = document.GetElement(ElementId(31))
     class Group:
         def __init__(self, *_):
             self.status = "Uninitialized"
@@ -727,6 +730,7 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
         def RollBack(self):
             created.clear()
             document.legend_contents.clear()
+            model.applied.clear()
             self.status = "RolledBack"
             return self.status
 
@@ -739,7 +743,8 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
                 created[999] = NS()
             event = NS(GetDocument=lambda: document, GetTransactionNames=lambda: [trial["TRANSACTION_NAME"]],
                        GetAddedElementIds=lambda: Collection(ElementId(value) for value in created),
-                       GetDeletedElementIds=Collection, GetModifiedElementIds=Collection)
+                       GetDeletedElementIds=Collection,
+                       GetModifiedElementIds=lambda: Collection([ElementId(31)] if fault == "combined" else []))
             document.Application.DocumentChanged.callback(None, event)
             return self.status
 
@@ -755,9 +760,76 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
     db.TransactionStatus = NS(Started="Started", Pending="Pending", RolledBack="RolledBack", Committed="Committed")
     trial["probe"].__globals__["List"] = Boundaries
 
-    result = trial["probe"](document, {"disposable_fixture": True, "request": request,
-                                       "proposal": proposal, "preview": display})
-    if fault:
+    if fault in ("combined", "competing_filter"):
+        model.ViewTemplateId = ElementId(-1)
+        model.TemporaryViewModes = None
+        model.GetPrimaryViewId = lambda: ElementId(-1)
+        model.GetDependentViewIds = lambda: []
+        model.GetPlacementOnSheetStatus = lambda: "NotPlaced"
+        model.GetElementOverrides = lambda _id: Settings()
+        document.GetElement(ElementId(101)).IsHidden = lambda _view: False
+        model.AddFilter = lambda item: model.applied.__setitem__(item.Value, (True, True))
+        model.SetFilterVisibility = lambda item, value: model.applied.__setitem__(item.Value, (value, True))
+        model.SetIsFilterEnabled = lambda item, value: model.applied.__setitem__(item.Value, (True, value))
+        model.GetFilterOverrides = lambda item: settings.get(item.Value, Settings())
+        model.SetFilterOverrides = lambda item, state: settings.__setitem__(item.Value, state)
+        setters = {
+            "SetProjectionLineColor": "ProjectionLineColor", "SetCutLineColor": "CutLineColor",
+            "SetCutForegroundPatternColor": "CutForegroundPatternColor",
+            "SetCutForegroundPatternId": "CutForegroundPatternId",
+            "SetCutForegroundPatternVisible": "IsCutForegroundPatternVisible",
+        }
+        for method, field in setters.items():
+            def store(self, value, field=field):
+                if isinstance(value, ElementId):
+                    value = {"kind": "element", "id": str(value.Value)}
+                elif isinstance(value, tuple):
+                    value = list(value)
+                self.values[field] = value
+            setattr(Settings, method, store)
+
+        existing_api = db.ParameterFilterElement
+        class ParameterFilter:
+            ElementFilterIsAcceptableForParameterFilterElement = staticmethod(
+                existing_api.ElementFilterIsAcceptableForParameterFilterElement)
+            AllRuleParametersApplicable = staticmethod(existing_api.AllRuleParametersApplicable)
+
+            def GetCategories(self):
+                return [ElementId(-200)]
+
+            @staticmethod
+            def Create(doc, name, categories, expression):
+                assert doc is document and categories.values == [-200]
+                item = ParameterFilter()
+                item.Id, item.UniqueId, item.Name = ElementId(601), "filter-601", name
+                item.tree = {"type": "ElementParameterFilter", "inverted": False,
+                             "rules": [expression.rule.signature]}
+                created[601] = item
+                return item
+
+        db.ParameterFilterElement = ParameterFilter
+        db.NamingUtils = NS(IsValidName=lambda _name: True)
+        db.TemporaryViewMode = NS(RevealHiddenElements=1, TemporaryHideIsolate=2, TemporaryViewProperties=3)
+        filters_module = runpy.run_path(str(SCRIPTS / "color_filter_trial.py"))
+        monkeypatch.setitem(sys.modules, "color_filter_trial", NS(**filters_module))
+
+    args = {"disposable_fixture": True, "request": request, "proposal": proposal, "preview": display,
+            "exercise_filters": fault in ("combined", "competing_filter")}
+    if fault == "competing_filter":
+        model.applied[999] = (True, True)
+        with pytest.raises(ValueError, match="other applied filters"):
+            trial["probe"](document, args)
+        assert not created and model.applied == {999: (True, True)}
+        return
+    result = trial["probe"](document, args)
+    if fault == "combined":
+        assert result["status"] == "color_trial_rolled_back", result
+        assert result["receipt"]["changes"] == {"added": ["41", "501", "502", "601"],
+                                                 "modified": ["31"], "deleted": []}
+        assert result["receipt"]["filters"][0]["filter_uid"] == "filter-601"
+        assert result["receipt"]["filters"][0]["graphics"]["CutLineColor"] == proposal["legend_rows"][0]["rgb"]
+        assert not model.applied
+    elif fault:
         assert result["status"] == "stopped_and_rolled_back", result
         expected = "reviewed color" if fault == "swatch" else "complete transaction change record"
         assert expected in result["message"]
