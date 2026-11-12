@@ -4,7 +4,7 @@ Audits CAD drawings for:
 1. Layer naming standards (CAD-LAY-01) - AIA layer naming conventions.
 2. Xref inspector (CAD-XREF-01) - missing paths, absolute network drive letters, circular links.
 3. Block and attribute inventory (CAD-BLK-01) - anonymous blocks, empty attributes.
-4. Scale and units verification (CAD-UNIT-01) - $INSUNITS and $MEASUREMENT alignment.
+4. Scale and units verification (CAD-UNIT-01) - insertion units and hatch/linetype standards.
 
 Exports findings directly to am-issue-board format and summary reports.
 """
@@ -21,6 +21,8 @@ from collections import defaultdict
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from cad_file_inventory import DRAWING_SETTINGS, INSERTION_UNITS, PATTERN_STANDARDS
+
 
 STANDARD_AIA_DISCIPLINES = ("A", "S", "M", "E", "P", "C", "L", "G", "Q", "T")
 STANDARD_AIA_MAJOR_GROUPS = (
@@ -28,18 +30,6 @@ STANDARD_AIA_MAJOR_GROUPS = (
     "EQPM", "ANNO", "DIMS", "TEXT", "GRID", "LEVL", "PATT", "DETL",
     "HVAC", "DUCT", "PIPE", "PLUM", "SANR", "LITE", "POWR", "FIRE",
 )
-
-INSUNITS_MAP = {
-    0: "Unspecified",
-    1: "Inches",
-    2: "Feet",
-    3: "Miles",
-    4: "Millimeters",
-    5: "Centimeters",
-    6: "Meters",
-    7: "Kilometers",
-}
-
 
 def check_layer_standards(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Verify layer naming compliance against CAD standards (CAD-LAY-01)."""
@@ -316,57 +306,44 @@ def check_attribute_policy(drawing, rules):
     return findings, {"checked_fields": checked, "unchecked_fields": unchecked, "unmatched_blocks": unmatched}
 
 
-def check_scale_and_units(header: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Audit $INSUNITS and $MEASUREMENT settings (CAD-UNIT-01)."""
-    findings: List[Dict[str, Any]] = []
+def unit_settings(header, expected):
+    settings = {}
+    for field, labels in DRAWING_SETTINGS.items():
+        raw = header.get(field)
+        code = int(raw) if isinstance(raw, str) and re.fullmatch(r"[0-9]{1,2}", raw.strip()) else raw
+        known = type(code) is int and 0 <= code < len(labels)
+        requested = expected.get(field)
+        settings[field] = {
+            "code": code if known else None,
+            "label": labels[code] if known else None,
+            "expected_code": requested,
+            "expected_label": labels[requested] if requested is not None else None,
+        }
+    return settings
 
-    insunits = header.get("$INSUNITS")
-    if insunits is not None:
-        try:
-            val = int(insunits)
-            unit_name = INSUNITS_MAP.get(val, "Unknown")
-            if val == 0:
-                findings.append({
-                    "ruleId": "CAD-UNIT-01",
-                    "severity": "error",
-                    "category": "CAD Units",
-                    "target": "$INSUNITS",
-                    "message": "$INSUNITS is 0 (Unspecified). Revit import will guess units and may scale incorrectly.",
-                })
-        except (ValueError, TypeError):
-            pass
 
-    measurement = header.get("$MEASUREMENT")
-    if measurement is not None and insunits is not None:
-        try:
-            m_val = int(measurement)  # 0 = English (Imperial), 1 = Metric
-            u_val = int(insunits)
-            # Imperial measurement with metric insunits or vice versa
-            is_metric_unit = u_val in (4, 5, 6, 7)
-            is_imperial_unit = u_val in (1, 2, 3)
-            if m_val == 0 and is_metric_unit:
-                findings.append({
-                    "ruleId": "CAD-UNIT-01",
-                    "severity": "warning",
-                    "category": "CAD Units",
-                    "target": "$MEASUREMENT",
-                    "message": f"$MEASUREMENT is English (0), but $INSUNITS is Metric ({INSUNITS_MAP.get(u_val)}).",
-                })
-            elif m_val == 1 and is_imperial_unit:
-                findings.append({
-                    "ruleId": "CAD-UNIT-01",
-                    "severity": "warning",
-                    "category": "CAD Units",
-                    "target": "$MEASUREMENT",
-                    "message": f"$MEASUREMENT is Metric (1), but $INSUNITS is Imperial ({INSUNITS_MAP.get(u_val)}).",
-                })
-        except (ValueError, TypeError):
-            pass
-
+def check_scale_and_units(header: Dict[str, Any], expected=None) -> List[Dict[str, Any]]:
+    """Check insertion units and hatch/linetype preferences independently."""
+    findings = []
+    for field, setting in unit_settings(header, expected or {}).items():
+        code, requested = setting["code"], setting["expected_code"]
+        if field == "$INSUNITS" and code == 0:
+            message = "The drawing has no declared insertion units. Confirm the source units before linking."
+            severity = "error"
+        elif requested is not None and code is None:
+            message = f"{field} could not be verified against the expected setting."
+            severity = "warning"
+        elif requested is not None and code != requested:
+            message = f"{field} is {setting['label']}; expected {setting['expected_label']}."
+            severity = "error" if field == "$INSUNITS" else "warning"
+        else:
+            continue
+        findings.append({"ruleId": "CAD-UNIT-01", "severity": severity, "category": "CAD Units",
+                         "target": field, **setting, "message": message})
     return findings
 
 
-def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=()) -> Dict[str, Any]:
+def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=(), *, expected_units=None) -> Dict[str, Any]:
     """Execute all CAD audit rules on drawing data dictionary."""
     all_findings: List[Dict[str, Any]] = []
     finding_id = 1
@@ -391,7 +368,7 @@ def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=()) -> Dict[str,
         finding_id += 1
         all_findings.append(f)
 
-    for f in check_scale_and_units(header):
+    for f in check_scale_and_units(header, expected_units):
         f["id"] = f"CAD-{finding_id:04d}"
         finding_id += 1
         all_findings.append(f)
@@ -405,6 +382,7 @@ def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=()) -> Dict[str,
         "total_layers": len(layers),
         "total_xrefs": len(xrefs),
         "total_findings": len(all_findings),
+        "units": unit_settings(header, expected_units or {}),
         "summary": {
             "errors": errors,
             "warnings": warnings,
@@ -435,11 +413,11 @@ def audit_file(args):
             drawing["coverage"][coverage] = "checked" if complete else "incomplete"
             if not complete:
                 drawing["notes"].append(f"One or more requested {label} checks lack drawing evidence.")
-        result = run_cad_audit(drawing, policy_findings)
+        result = run_cad_audit(drawing, policy_findings, expected_units=expected_unit_options(args))
         result.update(status="incomplete" if drawing["notes"] else "audited",
                       inventory=drawing)
         report = result if args.output or not args.summary else {
-            key: result[key] for key in ("drawing_name", "status", "summary")
+            key: result[key] for key in ("drawing_name", "status", "summary", "units")
         } | {"notes": drawing["notes"], "coverage": drawing["coverage"]}
         encoded = (json.dumps(report, ensure_ascii=True, indent=2) + "\n").encode()
         if len(encoded) > FILE_LIMIT:
@@ -457,6 +435,11 @@ def audit_file(args):
     return int(result["summary"]["errors"] > 0)
 
 
+def expected_unit_options(args):
+    return {"$INSUNITS": getattr(args, "expected_insunits", None),
+            "$MEASUREMENT": getattr(args, "expected_measurement", None)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AutoCAD / DWG & DXF Audit Tool (Issue #188 Phase 1)")
     parser.add_argument("input", help="Path to a local DWG, DXF or JSON drawing inventory")
@@ -466,6 +449,10 @@ def main() -> int:
     parser.add_argument("--dwgread", help="Absolute path to trusted LibreDWG 0.14 dwgread")
     parser.add_argument("--layer-policy", help="Local JSON layer color and linetype standard")
     parser.add_argument("--attribute-policy", help="Local JSON standard for required block attribute tags")
+    parser.add_argument("--expected-insunits", type=int, choices=range(1, len(INSERTION_UNITS)), metavar="CODE",
+                        help="Compare the declared insertion unit with AutoCAD code 1–24")
+    parser.add_argument("--expected-measurement", type=int, choices=range(len(PATTERN_STANDARDS)),
+                        help="Compare the hatch/linetype standard: 0 imperial, 1 metric")
     args = parser.parse_args()
 
     if Path(args.input).suffix.lower() in {".dxf", ".dwg"}:
@@ -480,7 +467,7 @@ def main() -> int:
     with open(args.input, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    result = run_cad_audit(data)
+    result = run_cad_audit(data, expected_units=expected_unit_options(args))
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:

@@ -290,3 +290,46 @@ def test_dwg_policy_marks_unknown_attribute_values_unchecked():
     assert [(f["insert_handle"], f["tag"], f["state"]) for f in findings] == [(20, "DATE", "missing")]
     assert evidence == {"checked_fields": 2, "unchecked_fields": [{"block": "Title", "insert_handle": 20,
                                                                   "tag": "SHEET"}], "unmatched_blocks": []}
+
+
+def test_dxf_insertion_units_and_pattern_standard_are_checked_independently(tmp_path):
+    source = tmp_path / "survey.dxf"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 21
+    doc.header["$MEASUREMENT"] = 1
+    doc.saveas(source)
+    original = source.read_bytes()
+
+    ordinary = run(source, "--summary")
+    assert ordinary.returncode == 0, ordinary.stderr
+    summary = json.loads(ordinary.stdout)
+    assert summary["status"] == "audited"
+    assert summary["summary"] == {"errors": 0, "warnings": 0, "infos": 0}
+    assert summary["units"]["$INSUNITS"] == {"code": 21, "label": "US Survey Feet",
+                                            "expected_code": None, "expected_label": None}
+    assert summary["units"]["$MEASUREMENT"]["label"] == "Metric"
+
+    matched = run(source, "--expected-insunits", 21, "--expected-measurement", 1)
+    assert matched.returncode == 0 and json.loads(matched.stdout)["findings"] == []
+    mismatch = run(source, "--expected-insunits", 2, "--expected-measurement", 0)
+    assert mismatch.returncode == 1, mismatch.stderr
+    findings = json.loads(mismatch.stdout)["findings"]
+    assert [(f["target"], f["severity"], f["code"], f["expected_code"]) for f in findings] == [
+        ("$INSUNITS", "error", 21, 2), ("$MEASUREMENT", "warning", 1, 0),
+    ]
+    assert source.read_bytes() == original
+
+
+def test_newer_dwg_unit_code_is_recognized_through_native_inventory(tmp_path, monkeypatch):
+    source = tmp_path / "survey.dwg"
+    source.write_bytes(b"AC1032fixture")
+    decoded = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14",
+               "HEADER": {"INSUNITS": 24}, "Template": {"MEASUREMENT": 0},
+               "OBJECTS": [{"object": "LAYER", "handle": [0, 1, 10], "name": "A-WALL"}]}
+    monkeypatch.setattr("cad_file_inventory.run_decoder", lambda *_: (json.dumps(decoded).encode(), b""))
+    output = tmp_path / "report.json"
+    assert audit_file(SimpleNamespace(input=str(source), dwgread=sys.executable, output=str(output),
+                                      summary=False, expected_insunits=24)) == 0
+    report = json.loads(output.read_text())
+    assert report["units"]["$INSUNITS"]["label"] == "US Survey Miles"
+    assert report["status"] == "audited"

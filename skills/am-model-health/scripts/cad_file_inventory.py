@@ -17,6 +17,15 @@ FILE_LIMIT = 32 * 1024 * 1024
 LOG_LIMIT = 128 * 1024
 RECORD_LIMIT = 150000
 VERSIONS = {"AC1015", "AC1032"}
+# AutoCAD INSUNITS codes are drawing metadata. The receiving application determines support.
+INSERTION_UNITS = (
+    "Unspecified", "Inches", "Feet", "Miles", "Millimeters", "Centimeters", "Meters", "Kilometers",
+    "Microinches", "Mils", "Yards", "Angstroms", "Nanometers", "Microns", "Decimeters",
+    "Dekameters", "Hectometers", "Gigameters", "Astronomical Units", "Light Years", "Parsecs",
+    "US Survey Feet", "US Survey Inches", "US Survey Yards", "US Survey Miles",
+)
+PATTERN_STANDARDS = ("Imperial", "Metric")
+DRAWING_SETTINGS = {"$INSUNITS": INSERTION_UNITS, "$MEASUREMENT": PATTERN_STANDARDS}
 LAYOUT_PREFIXES = ("*model_space", "*paper_space")
 RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", re.I)
 
@@ -346,9 +355,9 @@ def inspect_drawing(raw_source, decoder):
         result["notes"].append("Nested Xrefs and cycles were not inspected.")
     if any(xref["status"] == "unchecked" for xref in result["xrefs"]):
         result["notes"].append("Some Xref paths were outside the supported local path scope.")
-    if (type(result["header"]["$INSUNITS"]) is not int or not 0 <= result["header"]["$INSUNITS"] <= 7
-            or type(result["header"]["$MEASUREMENT"]) is not int or result["header"]["$MEASUREMENT"] not in (0, 1)):
-        result["notes"].append("One or more drawing unit settings were absent or outside the supported range.")
+    if any(type(result["header"][field]) is not int or not 0 <= result["header"][field] < len(labels)
+           for field, labels in DRAWING_SETTINGS.items()):
+        result["notes"].append("One or more drawing unit settings were absent or unrecognized.")
     result["notes"] = list(dict.fromkeys(result["notes"]))
     result.update(filename=source.name, sha256=digest, decoder=tool, coverage={
         "xref_scope": "drawing_directory_only",
