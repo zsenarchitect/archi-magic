@@ -337,6 +337,39 @@ def read_route_obstacles(source, transform, requested, clock):
     return rows
 
 
+def read_route_elbow(source, request):
+    if set(request) != {"curve_type_id", "curve_type_uid", "diameter_ft"}:
+        raise ReadError("Supply the reviewed curve type ID, UID and diameter.")
+    raw_id = request["curve_type_id"]
+    curve_type = source.GetElement(element_id(raw_id))
+    uid, diameter = request["curve_type_uid"], request["diameter_ft"]
+    if (not isinstance(uid, TEXT) or not 1 <= len(uid) <= 160
+            or curve_type is None or str(curve_type.UniqueId) != uid
+            or type(diameter) not in (int, float) or not 0 < diameter <= 1000):
+        raise ReadError("The reviewed curve type or diameter is missing or invalid.")
+    if isinstance(curve_type, DB.Mechanical.DuctType) and str(curve_type.Shape) == "Round":
+        domain = "DomainHvac"
+    elif isinstance(curve_type, DB.Plumbing.PipeType):
+        domain = "DomainPiping"
+    else:
+        raise ReadError("Elbow lookup requires a reviewed round duct or pipe type.")
+    with curve_type.RoutingPreferenceManager as manager:
+        if manager.OwnerId.Value != int(raw_id):
+            raise ReadError("Revit returned routing preferences for a different curve type.")
+        with DB.RoutingConditions(getattr(DB.RoutingPreferenceErrorLevel, "None")) as conditions:
+            with DB.RoutingCondition(float(diameter)) as primary, DB.RoutingCondition(float(diameter)) as secondary:
+                conditions.AppendCondition(primary)
+                conditions.AppendCondition(secondary)
+                part_id = manager.GetMEPPartId(DB.RoutingPreferenceRuleGroupType.Elbows, conditions)
+    part = None
+    if part_id.Value != DB.ElementId.InvalidElementId.Value:
+        symbol = source.GetElement(part_id)
+        if not isinstance(symbol, DB.FamilySymbol) or not symbol.UniqueId:
+            raise ReadError("Revit returned an unresolved routing preference fitting.")
+        part = {"id": str(part_id.Value), "uid": str(symbol.UniqueId)}
+    return dict(request, diameter_ft=float(diameter), domain=domain, elbow=part)
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -347,6 +380,17 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
+        if "route_elbow" in request:
+            if link_id is not None or any(field in request for field in (
+                    "route_endpoints", "route_obstacles", "element_ids", "clearance")):
+                raise ReadError("Use a separate host-project query for the route elbow preference.")
+            fitting = read_route_elbow(source, request["route_elbow"])
+            current_source, _, current_identity = resolve_source(host, link_id, link_uid)
+            if current_identity != identity or read_route_elbow(current_source, request["route_elbow"]) != fitting:
+                raise ReadError("The route fitting preference changed while being read.")
+            check_time(clock)
+            payload = {"kind": "mep-route-elbow", "version": 1, "source": identity, "fitting": fitting}
+            return {"status": "ok", "elbow_json": json.dumps(payload, ensure_ascii=True, allow_nan=False)}
         if "route_endpoints" in request:
             if any(field in request for field in ("route_obstacles", "element_ids", "clearance")):
                 raise ReadError("Use a separate query for route obstacles, endpoints and audit scope.")

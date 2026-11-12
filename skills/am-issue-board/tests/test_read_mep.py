@@ -228,6 +228,70 @@ def test_read_reviewed_route_endpoints(runtime, scenario):
         assert a["origin_ft"] == [1.0, 2.0, 3.0] and a["axes"][2] == [0.0, 0.0, 1.0]
 
 
+@pytest.mark.parametrize("scenario", ["duct", "pipe", "no_match", "changed", "wrong_type", "missing_symbol"])
+def test_route_elbow_uses_the_reviewed_type_and_both_end_sizes(runtime, scenario):
+    class Resource:
+        def __init__(self, **fields):
+            self.__dict__.update(fields)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class DuctType:
+        UniqueId = "curve-type"
+        Shape = "Round"
+
+    class PipeType:
+        UniqueId = "curve-type"
+
+    class FamilySymbol:
+        UniqueId = "elbow-type"
+
+    runtime.Mechanical, runtime.Plumbing = NS(DuctType=DuctType), NS(PipeType=PipeType)
+    runtime.FamilySymbol = FamilySymbol
+    runtime.RoutingPreferenceErrorLevel = NS(**{"None": "none"})
+    runtime.RoutingPreferenceRuleGroupType = NS(Elbows="elbows")
+    runtime.ElementId.InvalidElementId = ElementId(-1)
+    observed = []
+
+    def conditions(error_level):
+        assert error_level == "none"
+        values = []
+        return Resource(values=values, AppendCondition=lambda item: values.append(item.diameter))
+
+    def get_part(group, conditions):
+        assert group == "elbows" and conditions.values == [0.5, 0.5]
+        observed.append(conditions.values)
+        absent = scenario == "no_match" or (scenario == "changed" and len(observed) == 2)
+        return ElementId(-1 if absent else 43)
+
+    runtime.RoutingCondition = lambda diameter: Resource(diameter=diameter)
+    runtime.RoutingConditions = conditions
+    curve_type = PipeType() if scenario == "pipe" else DuctType()
+    curve_type.RoutingPreferenceManager = Resource(OwnerId=ElementId(42), GetMEPPartId=get_part)
+    if scenario == "wrong_type":
+        curve_type.Shape = "Rectangular"
+    host = model("host", {42: curve_type, 43: None if scenario == "missing_symbol" else FamilySymbol()})
+    identity = execute(host, describe=True)["source"]
+    reviewed = {"curve_type_id": "42", "curve_type_uid": "curve-type", "diameter_ft": 0.5}
+    result = execute(host, source=identity, route_elbow=reviewed)
+    errors = {"changed": "changed while being read", "wrong_type": "round duct or pipe",
+              "missing_symbol": "unresolved routing preference"}
+    if scenario in errors:
+        assert result["status"] == "incomplete" and errors[scenario] in result["message"]
+        assert "elbow_json" not in result
+        return
+    assert observed == [[0.5, 0.5], [0.5, 0.5]]
+    expected = None if scenario == "no_match" else {"id": "43", "uid": "elbow-type"}
+    assert json.loads(result["elbow_json"]) == {
+        "kind": "mep-route-elbow", "version": 1, "source": identity,
+        "fitting": dict(reviewed, domain="DomainPiping" if scenario == "pipe" else "DomainHvac", elbow=expected),
+    }
+
+
 @pytest.mark.parametrize("scenario", ["host", "rotated_link", "wrong_uid", "missing_box", "moved"])
 def test_read_reviewed_obstacle_boxes(runtime, scenario):
     low, high = point(1, 2, 3), point(4, 6, 8)

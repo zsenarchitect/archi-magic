@@ -201,7 +201,7 @@ def assess(points, first_axis, last_axis, minimum, boxes, bounds):
 
 def preview(data):
     required = {"endpoints", "minimum_segment_ft", "clearance_ft"}
-    if (not required <= set(data) <= required | {"obstacles", "obstacle_records", "routing_bounds_ft"}
+    if (not required <= set(data) <= required | {"obstacles", "obstacle_records", "routing_bounds_ft", "elbow_record"}
             or not {"obstacles", "obstacle_records"} & set(data)):
         raise ValueError("Supply the reviewed endpoints, minimum segment, clearance and obstacle evidence.")
     evidence = data["endpoints"]
@@ -220,6 +220,19 @@ def preview(data):
     if (size_count is None or not isinstance(size, list) or len(size) != size_count
             or size != last["dimensions_ft"] or any(number(value) <= 0 for value in size)):
         raise ValueError("Supply matching round or rectangular connector dimensions.")
+    elbow_record = data.get("elbow_record")
+    if "elbow_record" in data:
+        fitting = elbow_record["fitting"]
+        if (elbow_record["kind"] != "mep-route-elbow" or type(elbow_record["version"]) is not int
+                or elbow_record["version"] != 1 or elbow_record["source"] != evidence["source"]
+                or first["shape"] != "Round" or fitting["domain"] != first["domain"]
+                or number(fitting["diameter_ft"]) != number(size[0])):
+            raise ValueError("The elbow record does not match the reviewed route source, domain and diameter.")
+        part = fitting["elbow"]
+        if part is not None and (not isinstance(part, dict) or set(part) != {"id", "uid"}
+                                 or any(not isinstance(part[key], str) or not part[key] for key in ("id", "uid"))):
+            raise ValueError("The elbow record is missing an exact fitting identity.")
+    missing_elbow = elbow_record is not None and elbow_record["fitting"]["elbow"] is None
     start, end = point(first["origin_ft"]), point(last["origin_ft"])
     first_axis, last_axis = (point(endpoint["axes"][2]) for endpoint in (first, last))
     if any(abs(math.hypot(*axis) - 1) > EPSILON for axis in (first_axis, last_axis)):
@@ -277,6 +290,8 @@ def preview(data):
             result = assess(option, first_axis, last_axis, minimum, boxes, bounds)
             if result is not None:
                 length, bends = result
+                if bends and missing_elbow:
+                    continue
                 candidate = (length, len(bends), option, bends)
                 if best is None or candidate < best:
                     best = candidate
@@ -284,7 +299,7 @@ def preview(data):
     for raw in candidates(start, end, first_axis, last_axis, 2 * minimum, boxes):
         consider(raw)
     exhausted = False
-    if best is None:
+    if best is None and not missing_elbow:
         detour, exhausted = multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds)
         if detour is not None:
             consider(detour)
@@ -294,14 +309,18 @@ def preview(data):
     route = None
     if best is None:
         after = before
-        warnings.append({"row": "candidate", "blocking": True,
-                         "text": ("The route search reached its edge-check budget." if exhausted
-                                  else "The search found no route with compatible turns and supplied clearances.")})
+        if missing_elbow:
+            warning = "The reviewed type has no matching elbow and no straight route qualified."
+        elif exhausted:
+            warning = "The route search reached its edge-check budget."
+        else:
+            warning = "The search found no route with compatible turns and supplied clearances."
+        warnings.append({"row": "candidate", "blocking": True, "text": warning})
     else:
         length, _, path, bends = best
         route = {"source": evidence["source"], "endpoints": evidence["endpoints"],
                  "points_ft": path, "length_ft": length, "bends_degrees": bends,
-                 "obstacle_records": records}
+                 "obstacle_records": records, "elbow_record": elbow_record}
         after = [["candidate", length, ", ".join(map(str, bends)), str(path)]]
     return {"kind": "change-preview", "recipe": "mep-route", "title": "MEP route",
             "keyColumn": "Route", "columns": COLUMNS, "changedColumns": COLUMNS[1:],

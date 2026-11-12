@@ -145,3 +145,27 @@ def test_native_obstacle_record_is_used_and_bound_to_the_endpoint_host(tmp_path)
     mismatch = run(tmp_path, data)
     assert mismatch.returncode == 2 and "same host" in mismatch.stderr
     assert mismatch.stdout == ""
+
+
+def test_elbow_evidence_blocks_bent_routes_and_keeps_straight_candidates(tmp_path):
+    data = fixture()
+    record = {
+        "kind": "mep-route-elbow", "version": 1, "source": data["endpoints"]["source"],
+        "fitting": {"curve_type_id": "42", "curve_type_uid": "type", "domain": "DomainHvac",
+                    "diameter_ft": 1, "elbow": None},
+    }
+    data["elbow_record"] = record
+    straight = run(tmp_path, data)
+    assert straight.returncode == 0
+    assert json.loads(straight.stdout)["route"]["bends_degrees"] == []
+    data["obstacles"] = [{"min_ft": [4, -1, -1], "max_ft": [6, 1, 1]}]
+    blocked = run(tmp_path, data)
+    assert blocked.returncode == 1
+    assert "no matching elbow" in json.loads(blocked.stdout)["warnings"][0]["text"]
+    record["fitting"]["elbow"] = {"id": "43", "uid": "elbow"}
+    detour = run(tmp_path, data)
+    assert detour.returncode == 0, detour.stderr
+    assert json.loads(detour.stdout)["route"]["elbow_record"] == record
+    record["fitting"]["diameter_ft"] = 2
+    invalid = run(tmp_path, data)
+    assert invalid.returncode == 2 and "domain and diameter" in invalid.stderr
