@@ -190,6 +190,54 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
                                              "--view-readback", str(fresh)],
                                   check=True, text=True, capture_output=True)
         assert json.loads(verified.stdout)["view_verification"] == {"status": "verified_dry_run"}
+
+        import issue_board as ib
+        keep = tmp_path / "keep.json"
+        keep.write_text(json.dumps(dict(json.loads(dry_run.read_text()), mode="modify", decision="committed",
+                                        approval="user")))
+        response = json.loads(fresh.read_text())["response"]
+        response["result"] = {"status": "ok", "verification_json": json.dumps({
+            "view": receipt, "potentially_visible": plan["targets"],
+        })}
+        fresh.write_text(json.dumps(response))
+        note = tmp_path / "board.json"
+        board_body = ib.plan_create("Fixture", [])["final_text"]
+        target = {"id": "150", "unique_id": "board-note"}
+
+        def write_board(body, host_identity=plan["host_identity"]):
+            note.write_text(json.dumps({"host_identity": host_identity,
+                                       "note": dict(target, text=body, sha1=ib.text_sha1(body))}))
+
+        write_board(board_body)
+        handoff = command + ["--verify-view", "keep", "--view-run", str(keep), "--view-readback",
+                             str(fresh), "--board", str(note)]
+        refused = subprocess.run(handoff, capture_output=True, text=True)
+        assert refused.returncode == 2 and not refused.stdout
+        handoff.append("--confirm-visible")
+
+        def proposal():
+            return json.loads(subprocess.run(handoff, check=True, capture_output=True, text=True).stdout)
+
+        proposed = proposal()
+        board_plan = proposed["plan"]
+        assert proposed["board_handoff"] == "planned"
+        assert board_plan["structural_target"]["active"] == dict(target, sha1=ib.text_sha1(board_body))
+        assert board_plan["structural_target"]["view"]["view_uid"] == "fixture-view"
+        confirmed_issue, = ib.parse_board(board_plan["final_text"])["issues"]
+        assert confirmed_issue["findings"] == [
+            "Navisworks clash UUID: " + guid, "Verified Revit section view " + view_name + ".",
+        ]
+        write_board(board_plan["final_text"])
+        retry = proposal()
+        assert retry["board_handoff"] == "already_recorded" and retry["plan"] is None
+        previously_imported = board_plan["final_text"].replace(confirmed_issue["findings"][1],
+                                                               "Section bounds proposed for review.")
+        write_board(previously_imported)
+        updated = proposal()["plan"]["final_text"]
+        assert ib.parse_board(updated)["issues"] == [confirmed_issue]
+        write_board(board_body, {"project_uid": "another-project"})
+        refused = subprocess.run(handoff, capture_output=True, text=True)
+        assert refused.returncode == 2 and not refused.stdout
     else:
         assert plan["blocked"] and display["blocked"] and plan["steps"] == []
         assert display["warnings"][0]["blocking"]
@@ -399,3 +447,49 @@ def test_verify_view_run_requires_matching_runtime_and_readback(view_writer, out
                         readback)
     with pytest.raises(ValueError, match="independent readback"):
         verify_view_run(plan, outcome, record, dict(readback, run_id=record["run_id"]))
+
+
+@pytest.mark.parametrize("change", ["valid", "view_replaced", "box_changed"])
+def test_board_apply_checks_kept_view_before_transaction(view_writer, change):
+    import issue_board as ib
+    from navisworks_clash_cli import kept_board_preview
+
+    run, host, plan, display = view_writer
+    receipt = json.loads(run(host, {"mode": "apply", "plan": plan, "preview": display})["receipt_json"])
+    body = ib.plan_create("Fixture", [])["final_text"]
+    source = {"host_identity": plan["host_identity"], "note": {
+        "id": "150", "unique_id": "board-note", "text": body, "sha1": ib.text_sha1(body),
+    }}
+    clash = {"guid": receipt["clash_guid"], "name": "Fixture clash", "section_box": plan["box"]}
+    board_plan, _, status = kept_board_preview(source, None, clash, receipt)
+    assert status == "planned"
+
+    class TextNote:
+        UniqueId = "board-note"
+
+        def GetFormattedText(self):
+            return NS(GetPlainText=lambda: body)
+
+    db = run.__globals__["DB"]
+    db.TextNote = TextNote
+    view = host.views[0]
+    if change == "view_replaced":
+        view.UniqueId = "another-view"
+    elif change == "box_changed":
+        view.box.Min = xyz(0, 0, 0)
+    get_element = host.GetElement
+    host.GetElement = lambda item: TextNote() if item.Value == 150 else get_element(item)
+
+    def transaction(*_):
+        raise RuntimeError("transaction entry reached")
+
+    db.Transaction = transaction
+    globals_ = {"inputs": {"plan": board_plan, "note_id": "150"},
+                "__revit__": NS(ActiveUIDocument=NS(Document=host))}
+    expected, message = {
+        "valid": (RuntimeError, "transaction entry reached"),
+        "view_replaced": (ValueError, "verified clash view changed"),
+        "box_changed": (ValueError, "verified clash section box changed"),
+    }[change]
+    with pytest.raises(expected, match=message):
+        runpy.run_path(str(SCRIPTS / "apply_board.py"), init_globals=globals_)

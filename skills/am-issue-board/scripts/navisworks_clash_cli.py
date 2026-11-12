@@ -21,6 +21,8 @@ import issue_board as ib
 
 LIMIT = 2 * 1024 * 1024
 MARKER = "Navisworks clash UUID: "
+BOUNDS_PENDING = "Section bounds proposed for review."
+MAPPING_PENDING = "Element mapping requires review."
 STATUSES = {"new", "active", "reviewed", "approved", "resolved"}
 RESULT = ("exchange", "batchtest", "clashtests", "clashtest", "clashresults")
 
@@ -302,8 +304,8 @@ def snapshot_document(raw):
     return doc
 
 
-def board_rows(path, *, archive=False):
-    body, formats = board_cli.decode_note(json_input(local_bytes(path)))
+def board_rows(source, *, archive=False):
+    body, formats = board_cli.decode_note(source)
     board = ib.parse_board(body)
     issues = board["issues"]
     numbers = {row["number"] for row in issues}
@@ -322,9 +324,9 @@ def board_rows(path, *, archive=False):
     return body, formats, issues, markers
 
 
-def board_preview(path, archive, clashes):
-    body, formats, existing_rows, seen = board_rows(path)
-    if archive:
+def board_preview(source, archive, clashes, *, verified_finding=None):
+    body, formats, existing_rows, seen = board_rows(source)
+    if archive is not None:
         _, _, _, archived = board_rows(archive, archive=True)
         if seen & archived:
             raise ValueError("Clash provenance exists on both active and archive notes.")
@@ -343,7 +345,7 @@ def board_preview(path, archive, clashes):
         title = "Clash: " + (title or guid)
         issue = {"title": title, "status": "OPEN", "findings": [
             MARKER + guid,
-            "Section bounds proposed for review." if row["section_box"] else "Element mapping requires review.",
+            verified_finding or (BOUNDS_PENDING if row["section_box"] else MAPPING_PENDING),
         ]}
         proposals.append({"op": "add", "issue": issue})
     if not proposals:
@@ -428,6 +430,56 @@ def verify_view_run(plan, outcome, run, readback):
     return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
 
 
+def board_identity(source, host):
+    if source["host_identity"] != host:
+        raise ValueError("The board is not in the verified project.")
+    note = source["note"]
+    note_id = note["id"]
+    body, _ = board_cli.decode_note(source)
+    if (not re.fullmatch(r"[1-9][0-9]{0,18}", note_id) or int(note_id) >= 2**63
+            or not text(note["unique_id"]) or note["sha1"] != ib.text_sha1(body)):
+        raise ValueError("Read the board again with its saved project and note identities.")
+    return {key: note[key] for key in ("id", "unique_id", "sha1")}
+
+
+def kept_board_preview(source, archive, clash, view):
+    host = view["host_identity"]
+    active = board_identity(source, host)
+    archived = board_identity(archive, host) if archive is not None else None
+    if archived and (active["id"] == archived["id"] or active["unique_id"] == archived["unique_id"]):
+        raise ValueError("Choose distinct active and archive notes.")
+    guid = clash["guid"]
+    marker = MARKER + guid
+    finding = "Verified Revit section view " + view["view_name"] + "."
+    body, formats, issues, seen = board_rows(source)
+    plan, skipped = board_preview(source, archive, [clash], verified_finding=finding)
+    if guid in seen:
+        issue = next(row for row in issues if marker in row["findings"])
+        if finding in issue["findings"]:
+            return None, skipped, "already_recorded"
+        if issue["findings"] not in ([marker, BOUNDS_PENDING], [marker, MAPPING_PENDING]):
+            raise ValueError("The existing clash findings were edited. Review the issue before updating it.")
+        plan = ib.plan_replace_field(body, issue["number"], "finding", [marker, finding], formats)
+        old_paragraph = "Finding: " + issue["findings"][1]
+        new_paragraph = "Finding: " + finding
+        original = ib.split_paragraphs(body)
+        changed = ib.split_paragraphs(plan["final_text"])
+        expected = [line for _, line in original]
+        status_rows = [row["index"] for row in issue["lines"] if row["text"] == old_paragraph]
+        if len(status_rows) != 1:
+            raise ValueError("Cannot identify one original clash status paragraph.")
+        expected[status_rows[0]] = new_paragraph
+        if [line for _, line in changed] != expected:
+            raise ValueError("The board preview changed more than the clash status paragraph.")
+        skipped = []
+    if plan is None:
+        return None, skipped, "archived"
+    plan["structural_target"] = {"host_identity": host, "active": active, "archive": archived,
+                                 "view": {key: view[key] for key in (
+                                     "view_id", "view_uid", "view_name", "box_min", "box_max")}}
+    return plan, skipped, "planned"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
@@ -439,6 +491,7 @@ def main(argv=None):
     parser.add_argument("--verify-view", choices=("dry-run", "keep", "discard"))
     parser.add_argument("--view-run", help="Complete guarded pyRevit run record")
     parser.add_argument("--view-readback", help="Complete independent pyRevit query record")
+    parser.add_argument("--confirm-visible", action="store_true", help="Both clash targets were visible in the kept view")
     args = parser.parse_args(argv)
     suffix = Path(args.report).suffix.lower()
     is_html = suffix in (".html", ".htm")
@@ -449,11 +502,14 @@ def main(argv=None):
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
-        if args.view_clash and (is_html or not args.snapshot or args.board):
-            raise ValueError("Use XML and a Revit snapshot in a separate section-view preview.")
+        if args.view_clash and (is_html or not args.snapshot):
+            raise ValueError("Use XML and a Revit snapshot for a section-view preview.")
         if any((args.verify_view, args.view_run, args.view_readback)) and not all(
                 (args.verify_view, args.view_run, args.view_readback, args.view_clash)):
             raise ValueError("Supply the view GUID, outcome, full run record and independent readback together.")
+        kept_board = bool(args.board and args.view_clash and args.verify_view == "keep")
+        if args.confirm_visible != kept_board or (args.board and args.view_clash and not kept_board):
+            raise ValueError("Use a verified Keep and visual confirmation for a kept-view board preview.")
         raw = local_bytes(args.report)
         units, clashes = parse_tabular_report(raw) if is_html else parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
@@ -468,7 +524,14 @@ def main(argv=None):
                 row["warnings"].append("Unknown Navisworks status.")
             if row["section_box"] is None:
                 row["warnings"].append("Both distinct elements must match one scoped Revit snapshot.")
-        plan, skipped = board_preview(args.board, args.archive, clashes) if args.board else (None, [])
+        board = runtime_record(args.board) if args.board else None
+        archive = runtime_record(args.archive) if args.archive else None
+        if kept_board:
+            board = board.get("result", board)
+            archive = archive.get("result", archive) if archive is not None else None
+            if args.archive and not isinstance(archive, dict):
+                raise ValueError("The archive query did not return a note.")
+        plan, skipped = board_preview(board, archive, clashes) if args.board and not kept_board else (None, [])
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
             "source_format": "html_tabular" if is_html else "xml",
@@ -485,6 +548,11 @@ def main(argv=None):
         if args.verify_view:
             report["view_verification"] = verify_view_run(
                 report["view_plan"], args.verify_view, runtime_record(args.view_run), runtime_record(args.view_readback)
+            )
+        if kept_board:
+            clash = next(row for row in clashes if row["guid"] == args.view_clash)
+            report["plan"], report["skipped_guids"], report["board_handoff"] = kept_board_preview(
+                board, archive, clash, report["view_verification"]["view"]
             )
         if is_html:
             report["warnings"].append("Tabular rows lack clash GUIDs and selection-tree paths. Export XML for model mapping and board import.")
