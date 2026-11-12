@@ -47,6 +47,21 @@ def model(uid, elements):
               IsFamilyDocument=False, GetElement=lambda item: elements.get(item.Value))
 
 
+def test_clash_snapshot_digest_preserves_exact_floating_point_evidence():
+    from clash_section import snapshot_sha256
+
+    # This vector produced the same digest in CPython and IronPython 2.7.12.
+    snapshot = {"min": [1e-8, -0.0, 9.292893218813452], "id": "9007199254740993",
+                "name": "fixture-\u03a9"}
+    digest = "79630270d421dc98b7a0c6b27246e9eb5ff692b98188fac1bb4fe753b72d7bf8"
+    assert snapshot_sha256(snapshot) == digest
+    snapshot["min"][0] = math.nextafter(1e-8, math.inf)
+    assert snapshot_sha256(snapshot) != digest
+    snapshot["min"][0] = math.nan
+    with pytest.raises(ValueError, match="nonfinite"):
+        snapshot_sha256(snapshot)
+
+
 @pytest.fixture
 def runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))

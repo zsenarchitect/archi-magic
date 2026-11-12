@@ -1,11 +1,32 @@
 # -*- coding: utf-8 -*-
 """Pure Navisworks clash mapping and section-view preview."""
+import binascii
 import hashlib
 import json
+import math
 import re
+import struct
 import uuid
 
 FRAME = "revit_host_internal_feet"
+
+
+def snapshot_sha256(snapshot):
+    # The preview and writer run under different Python engines. Hash the
+    # float bits so JSON formatting of exponents and precision cannot drift.
+    def canonical(value):
+        if type(value) is float:
+            if math.isnan(value) or math.isinf(value):
+                raise ValueError("The clash snapshot contains a nonfinite value.")
+            return ["float64", binascii.hexlify(struct.pack(">d", value)).decode("ascii")]
+        if isinstance(value, dict):
+            return ["object", [[key, canonical(value[key])] for key in sorted(value)]]
+        if isinstance(value, list):
+            return ["array", [canonical(item) for item in value]]
+        return value
+
+    basis = json.dumps(canonical(snapshot), ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    return hashlib.sha256(basis.encode("ascii")).hexdigest()
 
 
 def text(value):
@@ -129,8 +150,7 @@ def section_view_preview(guid, clashes, snapshot, padding, report_sha256):
                      source_object["element_id"], element["min"], element["max"]])
     view = ["view", name, None, None, box["min"] if box else None, box["max"] if box else None]
     blocked = bool(warnings)
-    basis = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-    digest = hashlib.sha256(basis.encode("ascii")).hexdigest()
+    digest = snapshot_sha256(snapshot)
     plan = {"kind": "navisworks-section-view-plan", "basis_sha256": digest, "report_sha256": report_sha256,
             "host_identity": snapshot["host_identity"], "active_view_uid": snapshot["active_view_uid"],
             "request": snapshot["request"], "view": target, "targets": targets, "box": box,

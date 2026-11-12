@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 
 import bcf_cli
 import board_cli
-from clash_section import FRAME, element_snapshot, point, section_box, section_view_preview, text
+from clash_section import FRAME, element_snapshot, point, section_box, section_view_preview, snapshot_sha256, text
 import issue_board as ib
 
 LIMIT = 2 * 1024 * 1024
@@ -687,8 +687,7 @@ def verify_view_run(plan, outcome, run, readback):
             raise ValueError("The independent query did not verify the kept view and both mapped targets.")
         return {"status": "verified_keep", "view": receipt, "visual_inspection_required": True}
     snapshot = runtime_payload(readback, "snapshot_json")
-    basis = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-    if hashlib.sha256(basis.encode("ascii")).hexdigest() != plan["basis_sha256"]:
+    if snapshot_sha256(snapshot) != plan["basis_sha256"]:
         raise ValueError("The original model readback changed after rollback.")
     return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
 
