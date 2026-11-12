@@ -123,6 +123,26 @@ def test_complete_get_run_response_can_be_used_for_comparison(tmp_path):
     assert json.loads(result.stdout)["status"] == "match"
 
 
+@pytest.mark.parametrize("problem", ["missing_change_summary", "cleanup_warning", "unexpected_dialog"])
+def test_native_record_cannot_pass_without_clean_host_evidence(tmp_path, problem):
+    takeoff = query(tmp_path / "query.json", [quantity("A", 3, 1)])
+    record = json.loads(takeoff.read_text())
+    record.update(mode="query", status="ok", result_truncated=False,
+                  changes={"added_count": 0, "modified_count": 0, "deleted_count": 0})
+    if problem == "missing_change_summary":
+        del record["changes"]
+    elif problem == "cleanup_warning":
+        record["warnings"] = ["Closing leftover documents failed"]
+    else:
+        record["dialogs"] = [{"title": "Warning"}]
+    takeoff.write_text(json.dumps({"response": record}))
+
+    result = compare(tmp_path, [["A", "Walls", "Level 1", 3, 1]], takeoff)
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["status"] == "incomplete"
+
+
 def test_schedule_metadata_and_existing_csv_export(tmp_path):
     powershell = shutil.which("pwsh")
     if not powershell:
