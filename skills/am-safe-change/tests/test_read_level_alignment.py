@@ -388,7 +388,8 @@ def saved_run(run_id, mode, result):
         "exit_code": 0, "result_truncated": False, "error": None, "approval": None,
         "warnings": [], "dialogs": [], "failures": [], "blocked": [],
         "engine": {"requested": "cpython"},
-        "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
+        "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {},
+                    "added": [], "modified": [], "deleted": [], "transactions": []},
         "result": result,
     }
 
@@ -442,6 +443,13 @@ def test_saved_probe_requires_three_independent_runs_and_exact_effects(probe, tm
     unrelated_rollback["result"]["rollback_events"] = [{"operation": "TransactionGroupRolledBack", "modified": ["102"]}]
     for invalid in (wrong_id, wrong_transaction, wrong_measurement, wrong_build, unrelated_rollback):
         assert verify(plan, original, invalid, fresh).returncode == 2
+
+    for field, value in (("closed_documents", ["Another project"]), ("reckless", True)):
+        invalid = verify(plan, original, dict(dry, **{field: value}), fresh)
+        assert invalid.returncode == 2 and "complete successful CPython" in invalid.stderr
+    incomplete = deepcopy(dry)
+    del incomplete["changes"]["deleted"]
+    assert verify(plan, original, incomplete, fresh).returncode == 2
 
     assert verify(plan, original, dry, dict(fresh, run_id=original["run_id"])).returncode == 2
     assert verify(plan, original, dict(dry, result_truncated=True), fresh).returncode == 2

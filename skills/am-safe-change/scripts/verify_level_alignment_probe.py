@@ -20,7 +20,8 @@ def runtime_record(value, mode):
             or record.get("decision") not in ("no_changes", "rolled_back")
             or type(record.get("exit_code")) is not int or record["exit_code"] != 0
             or record.get("result_truncated") is not False or record.get("error") is not None
-            or record.get("approval") is not None or record.get("unclosed_documents", [])
+            or record.get("approval") is not None
+            or any(record.get(field) for field in ("closed_documents", "unclosed_documents", "reckless"))
             or any(record.get(field) != [] for field in ("blocked", "dialogs", "failures", "warnings"))
             or not isinstance(engine, dict) or engine.get("requested") != "cpython"
             or not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{12}", run_id)
@@ -33,7 +34,7 @@ def runtime_changes(record, expected=(), transaction=None):
     changes = record["changes"]
     for kind in ("added", "modified", "deleted"):
         count = changes.get(kind + "_count")
-        rows = changes.get(kind, [])
+        rows = changes.get(kind)
         if (type(count) is not int or not isinstance(rows, list) or len(rows) != count
                 or changes.get(kind + "_ids")):
             raise ValueError("Revit effect counts and full element lists disagree.")
@@ -41,12 +42,12 @@ def runtime_changes(record, expected=(), transaction=None):
             raise ValueError("Revit reported an addition or deletion outside the reviewed operation.")
     if changes.get("other_documents"):
         raise ValueError("Revit reported an effect in another document.")
-    modified = [str(row["id"]) for row in changes.get("modified", [])]
+    modified = [str(row["id"]) for row in changes["modified"]]
     if modified:
         if (record["decision"] != "rolled_back" or not all(map(element_id, modified))
                 or sorted(modified, key=int) != list(expected)):
             raise ValueError("Revit did not report the exact reviewed modified element IDs.")
-    transactions = changes.get("transactions", [])
+    transactions = changes.get("transactions")
     if transactions != ([transaction] if modified else []) and not (
             not modified and transaction and record["decision"] == "rolled_back" and transactions == [transaction]):
         raise ValueError("Revit reported transactions outside the reviewed probe.")
