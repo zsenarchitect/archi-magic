@@ -95,3 +95,48 @@ def test_creation_only_preview_shows_rows_and_blocking_status():
     assert "<td>Added</td><td>1</td><td>New view</td>" in out
     assert "Preview blocked" in out and "Name already used" in out
     assert "Approve or discard" not in out
+
+
+def test_project_page_renders_parsed_issue_board(tmp_path):
+    from pathlib import Path
+
+    root = Path(HERE).parents[2]
+    note = tmp_path / "note.json"
+    note.write_text(json.dumps({"text": "\r".join([
+        "Coordination board",
+        "Issues use fixed numbers; next new issue is #2. Never renumber.",
+        "#1 [OPEN] Check <img src=x> - @reviewer",
+        "Severity: High",
+        "Finding: Check opening id9007199254740993.",
+        "To do: Review the opening.",
+        "2026-11-11 @reviewer: Keep this on the board.",
+        "Related: #42",
+    ])}), encoding="utf-8")
+    board = tmp_path / "board.json"
+    board.write_bytes(subprocess.check_output([
+        sys.executable, root / "skills/am-issue-board/scripts/board_cli.py", "parse", note,
+    ]))
+    out = tmp_path / "project.html"
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--board", board, "--out", out,
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    page = out.read_text()
+    assert "<h2>Issue board</h2>" in page and "Coordination board" in page
+    assert "<summary>#1 [OPEN] Check &lt;img src=x&gt;</summary>" in page
+    assert "<img" not in page
+    assert "id9007199254740993" in page and "@reviewer" in page and "High" in page
+    assert "Review the opening." in page and "Keep this on the board." in page and "#42" in page
+    assert "default-src 'none'" in page
+
+
+def test_invalid_board_export_does_not_replace_project_page(tmp_path):
+    board = tmp_path / "board.json"
+    board.write_text(json.dumps({"findings": []}))
+    out = tmp_path / "project.html"
+    out.write_text("Existing project page")
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--board", board, "--out", out,
+    ], capture_output=True, text=True)
+    assert result.returncode == 1 and "board_cli.py parse" in result.stderr
+    assert out.read_text() == "Existing project page"

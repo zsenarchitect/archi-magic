@@ -2,14 +2,15 @@
 
 Builds one self-contained, read-only HTML page from local JSON files:
 - audit findings (mep_qa.py, dwg_cad_audit.py, check_packs.py output),
-- optional change-preview JSON (am-safe-change).
+- optional change-preview JSON (am-safe-change),
+- optional read-only issue board JSON (board_cli.py parse).
 
 No network call. No data leaves the machine. The page cannot change a model.
 Model changes stay behind the Revit Keep/Discard step.
 
 Usage:
     python project_page.py --title "Project A" --audit a.json [--audit b.json] \
-        [--preview p.json] --out project.html
+        [--preview p.json] [--board board.json] --out project.html
 """
 
 from __future__ import annotations
@@ -142,6 +143,58 @@ def render_preview(preview: Dict[str, Any]) -> str:
     )
 
 
+def render_board(board):
+    error = "Use the JSON output of board_cli.py parse for the issue board."
+    if not isinstance(board, dict) or not isinstance(board.get("header"), dict):
+        raise ValueError(error)
+    title = board["header"].get("title")
+    issues, warnings = board.get("issues"), board.get("warnings")
+    if (not isinstance(title, str) or not isinstance(issues, list)
+            or not isinstance(warnings, list) or any(not isinstance(item, str) for item in warnings)):
+        raise ValueError(error)
+
+    def fields(issue):
+        for name in ("assignees", "severity", "findings", "todos"):
+            values = issue.get(name)
+            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                raise ValueError(error)
+        for name in ("element_ids", "related"):
+            values = issue.get(name)
+            if not isinstance(values, list) or any(type(value) is not int for value in values):
+                raise ValueError(error)
+        comments = issue.get("comments")
+        if not isinstance(comments, list) or any(
+            not isinstance(item, dict)
+            or any(not isinstance(item.get(key), str) for key in ("date", "user", "text"))
+            for item in comments
+        ):
+            raise ValueError(error)
+        return (
+            ("Assignees", [" ".join(issue["assignees"])] if issue["assignees"] else []),
+            ("Severity", issue["severity"]),
+            ("Findings", issue["findings"]),
+            ("To do", issue["todos"]),
+            ("Comments", [f"{c['date']} {c['user']} {c['text']}" for c in comments]),
+            ("Element IDs", [", ".join(map(str, dict.fromkeys(issue["element_ids"])))] if issue["element_ids"] else []),
+            ("Related issues", [", ".join(f"#{n}" for n in issue["related"])] if issue["related"] else []),
+        )
+
+    rendered = []
+    for issue in issues:
+        if (not isinstance(issue, dict) or type(issue.get("number")) is not int
+                or issue["number"] < 1 or issue.get("status") not in ("OPEN", "IN PROGRESS", "DONE")
+                or not isinstance(issue.get("title"), str)):
+            raise ValueError(error)
+        summary = f"#{issue['number']} [{issue['status']}] {issue['title']}"
+        details = "".join(f"<dt>{label}</dt>" + "".join(f"<dd>{_e(value)}</dd>" for value in values)
+                          for label, values in fields(issue) if values)
+        rendered.append(f"<details><summary>{_e(summary)}</summary><dl>{details}</dl></details>")
+    notices = "".join(f"<li>{_e(warning)}</li>" for warning in warnings)
+    warnings_html = f"<h3>Board warnings</h3><ul class='warn'>{notices}</ul>" if notices else ""
+    rows = "".join(rendered) if rendered else "<p>No issues in the board.</p>"
+    return f"<h2>Issue board</h2><p>{_e(title)}</p>{warnings_html}{rows}"
+
+
 STYLE = (
     "body{font-family:system-ui,sans-serif;margin:2rem;background:#f6f4ef;color:#0a0a0a}"
     "table{border-collapse:collapse;width:100%;margin:1rem 0}"
@@ -149,12 +202,13 @@ STYLE = (
     ".cards{display:flex;gap:1rem}.card{padding:.8rem 1.2rem;border:1px solid #0a0a0a;border-radius:12px}"
     ".sev-error td:first-child{color:#b00020;font-weight:600}"
     ".sev-warning td:first-child{color:#8a5a00;font-weight:600}"
+    "details{margin:.5rem 0}summary{cursor:pointer}dt{font-weight:600;margin-top:.5rem}"
     ".chg{background:#fff3c4}.gate{font-weight:600}.warn{color:#b00020}"
     "@media(prefers-color-scheme:dark){body{background:#111;color:#eee}th,td{border-color:#555}}"
 )
 
 
-def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any]) -> str:
+def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *, board=None) -> str:
     s = summarize(findings)
     cards = "".join(
         f"<div class='card'><strong>{s[k]}</strong><br>{label}</div>"
@@ -168,6 +222,7 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
         f"<div class='cards'>{cards}</div>"
         f"<h2>Audit findings</h2>{render_findings(findings)}"
         f"<h2>Change preview</h2>{render_preview(preview)}"
+        f"{render_board(board) if board is not None else ''}"
         "</body></html>"
     )
 
@@ -177,18 +232,26 @@ def main() -> int:
     p.add_argument("--title", default="Project report")
     p.add_argument("--audit", action="append", default=[], help="Audit result JSON (repeatable)")
     p.add_argument("--preview", help="Change preview JSON")
+    p.add_argument("--board", help="Issue board JSON from board_cli.py parse")
     p.add_argument("--out", required=True, help="Output HTML path")
     args = p.parse_args()
 
-    for path in args.audit + ([args.preview] if args.preview else []):
+    inputs = args.audit + [path for path in (args.preview, args.board) if path]
+    for path in inputs:
         if not os.path.isfile(path):
             print(f"Error: file '{path}' not found.", file=sys.stderr)
+            return 1
+        if os.path.exists(args.out) and os.path.samefile(path, args.out):
+            print("Error: output must be separate from the input files.", file=sys.stderr)
             return 1
 
     findings = collect_findings([load_json(a) for a in args.audit])
     preview = load_json(args.preview) if args.preview else {}
     try:
-        page = build_page(args.title, findings, preview)
+        board = load_json(args.board) if args.board else None
+        if args.board and board is None:
+            raise ValueError("Use the JSON output of board_cli.py parse for the issue board.")
+        page = build_page(args.title, findings, preview, board=board)
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
