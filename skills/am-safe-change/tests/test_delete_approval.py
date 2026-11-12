@@ -1,3 +1,4 @@
+import hashlib
 import json
 from html.parser import HTMLParser
 from pathlib import Path
@@ -30,25 +31,30 @@ def preview():
     }
 
 
-def run_cli(tmp_path, preview, run=None):
+def run_cli(tmp_path, preview, run=None, *, approved_digest=None):
     preview_file = tmp_path / "preview.json"
     preview_file.write_text(json.dumps(preview), encoding="utf-8")
     command = [sys.executable, str(SCRIPT), str(preview_file)]
     if run is not None:
         dry_run = tmp_path / "run.json"
         dry_run.write_text(json.dumps({"response": run}), encoding="utf-8")
+        digest = approved_digest if approved_digest is not None else hashlib.sha256(preview_file.read_bytes()).hexdigest()
         command.extend(["--dry-run", str(dry_run)])
+        if digest:
+            command.extend(["--approved-preview-sha256", digest])
     return subprocess.run(command, capture_output=True, text=True)
 
 
 def test_preview_lists_both_deletes_separately_from_twenty_one_edits(tmp_path, preview):
     completed = run_cli(tmp_path, preview)
     assert completed.returncode == 0
-    assert completed.stdout.splitlines() == [
+    assert completed.stdout.splitlines()[:-1] == [
         "Delete: 2 elements",
         "- ID 300 | Shared Parameters | Unused room parameter",
         "- ID 301 | Detail Lines | Horizontal grid line under the removed row",
     ]
+    digest = hashlib.sha256((tmp_path / "preview.json").read_bytes()).hexdigest()
+    assert completed.stdout.splitlines()[-1] == f"Preview SHA-256: {digest}"
     assert [row[0] for row in preview["before"]] == [*range(100, 110), *range(200, 211)]
     assert [row[0] for row in preview["after"]] == [*range(100, 110), *range(200, 211)]
 
@@ -72,6 +78,21 @@ def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corrupt
     assert completed.returncode == (2 if corruption else 0)
     if corruption == "same_count_wrong_ids":
         assert "Extra IDs: 999. Missing IDs: 301." in completed.stderr
+
+
+@pytest.mark.parametrize("include_approval", [False, True])
+def test_dry_run_refuses_a_missing_or_changed_preview_approval(tmp_path, preview, include_approval):
+    run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
+           "changes": {"deleted_count": 2, "deleted": [300, "301"]}}
+    original = json.dumps(preview).encode("utf-8")
+    approved_digest = hashlib.sha256(original).hexdigest() if include_approval else ""
+    if include_approval:
+        preview["after"][0][2] = "Changed after approval"
+    completed = run_cli(tmp_path, preview, run, approved_digest=approved_digest)
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    message = "differs from the approved file" if include_approval else "recorded when the user approved"
+    assert message in completed.stderr
 
 
 def test_accepts_named_deletion_rows_in_saved_evidence(tmp_path, preview):

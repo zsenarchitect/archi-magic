@@ -1,7 +1,9 @@
 """Show every planned deletion and check the exact IDs from a Revit dry run."""
 
 import argparse
+import hashlib
 import json
+from pathlib import Path
 import re
 import sys
 
@@ -75,12 +77,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("preview")
     parser.add_argument("--dry-run")
+    parser.add_argument("--approved-preview-sha256", help="SHA-256 printed when the user reviewed the preview")
     args = parser.parse_args()
     try:
-        rows = planned_deletions(load(args.preview))
-        print(delete_list(rows))
+        preview = Path(args.preview).read_bytes()
+        digest = hashlib.sha256(preview).hexdigest()
+        if args.dry_run and not args.approved_preview_sha256:
+            raise ValueError("Provide the preview SHA-256 recorded when the user approved the deletion list.")
+        if args.approved_preview_sha256 is not None and args.approved_preview_sha256 != digest:
+            raise ValueError("The preview differs from the approved file. Show the new preview and ask again.")
+        rows = planned_deletions(json.loads(preview.decode("utf-8-sig")))
         if args.dry_run:
             verify_dry_run(rows, load(args.dry_run))
+        print(delete_list(rows))
+        print(f"Preview SHA-256: {digest}")
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
         print(f"Delete approval blocked. {error}", file=sys.stderr)
         return 2
