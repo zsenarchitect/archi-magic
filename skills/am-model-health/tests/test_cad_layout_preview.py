@@ -10,7 +10,7 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from cad_layout_preview import FRAME, propose
+from cad_layout_preview import FRAME, classify_room_boundaries, propose
 
 
 @pytest.fixture
@@ -72,6 +72,78 @@ def test_actual_dxf_geometry_through_cli(layout, tmp_path):
     room, = preview["rooms"]
     assert room["boundary"] == [[0, 500], [3500, 500], [3500, 3000], [0, 3000]]
     assert room["interior_point"] == [500, 1000]
+
+
+def test_cli_classifies_one_wall_face_and_three_room_separators(layout, tmp_path):
+    snapshot, mapping = layout
+    for vertex in snapshot["room_loops"][0]["vertices"][:2]:
+        vertex[1] = 200
+    source, config = tmp_path / "snapshot.json", tmp_path / "mapping.json"
+    source.write_text(json.dumps(snapshot))
+    config.write_text(json.dumps(mapping))
+    command = [sys.executable, str(SCRIPTS / "cad_layout_preview.py"),
+               str(source), "--mapping", str(config), "--room-bounding"]
+    preview = json.loads(subprocess.check_output([*command, "all"]))
+    room, = preview["rooms"]
+    assert room["boundary_edges"] == [
+        {"edge": [[0, 200], [3500, 200]], "kind": "wall_face", "wall_id": "wall-1", "face_sign": 1},
+        {"edge": [[3500, 200], [3500, 3000]], "kind": "separator"},
+        {"edge": [[3500, 3000], [0, 3000]], "kind": "separator"},
+        {"edge": [[0, 3000], [0, 200]], "kind": "separator"},
+    ]
+    assert preview["status"] == "proposed" and not preview["model_write_approved"]
+    without_bounding = json.loads(subprocess.check_output([*command, "none"]))
+    assert all(row["kind"] == "separator" for row in without_bounding["rooms"][0]["boundary_edges"])
+
+
+@pytest.mark.parametrize("edge_y,edge_end", [(0, 3500), (100, 3500), (200, 4500)])
+def test_wall_on_wrong_side_crossing_or_partly_supporting_room_stops(layout, edge_y, edge_end):
+    snapshot, mapping = layout
+    vertices = snapshot["room_loops"][0]["vertices"]
+    vertices[0][1] = vertices[1][1] = edge_y
+    vertices[1][0] = vertices[2][0] = edge_end
+    proposal = propose(snapshot, mapping)
+    assert proposal["status"] == "proposed"
+    result = classify_room_boundaries(proposal, {"wall-1": True})
+    assert result["status"] == "unresolved"
+    bottom = result["rooms"][0]["boundary_edges"][0]
+    assert bottom["kind"] == "unresolved" and bottom["wall_ids"] == ["wall-1"]
+    assert proposal["unresolved"] == []
+
+
+def test_reversed_contour_keeps_face_and_wall_inside_room_is_rejected(layout):
+    snapshot, mapping = layout
+    room = snapshot["room_loops"][0]
+    for vertex in room["vertices"][:2]:
+        vertex[1] = 200
+    room["vertices"].reverse()
+    result = classify_room_boundaries(propose(snapshot, mapping), {"wall-1": True})
+    support, = [row for row in result["rooms"][0]["boundary_edges"] if row["kind"] == "wall_face"]
+    assert support["edge"] == ((3500, 200), (0, 200))
+    assert support["face_sign"] == 1
+    room["vertices"] = [[-100, -500, 3000], [4100, -500, 3000], [4100, 3000, 3000], [-100, 3000, 3000]]
+    result = classify_room_boundaries(propose(snapshot, mapping), {"wall-1": False})
+    assert result["status"] == "unresolved"
+    assert any("extends into the room interior" in row["reason"] for row in result["unresolved"])
+
+
+def test_two_adjacent_walls_do_not_silently_split_one_room_edge(layout):
+    snapshot, mapping = layout
+    for vertex in snapshot["room_loops"][0]["vertices"][:2]:
+        vertex[1] = 200
+    first, second = snapshot["segments"][:2]
+    first["end"][0] = second["start"][0] = 2000
+    snapshot["segments"].extend([
+        {**first, "id": "east-outer", "start": [2000, 0, 3000], "end": [4000, 0, 3000]},
+        {**second, "id": "east-inner", "start": [4000, 200, 3000], "end": [2000, 200, 3000]},
+    ])
+    proposal = propose(snapshot, mapping)
+    assert proposal["status"] == "proposed"
+    result = classify_room_boundaries(proposal, {"wall-1": True, "wall-2": True})
+    assert result["status"] == "unresolved"
+    assert result["rooms"][0]["boundary_edges"][0] == {
+        "edge": ((0, 200), (3500, 200)), "kind": "unresolved", "wall_ids": ["wall-1", "wall-2"],
+    }
 
 
 def test_tail_and_wrong_width_or_height_block_wall_and_door(layout):

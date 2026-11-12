@@ -201,6 +201,8 @@ Keep the `evidence_sha256` from a complete mapped read. To recheck the same inpu
 3. Run `python scripts/cad_layout_preview.py snapshot.json --mapping mapping.json`. Review the wall axes, maximum face errors, uncovered lengths, door spans, and room outlines. The door marker must lie along its proposed host wall. Check each unresolved item. Exit 1 means geometry needs review. Exit 2 means the input or calculation failed.
 4. Treat this JSON as a proposal. It contains no Revit write instructions. The linked DWG reader and guarded Revit creation still require live qualification.
 
+Add `--room-bounding all` to preview which room edges a proposed wall face supports. Use `--room-bounding none` when the proposed walls will not bound rooms. Review every separator edge and every unresolved wall contact. Verify the actual enclosure in Revit before creation.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).
