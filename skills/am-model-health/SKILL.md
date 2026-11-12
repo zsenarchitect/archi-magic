@@ -273,6 +273,16 @@ Run `python scripts/family_formula_dependencies.py request.json` before reviewin
 
 The report resolves arithmetic dependencies through selected and reused definitions. It rejects ambiguous references, unsupported syntax, and cycles. Revit must still verify the transferred formula values and references.
 
+### Read the source and loaded family
+
+Run `scripts/read_family_parameter_transfer.py` with the Revit CPython bridge. Read the full result with `get_run`. Keep the snapshot private.
+
+- For the source, supply `role: "source"`, `staging`, `source_path`, and `revit_build`. Start with no open documents in the disposable worker.
+- For the target, supply `role: "target"`, `family_id`, `family_uid`, and `revit_build`. Use a decimal string for `family_id`. Open only the saved standalone project.
+- Stop if the read fails, the snapshot is partial, or the worker state is unresolved. Retain the definitions, formulas, values, labels, and associations for review. Keep dimension reference strings tied to the family document that produced them.
+
+The reader closes the inspection document without saving. Verify this workflow in Revit 2026 before use on project data.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
