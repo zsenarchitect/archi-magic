@@ -1,4 +1,6 @@
+import hashlib
 import json
+from pathlib import Path
 import os
 import subprocess
 import sys
@@ -98,8 +100,6 @@ def test_creation_only_preview_shows_rows_and_blocking_status():
 
 
 def test_project_page_renders_parsed_issue_board(tmp_path):
-    from pathlib import Path
-
     root = Path(HERE).parents[2]
     note = tmp_path / "note.json"
     note.write_text(json.dumps({"text": "\r".join([
@@ -143,7 +143,6 @@ def test_invalid_board_export_does_not_replace_project_page(tmp_path):
 
 
 def test_model_health_snapshot_flags_its_bad_and_warn_metrics(tmp_path):
-    from pathlib import Path
     import runpy
 
     root = Path(HERE).parents[2]
@@ -186,3 +185,44 @@ def test_failed_health_audit_cannot_be_rendered_as_clean(tmp_path):
     assert result.returncode == 1
     assert "audit" in result.stderr.lower()
     assert out.read_text() == "Existing project page"
+
+
+def test_project_page_builds_and_links_local_model(tmp_path, monkeypatch):
+    model = tmp_path / "model.json"
+    model.write_text('{"elements": []}')
+    out = tmp_path / "project.html"
+    viewer = b"<!doctype html><title>Offline BIM viewer</title>"
+
+    def build_model(command, **kwargs):
+        assert command[0] == "node"
+        assert Path(command[1]).name == "build-viewer.mjs"
+        assert command[2] == "--offline"
+        assert Path(command[3]) == model.resolve()
+        Path(command[4]).write_bytes(viewer)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", build_model)
+    monkeypatch.setattr(sys, "argv", ["project_page.py", "--model", str(model), "--out", str(out)])
+    assert pp.main() == 0
+    sibling = f"model-{hashlib.sha256(viewer).hexdigest()}.viewer.html"
+    assert (tmp_path / sibling).read_bytes() == viewer
+    assert f"href='{sibling}'" in out.read_text()
+    assert str(model) not in out.read_text()
+    assert model.read_text() == '{"elements": []}'
+
+
+def test_project_page_preserves_old_report_if_model_build_fails(tmp_path, monkeypatch):
+    model = tmp_path / "model.json"
+    model.write_text("invalid JSON")
+    out = tmp_path / "project.html"
+    out.write_text("Existing project page")
+
+    def fail_model(command, **kwargs):
+        Path(command[4]).write_text("partial viewer")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(subprocess, "run", fail_model)
+    monkeypatch.setattr(sys, "argv", ["project_page.py", "--model", str(model), "--out", str(out)])
+    assert pp.main() == 1
+    assert out.read_text() == "Existing project page"
+    assert list(tmp_path.glob("*.viewer.html")) == []

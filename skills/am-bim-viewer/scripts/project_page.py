@@ -3,26 +3,31 @@
 Builds one self-contained, read-only HTML page from local JSON files:
 - audit findings (model_health.py, mep_qa.py, dwg_cad_audit.py, check_packs.py output),
 - optional change-preview JSON (am-safe-change),
-- optional read-only issue board JSON (board_cli.py parse).
+- optional read-only issue board JSON (board_cli.py parse),
+- optional BIM JSON export for an offline model viewer.
 
 No network call. No data leaves the machine. The page cannot change a model.
 Model changes stay behind the Revit Keep/Discard step.
 
 Usage:
     python project_page.py --title "Project A" --audit a.json [--audit b.json] \
-        [--preview p.json] [--board board.json] --out project.html
+        [--preview p.json] [--board board.json] [--model model.json] --out project.html
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import html
 import math
 from itertools import zip_longest
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List
 
 SEVERITIES = ("error", "warning", "info")
@@ -244,23 +249,54 @@ STYLE = (
 )
 
 
-def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *, board=None) -> str:
+def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *, board=None, viewer_name=None) -> str:
     s = summarize(findings)
     cards = "".join(
         f"<div class='card'><strong>{s[k]}</strong><br>{label}</div>"
         for k, label in (("error", "errors"), ("warning", "warnings"), ("info", "info"), ("total", "total"))
     )
+    model_link = f"<p><a href='{_e(viewer_name)}'>Open 3D model</a></p>" if viewer_name else ""
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\">"
         f"<title>{_e(title)}</title><style>{STYLE}</style></head><body>"
         f"<h1>{_e(title)}</h1><p>Read-only local report. No data leaves this computer.</p>"
-        f"<div class='cards'>{cards}</div>"
+        f"{model_link}<div class='cards'>{cards}</div>"
         f"<h2>Audit findings</h2>{render_findings(findings)}"
         f"<h2>Change preview</h2>{render_preview(preview)}"
         f"{render_board(board) if board is not None else ''}"
         "</body></html>"
     )
+
+
+def write_project_with_model(output, model, title, findings, preview, board):
+    builder = Path(__file__).resolve().with_name("build-viewer.mjs")
+    with TemporaryDirectory(prefix=".project-viewer-", dir=output.parent) as temporary:
+        staging = Path(temporary)
+        built = staging / "viewer.html"
+        try:
+            subprocess.run(
+                ["node", str(builder), "--offline", str(model.resolve()), str(built)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as error:
+            raise ValueError("Install Node.js to build the offline model viewer.") from error
+        except subprocess.CalledProcessError as error:
+            raise ValueError("Could not build the model viewer. Check the BIM JSON export and run npm ci in am-bim-viewer.") from error
+
+        viewer_bytes = built.read_bytes()
+        digest = hashlib.sha256(viewer_bytes).hexdigest()
+        viewer = output.with_name(f"model-{digest}.viewer.html")
+        if viewer == output:
+            raise ValueError("The project page and model viewer need separate output names.")
+        if viewer.is_symlink() or (viewer.exists() and (not viewer.is_file() or viewer.read_bytes() != viewer_bytes)):
+            raise ValueError("The model viewer output name is already in use by another file.")
+
+        page = staging / "report.html"
+        page.write_text(build_page(title, findings, preview, board=board, viewer_name=viewer.name), encoding="utf-8")
+        if not viewer.exists():
+            os.replace(built, viewer)
+        os.replace(page, output)
 
 
 def main() -> int:
@@ -269,10 +305,11 @@ def main() -> int:
     p.add_argument("--audit", action="append", default=[], help="Audit result JSON (repeatable)")
     p.add_argument("--preview", help="Change preview JSON")
     p.add_argument("--board", help="Issue board JSON from board_cli.py parse")
+    p.add_argument("--model", help="BIM JSON export for the offline 3D viewer")
     p.add_argument("--out", required=True, help="Output HTML path")
     args = p.parse_args()
 
-    inputs = args.audit + [path for path in (args.preview, args.board) if path]
+    inputs = args.audit + [path for path in (args.preview, args.board, args.model) if path]
     for path in inputs:
         if not os.path.isfile(path):
             print(f"Error: file '{path}' not found.", file=sys.stderr)
@@ -287,12 +324,14 @@ def main() -> int:
         board = load_json(args.board) if args.board else None
         if args.board and board is None:
             raise ValueError("Use the JSON output of board_cli.py parse for the issue board.")
-        page = build_page(args.title, findings, preview, board=board)
-    except ValueError as error:
+        output = Path(args.out).absolute()
+        if args.model:
+            write_project_with_model(output, Path(args.model), args.title, findings, preview, board)
+        else:
+            output.write_text(build_page(args.title, findings, preview, board=board), encoding="utf-8")
+    except (ValueError, OSError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(page)
     print(f"Wrote {args.out} ({len(findings)} findings)")
     return 0
 
