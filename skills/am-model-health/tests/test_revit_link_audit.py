@@ -218,6 +218,41 @@ def test_long_windows_paths_and_conflicting_ifc_source_risk(query, capsys):
         "private-long-owner", "private-long-model", "private-long-server", "private-device"))
 
 
+def test_rvt_audit_keeps_personal_saved_path_when_resolved_path_is_shared(query, capsys):
+    execute, _ = query
+    shared = NS(path=r"\\private-server\share\private-model.rvt", CloudPath=False, ServerPath=False)
+    personal = NS(path=r"C:\Users\private-owner\Documents\private-model.rvt", CloudPath=False, ServerPath=False)
+    conflicting = LinkType(1, None)
+    conflicting.PathType = "Absolute"
+    conflicting.GetExternalFileReference = lambda: NS(GetAbsolutePath=lambda: shared, GetPath=lambda: personal)
+    control = LinkType(2, None)
+    control.PathType = "Relative"
+    control.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=lambda: personal, GetPath=lambda: NS(path=r"..\links\private-model.rvt"))
+    result = execute(Document([conflicting, control], {}))
+    first, second = result["revit_links"]["types"]
+    assert (first["model_path_kind"], first["source_path_kind"], first["path_risk"]) == ("network", None, "personal")
+    assert first["source_path_kind_candidates"] == ["network", "personal"]
+    assert (second["saved_model_path_type"], second["source_path_kind"], second["path_risk"]) == (
+        "Relative", "personal", "personal")
+    output = json.dumps(result) + capsys.readouterr().out
+    assert all(value not in output for value in ("private-owner", "private-model", "private-server"))
+
+
+@pytest.mark.parametrize(("workshared", "expected"), [(False, "personal"), (True, None)])
+def test_relative_path_uses_standalone_host_only_when_absolute_path_is_unavailable(query, workshared, expected):
+    execute, _ = query
+    link = LinkType(1, None)
+    link.GetExternalFileReference = lambda: NS(
+        GetAbsolutePath=fail, GetPath=lambda: NS(path=r"..\links\fixture.rvt"))
+    document = Document([link], {})
+    document.PathName = r"C:\Users\private-owner\Office\Host.rvt"
+    document.IsWorkshared, document.IsModelInCloud = workshared, False
+    row, = execute(document)["revit_links"]["types"]
+    assert row["saved_model_path_type"] == "Relative"
+    assert row["source_path_kind"] == row["path_risk"] == expected
+
+
 def test_unreadable_absolute_path_preserves_saved_evidence_without_inventing_locality(query, capsys):
     execute, _ = query
     opaque = NS(CloudPath=False, ServerPath=False)
