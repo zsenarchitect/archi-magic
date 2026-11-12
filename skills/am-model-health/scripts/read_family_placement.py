@@ -42,9 +42,9 @@ def parameter_state(symbol, field):
     return {"state": "value", "value": value}
 
 
-def read_snapshot(document, DB, request):
+def read_snapshot(document, DB, request, require_unmodified=True):
     if (document is None or not document.PathName or document.IsFamilyDocument or document.IsReadOnly
-            or document.IsWorkshared or document.IsModelInCloud or document.IsModified):
+            or document.IsWorkshared or document.IsModelInCloud or (require_unmodified and document.IsModified)):
         raise ValueError("Open a saved, unmodified, local standalone Revit project.")
     selection = request["selection"]
     level_key = request["level_id"]
@@ -88,7 +88,8 @@ def read_snapshot(document, DB, request):
         "revit_build": str(document.Application.VersionBuild),
         "level": {"id": eid(level), "uid": str(level.UniqueId), "name": level.Name,
                   "project_elevation": float(level.ProjectElevation)},
-        "same_name_families": families, "exact_symbols": exact,
+        "same_name_families": sorted(families, key=lambda row: int(row["id"])),
+        "exact_symbols": sorted(exact, key=lambda row: int(row["id"])),
     }
 
 
