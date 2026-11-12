@@ -187,7 +187,7 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 1. Run `family_library_discovery.py` to create a discovery manifest. Run `stage_family_library.py` with that manifest and the exact family path to create a staging receipt. Use Python 3.13 or newer for Windows staging.
 2. Prepare one native request with `python scripts/read_family_library.py prepare staging.json --path "Fixtures/Example.rfa" --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use the expected loaded build identifiers. Keep the printed worker directory private.
 3. Set `ARCHI_MAGIC_FAMILY_WORKER_DIR` to the printed directory in the shell that launches the worker. Run `pyrevit run scripts/read_family_library.py --revit=2026` with no model arguments. Use a CPython-capable batch runner. Set a timeout outside Revit and confirm the disposable process exits.
-4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt reports catalog coverage separately. Prepare a new request for any retry.
+4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt lists thumbnail availability for each embedded type and reports catalog coverage separately. Add `--metadata-only` during preparation to qualify the metadata read alone. Prepare a new request for any retry.
 
 ## Preview a CAD layout (issue #166)
 

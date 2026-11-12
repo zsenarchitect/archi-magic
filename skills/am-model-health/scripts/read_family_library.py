@@ -16,11 +16,13 @@ from family_library_discovery import (
     MAX_CATALOG_BYTES, MAX_FAMILIES, MAX_FAMILY_BYTES, MAX_SECONDS, WindowsDirectory,
     checked_file, child_info, directory_info, identity, manifest_digest, pinned_directory, pinned_root, root_path, windows,
 )
+from family_library_thumbnails import MAX_IMAGE_BYTES, png_record, render_thumbnails
 from read_batch_models import normalized_path
 from stage_family_library import MAX_MANIFEST, check_file_record, make_directory, new_file, parts, verify_pair
 
-MAX_TYPES = 2048
-MAX_PARAMETERS = 64
+MAX_TYPES = 250
+MAX_PARAMETERS = 50
+MAX_SOURCE_SECONDS = 60
 MAX_TEXT = 4096
 MAX_RECEIPT = 8 * 1024 * 1024
 WORKER_DIRECTORY_ENV = "ARCHI_MAGIC_FAMILY_WORKER_DIR"
@@ -129,22 +131,28 @@ def family_metadata(document, parameter_names):
         raise ValueError("The family has duplicate type parameter IDs.")
     types = {}
     type_bytes = 0
+    coverage = "complete"
     for family_type in manager.Types:
         name = bounded_text(family_type.Name)
-        if name in types or len(types) >= MAX_TYPES:
-            raise ValueError("The family has duplicate names or too many embedded types.")
+        if len(types) >= MAX_TYPES:
+            coverage = "type_limit"
+            break
+        if name in types:
+            raise ValueError("The family has duplicate type names.")
         values = {
             record["id"]: parameter_values(family_type, parameter, record["storage"])
             for parameter, record in parameters
         }
         type_bytes += len(json.dumps({name: values}, ensure_ascii=True, allow_nan=False))
-        if type_bytes > MAX_RECEIPT:
-            raise ValueError("The family type data exceeds the receipt size limit.")
+        if type_bytes > MAX_RECEIPT // 2:
+            coverage = "size_limit"
+            break
         types[name] = values
     return {
         "family": bounded_text(family.Name),
         "category": {"id": str(category.Id.Value), "name": bounded_text(category.Name)},
         "parameters": [record for _, record in parameters],
+        "embedded_type_coverage": coverage,
         "embedded_types": [{"name": name, "values": types[name]} for name in sorted(types)],
     }
 
@@ -156,31 +164,41 @@ def validate_parameter_names(parameter_names):
         raise ValueError("Select a bounded list of distinct type parameter names.")
 
 
-def read_family(ui, receipt, source_path, parameter_names):
-    """Return a receipt only after a successful read, close, and staging recheck."""
-    validate_parameter_names(parameter_names)
+@contextmanager
+def worker_document(ui, open_document):
     app = ui.Application
     if ui.ActiveUIDocument is not None or list(app.Documents):
         raise WorkerUnresolved("Start a disposable Revit worker with no open documents.")
     document = None
-    with staged_pair(receipt, source_path) as (path, pair):
+    try:
+        document = open_document(app)
+        if document is None or list(app.Documents) != [document] or ui.ActiveUIDocument is not None:
+            raise WorkerUnresolved("Revit did not open exactly one background document.")
+        yield document
+        if list(app.Documents) != [document] or ui.ActiveUIDocument is not None:
+            raise WorkerUnresolved("The Revit worker changed while the document was open.")
+    finally:
         try:
-            document = app.OpenDocumentFile(os.fspath(path))
-            if (list(app.Documents) != [document] or ui.ActiveUIDocument is not None
-                    or not document.IsFamilyDocument or document.IsModified
+            closed = document is None or document.Close(False)
+            restored = not list(app.Documents) and ui.ActiveUIDocument is None
+        except Exception as error:
+            raise WorkerUnresolved("Revit could not confirm document closure.") from error
+        if not closed or not restored:
+            raise WorkerUnresolved("Revit did not restore the empty document baseline.")
+
+
+def read_family(ui, receipt, source_path, parameter_names):
+    """Return a receipt only after a successful read, close, and staging recheck."""
+    validate_parameter_names(parameter_names)
+    app = ui.Application
+    with staged_pair(receipt, source_path) as (path, pair):
+        with worker_document(ui, lambda app: app.OpenDocumentFile(os.fspath(path))) as document:
+            if (not document.IsFamilyDocument or document.IsModified
                     or normalized_path(document.PathName) != normalized_path(path)):
                 raise WorkerUnresolved("Revit did not open exactly the staged family.")
             metadata = family_metadata(document, set(parameter_names))
-            if document.IsModified or list(app.Documents) != [document] or ui.ActiveUIDocument is not None:
-                raise WorkerUnresolved("The Revit worker changed during the metadata read.")
-        finally:
-            try:
-                closed = document is None or document.Close(False)
-                restored = not list(app.Documents) and ui.ActiveUIDocument is None
-            except Exception as error:
-                raise WorkerUnresolved("Revit could not confirm document closure.") from error
-            if not closed or not restored:
-                raise WorkerUnresolved("Revit did not restore the empty document baseline.")
+            if document.IsModified:
+                raise WorkerUnresolved("The staged family was modified during the metadata read.")
 
     result = {
         "kind": "family-library-metadata", "version": 1,
@@ -197,6 +215,54 @@ def read_family(ui, receipt, source_path, parameter_names):
     return result
 
 
+def capture_thumbnails(ui, path, metadata, deadline):
+    names = [row["name"] for row in metadata["embedded_types"]]
+    if not names:
+        return [], {}
+    if metadata["catalog"] is not None:
+        return [{"type": name, "status": "catalog_pending"} for name in names], {}
+    if monotonic() >= deadline:
+        return [{"type": name, "status": "time_limit"} for name in names], {}
+
+    from pyrevit.api import DB
+    with worker_document(ui, lambda app: app.NewProjectDocument(DB.UnitSystem.Metric)) as scratch:
+        if scratch.IsFamilyDocument or scratch.PathName or scratch.IsWorkshared or scratch.IsModelInCloud:
+            raise WorkerUnresolved("Revit did not create an unsaved scratch project.")
+        return render_thumbnails(scratch, DB, path, metadata, deadline)
+
+
+def verify_thumbnail_assets(parent, records, metadata, requested):
+    if not requested:
+        if records:
+            raise ValueError("A metadata-only request returned thumbnails.")
+        return
+    expected = [row["name"] for row in metadata["embedded_types"]]
+    if [row["type"] for row in records] != expected:
+        raise ValueError("The thumbnail rows do not match the exact embedded types.")
+    if metadata["catalog"] is not None and any(row["status"] != "catalog_pending" for row in records):
+        raise ValueError("A paired family needs native catalog verification before publishing previews.")
+    checked = {}
+    for row in records:
+        if row["status"] in {"scratch_name_collision", "time_limit", "preview_unavailable",
+                             "type_unavailable", "invalid_preview", "catalog_pending"} and set(row) == {"type", "status"}:
+            continue
+        if row["status"] != "available" or set(row) != {"type", "status", "image"}:
+            raise ValueError("A thumbnail row has invalid coverage.")
+        image = row["image"]
+        digest = image["sha256"]
+        if (not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+                or image["file"] != f"thumbnail-{digest}.png"):
+            raise ValueError("A thumbnail has an invalid content address.")
+        name = image["file"]
+        if name not in checked:
+            data = BytesIO()
+            checked_file(parent, name, child_info(parent, name), MAX_IMAGE_BYTES,
+                         {"bytes": 0, "deadline": monotonic() + MAX_SECONDS}, data)
+            checked[name] = png_record(data.getvalue())
+        if checked[name] != image:
+            raise ValueError("A thumbnail does not match its receipt.")
+
+
 def read_request_file(parent, name):
     budget = {"bytes": 0, "deadline": monotonic() + MAX_SECONDS}
     data = BytesIO()
@@ -211,10 +277,10 @@ def encode_record(record):
     return data
 
 
-def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_build, pyrevit_build):
+def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_build, pyrevit_build, *, thumbnails=True):
     """Make a private, one-use native worker request for an exact source pair."""
     validate_parameter_names(parameter_names)
-    if (revit_year != "2026"
+    if (type(thumbnails) is not bool or revit_year != "2026"
             or any(not isinstance(build, str) or not build.strip() or len(build) > 100
                    for build in (revit_build, pyrevit_build))):
         raise ValueError("Supply the expected Revit 2026 and pyRevit build identifiers.")
@@ -232,7 +298,7 @@ def prepare_worker(receipt, source_path, parameter_names, revit_year, revit_buil
                 "directory_identity": identity(directory_info(directory)),
                 "source_path": source_path, "parameter_names": sorted(parameter_names),
                 "revit_year": revit_year, "revit_build": revit_build, "pyrevit_build": pyrevit_build,
-                "staging": receipt,
+                "staging": receipt, "thumbnails": thumbnails,
             }
             request["request_sha256"] = manifest_digest(request)
             data = encode_record(request)
@@ -246,13 +312,14 @@ def worker_request(parent, directory):
     basis = {key: value for key, value in request.items() if key != "request_sha256"}
     if (request.get("kind") != "family-library-worker-request" or request.get("version") != 1
             or request.get("request_sha256") != manifest_digest(basis)
+            or type(request.get("thumbnails")) is not bool
             or request["directory_identity"] != identity(directory_info(parent))
             or directory.parent != root_path(request["staging"]["workspace"])):
         raise ValueError("The family worker request or its directory changed.")
     return request
 
 
-def run_worker(ui, runtime, raw_directory):
+def run_worker(ui, runtime, raw_directory, thumbnail_reader=capture_thumbnails):
     """Consume one prepared request and write a receipt after the worker is empty."""
     directory = root_path(raw_directory)
     with pinned_root(directory) as parent:
@@ -264,13 +331,24 @@ def run_worker(ui, runtime, raw_directory):
             raise ValueError("The loaded Revit or pyRevit build differs from the request.")
         with new_file(parent, "worker.started") as stream:
             stream.write(request["request_sha256"].encode("ascii"))
+        deadline = monotonic() + MAX_SOURCE_SECONDS
         metadata = read_family(ui, request["staging"], request["source_path"], request["parameter_names"])
+        thumbnails, assets = [], {}
+        if request["thumbnails"]:
+            with staged_pair(request["staging"], request["source_path"]) as (path, _):
+                thumbnails, assets = thumbnail_reader(ui, path, metadata, deadline)
+        for name, data in assets.items():
+            if png_record(data)["file"] != name:
+                raise ValueError("A thumbnail asset name does not match its bytes.")
+            with new_file(parent, name) as stream:
+                stream.write(data)
+        verify_thumbnail_assets(parent, thumbnails, metadata, request["thumbnails"])
         result = {
             "kind": "family-library-worker-receipt", "version": 1,
             "request_sha256": request["request_sha256"],
             "runtime": {"pyrevit_build": str(runtime), "engine": platform.python_implementation(),
                         "engine_version": platform.python_version()},
-            "metadata": metadata,
+            "metadata": metadata, "thumbnails": thumbnails,
         }
         result["receipt_sha256"] = manifest_digest(result)
         data = encode_record(result)
@@ -304,6 +382,7 @@ def collect_worker(raw_directory):
                     or metadata["revit_build"] != request["revit_build"]
                     or metadata["rfa"] != pair["rfa"] or metadata["catalog"] != pair["catalog"]):
                 raise ValueError("The metadata does not match the requested build and staged family.")
+            verify_thumbnail_assets(parent, result["thumbnails"], metadata, request["thumbnails"])
     return result
 
 
@@ -313,6 +392,7 @@ def main():
     prepare = commands.add_parser("prepare", help=prepare_worker.__doc__)
     prepare.add_argument("staging_receipt")
     prepare.add_argument("--path", required=True, help="Exact staged RFA path")
+    prepare.add_argument("--metadata-only", action="store_true")
     prepare.add_argument("--parameter", action="append", default=[])
     prepare.add_argument("--revit-build", required=True)
     prepare.add_argument("--pyrevit-build", required=True)
@@ -328,7 +408,8 @@ def main():
             staging = root_path(args.staging_receipt)
             with pinned_root(staging.parent) as parent:
                 receipt = read_request_file(parent, staging.name)
-            directory = prepare_worker(receipt, args.path, args.parameter, "2026", args.revit_build, args.pyrevit_build)
+            directory = prepare_worker(receipt, args.path, args.parameter, "2026", args.revit_build,
+                                       args.pyrevit_build, thumbnails=not args.metadata_only)
             print(directory)
     except (AttributeError, KeyError, OSError, TypeError, ValueError, RecursionError) as error:
         print(str(error), file=sys.stderr)

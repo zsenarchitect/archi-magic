@@ -67,19 +67,23 @@ class Worker:
         return document
 
 
-@pytest.fixture
-def staged(tmp_path, monkeypatch):
+def stage_fixture(tmp_path, monkeypatch, *, catalog=True):
     root = tmp_path.resolve() / "library"
     destination = tmp_path.resolve() / "staging"
     root.mkdir()
     destination.mkdir()
     (root / "Fixture.rfa").write_bytes(b"reviewed family")
-    (root / "Fixture.txt").write_bytes(b"reviewed catalog")
+    if catalog:
+        (root / "Fixture.txt").write_bytes(b"reviewed catalog")
     monkeypatch.setattr(staging, "free_bytes", lambda parent: 10 * staging.HEADROOM)
     receipt = staging.stage(discover(str(root)), ["Fixture.rfa"], str(destination))
     pair = Path(receipt["workspace"]) / receipt["pairs"][0]["directory"]
     return receipt, pair
 
+
+@pytest.fixture
+def staged(tmp_path, monkeypatch):
+    return stage_fixture(tmp_path, monkeypatch)
 
 def read(worker, receipt, source="Fixture.rfa"):
     ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
@@ -155,7 +159,7 @@ def test_stop_worker_when_document_state_is_unresolved(staged, condition):
 
 def test_worker_handoff_binds_build_and_cannot_be_replayed(staged):
     receipt, _ = staged
-    directory = prepare_worker(receipt, "Fixture.rfa", ["Width"], "2026", "fixture", "pyrevit-fixture")
+    directory = prepare_worker(receipt, "Fixture.rfa", ["Width"], "2026", "fixture", "pyrevit-fixture", thumbnails=False)
     worker = Worker()
     ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
 
@@ -183,7 +187,7 @@ def test_worker_handoff_binds_build_and_cannot_be_replayed(staged):
 
 def test_collect_rejects_partial_receipt_and_changed_pair(staged):
     receipt, pair = staged
-    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture", thumbnails=False)
     worker = Worker()
     ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
     run_worker(ui, "pyrevit-fixture", str(directory))
@@ -202,7 +206,7 @@ def test_collect_rejects_partial_receipt_and_changed_pair(staged):
 
 def test_unresolved_close_cannot_publish_worker_receipt(staged):
     receipt, _ = staged
-    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture", thumbnails=False)
     worker = Worker()
     worker.close_ok = False
     ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
@@ -211,3 +215,112 @@ def test_unresolved_close_cannot_publish_worker_receipt(staged):
     assert (directory / "worker.started").is_file()
     with pytest.raises(FileNotFoundError):
         collect_worker(str(directory))
+
+
+def fixture_png(red):
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes([0, red, 0, 0])))
+            + chunk(b"IEND", b""))
+
+
+def test_collect_binds_thumbnail_bytes_to_exact_type_and_source(tmp_path, monkeypatch):
+    from family_library_thumbnails import png_record
+
+    receipt, pair = stage_fixture(tmp_path, monkeypatch, catalog=False)
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    worker = Worker()
+    ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
+    data = fixture_png(100)
+    image = png_record(data)
+    row = {"type": "600 × 900", "status": "available", "image": image}
+
+    def thumbnail_reader(current_ui, path, metadata, deadline):
+        assert current_ui is ui and worker.Documents == []
+        assert path == pair / "Fixture.rfa"
+        assert metadata["family"] == "Fixture Family"
+        return [row], {image["file"]: data}
+
+    run_worker(ui, "pyrevit-fixture", str(directory), thumbnail_reader)
+    assert collect_worker(str(directory))["thumbnails"] == [row]
+    (directory / image["file"]).write_bytes(fixture_png(101))
+    with pytest.raises(ValueError, match="thumbnail does not match"):
+        collect_worker(str(directory))
+
+
+def test_render_loads_exact_symbol_and_preserves_missing_preview():
+    from family_library_thumbnails import render_thumbnails
+    from time import monotonic
+
+    status = SimpleNamespace(Started=1, Committed=2, RolledBack=3)
+    transactions = []
+    loads = []
+    symbols = {}
+
+    class Transaction:
+        def __init__(self, scratch, label):
+            self.status = None
+            self.disposed = False
+            transactions.append(self)
+
+        def Start(self):
+            self.status = status.Started
+            return self.status
+
+        def Commit(self):
+            self.status = status.Committed
+            return self.status
+
+        def RollBack(self):
+            self.status = status.RolledBack
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def Dispose(self):
+            self.disposed = True
+
+    family = SimpleNamespace(Name="Fixture Family",
+                             FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-2000011)))
+
+    def load_symbol(path, name):
+        loads.append((path, name))
+        symbol = SimpleNamespace(Name=name, Family=family)
+        symbols[name] = symbol
+        return True, symbol
+
+    db = SimpleNamespace(Transaction=Transaction, TransactionStatus=status, Family=type(family),
+                         FilteredElementCollector=lambda scratch: SimpleNamespace(OfClass=lambda cls: []))
+    scratch = SimpleNamespace(LoadFamilySymbol=load_symbol)
+    metadata = {"family": family.Name, "category": {"id": "-2000011"},
+                "embedded_types": [{"name": "A"}, {"name": "B"}]}
+    rows, assets = render_thumbnails(scratch, db, "fixture.rfa", metadata, monotonic() + 30,
+                                     lambda symbol: fixture_png(1) if symbol is symbols["A"] else None)
+    assert loads == [("fixture.rfa", "A"), ("fixture.rfa", "B")]
+    assert all(tx.status == status.Committed and tx.disposed for tx in transactions)
+    assert [row["status"] for row in rows] == ["available", "preview_unavailable"]
+    assert assets == {rows[0]["image"]["file"]: fixture_png(1)}
+
+    db.FilteredElementCollector = lambda scratch: SimpleNamespace(OfClass=lambda cls: [family])
+    rows, assets = render_thumbnails(scratch, db, "different/fixture.rfa", metadata, monotonic() + 30)
+    assert [row["status"] for row in rows] == ["scratch_name_collision", "scratch_name_collision"]
+    assert assets == {} and len(loads) == 2
+
+
+def test_catalog_pair_reports_previews_pending_without_opening_scratch(staged):
+    receipt, _ = staged
+    directory = prepare_worker(receipt, "Fixture.rfa", [], "2026", "fixture", "pyrevit-fixture")
+    worker = Worker()
+    ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
+    run_worker(ui, "pyrevit-fixture", str(directory))
+    result = collect_worker(str(directory))
+    assert result["metadata"]["catalog_coverage"] == "pending"
+    assert result["thumbnails"] == [{"type": "600 × 900", "status": "catalog_pending"}]
+    assert len(worker.opened) == 1 and not list(directory.glob("*.png"))
