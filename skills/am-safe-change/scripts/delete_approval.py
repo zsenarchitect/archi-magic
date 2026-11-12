@@ -53,7 +53,8 @@ def verify_dry_run(by_id, saved):
     if (run.get("mode") != "dry_run" or run.get("status") != "ok" or run.get("decision") != "rolled_back"
             or not isinstance(run_id, str) or not run_id.strip() or type(exit_code) is not int or exit_code != 0
             or run.get("approval") is not None or run.get("result_truncated") is not False
-            or run.get("error") is not None or any(run.get(field) for field in (
+            or "error" not in run or run["error"] is not None
+            or any(run.get(field) != [] for field in (
                 "blocked", "failures", "dialogs", "warnings", "closed_documents", "unclosed_documents"))):
         raise ValueError("Save the complete successful rolled-back Revit dry run.")
     changes = run["changes"]
