@@ -140,7 +140,9 @@ def compute(snapshot):
 
     plan = {"kind": "warning-repair-plan", "document": document, "basis_sha256": digest, "request": request,
             "blocked": blocked, "steps": [] if blocked else operations,
-            "expected_warnings": warning_rows(projected), "ownership_ids": [pair["remove_id"] for pair in pairs]}
+            "expected_warnings": warning_rows(projected), "ownership_ids": [pair["remove_id"] for pair in pairs],
+            "removal_ownership": {pair["remove_id"]: (snapshot["elements"].get(pair["remove_id"]) or {}).get("ownership")
+                                  for pair in pairs}}
     display = {"kind": "change-preview", "recipe": "warning-repair", "title": "Review Revit warning repairs",
                "basis_sha256": digest, "keyColumn": "Row", "columns": [
                    "Row", "Warning type", "Keep element ID", "Removal element ID", "Action or warning count"],

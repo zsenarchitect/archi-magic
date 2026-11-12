@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Read native warning repair evidence through the pyRevit Agent Runtime."""
+"""Read and apply reviewed warning repair pairs through the pyRevit Agent Runtime."""
 import hashlib
 import json
 import math
+from uuid import uuid4
 
 from System import Int64
 from System.Diagnostics import Stopwatch
@@ -300,9 +301,226 @@ def read_snapshot(document, request):
     return snapshot
 
 
+TRANSACTION_NAME = "Repair reviewed Revit warnings"
+
+
+def approved_snapshot(document, plan, display, approved_borrowing):
+    snapshot = read_snapshot(document, plan["request"])
+    if not isinstance(approved_borrowing, list) or len(approved_borrowing) > preview.MAX_PAIRS:
+        raise ValueError("Supply at most 20 reviewed borrowing IDs.")
+    ids = set(map(preview.element_id, approved_borrowing))
+    if len(ids) != len(approved_borrowing) or not ids.issubset(plan["ownership_ids"]):
+        raise ValueError("Review borrowing for approved removal IDs only.")
+    live_ownership = {}
+    actual_borrowing = []
+    for item in plan["ownership_ids"]:
+        element = snapshot["elements"][item]
+        current = element.get("ownership")
+        prior = plan["removal_ownership"][item]
+        live_ownership[item] = current
+        if item in ids and prior is not None and current is not None:
+            if prior[0] == "NotOwned" and current[0] == "OwnedByCurrentUser" and prior[1] == current[1]:
+                element["ownership"] = prior
+                actual_borrowing.append(item)
+    if set(actual_borrowing) != ids:
+        raise ValueError("The observed post-dry-run borrowing does not match the approved IDs.")
+    recomputed_plan, recomputed_display = preview.compute(snapshot)
+    if recomputed_plan["blocked"] or recomputed_plan != plan:
+        raise ValueError("The approved repair plan no longer matches the model.")
+    if display.get("blocked") is not False or any(warning.get("blocking") for warning in display["warnings"]):
+        raise ValueError("The displayed warning repair preview is blocked.")
+    for field, value in recomputed_display.items():
+        if field != "warnings" and display.get(field) != value:
+            raise ValueError("The displayed repair rows differ from the approved plan.")
+    annotation = display.get("ownership")
+    if annotation and (annotation["owned_by_others"] or annotation["updated_in_central"]):
+        raise ValueError("The displayed preview reports a worksharing conflict.")
+    return snapshot, live_ownership, actual_borrowing
+
+
+def install_failure_guard(transaction):
+    class RepairFailureGuard(DB.IFailuresPreprocessor):
+        __namespace__ = "ArchiMagic.WarningRepair." + uuid4().hex
+
+        def __init__(self):
+            self.failure_count = 0
+            self.failures = []
+
+        def PreprocessFailures(self, accessor):
+            try:
+                failures = accessor.GetFailureMessages()
+                self.failure_count += len(failures)
+                for failure in failures:
+                    if len(self.failures) == 20:
+                        break
+                    self.failures.append([str(failure.GetFailureDefinitionId().Guid), str(failure.GetSeverity())])
+            except Exception:
+                self.failure_count += 1
+            if self.failure_count:
+                return DB.FailureProcessingResult.ProceedWithRollBack
+            return DB.FailureProcessingResult.Continue
+
+    guard = RepairFailureGuard()
+    options = transaction.GetFailureHandlingOptions()
+    try:
+        options.SetFailuresPreprocessor(guard)
+        options.SetClearAfterRollback(True)
+        transaction.SetFailureHandlingOptions(options)
+    finally:
+        options.Dispose()
+    installed = transaction.GetFailureHandlingOptions()
+    try:
+        if installed.GetFailuresPreprocessor() != guard or not installed.GetClearAfterRollback():
+            raise ValueError("Revit did not install the transaction failure guard.")
+    finally:
+        installed.Dispose()
+    return guard
+
+
+def expected_room_state(rooms, aliases):
+    if rooms is None:
+        return None
+    result = {}
+    for item, room in rooms.items():
+        loops = []
+        for loop in room["loops"]:
+            edges = [(aliases.get(source, source) if linked == "-1" else source, linked, points)
+                     for source, linked, points in loop]
+            loops.append(canonical_loop(edges))
+        result[item] = dict(room, loops=sorted(loops))
+    return result
+
+
+def inspect_result(document, plan, clock, expect_rooms):
+    if project_identity(document) != plan["document"]:
+        raise ValueError("The repair result came from another project.")
+    warnings = native_warnings(document, clock)
+    if warnings != plan["expected_warnings"]:
+        raise ValueError("The resulting warning inventory differs from the approved warning reductions.")
+    kept = {}
+    budget = {"parameters": 4000, "relationships": 4000}
+    for step in plan["steps"]:
+        item = step["keep_id"]
+        state = describe_element(document, item, step["recipe"], budget, clock)
+        if state.get("eligible") is not True or state.get("uid") != step["keep_uid"]:
+            raise ValueError("A reviewed keeper is missing or changed identity.")
+        kept[item] = state
+        if document.GetElement(identifier(step["remove_id"])) is not None:
+            raise ValueError("A reviewed removal is still present.")
+        clock_check(clock)
+    rooms = room_inventory(document, clock) if expect_rooms else None
+    return kept, rooms, warnings
+
+
+def rollback(transaction, group):
+    try:
+        state = transaction.GetStatus()
+        if state == DB.TransactionStatus.Started:
+            state = transaction.RollBack()
+        if state == DB.TransactionStatus.Pending:
+            return False
+        group_state = group.GetStatus()
+        if group_state == DB.TransactionStatus.Started:
+            group_state = group.RollBack()
+        return group_state == DB.TransactionStatus.RolledBack
+    except Exception:
+        return False
+
+
+def apply(document, plan, display, approved_borrowing):
+    snapshot, live_ownership, borrowed = approved_snapshot(document, plan, display, approved_borrowing)
+    removals = set(plan["ownership_ids"])
+    aliases = {step["remove_id"]: step["keep_id"] for step in plan["steps"]
+               if step["recipe"] == "coincident-room-separators"}
+    expected_rooms = expected_room_state(snapshot["rooms"], aliases)
+    expected_keepers = {step["keep_id"]: snapshot["elements"][step["keep_id"]] for step in plan["steps"]}
+    application = document.Application
+    events = []
+
+    def record_change(_sender, event):
+        try:
+            same_document = event.GetDocument().Equals(document)
+            if not same_document:
+                events.append("other_document")
+                return
+            if events or list(event.GetTransactionNames()) != [TRANSACTION_NAME]:
+                events.append("unattributed")
+                return
+            added, modified = event.GetAddedElementIds(), event.GetModifiedElementIds()
+            deleted = event.GetDeletedElementIds()
+            if len(added) or len(modified) or len(deleted) != len(removals):
+                events.append("unexpected")
+                return
+            events.append({key(item) for item in deleted})
+        except Exception:
+            events.append("unavailable")
+
+    group = DB.TransactionGroup(document, TRANSACTION_NAME)
+    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    if group.Start() != DB.TransactionStatus.Started:
+        return {"status": "transaction_unresolved", "message": "Revit did not start the repair group."}
+    clock = Stopwatch.StartNew()
+    guard = None
+    try:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise ValueError("Revit did not start the repair transaction.")
+        guard = install_failure_guard(transaction)
+        application.DocumentChanged += record_change
+        try:
+            for step in plan["steps"]:
+                item = step["remove_id"]
+                element = document.GetElement(identifier(item))
+                if element is None or str(element.UniqueId) != step["remove_uid"]:
+                    raise ValueError("A removal element changed identity before deletion.")
+                state = ownership(document, element)
+                if state != live_ownership[item] or not writable(state):
+                    raise ValueError("Ownership or central state changed before deletion.")
+                clock_check(clock)
+                deleted = document.Delete(element.Id)
+                if len(deleted) != 1 or key(next(iter(deleted))) != item:
+                    raise ValueError("Revit returned an unapproved deletion set.")
+                clock_check(clock)
+            state = transaction.Commit()
+        finally:
+            application.DocumentChanged -= record_change
+        if guard.failure_count:
+            raise ValueError("Revit posted %d failure(s) during repair. Review the native warning or error."
+                             % guard.failure_count)
+        if state != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not commit the inner repair transaction.")
+        if "other_document" in events:
+            raise ValueError("Revit reported a change in another document. Review it separately.")
+        if events != [removals]:
+            raise ValueError("Revit did not report exactly the approved deletions with no other effects.")
+        clock_check(clock)
+        kept, rooms, warnings = inspect_result(document, plan, clock, expected_rooms is not None)
+        if kept != expected_keepers or rooms != expected_rooms:
+            raise ValueError("A survivor or room boundary differs from the approved state.")
+        receipt = {"document": plan["document"], "basis_sha256": plan["basis_sha256"],
+                   "deleted": sorted(removals, key=int), "kept_sha256": preview.snapshot_digest(kept),
+                   "rooms_sha256": preview.snapshot_digest(rooms), "warnings": warnings,
+                   "borrowed_after_dry_run": borrowed}
+        payload = json.dumps(receipt, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        if len(payload) > preview.MAX_BYTES:
+            raise ValueError("The repair receipt exceeds 2 MiB.")
+        clock_check(clock)
+        if group.Assimilate() != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not complete the repair group.")
+        return {"status": "ok", "receipt_json": payload}
+    except Exception as error:
+        if rollback(transaction, group):
+            return {"status": "stopped", "target_rollback_verified": True, "message": str(error),
+                    "posted_failures": guard.failures if guard else []}
+        return {"status": "transaction_unresolved", "message": "Check the Revit repair transaction before continuing.",
+                "posted_failures": guard.failures if guard else []}
+
+
 def main(document, args):
-    if args.get("mode", "read") != "read":
-        raise ValueError("Choose read for a native warning repair snapshot.")
+    mode = args.get("mode", "read")
+    if mode == "apply":
+        return apply(document, args["plan"], args["preview"], args.get("approved_borrowing", []))
+    if mode != "read":
+        raise ValueError("Choose read or apply for a native warning repair.")
     snapshot = read_snapshot(document, args["request"])
     return {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, sort_keys=True,
                                                         separators=(",", ":"), allow_nan=False)}
