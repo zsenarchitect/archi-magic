@@ -17,7 +17,7 @@ archi-magic functions today as a conversational agent inside the Revit session a
 
 ### Data Confidentiality and Governance
 - **Local Boundary Guarantee**: By default, the web workspace runs strictly on localhost (`127.0.0.1:<port>`). No geometry, parameters, or project notes leave the workstation.
-- **Office Network Mode**: When enabled for team collaboration, the server binds to the local area network with token-based authentication. Models remain on firm-managed file shares.
+- **Office Network Mode**: When enabled for team collaboration, an office HTTPS reverse proxy serves the LAN or VPN. One aiohttp service listens on loopback behind that proxy. Team members exchange individual tokens for browser sessions. Models remain on firm-managed file shares.
 - **Model Change Safety**: The web workspace is strictly informational and collaborative. It cannot write directly to the active Revit database. The native Revit Keep/Discard prompt remains the single mandatory gate for model transactions.
 
 ## 3. System Architecture

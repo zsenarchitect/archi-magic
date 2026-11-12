@@ -173,6 +173,16 @@ Build one read-only HTML page that shows audit results, a change preview, and an
 - Open **Frame element** on a changed or removed preview row to inspect its current geometry. The link uses the exact element ID.
 - The page escapes all model text. It sets a strict content policy.
 
+## Office review API (issue #187 Phase 2)
+
+Install the optional dependencies from `requirements-workspace.txt`. Use Python 3.10 or later on POSIX. Run `python scripts/workspace_server.py <private-config.json> --port 8765` from this skill folder.
+
+Configure `origin` as the canonical office HTTPS origin. Under `accounts`, map account names to SHA-256 digests of individual random tokens. Under `projects`, map slugs to `root`, `members`, and `targets`. Use absolute physical directories. Map project members to `viewer` or `editor`. Set `targets` to the exact review target keys allowed in the project.
+
+Preserve the canonical Host at the office HTTPS proxy. Disable caching of private responses. Keep the configuration outside project directories and protect it with operator-only permissions. The service listens only on `127.0.0.1`.
+
+Send `POST /session` with the token in a JSON body to start a browser session. Read state with `GET /projects/<project>/review`. Editors can send `PATCH` to the same route with `target`, `operation_id`, and `patch`. Send the current `ETag` as `If-Match`. Send `DELETE /session` to sign out.
+
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)
 
 - **Rhino navigation in custom three.js viewers**: `am-bim-viewer` uses Rhino mouse controls by default. When configuring a custom three.js `OrbitControls` viewer, set `controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }` (right-drag orbits, `Shift` + right-drag pans automatically, left-click selects, wheel zooms).

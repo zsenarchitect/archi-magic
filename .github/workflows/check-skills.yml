@@ -19,7 +19,7 @@ jobs:
         run: node design/tests/theme.test.js
       - name: Python skill tests (offline, every skills/*/tests with test_*.py)
         run: |
-          python3 -m pip install --quiet pytest pypdf ezdxf==1.4.5 -r skills/am-markup-intake/requirements-documents.txt
+          python3 -m pip install --quiet pytest pypdf ezdxf==1.4.5 -r skills/am-markup-intake/requirements-documents.txt -r skills/am-bim-viewer/requirements-workspace.txt
           n=0
           for d in skills/*/tests; do
             ls "$d"/test_*.py >/dev/null 2>&1 || continue
