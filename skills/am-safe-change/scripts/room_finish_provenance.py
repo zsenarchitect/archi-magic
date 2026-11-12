@@ -8,13 +8,15 @@ import re
 
 from Autodesk.Revit.DB.ExtensibleStorage import ContainerType, ExtensibleStorageFilter, Schema
 from pyrevit.api import DB
-from System import Guid, String
+from System import Guid, Int64, String
 
 
 SCHEMA_GUID = "cc22c4e6-6e21-4d64-a509-c6f4ec35725b"
 SCHEMA_NAME = "ArchiMagicRoomFinishV1"
 FIELDS = {"room_uid", "element_uid", "piece_key", "kind", "type_uid", "level_uid", "observed_sha256"}
 MAX_RECORDS = 10000
+MAX_NEARBY_MATCHES = 1000
+OVERLAP_TOLERANCE_FT = 1e-6
 TEXT = (str, type(u""))
 
 
@@ -144,6 +146,77 @@ def records_by_room(document, selected):
     return records
 
 
+def nearby_finish_scopes(document, row):
+    edges = [edge for loop in row["boundary_loops"] for edge in loop]
+    if row["horizontal_finishes"]:
+        points = [point for edge in edges for point in (edge["start_ft"], edge["end_ft"])]
+        for edge in edges:
+            if edge["curve_type"] == "Arc":
+                cx, cy = edge["center_ft"][:2]
+                radius = edge["radius_ft"]
+                points.extend([(cx - radius, cy - radius), (cx + radius, cy + radius)])
+        min_x, min_y = (min(point[i] for point in points) for i in (0, 1))
+        max_x, max_y = (max(point[i] for point in points) for i in (0, 1))
+        for finish in row["horizontal_finishes"]:
+            selected_type = document.GetElement(DB.ElementId(Int64(int(finish["type_id"]))))
+            structure = selected_type.GetCompoundStructure()
+            if structure is None:
+                raise ValueError("The selected finish type has no known thickness.")
+            try:
+                width = structure.GetWidth()
+            finally:
+                structure.Dispose()
+            if not 0 < width < float("inf"):
+                raise ValueError("The selected finish type has no known thickness.")
+            elevation = finish["project_elevation_ft"]
+            yield (finish["kind"], finish["type_id"],
+                   (min_x, min_y, elevation - width), (max_x, max_y, elevation + width))
+    if row.get("wall_finish", {}).get("status") == "reported":
+        room = document.GetElement(DB.ElementId(Int64(row["room_id"])))
+        box = room.get_BoundingBox(None)
+        if box is None or not box.Enabled or not box.Transform.IsIdentity or not box.Min.Z < box.Max.Z:
+            raise ValueError("The room's vertical scope is unavailable.")
+        wall = row["wall_finish"]
+        half_width = wall["width_ft"] / 2.0
+        for edge in edges:
+            for footprint in edge["wall_finish"]["finish_footprints"]:
+                a, b = footprint["centerline_ft"]
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                length = math.hypot(dx, dy)
+                pad_x, pad_y = abs(dy) * half_width / length, abs(dx) * half_width / length
+                yield ("wall", wall["type_id"],
+                       (min(a[0], b[0]) - pad_x, min(a[1], b[1]) - pad_y, box.Min.Z),
+                       (max(a[0], b[0]) + pad_x, max(a[1], b[1]) + pad_y, box.Max.Z))
+
+
+def nearby_finishes(document, row, recorded_ids):
+    candidates = {}
+    visited = 0
+    classes = {"wall": DB.Wall, "floor": DB.Floor, "ceiling": DB.Ceiling}
+    for kind, selected_type, low, high in nearby_finish_scopes(document, row):
+        outline = DB.Outline(DB.XYZ(*low), DB.XYZ(*high))
+        collector = DB.FilteredElementCollector(document)
+        filter_ = None
+        try:
+            filter_ = DB.BoundingBoxIntersectsFilter(outline, -OVERLAP_TOLERANCE_FT)
+            for element in collector.OfClass(classes[kind]).WherePasses(filter_):
+                visited += 1
+                if visited > MAX_NEARBY_MATCHES:
+                    raise ValueError("The nearby finish inventory is incomplete.")
+                element_id = str(element.Id.Value)
+                if element_id in recorded_ids:
+                    continue
+                type_id = str(element.GetTypeId().Value)
+                candidates[element_id] = {"id": element_id, "uid": str(element.UniqueId), "kind": kind,
+                                          "type_id": type_id, "same_selected_type": type_id == selected_type}
+        finally:
+            collector.Dispose()
+            if filter_ is not None:
+                filter_.Dispose()
+            outline.Dispose()
+    return sorted(candidates.values(), key=lambda item: int(item["id"]))
+
+
 def audit_existing_finishes(document, rows):
     selected = {row["room_uid"] for row in rows if row["status"] == "boundary_verified"}
     records = records_by_room(document, selected)
@@ -156,6 +229,12 @@ def audit_existing_finishes(document, rows):
         if row.get("wall_finish", {}).get("status", "reported") != "reported":
             audit["reason"] = "wall_preview_incomplete"
             continue
+        try:
+            recorded_ids = {str(element.Id.Value) for _, element in existing}
+            nearby = nearby_finishes(document, row, recorded_ids)
+            audit["nearby"] = {"status": "review_required" if nearby else "none_in_scope", "candidates": nearby}
+        except Exception as error:
+            audit["nearby"] = {"status": "unavailable", "reason": type(error).__name__}
         try:
             expected = expected_pieces(row)
             audit["expected_piece_keys"] = sorted(expected)

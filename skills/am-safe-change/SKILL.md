@@ -217,7 +217,9 @@ Pass `wall_type_id` to review a basic wall finish type and its width. Review eac
 
 Review `finish_footprints` for the centerlines that fit inside the room outline at the selected width. The check accounts for holes in straight-edged outlines. Curved outlines need separate review. Within each room, longer pieces take priority when footprints overlap. Review `original_span_ft` and `span_ft` for any trim. Check oblique joints for gaps before placement.
 
-Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict. Check untagged finishes separately. This query registers no schema and writes no elements.
+Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict.
+
+Review `nearby.candidates` for other walls, floors, and ceilings whose bounding boxes intersect a proposed finish scope. These are candidates for review. Check the actual geometry before deciding whether a candidate overlaps a finish. An unavailable scan leaves the report incomplete. This query registers no schema and writes no elements.
 
 ## House rules (all am-* skills)
 

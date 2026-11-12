@@ -95,9 +95,13 @@ class FloorType:
     UniqueId = "synthetic-floor-type"
     IsFoundationSlab = False
 
+    def GetCompoundStructure(self):
+        return NS(GetWidth=lambda: 0.25, Dispose=lambda: None)
+
 
 class CeilingType:
     UniqueId = "synthetic-ceiling-type"
+    GetCompoundStructure = FloorType.GetCompoundStructure
 
 
 class WallType:
@@ -358,7 +362,9 @@ def test_wall_finish_excludes_unverified_insert_without_hiding_horizontal_previe
     assert row["boundary_loops"][0][0]["wall_finish"] == {"status": "excluded", "reason": reason}
 
 
-@pytest.mark.parametrize("state", ["empty", "match", "partial", "copied", "edited", "wrong_geometry"])
+@pytest.mark.parametrize("state", [
+    "empty", "match", "partial", "copied", "edited", "wrong_geometry", "nearby", "nearby_unavailable",
+])
 def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monkeypatch, state):
     db = sys.modules["pyrevit.api"].DB
     db.StorageType.Double = "double"
@@ -402,7 +408,29 @@ def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monke
     db.Ceiling = type("Ceiling", (Floor,), {})
     db.Sketch = type("Sketch", (), {})
     db.Wall = Wall
-    db.FilteredElementCollector = lambda _doc: NS(WherePasses=lambda _filter: tagged, Dispose=lambda: None)
+    db.XYZ = Point
+    db.Outline = lambda low, high: NS(low=low, high=high, Dispose=lambda: None)
+    db.BoundingBoxIntersectsFilter = lambda box, tolerance: NS(
+        box=box, tolerance=tolerance, Dispose=lambda: None,
+    )
+    manual_floor = NS(Id=NS(Value=203), UniqueId="manual-floor", GetTypeId=lambda: NS(Value=103))
+
+    def near(class_, filter_):
+        low, high = filter_.box.low, filter_.box.high
+        z = 25.0 if class_ is Floor else 34.0
+        assert (low.X, low.Y, low.Z, high.X, high.Y, high.Z) == (0, 0, z - 0.25, 8, 8, z + 0.25)
+        assert filter_.tolerance == -1e-6
+        if state == "nearby_unavailable":
+            raise RuntimeError("fixture collector failed")
+        if class_ is Floor:
+            return [floor, manual_floor] if state == "nearby" else ([floor] if floor in tagged else [])
+        return [ceiling] if ceiling in tagged else []
+
+    db.FilteredElementCollector = lambda _doc: NS(
+        WherePasses=lambda _filter: tagged,
+        OfClass=lambda class_: NS(WherePasses=lambda filter_: near(class_, filter_)),
+        Dispose=lambda: None,
+    )
 
     boundary = loop(rectangle(0, 0, 8, 8))
     room = Room(Seq([boundary]))
@@ -434,7 +462,53 @@ def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monke
     if state in ("empty", "match"):
         assert report["status"] == "reported"
         assert audit["status"] == ("no_tagged_pieces" if state == "empty" else "tagged_set_matches")
+        assert audit["nearby"] == {"status": "none_in_scope", "candidates": []}
+    elif state in ("nearby", "nearby_unavailable"):
+        assert report["status"] == "incomplete" and audit["status"] == "tagged_set_matches"
+        if state == "nearby":
+            assert audit["nearby"] == {"status": "review_required", "candidates": [
+                {"id": "203", "uid": "manual-floor", "kind": "floor", "type_id": "103", "same_selected_type": True},
+            ]}
+        else:
+            assert audit["nearby"] == {"status": "unavailable", "reason": "RuntimeError"}
     else:
         assert report["status"] == "incomplete" and audit["status"] == "conflict"
         assert audit["reason"] == ("tagged_piece_set_differs" if state == "partial"
                                     else "tagged_piece_changed_or_copied")
+
+
+def test_existing_wall_scan_uses_each_trimmed_footprint_and_deduplicates_candidates(run, monkeypatch):
+    db = sys.modules["pyrevit.api"].DB
+    db.Floor, db.Ceiling = type("Floor", (), {}), type("Ceiling", (), {})
+    monkeypatch.setitem(sys.modules, "Autodesk.Revit.DB.ExtensibleStorage", NS(
+        ContainerType=NS(Simple="simple"), ExtensibleStorageFilter=str, Schema=NS(Lookup=lambda _guid: None),
+    ))
+    monkeypatch.delitem(sys.modules, "room_finish_provenance", raising=False)
+    db.XYZ = Point
+    db.Outline = lambda low, high: NS(low=low, high=high, Dispose=lambda: None)
+    db.BoundingBoxIntersectsFilter = lambda box, _tolerance: box
+    seen = []
+    manual = NS(Id=NS(Value=201), UniqueId="manual-wall", GetTypeId=lambda: NS(Value=103))
+
+    def near(box):
+        low, high = box.low, box.high
+        seen.append((low.X, low.Y, low.Z, high.X, high.Y, high.Z))
+        return [manual]
+
+    db.FilteredElementCollector = lambda _doc: NS(
+        OfClass=lambda _class: NS(WherePasses=near), Dispose=lambda: None,
+    )
+    room = Room(Seq([loop(rectangle(0, 0, 10, 8), source=[50, 51, 52, 53])]))
+    room.get_BoundingBox = lambda _view: NS(Enabled=True, Transform=NS(IsIdentity=True),
+                                           Min=Point(0, 0, 24.75), Max=Point(10, 8, 35))
+    report = run({1: room, 50: Wall(50), 51: Wall(51), 52: Wall(52), 53: Wall(53),
+                  101: Level(), 102: Phase(), 103: WallType()}, ["1"],
+                 wall_type_id="103", audit_existing_finishes=True)
+    assert report["status"] == "incomplete"
+    assert set(seen) == {
+        (0, 0, 24.75, 10, 0.125, 35), (0, 7.875, 24.75, 10, 8, 35),
+        (0, 0.125, 24.75, 0.125, 7.875, 35), (9.875, 0.125, 24.75, 10, 7.875, 35),
+    }
+    assert report["rooms"][0]["existing_finishes"]["nearby"]["candidates"] == [
+        {"id": "201", "uid": "manual-wall", "kind": "wall", "type_id": "103", "same_selected_type": True},
+    ]

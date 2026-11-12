@@ -361,6 +361,8 @@ def inspect_room(room, room_id, options, remaining):
                 }
                 if facts_for_curve["curve_type"] == "Arc":
                     facts_for_curve["midpoint_ft"] = xyz(curve.Evaluate(0.5, True))
+                    facts_for_curve["center_ft"] = xyz(curve.Center)
+                    facts_for_curve["radius_ft"] = curve.Radius
                 loop_facts.append(facts_for_curve)
             if not profile.HasPlane():
                 return excluded(room_id, "nonplanar_boundary_loop"), count
@@ -429,6 +431,8 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
         "status": "reported" if all(row["status"] == "boundary_verified"
                                    and row.get("wall_finish", {}).get("status", "reported") == "reported"
                                    and row.get("existing_finishes", {}).get("status") != "conflict"
+                                   and row.get("existing_finishes", {}).get("nearby", {}).get(
+                                       "status", "none_in_scope") == "none_in_scope"
                                    for row in rows) else "incomplete",
         "rooms": rows,
         "boundary_location": "finish",
