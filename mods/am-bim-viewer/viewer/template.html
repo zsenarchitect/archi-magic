@@ -1750,9 +1750,44 @@ window.__bim = {
   }),
 };
 
+function frameLinkedElements() {
+  const prefix = '#elements=';
+  if (!location.hash.startsWith(prefix)) return;
+  const ids = location.hash.slice(prefix.length).split(',');
+  if (ids.some(id => !/^[1-9][0-9]{0,18}$/.test(id) || BigInt(id) > 9223372036854775807n)
+      || new Set(ids).size !== ids.length) {
+    toast('Invalid element link.');
+    return;
+  }
+  const requested = new Set(ids);
+  const matched = new Map();
+  for (const mesh of meshes) {
+    const raw = mesh.userData.el.id;
+    if (typeof raw === 'number' && !Number.isSafeInteger(raw)) continue;
+    const id = String(raw);
+    if (requested.has(id)) matched.set(id, matched.has(id) ? null : mesh);
+  }
+  const found = ids.map(id => matched.get(id)).filter(mesh => {
+    if (!mesh) return false;
+    const geometry = mesh.userData.el.mesh;
+    return geometry.indices.length > 0 && geometry.vertices.length > 0 && geometry.vertices.every(Number.isFinite);
+  });
+  if (!found.length) {
+    toast('No linked elements found in this model.');
+    return;
+  }
+  if (found.length === 1) select(found[0]);
+  fitBounds(state, meshBounds(found.map(mesh => posedEl(mesh.userData.el))));
+  requestRender();
+  toast(found.length < ids.length
+    ? 'Framed ' + found.length + ' of ' + ids.length + ' elements.'
+    : 'Framed ' + found.length + (found.length === 1 ? ' element.' : ' elements.'));
+}
+
 state.aspect = aspect();
 setView('perspective');
 showProps(null);
+frameLinkedElements();
 </script>
 </body>
 </html>
