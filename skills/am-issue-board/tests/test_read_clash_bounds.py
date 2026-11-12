@@ -118,3 +118,58 @@ def test_reader_reports_missing_visibility_and_refuses_stale_identity(runtime):
     request["active_view_uid"] = "other-view"
     with pytest.raises(ValueError, match="current view differs"):
         reader(host, request)
+
+
+@pytest.mark.parametrize("state", ["ready", "name_collision", "default_template", "unresolved"])
+def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_path, state):
+    reader, host, request, links = runtime
+    guid = "11111111-0000-4000-8000-000000000001"
+    view_name = "Clash " + guid
+    request["view_request"] = {"clash_guid": guid, "view_type_id": "8"}
+    db = reader.__globals__["DB"]
+    db.ViewFamilyType = type("ViewFamilyType", (), {})
+    db.ViewFamily = NS(ThreeDimensional="3D")
+    db.View = type("View", (), {})
+    db.NamingUtils = NS(IsValidName=lambda name: name == view_name)
+    named = [NS(Name=view_name.upper(), Id=Id(9), UniqueId="prior-view")] if state == "name_collision" else []
+    db.FilteredElementCollector = lambda _host: NS(OfClass=lambda _class: named)
+    family_type = db.ViewFamilyType()
+    family_type.ViewFamily = "3D"
+    family_type.UniqueId = "fixture-view-type"
+    family_type.DefaultTemplateId = Id(99 if state == "default_template" else -1)
+    get_element = host.GetElement
+    host.GetElement = lambda item: family_type if item.Value == 8 else get_element(item)
+    if state == "unresolved":
+        links[1].hidden = True
+    native = reader(host, request)
+    record = tmp_path / "full-run.json"
+    record.write_text(json.dumps({"result": native}))
+    xml = tmp_path / "fixture.xml"
+    objects = "".join(
+        '<clashobject><objectattribute><name>Element ID</name><value>42</value></objectattribute>'
+        f'<pathlink><node>{prefix}</node><node>Fixture</node></pathlink></clashobject>'
+        for prefix in ("Rotated", "Mirrored")
+    )
+    xml.write_text('<exchange units="m"><batchtest><clashtests><clashtest><clashresults>'
+                   f'<clashresult guid="{guid}" name="Fixture clash" status="new">'
+                   f'<clashobjects>{objects}</clashobjects></clashresult>'
+                   '</clashresults></clashtest></clashtests></batchtest></exchange>')
+    output = subprocess.run(
+        [sys.executable, str(SCRIPTS / "navisworks_clash_cli.py"), str(xml),
+         "--snapshot", str(record), "--view-clash", guid],
+        check=True, text=True, capture_output=True,
+    )
+    result = json.loads(output.stdout)
+    plan, display = result["view_plan"], result["view_preview"]
+    assert plan["view"]["name"] == view_name
+    assert display["basis_sha256"] == plan["basis_sha256"]
+    assert display["review_only"] and display["steps"] == [] and display["ownership_ids"] == []
+    assert result["plan"] is None
+    if state == "ready":
+        assert [target["link_instance_id"] for target in plan["targets"]] == ["6", "7"]
+        assert [target["element_id"] for target in plan["targets"]] == ["42", "42"]
+        assert display["after"][-1][-1] == [21, 4, 4]
+        assert plan["steps"] == [{"action": "create_view"}]
+    else:
+        assert plan["blocked"] and display["blocked"] and plan["steps"] == []
+        assert display["warnings"][0]["blocking"]

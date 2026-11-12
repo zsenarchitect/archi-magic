@@ -298,7 +298,7 @@ def point(value):
     return value
 
 
-def element_snapshot(raw):
+def snapshot_document(raw):
     doc = json_input(raw)
     doc = doc.get("response", doc)
     if "result" in doc:
@@ -312,6 +312,10 @@ def element_snapshot(raw):
         if not isinstance(encoded, str) or not encoded.isascii() or len(encoded) > LIMIT:
             raise ValueError("The Revit clash snapshot is unavailable or exceeds its limit.")
         doc = json_input(encoded.encode("ascii"))
+    return doc
+
+
+def element_snapshot(doc):
     if doc["coordinate_frame"] != FRAME or not text(doc["host_id"]):
         raise ValueError("Use a named Revit host snapshot in internal feet.")
     sources = doc["sources"]
@@ -350,17 +354,24 @@ def element_snapshot(raw):
     return doc["host_id"], index
 
 
-def section_box(objects, index, padding):
+def mapped_elements(objects, index):
     if len(objects) != 2:
         return None
     targets = []
     for item in objects:
         path = tuple(item["selection_path"])
-        matched = [elements for prefix, elements in index.items() if path[:len(prefix)] == prefix]
-        if len(matched) != 1 or item["element_id"] not in matched[0]:
+        matches = [elements for prefix, elements in index.items() if path[:len(prefix)] == prefix]
+        if len(matches) != 1 or item["element_id"] not in matches[0]:
             return None
-        targets.append(matched[0][item["element_id"]])
+        targets.append(matches[0][item["element_id"]])
     if (targets[0]["model_id"], targets[0]["unique_id"]) == (targets[1]["model_id"], targets[1]["unique_id"]):
+        return None
+    return targets
+
+
+def section_box(objects, index, padding):
+    targets = mapped_elements(objects, index)
+    if targets is None:
         return None
     low = [min(a, b) - padding for a, b in zip(targets[0]["min"], targets[1]["min"])]
     high = [max(a, b) + padding for a, b in zip(targets[0]["max"], targets[1]["max"])]
@@ -369,6 +380,59 @@ def section_box(objects, index, padding):
     return {"min": low, "max": high, "targets": [
         {key: item[key] for key in ("model_id", "unique_id")} for item in targets
     ]}
+
+
+def section_view_preview(guid, clashes, snapshot, padding, report_sha256):
+    if str(uuid.UUID(guid)) != guid:
+        raise ValueError("Choose one canonical clash GUID.")
+    selected = [clash for clash in clashes if clash["guid"] == guid]
+    if len(selected) != 1 or snapshot["kind"] != "navisworks-revit-snapshot":
+        raise ValueError("Use one XML clash and its Revit section-view snapshot.")
+    clash = selected[0]
+    target = snapshot["view_target"]
+    name = "Clash " + guid
+    if target["clash_guid"] != guid or target["name"] != name or not text(target["view_type_uid"]):
+        raise ValueError("The snapshot is for a different clash or view type.")
+    _, index = element_snapshot(snapshot)
+    mapped = mapped_elements(clash["objects"], index)
+    box = section_box(clash["objects"], index, padding)
+    warnings = []
+    if not box:
+        warnings.append({"row": "view", "text": "Both exact Revit targets need verified bounds.", "blocking": True})
+    if target["default_template_id"] != "-1":
+        warnings.append({"row": "view", "text": "Choose a 3D view type without a default template.", "blocking": True})
+    if target["name_conflicts"]:
+        warnings.append({"row": "view", "text": "A clash view name is already in use. Verify the existing view before retrying.",
+                         "blocking": True})
+    sources = {item["model_id"]: item for item in snapshot["sources"]}
+    rows = []
+    targets = []
+    for position, (source_object, element) in enumerate(zip(clash["objects"], mapped or []), 1):
+        source = sources[element["model_id"]]
+        if not source["document_identity"]:
+            raise ValueError("A mapped source does not have a saved document identity.")
+        targets.append({"model_id": element["model_id"], "element_id": source_object["element_id"],
+                        "element_uid": element["unique_id"], "link_instance_id": source["link_instance_id"],
+                        "link_instance_uid": source["link_instance_uid"],
+                        "document_identity": source["document_identity"], "min": element["min"], "max": element["max"]})
+        rows.append(["target:%d" % position, "Clash element", element["model_id"],
+                     source_object["element_id"], element["min"], element["max"]])
+    view = ["view", name, None, None, box["min"] if box else None, box["max"] if box else None]
+    blocked = bool(warnings)
+    basis = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    digest = hashlib.sha256(basis.encode("ascii")).hexdigest()
+    plan = {"kind": "navisworks-section-view-plan", "basis_sha256": digest, "report_sha256": report_sha256,
+            "host_identity": snapshot["host_identity"], "active_view_uid": snapshot["active_view_uid"],
+            "request": snapshot["request"], "view": target, "targets": targets, "box": box,
+            "padding_ft": padding, "blocked": blocked, "steps": [] if blocked else [{"action": "create_view"}]}
+    display = {"kind": "change-preview", "recipe": "navisworks-section-view", "title": "Create a Navisworks clash view",
+               "basis_sha256": digest, "keyColumn": "Row",
+               "columns": ["Row", "View or target", "Source", "Element ID", "Minimum ft", "Maximum ft"],
+               "changedColumns": ["Minimum ft", "Maximum ft"], "before": rows, "after": rows + [view],
+               "notes": ["Clash %s. Section box padding %.3f ft." % (guid, padding),
+                         "Verify both target elements in the kept view before recording view availability."],
+               "warnings": warnings, "blocked": blocked, "steps": [], "ownership_ids": [], "review_only": True}
+    return plan, display
 
 
 def board_rows(path, *, archive=False):
@@ -441,6 +505,7 @@ def main(argv=None):
     parser.add_argument("--padding-ft", type=float, default=1.0)
     parser.add_argument("--board")
     parser.add_argument("--archive")
+    parser.add_argument("--view-clash", help="Preview one section view for an XML clash GUID")
     args = parser.parse_args(argv)
     suffix = Path(args.report).suffix.lower()
     is_html = suffix in (".html", ".htm")
@@ -451,10 +516,13 @@ def main(argv=None):
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
+        if args.view_clash and (is_html or not args.snapshot or args.board):
+            raise ValueError("Use XML and a Revit snapshot in a separate section-view preview.")
         raw = local_bytes(args.report)
         units, clashes = parse_tabular_report(raw) if is_html else parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
-        host, index = element_snapshot(snapshot) if snapshot is not None else (None, {})
+        snapshot_data = snapshot_document(snapshot) if snapshot is not None else None
+        host, index = element_snapshot(snapshot_data) if snapshot_data is not None else (None, {})
         for row in clashes:
             row["section_box"] = section_box(row["objects"], index, args.padding_ft)
             row["warnings"] = []
@@ -474,6 +542,10 @@ def main(argv=None):
             "clashes": clashes, "plan": plan, "skipped_guids": skipped,
             "warnings": ["Archive note not checked for duplicates."] if args.board and not args.archive else [],
         }
+        if args.view_clash:
+            report["view_plan"], report["view_preview"] = section_view_preview(
+                args.view_clash, clashes, snapshot_data, args.padding_ft, report["report_sha256"]
+            )
         if is_html:
             report["warnings"].append("Tabular rows lack clash GUIDs and selection-tree paths. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)

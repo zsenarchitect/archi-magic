@@ -3,6 +3,7 @@
 import itertools
 import json
 import re
+from uuid import UUID
 
 from System import Int64
 from System.Diagnostics import Stopwatch
@@ -108,6 +109,30 @@ def read_scope(host, scope, view, clock):
     return result
 
 
+def read_view_target(host, request, clock):
+    clash_guid = request["clash_guid"]
+    if not isinstance(clash_guid, TEXT) or str(UUID(str(clash_guid))) != clash_guid:
+        raise ValueError("Choose one canonical Navisworks clash GUID.")
+    view_type_id = request["view_type_id"]
+    view_type = host.GetElement(element_id(view_type_id))
+    if (not isinstance(view_type, DB.ViewFamilyType) or view_type.ViewFamily != DB.ViewFamily.ThreeDimensional
+            or not view_type.UniqueId):
+        raise ValueError("Choose a reviewed orthographic 3D view type.")
+    name = "Clash " + clash_guid
+    if not DB.NamingUtils.IsValidName(name):
+        raise ValueError("Revit rejected the proposed clash view name.")
+    matches = []
+    for index, view in enumerate(DB.FilteredElementCollector(host).OfClass(DB.View)):
+        budget_check(clock)
+        if index >= 10000:
+            raise ValueError("More than 10,000 view names. The view name inventory is incomplete.")
+        if view.Name.upper() == name.upper():
+            matches.append({"id": str(view.Id.Value), "uid": str(view.UniqueId), "name": view.Name})
+    return {"clash_guid": clash_guid, "name": name, "view_type_id": view_type_id,
+            "view_type_uid": str(view_type.UniqueId), "default_template_id": str(view_type.DefaultTemplateId.Value),
+            "name_conflicts": sorted(matches, key=lambda item: int(item["id"]))}
+
+
 def main(host, request):
     if host is None or host.IsFamilyDocument or host.ActiveView is None:
         raise ValueError("Open a saved Revit project with a model view.")
@@ -130,6 +155,9 @@ def main(host, request):
     payload = {"kind": "navisworks-revit-snapshot", "coordinate_frame": FRAME,
                "host_id": identity["project_uid"] + "/" + identity["path_sha256"],
                "host_identity": identity, "active_view_uid": str(view.UniqueId), "sources": results}
+    if "view_request" in request:
+        payload["view_target"] = read_view_target(host, request["view_request"], clock)
+        payload["request"] = request
     encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
     budget_check(clock)
     if len(encoded) > LIMIT:
