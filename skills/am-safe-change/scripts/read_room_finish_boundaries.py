@@ -612,28 +612,32 @@ def native_preflight(document, selection, preflight):
             "checks": checks, "placement_available": False}
 
 
-if doc is None or doc.IsFamilyDocument:
-    result = {"error": "Open a Revit project before reading room boundaries."}
-elif inputs.get("room_views") is not None:
+def run_query(document, args):
+    if document is None or document.IsFamilyDocument:
+        return {"error": "Open a Revit project before reading room boundaries."}
+    if args.get("room_views") is None:
+        report = read_boundaries(document, ids_from(args.get("room_ids")))
+        return {"payload": json.dumps(report, ensure_ascii=True)}
     try:
-        selection = inputs["room_views"]
+        selection = args["room_views"]
         if not isinstance(selection, dict):
             raise ValueError("Provide room view selections as an object.")
-        preflight = inputs.get("room_view_preflight")
+        preflight = args.get("room_view_preflight")
         if preflight is None:
-            snapshot, _ = read_room_view_snapshot(doc, selection)
+            snapshot, _ = read_room_view_snapshot(document, selection)
             payload = json.dumps(snapshot, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
             response = {"status": "reported", "payload": payload}
         else:
-            response = native_preflight(doc, selection, preflight)
+            response = native_preflight(document, selection, preflight)
             payload = json.dumps(response, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         if len(payload) > MAX_BYTES:
             raise ValueError("Room view evidence exceeds the read byte limit.")
-        result = response
+        return response
     except ValueError as exc:
-        result = {"status": "blocked", "reason": str(exc)}
+        return {"status": "blocked", "reason": str(exc)}
     except Exception as exc:
-        result = {"status": "blocked", "reason": "Native room view read failed.", "error_type": type(exc).__name__}
-else:
-    report = read_boundaries(doc, ids_from(inputs.get("room_ids")))
-    result = {"payload": json.dumps(report, ensure_ascii=True)}
+        return {"status": "blocked", "reason": "Native room view read failed.", "error_type": type(exc).__name__}
+
+
+if "doc" in globals() and "inputs" in globals():
+    result = run_query(doc, inputs)
