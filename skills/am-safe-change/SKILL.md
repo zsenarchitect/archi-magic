@@ -19,6 +19,12 @@ Recipes (the task-specific parts):
 
 - Clear visibility hides: [recipes/hidden-elements.md](recipes/hidden-elements.md). Use it to diagnose hide sources and review an unhide.
 
+### Read sheet revisions and clouds
+
+Run `scripts/read_sheets.py` with `run_query`. Pass up to 30 real sheet IDs as decimal strings in `revision_sheet_ids`. Use `revision_ids` to include specific project revisions that are not on the selected sheets. Decode `snapshot_json` to review revision numbers, manually added revisions, cloud owners, and comments.
+
+Use `scheduled` to identify the clouds included in the native sheet revision schedule. Review cloud rows with `revision_on_sheet` set to `false`. Revit can identify a candidate cloud through its owner view or related views even if visibility or cropping keeps it off the sheet. The report is read-only.
+
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
 ## The 8 steps (do all of them, in this order)
