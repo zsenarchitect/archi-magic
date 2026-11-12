@@ -420,6 +420,15 @@ def test_color_preview_rejects_duplicate_element_membership(reader):
         build(inventory)
 
 
+def formatted_text(text):
+    return NS(
+        GetPlainText=lambda: text, AsTextRange=lambda: object(), GetListType=lambda _span: "None",
+        GetIndentLevel=lambda _span: 0, Dispose=lambda: None,
+        **{method: lambda: "None" for method in ("GetBoldStatus", "GetItalicStatus", "GetUnderlineStatus",
+                                                  "GetAllCapsStatus", "GetSuperscriptStatus", "GetSubscriptStatus")},
+    )
+
+
 def native_legend_fixture(reader, monkeypatch, existing=None):
     from view_color_preview import legend_name, workflow_identity
 
@@ -456,6 +465,12 @@ def native_legend_fixture(reader, monkeypatch, existing=None):
         VersionGuid = "legend-version"
         ViewTemplateId = ElementId(-1)
         Scale = 1
+        Origin = NS(X=0, Y=0, Z=0)
+        RightDirection = NS(X=1, Y=0, Z=0)
+        UpDirection = NS(X=0, Y=1, Z=0)
+
+        def GetCategoryHidden(self, _identifier):
+            return False
 
         def GetTypeId(self):
             return ElementId(71)
@@ -469,6 +484,17 @@ def native_legend_fixture(reader, monkeypatch, existing=None):
         OwnerViewId = ElementId(41)
         Text = "Existing North label"
         Coord = NS(X=0.1, Y=0.2, Z=0)
+        Category = NS(Id=ElementId(-200))
+        HorizontalAlignment = "Left"
+
+        def IsHidden(self, _view):
+            return False
+
+        def GetFormattedText(self):
+            return formatted_text(self.Text)
+
+        def get_BoundingBox(self, _view):
+            return None
 
         def GetTypeId(self):
             return ElementId(73)
@@ -543,10 +569,70 @@ def test_native_legend_preserves_collisions_and_records_existing_contents(reader
         assert preflight["existing"]["placements"] == [["200", "sheet-200", "A-101", "201", "viewport-201"]]
         assert preflight["existing"]["contents"] == [
             {"id": "151", "uid": "note-151", "owner_id": "41", "type_id": "73", "native_kind": "TextNote",
-             "kind": "note", "text": "Existing North label", "position": [0.1, 0.2, 0.0], "leaders": 0},
+             "kind": "note", "text": "Existing North label", "position": [0.1, 0.2, 0.0], "leaders": 0,
+             "visible": True, "plain": True, "bounds_ft": None},
         ]
     proposal, display = build(inventory)
     assert proposal["blocked"] and any(expected in item["text"] for item in display["warnings"])
+
+
+@pytest.mark.parametrize("difference", [None, "note_format", "swatch_color", "extra_element", "filter_pattern"])
+def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reader, monkeypatch, difference):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    document, args, _, _ = native_legend_fixture(reader, monkeypatch)
+    inventory = json.loads(reader["main"](document, args)["inventory_json"])
+    native = qualifying_inventory(reader, [candidate(101, parameter("String", "North"), "North")],
+                                  existing=[existing_filter(201, "North")],
+                                  applied=[(201, (True, True))], reuse=True)
+    inventory["existing_filters"] = native["existing_filters"]
+    inventory["link_candidate_ids"] = []
+    solid = {"kind": "element", "id": "74"}
+    graphics = reuse_by_value(inventory)["North"]["exact"][0]
+    graphics["graphics"] = dict(existing_graphics([30, 90, 160]), SurfaceForegroundPatternId=solid,
+                                CutForegroundPatternId=solid)
+    initial, _ = build(inventory)
+    row = initial["legend_rows"][0]
+    left, bottom, right, top = row["swatch_bounds_ft"]
+    corners = [[left, bottom, 0], [right, bottom, 0], [right, top, 0], [left, top, 0]]
+    edges = sorted(sorted([a, b]) for a, b in zip(corners, corners[1:] + corners[:1]))
+    swatch = {"id": "501", "uid": "region-501", "owner_id": "41", "kind": "region", "type_id": "72",
+              "visible": True, "lines": [edges], "graphics": {
+                  "SurfaceForegroundPatternId": solid, "SurfaceForegroundPatternColor": [30, 90, 160],
+                  "IsSurfaceForegroundPatternVisible": True, "IsSurfaceBackgroundPatternVisible": False,
+              }}
+    x, y = row["label_origin_ft"]
+    note = {"id": "502", "uid": "note-502", "owner_id": "41", "kind": "note", "type_id": "73",
+            "visible": True, "plain": True, "leaders": 0, "text": row["label"], "position": [x, y, 0],
+            "bounds_ft": [x, y - 0.01, x + 0.1, y]}
+    contents = [swatch, note]
+    placements = [["200", "sheet-200", "A-101", "201", "viewport-201"]]
+    inventory["legend_preflight"].update(state="existing_requires_verification", existing={
+        "id": "41", "uid": "legend-41", "scale": 1, "placements": placements, "contents": contents,
+        "frame": {"origin": [0, 0, 0], "right": [1, 0, 0], "up": [0, 1, 0]},
+    })
+    if difference == "note_format":
+        note["plain"] = False
+    elif difference == "swatch_color":
+        swatch["graphics"]["SurfaceForegroundPatternColor"] = [1, 2, 3]
+    elif difference == "extra_element":
+        contents.append(dict(note, id="503", uid="note-503"))
+    elif difference == "filter_pattern":
+        graphics["graphics"]["CutForegroundPatternId"] = {"kind": "element", "id": "75"}
+
+    proposal, preview = build(inventory)
+    if difference in (None, "filter_pattern"):
+        assert proposal["legend_reuse"] == {"view_id": "41", "view_uid": "legend-41", "placements": placements,
+                                            "pairs": [{"value_key": row["value_key"], "region_id": "501",
+                                                       "region_uid": "region-501", "note_id": "502",
+                                                       "note_uid": "note-502"}]}
+        assert proposal["blocked"] is False
+        assert proposal["no_change_candidate"] is (difference is None)
+        assert (preview["after"][0][4] == "Filter and legend match") is (difference is None)
+    else:
+        assert proposal["blocked"] and not proposal["no_change_candidate"] and proposal["legend_reuse"] is None
+    assert preview["review_only"] and preview["steps"] == []
 
 
 def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(reader, monkeypatch):
@@ -646,6 +732,11 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
     document.GetElement = lambda identifier: created.get(identifier.Value) or original_get(identifier)
 
     class Region:
+        Category = NS(Id=ElementId(-200))
+
+        def IsHidden(self, _view):
+            return False
+
         def __init__(self, boundaries):
             self.Id, self.UniqueId, self.OwnerViewId = ElementId(501), "region-501", ElementId(41)
             self.loops = [list(boundaries.loop)]
@@ -668,6 +759,15 @@ def test_legend_trial_reads_created_swatch_and_rolls_back(reader, monkeypatch, f
             return result
 
     class Note:
+        Category = NS(Id=ElementId(-200))
+        HorizontalAlignment = "Left"
+
+        def IsHidden(self, _view):
+            return False
+
+        def GetFormattedText(self):
+            return formatted_text(self.Text)
+
         def __init__(self, position, text):
             self.Id, self.UniqueId, self.OwnerViewId = ElementId(502), "note-502", ElementId(41)
             self.Coord, self.Text = position, text

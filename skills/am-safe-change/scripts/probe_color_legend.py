@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Create and verify color swatches in a disposable Revit legend, then roll back."""
 
-from itertools import product
 import json
 
 from System.Collections.Generic import List
@@ -11,11 +10,9 @@ from pyrevit.api import DB
 from duplicate_views import capture_changes, identifier, key, rollback
 from read_color_legend import name_of, point, read_contents
 from read_color_parameter_values import main as read_inventory
-from read_view_filter_graphics import native_number
-from view_color_preview import build
+from view_color_preview import build, close_points, note_fits_row
 
 TRANSACTION_NAME = "Test parameter color drafting legend"
-POSITION_TOLERANCE = 1e-7
 
 
 def world(view, x, y):
@@ -66,26 +63,6 @@ def create_rows(document, view, proposal):
     return created
 
 
-def close_points(actual, expected):
-    if isinstance(expected, list):
-        return (isinstance(actual, list) and len(actual) == len(expected)
-                and all(close_points(a, b) for a, b in zip(actual, expected)))
-    return isinstance(actual, (int, float)) and abs(actual - expected) <= POSITION_TOLERANCE
-
-
-def note_bounds(view, note):
-    box = note.get_BoundingBox(view)
-    if box is None:
-        raise ValueError("A drafted legend note has no measurable bounds.")
-    points = []
-    for coords in product((box.Min.X, box.Max.X), (box.Min.Y, box.Max.Y), (box.Min.Z, box.Max.Z)):
-        offset = box.Transform.OfPoint(DB.XYZ(*coords)).Subtract(view.Origin)
-        points.append((native_number(offset.DotProduct(view.RightDirection)),
-                       native_number(offset.DotProduct(view.UpDirection))))
-    xs, ys = zip(*points)
-    return min(xs), min(ys), max(xs), max(ys)
-
-
 def verify_rows(document, view, proposal, created):
     validate_view(view, proposal)
     resources = proposal["legend_preflight"]["resources"]
@@ -100,7 +77,7 @@ def verify_rows(document, view, proposal, created):
         edges = sorted(sorted([start, end]) for start, end in zip(vertices, vertices[1:] + vertices[:1]))
         graphics = region["graphics"]
         if (region["owner_id"] != key(view.Id) or region["kind"] != "region"
-                or region["type_id"] != resources["region"]["id"] or not region["lines"]
+                or region["type_id"] != resources["region"]["id"] or not region["visible"] or not region["lines"]
                 or not close_points(region["lines"], [edges])
                 or graphics["SurfaceForegroundPatternId"] != {"kind": "element", "id": resources["solid"]["id"]}
                 or graphics["SurfaceForegroundPatternColor"] != row["rgb"]
@@ -108,12 +85,10 @@ def verify_rows(document, view, proposal, created):
             raise ValueError("A native swatch differs from the reviewed color or geometry.")
         if (note["owner_id"] != key(view.Id) or note["kind"] != "note"
                 or note["type_id"] != resources["text"]["id"] or note["text"] != row["label"] or note["leaders"]
+                or not note["visible"] or not note["plain"]
                 or not close_points(note["position"], point(world(view, *row["label_origin_ft"])))):
             raise ValueError("A native legend note differs from the reviewed text or placement.")
-        bounds = note_bounds(view, document.GetElement(identifier(note["id"])))
-        text_size = resources["text"]["text_size_ft"]
-        if (bounds[0] <= row["swatch_bounds_ft"][2] or bounds[1] <= row["label_origin_ft"][1] - 4 * text_size
-                or bounds[3] > row["label_origin_ft"][1] + POSITION_TOLERANCE):
+        if not note_fits_row(note["bounds_ft"], row, resources["text"]["text_size_ft"]):
             raise ValueError("A native note overlaps the swatch or extends outside its legend row.")
         verified.append({"value_key": row["value_key"], "rgb": row["rgb"],
                          "region_id": region["id"], "region_uid": region["uid"],

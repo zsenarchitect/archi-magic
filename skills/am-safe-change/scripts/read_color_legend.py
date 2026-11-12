@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Read the native drafting resources and any existing color legend candidate."""
 
+from itertools import product
+
 from pyrevit.api import DB
 
 from duplicate_views import bounded, can_edit, identifier, key, owner_state, viewports
@@ -18,6 +20,38 @@ def identity(item):
 
 def point(value):
     return [native_number(value.X), native_number(value.Y), native_number(value.Z)]
+
+
+def frame(view):
+    return {"origin": point(view.Origin), "right": point(view.RightDirection), "up": point(view.UpDirection)}
+
+
+def note_bounds(view, note):
+    box = note.get_BoundingBox(view)
+    if box is None:
+        return None
+    points = []
+    for coords in product((box.Min.X, box.Max.X), (box.Min.Y, box.Max.Y), (box.Min.Z, box.Max.Z)):
+        offset = box.Transform.OfPoint(DB.XYZ(*coords)).Subtract(view.Origin)
+        points.append((native_number(offset.DotProduct(view.RightDirection)),
+                       native_number(offset.DotProduct(view.UpDirection))))
+    xs, ys = zip(*points)
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def plain_note(note):
+    formatted = note.GetFormattedText()
+    try:
+        text = formatted.GetPlainText()
+        span = formatted.AsTextRange()
+        flags = ("GetBoldStatus", "GetItalicStatus", "GetUnderlineStatus", "GetAllCapsStatus",
+                 "GetSuperscriptStatus", "GetSubscriptStatus")
+        return (text == note.Text and bool(text) and not any(item in text for item in ("\r", "\n", "\v", "\t"))
+                and all(str(getattr(formatted, method)()) == "None" for method in flags)
+                and str(formatted.GetListType(span)) == "None" and formatted.GetIndentLevel(span) == 0
+                and str(note.HorizontalAlignment) == "Left")
+    finally:
+        formatted.Dispose()
 
 
 def boundary_lines(region, clock):
@@ -41,6 +75,9 @@ def read_contents(document, view, clock):
         for item in bounded(owned, 128, "legend detail", clock):
             row = {"id": key(item.Id), "uid": str(item.UniqueId), "owner_id": key(item.OwnerViewId),
                    "type_id": key(item.GetTypeId()), "native_kind": str(item.GetType().Name)}
+            if isinstance(item, (DB.FilledRegion, DB.TextNote)):
+                row["visible"] = bool(item.Category is not None and not item.IsHidden(view)
+                                      and not view.GetCategoryHidden(item.Category.Id))
             if isinstance(item, DB.FilledRegion):
                 settings = view.GetElementOverrides(item.Id)
                 try:
@@ -50,7 +87,8 @@ def read_contents(document, view, clock):
                     settings.Dispose()
             elif isinstance(item, DB.TextNote):
                 row.update(kind="note", text=str(item.Text), position=point(item.Coord),
-                           leaders=len(list(bounded(item.GetLeaders(), 16, "legend leader", clock))))
+                           leaders=len(list(bounded(item.GetLeaders(), 16, "legend leader", clock))),
+                           plain=plain_note(item), bounds_ft=note_bounds(view, item))
             else:
                 row["kind"] = "other"
             contents.append(row)
@@ -112,7 +150,7 @@ def legend_resources(document, proposed_name, request, clock):
             ownership = owner_state(document, view)
             existing.update(scale=int(view.Scale), template_id=key(view.ViewTemplateId),
                             placements=placements, ownership=ownership, writable=can_edit(ownership),
-                            contents=read_contents(document, view, clock))
+                            frame=frame(view), contents=read_contents(document, view, clock))
             state = "existing_requires_verification"
     elif resources["drafting"]["default_template_id"] != "-1":
         state = "default_template_requires_verification"

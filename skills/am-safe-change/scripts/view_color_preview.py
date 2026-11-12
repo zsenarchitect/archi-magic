@@ -15,6 +15,7 @@ from view_filter_transfer_preview import MAX_SAVED_RECORD, complete_record
 COLOR_FIELDS = ("ProjectionLineColor", "CutLineColor", "SurfaceForegroundPatternColor", "CutForegroundPatternColor")
 COLUMNS = ["Row", "Value", "Elements", "Filter", "Action", "Color"]
 MAX_VALUES = 24
+POSITION_TOLERANCE = 1e-7
 
 
 def color_text(rgb):
@@ -103,6 +104,73 @@ def legend_layout(rows, resources):
     return result
 
 
+def close_points(actual, expected):
+    if isinstance(expected, list):
+        return (isinstance(actual, list) and len(actual) == len(expected)
+                and all(close_points(a, b) for a, b in zip(actual, expected)))
+    return isinstance(actual, (int, float)) and abs(actual - expected) <= POSITION_TOLERANCE
+
+
+def note_fits_row(bounds, row, text_size):
+    return (bounds is not None and bounds[0] > row["swatch_bounds_ft"][2]
+            and bounds[1] > row["label_origin_ft"][1] - 4 * text_size
+            and bounds[3] <= row["label_origin_ft"][1] + POSITION_TOLERANCE)
+
+
+def frame_point(frame, x, y):
+    return [base + x * right + y * up for base, right, up in
+            zip(frame["origin"], frame["right"], frame["up"])]
+
+
+def existing_legend_matches(preflight, rows):
+    existing, resources = preflight["existing"], preflight["resources"]
+    if not existing.get("frame") or existing["scale"] != 1 or len(existing["contents"]) != 2 * len(rows):
+        return None
+    contents = {item["id"]: item for item in existing["contents"]}
+    if (len(contents) != len(existing["contents"])
+            or len({item["uid"] for item in contents.values()}) != len(contents)
+            or any(item["owner_id"] != existing["id"] or not item.get("visible") for item in contents.values())):
+        return None
+    solid = {"kind": "element", "id": resources["solid"]["id"]}
+    frame = existing["frame"]
+    pairs = []
+    for row in rows:
+        left, bottom, right, top = row["swatch_bounds_ft"]
+        corners = [frame_point(frame, x, y) for x, y in ((left, bottom), (right, bottom), (right, top), (left, top))]
+        edges = [sorted(sorted([a, b]) for a, b in zip(corners, corners[1:] + corners[:1]))]
+        region_matches, note_matches = [], []
+        for item in contents.values():
+            if item["kind"] == "region" and item["type_id"] == resources["region"]["id"]:
+                settings = item["graphics"]
+                if (close_points(item["lines"], edges) and settings["SurfaceForegroundPatternId"] == solid
+                        and settings["SurfaceForegroundPatternColor"] == row["rgb"]
+                        and settings["IsSurfaceForegroundPatternVisible"] is True
+                        and settings["IsSurfaceBackgroundPatternVisible"] is False):
+                    region_matches.append(item)
+            elif (item["kind"] == "note" and item["type_id"] == resources["text"]["id"]
+                    and item["text"] == row["label"] and item["plain"] and item["leaders"] == 0
+                    and close_points(item["position"], frame_point(frame, *row["label_origin_ft"]))
+                    and note_fits_row(item["bounds_ft"], row, resources["text"]["text_size_ft"])):
+                note_matches.append(item)
+        if len(region_matches) != 1 or len(note_matches) != 1:
+            return None
+        region, note = region_matches[0], note_matches[0]
+        del contents[region["id"]]
+        del contents[note["id"]]
+        pairs.append({"value_key": row["value_key"], "region_id": region["id"], "region_uid": region["uid"],
+                      "note_id": note["id"], "note_uid": note["uid"]})
+    return {"view_id": existing["id"], "view_uid": existing["uid"], "pairs": pairs,
+            "placements": existing["placements"]}
+
+
+def matching_applied_filter(row, candidate, solid_id):
+    if (not candidate or not candidate["applied"] or not candidate["visible"] or not candidate["enabled"]
+            or applied_color(candidate) != tuple(row["rgb"])):
+        return False
+    solid = {"kind": "element", "id": solid_id}
+    return all(candidate["graphics"].get(side + "ForegroundPatternId") == solid for side in ("Surface", "Cut"))
+
+
 def build(inventory):
     rules = inventory["native_rules"]
     if inventory["kind"] != "view-color-parameter-inventory" or rules["status"] != "verified_host_partition":
@@ -174,17 +242,27 @@ def build(inventory):
         legend.append({"value_key": group_id, "label": label, "rgb": list(rgb), "filter_name": filter_name,
                        "filter_id": selected["id"] if selected else None, "slot": len(legend)})
     native_legend = inventory.get("legend_preflight")
+    legend_reuse = None
     if native_legend is not None:
         if native_legend["name"] != legend_name(workflow):
             raise ValueError("The native legend preflight does not match the proposed view name.")
-        if native_legend["state"] != "available":
+        legend = legend_layout(legend, native_legend["resources"])
+        if native_legend["state"] == "existing_requires_verification":
+            legend_reuse = existing_legend_matches(native_legend, legend)
+        if native_legend["state"] != "available" and legend_reuse is None:
             warnings.append({"row": groups[0]["key"], "blocking": True,
                              "text": "Resolve the native legend preflight state before using this proposal: "
                                      + native_legend["state"] + "."})
-        legend = legend_layout(legend, native_legend["resources"])
+    no_change_candidate = bool(legend_reuse) and not warnings and all(
+        matching_applied_filter(row, chosen[row["value_key"]], native_legend["resources"]["solid"]["id"])
+        for row in legend)
+    if no_change_candidate:
+        for row in after:
+            row[4] = "Filter and legend match"
     proposal = {"kind": "view-color-proposal", "basis_sha256": basis, "workflow_sha256": workflow,
                 "document": inventory["document"], "view": inventory["view"],
                 "legend_name": legend_name(workflow), "legend_rows": legend, "legend_preflight": native_legend,
+                "legend_reuse": legend_reuse, "no_change_candidate": no_change_candidate,
                 "blocked": bool(warnings)}
     display = {"kind": "change-preview", "recipe": "view-color", "title": "Color view by parameter",
                "keyColumn": "Row", "columns": COLUMNS, "changedColumns": COLUMNS[3:],
