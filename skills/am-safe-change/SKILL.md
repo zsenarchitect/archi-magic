@@ -223,6 +223,15 @@ Set `audit_existing_finishes` to `true` with the selected finish types. Pass the
 
 Review `nearby.candidates` for other walls, floors, and ceilings whose bounding boxes intersect a proposed finish scope. These are candidates for review. Check the actual geometry before deciding whether a candidate overlaps a finish. An unavailable scan leaves the report incomplete. This query registers no schema and writes no elements.
 
+### Qualify finish placement in Revit 2026
+
+Use the disposable model and acceptance cases in the [room-finish plan](../../docs/plans/2026-11-09-room-finishes.md). The guarded placement script still needs this native qualification.
+
+1. Use the scripts directory as the workspace. Run `room_finish_placement.py` with `run_query` and `mode: "schema-check"`. This checks a detached entity and registers the schema in Revit memory if needed.
+2. Run the same script with `run_query`, `mode: "preview"`, and the room and finish inputs under `request`. Decode `preview_json`. Review the proposed pieces, excluded rooms, and ownership. Verify the active view phase.
+3. Follow the safe-change steps with the exact preview as `plan` and `mode: "apply"`. Use the host's Dry Run and Keep or Discard. Compare the created piece keys and side effects with the preview.
+4. After Dry Run or Discard, repeat the preview and check that it matches the baseline. After Keep, audit the same rooms and finish types. Verify the tagged sets and the placement geometry independently.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.

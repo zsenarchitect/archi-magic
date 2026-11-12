@@ -453,10 +453,11 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
     return report
 
 
-if doc is None or doc.IsFamilyDocument:
-    result = {"error": "Open a Revit project before reading room boundaries."}
-else:
-    report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
-                             inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
-                             inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"))
-    result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}
+if "inputs" in globals():
+    if doc is None or doc.IsFamilyDocument:
+        result = {"error": "Open a Revit project before reading room boundaries."}
+    else:
+        report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
+                                 inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
+                                 inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"))
+        result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

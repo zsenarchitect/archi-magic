@@ -1,6 +1,7 @@
 import importlib
 import json
 from pathlib import Path
+import runpy
 import sys
 from types import SimpleNamespace as NS
 
@@ -38,7 +39,10 @@ class Entity:
         return self.value is not None
 
 
-@pytest.mark.parametrize("outcome", ["committed", "offset_mismatch", "provenance_missing", "unqualified_schema", "stale_profile"])
+@pytest.mark.parametrize("outcome", [
+    "committed", "offset_mismatch", "provenance_missing", "unqualified_schema", "stale_profile",
+    "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned",
+])
 def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(monkeypatch, outcome):
     def xyz(x, y, z):
         return NS(X=x, Y=y, Z=z)
@@ -165,6 +169,95 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
     pieces = [{"room_uid": "room", "piece_key": provenance.digest(intended), "intended": intended,
                "level_id": "10", "type_id": str(type_id), "profiles": [profile], "centerline_ft": axis}
               for type_id, intended in zip((30, 40, 50), intentions)]
+    if outcome.startswith("workflow_"):
+        class CurveLoop(list):
+            Append = list.append
+
+            def Dispose(self):
+                pass
+
+        class GenericList:
+            def __getitem__(self, _):
+                return type("Profiles", (list,), {"Add": list.append})
+
+        room_type = type("Room", (), {"UniqueId": "room"})
+        room = room_type()
+        room.GetBoundarySegments = lambda _options: [[NS(GetCurve=lambda c=curve: c) for curve in profile]]
+        db.Architecture = NS(Room=room_type)
+        db.CurveLoop = CurveLoop
+        db.SpatialElementBoundaryOptions = lambda: NS(Dispose=lambda: None)
+        db.SpatialElementBoundaryLocation = NS(Finish="finish")
+        db.BuiltInParameter.VIEW_PHASE = "view-phase"
+        db.DesignOption = NS(GetActiveDesignOptionId=lambda _doc: ElementId(-1))
+        db.WorksharingUtils = NS(
+            GetCheckoutStatus=lambda _doc, _id: "OwnedByOtherUser",
+            GetModelUpdatesStatus=lambda _doc, _id: "CurrentWithCentral",
+        )
+        document.Application.VersionNumber = "2026"
+        document.IsWorkshared = outcome == "workflow_owned"
+        document.ActiveView = NS(IsTemplate=False, UniqueId="fixture-view",
+                                 get_Parameter=lambda _name: NS(StorageType="id", AsElementId=lambda: ElementId(20)))
+        document.elements[1] = room
+        audit = {"nearby": {"status": "none_in_scope"},
+                 "status": "tagged_set_matches" if outcome == "workflow_existing" else "no_tagged_pieces"}
+        edges = [{"curve_type": "Line", "source_id": 70, "linked_source_id": -1,
+                  "start_ft": provenance.native_xyz(curve.GetEndPoint(0)),
+                  "end_ft": provenance.native_xyz(curve.GetEndPoint(1))} for curve in profile]
+        row = {"status": "boundary_verified", "room_id": 1, "room_uid": "room", "boundary_loops": [edges],
+               "level": {"id": "10", "uid": "level"}, "phase": {"id": "20", "uid": "phase"},
+               "horizontal_finishes": [{"kind": "floor", "type_id": "30", "type_uid": "floor-type",
+                                        "offset_ft": 0.125}],
+               "existing_finishes": audit}
+        report = {"rooms": [row], "host_identity": {"project_uid": "project", "path_sha256": "a" * 64}}
+        monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=GenericList()))
+        monkeypatch.setitem(sys.modules, "read_room_finish_boundaries", NS(
+            ids_from=lambda values: list(map(int, values)),
+            read_boundaries=lambda *_args: report,
+        ))
+        script = placement.__file__
+
+        def execute(**inputs):
+            return runpy.run_path(script, init_globals={"doc": document, "inputs": inputs})["result"]
+
+        request = {"room_ids": ["1"], "horizontal_finishes": {"floor": {"type_id": "30", "offset_ft": 0.125}}}
+        if outcome == "workflow_commit":
+            configured = []
+
+            def register():
+                assert configured == [
+                    ("name", "ArchiMagicRoomFinishV1"), ("read", "public"), ("write", "public"),
+                    ("field", "Payload", str),
+                ]
+                ext.Schema.Lookup = lambda _guid: schema
+                return schema
+
+            ext.Schema.Lookup = lambda _guid: None
+            ext.AccessLevel = NS(Public="public")
+            ext.SchemaBuilder = lambda _guid: NS(
+                SetSchemaName=lambda value: configured.append(("name", value)),
+                SetReadAccessLevel=lambda value: configured.append(("read", value)),
+                SetWriteAccessLevel=lambda value: configured.append(("write", value)),
+                AddSimpleField=lambda name, value: configured.append(("field", name, value)),
+                Finish=register, Dispose=lambda: None,
+            )
+            monkeypatch.setitem(sys.modules, "clr", NS(GetClrType=lambda value: value))
+        assert execute(mode="schema-check")["status"] == "schema_checked"
+        assert not created and not events
+        preview = json.loads(execute(mode="preview", request=request)["preview_json"])
+        if outcome == "workflow_existing":
+            assert not preview["steps"] and execute(mode="apply", plan=preview) == {"status": "no_changes"}
+            assert not created and not events
+            return
+        assert len(preview["steps"]) == 1 and preview["ownership_ids"] == ["1", "70"]
+        if outcome == "workflow_stale":
+            document.ActiveView.UniqueId = "changed-view"
+        receipt = execute(mode="apply", plan=preview)
+        if outcome == "workflow_commit":
+            assert events == ["started", "committed"] and receipt["status"] == "ok"
+            assert receipt["created"][0]["piece_key"] == preview["steps"][0]["piece_key"]
+        else:
+            assert receipt["status"] == "stopped" and not events and not created
+        return
     if outcome == "stale_profile":
         pieces[0]["profiles"] = [[]]
     if outcome in ("unqualified_schema", "stale_profile"):
