@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from typing import Any, Dict, List
@@ -130,39 +129,53 @@ def read_airflow(value):
     return flow if math.isfinite(flow) else None
 
 
+LENGTH = re.compile(
+    r"(?:(?:dn|nps)\s*)?"
+    r"(?:(?P<decimal>[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+    r"|(?:(?P<whole>[0-9]+)\s+)?(?P<numerator>[0-9]+)/(?P<denominator>[0-9]+))"
+    r"""\s*(?:mm|cm|m|ft|in|["'′″])?""",
+    re.IGNORECASE,
+)
+
+
+def positive_dimension(value):
+    if type(value) in (int, float):
+        return value > 0 and (type(value) is int or math.isfinite(value))
+    if not isinstance(value, str) or len(value) > 120:
+        return False
+    match = LENGTH.fullmatch(value.strip())
+    if match is None:
+        return False
+    if match["decimal"] is not None:
+        return float(match["decimal"]) > 0
+    return int(match["denominator"]) > 0 and (int(match["whole"] or "0") > 0 or int(match["numerator"]) > 0)
+
+
 def check_sizing_and_flow(element: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Check missing sizing and missing or nonpositive airflow (MEP-FLOW-01)."""
+    """Check sizing evidence and missing or nonpositive airflow (MEP-FLOW-01)."""
     findings: List[Dict[str, Any]] = []
-    category = str(element.get("category", ""))
+    category = element.get("category", "")
     params = element.get("parameters", {})
-
-    if "Duct" in category and not ("Fitting" in category):
-        width = params.get("Width")
-        height = params.get("Height")
-        diam = params.get("Diameter")
-        if not (diam or (width and height)):
-            findings.append({
-                "ruleId": "MEP-FLOW-01",
-                "severity": "error",
-                "elementId": element.get("id"),
-                "category": category,
-                "level": element.get("level", "Unassigned"),
-                "message": f"Duct ID {element.get('id')} is missing cross-section dimensions (Width/Height or Diameter).",
-                "location": element.get("location"),
-            })
-
-    if "Pipe" in category and not ("Fitting" in category):
-        size = params.get("Size") or params.get("Diameter")
-        if not size:
-            findings.append({
-                "ruleId": "MEP-FLOW-01",
-                "severity": "error",
-                "elementId": element.get("id"),
-                "category": category,
-                "level": element.get("level", "Unassigned"),
-                "message": f"Pipe ID {element.get('id')} has no dimension or diameter specified.",
-                "location": element.get("location"),
-            })
+    diameter = positive_dimension(params.get("Diameter"))
+    size = positive_dimension(params.get("Size"))
+    rectangular = all(positive_dimension(params.get(field)) for field in ("Width", "Height"))
+    message = None
+    if category in ("Ducts", "Flex Ducts") and not (diameter or rectangular):
+        message = "needs a positive diameter or positive width and height"
+    elif category in ("Pipes", "Flex Pipes", "Conduits") and not (size or diameter):
+        message = "needs a readable positive size or diameter"
+    elif category == "Cable Trays" and not rectangular:
+        message = "needs a positive width and height"
+    if message:
+        findings.append({
+            "ruleId": "MEP-FLOW-01",
+            "severity": "error",
+            "elementId": element.get("id"),
+            "category": category,
+            "level": element.get("level", "Unassigned"),
+            "message": f"{category} ID {element.get('id')} {message}.",
+            "location": element.get("location"),
+        })
 
     system_type = str(params.get("System Type") or params.get("System Classification") or "")
     if any(kind in system_type.lower() for kind in ("supply", "return", "exhaust")):
@@ -256,6 +269,24 @@ def run_mep_audit(elements: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def audit_input(data):
+    elements = data.get("elements") if isinstance(data, dict) else data
+    if not isinstance(elements, list) or not elements:
+        raise ValueError("The audit needs a nonempty extracted MEP element list.")
+    seen = set()
+    for row in elements:
+        if (not isinstance(row, dict) or not isinstance(row.get("category"), str) or not row["category"].strip()
+                or not isinstance(row.get("parameters", {}), dict)):
+            raise ValueError("Each element needs a category and a valid parameter map.")
+        value = row.get("id")
+        identifier = str(value) if type(value) is int else value
+        if (not isinstance(identifier, str) or re.fullmatch(r"[1-9][0-9]{0,18}", identifier) is None
+                or int(identifier) > 2**63 - 1 or identifier in seen):
+            raise ValueError("Each element needs a distinct positive Revit ID.")
+        seen.add(identifier)
+    return elements
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MEP QA Audit Tool (Issue #186 Phase 1)")
     parser.add_argument("input", help="Path to JSON file containing extracted MEP elements")
@@ -264,15 +295,13 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if not os.path.isfile(args.input):
-        print(f"Error: input file '{args.input}' not found.", file=sys.stderr)
-        return 1
-
-    with open(args.input, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    elements = data if isinstance(data, list) else data.get("elements", [])
-    result = run_mep_audit(elements)
+    try:
+        with open(args.input, "r", encoding="utf-8") as stream:
+            elements = audit_input(json.load(stream))
+        result = run_mep_audit(elements)
+    except (OSError, ValueError, RecursionError) as error:
+        print(f"MEP audit could not read the input. {error}", file=sys.stderr)
+        return 2
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:

@@ -157,10 +157,11 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
   - `MEP-SYS-01`: System classification and naming convention.
   - `MEP-CON-01`: Confirmed open connectors.
   - `MEP-CON-02`: Missing connector inventory on distribution elements or unknown connection states.
-  - `MEP-FLOW-01`: Missing duct or pipe dimensions, missing or unreadable airflow on active duct runs, and zero or negative calculated airflow.
+  - `MEP-FLOW-01`: Missing or invalid duct, pipe, conduit, or cable tray dimensions, missing or unreadable airflow on active duct runs, and zero or negative calculated airflow.
   - `MEP-CLR-01`: Mechanical equipment maintenance clearance zones.
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
+  An empty or invalid extract returns exit 2 without a findings file. A completed audit with errors returns exit 1 and writes its findings.
 
 - Review the saved report and select finding IDs from that report.
 - Run `python skills/am-issue-board/scripts/board_cli.py mep-ops findings.json MEP-0001 > ops.json`.
