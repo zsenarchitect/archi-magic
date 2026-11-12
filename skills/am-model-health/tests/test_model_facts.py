@@ -166,3 +166,16 @@ def test_output_budget_refuses_excessive_link_paths(project):
     assert output["status"] == "incomplete"
     assert output["links"] is None
     assert output["issues"] == ["output_limit"]
+
+
+def test_revit_server_central_name_is_available_without_a_working_path(project):
+    project.PathName = ""
+    project.IsWorkshared = True
+    project.GetWorksharingCentralModelPath = lambda: NS(
+        path="RSN://Server/Project/Central.rvt", ServerPath=True)
+    output = query(project, expected_project_uid="project-uid")
+    assert output["model"]["file_name"] is None
+    assert output["model"]["central_file_name"] == "Central.rvt"
+    assert output["model"]["location"] == "revit_server"
+    assert output["issues"] == []
+    assert output["status"] == "complete"
