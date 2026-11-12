@@ -299,7 +299,18 @@ Use only a disposable Revit fixture. Open only the private writable copy of the 
 
 Supply `source_read`, `target_read`, `request`, and the reviewed `preview_sha256`. Set `disposable_fixture` to true. Supply `working_copy` with its absolute `workspace`, the directory `workspace_identity`, and the reviewed RFA `file` record. Use the directory identity and file record format from the family library scanner.
 
-The trial checks the copy against the loaded target read before editing. It rolls back the transaction group and checks the original family and file again. Stop on an unresolved result. Verify this trial in native Revit before use on project data. The replay and project reload also require native verification.
+Save the trial inputs as `transfer.json`. Run `scripts/read_family_parameter_transfer_audit.py` in query mode before the trial. Pass the inputs as `transfer`. Save the full query as `before.json`.
+
+Save the full trial as `trial.json`. Run the audit again with the trial's `transaction` as `trial_transaction`. Save it as `after.json`. Stop on an unresolved result.
+
+### Verify rollback and replay
+
+1. Run `python scripts/verify_family_parameter_transfer.py transfer.json before.json trial.json after.json`. Check the measured values and the restored family.
+2. Confirm the active family and ask policy. Obtain approval for replay. Run `scripts/apply_family_parameter_transfer.py` in guarded CPython modify mode. Pass `transfer`, `before`, `trial`, and `after`.
+3. Use Revit's Keep or Discard prompt. Save the full modify record as `modify.json`. Run the audit again with the replay's `transaction` as `trial_transaction`. Set `kept` to true only after Keep. Save the full audit as `fresh.json`.
+4. Run the same verifier with `--modify modify.json --fresh fresh.json`. Save the decision receipt. Stop if the audit does not match the decision.
+
+Verify both decisions in native Revit before use on project data. The private export and guarded project reload also require native verification.
 
 ## Preview a CAD layout (issue #166)
 

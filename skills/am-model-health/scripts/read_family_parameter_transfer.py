@@ -117,8 +117,8 @@ def transfer_state(document, DB, *, inspect_trial=False):
     return result
 
 
-def snapshot(document, DB):
-    if (document is None or not document.IsFamilyDocument or document.IsModified or document.IsModifiable
+def snapshot(document, DB, *, kept=False):
+    if (document is None or not document.IsFamilyDocument or (document.IsModified and not kept) or document.IsModifiable
             or str(document.Application.VersionNumber) != "2026"):
         raise ValueError("Open the exact unmodified family in Revit 2026.")
     family = document.OwnerFamily
@@ -126,7 +126,7 @@ def snapshot(document, DB):
     if category is None:
         raise ValueError("The family category is unavailable.")
     return {"family": bounded_text(family.Name), "category_id": eid(category),
-            "revit_build": bounded_text(document.Application.VersionBuild), "state": transfer_state(document, DB)}
+            "revit_build": bounded_text(document.Application.VersionBuild), "state": transfer_state(document, DB, inspect_trial=kept)}
 
 
 def staged_source(ui, DB, request):

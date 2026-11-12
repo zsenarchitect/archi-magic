@@ -15,6 +15,7 @@ DEFINITION_FIELDS = ("name", "data_type", "group", "storage", "instance", "built
 
 
 def reviewed_snapshot(record, role, expected_digest):
+    record = record.get("response", record)
     record = record.get("result", record)
     if "snapshot_json" in record:
         if record.get("status") != "ok":

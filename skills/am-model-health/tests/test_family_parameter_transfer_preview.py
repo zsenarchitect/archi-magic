@@ -57,7 +57,7 @@ def seal(records):
 def test_preview_cli_binds_exact_reads_and_orders_additions(records, tmp_path):
     source, target, request = seal(records)
     paths = [tmp_path / name for name in ("source.json", "target.json", "request.json")]
-    wrapper = {"result": {"status": "ok", "snapshot_json": json.dumps(target)}}
+    wrapper = {"response": {"result": {"status": "ok", "snapshot_json": json.dumps(target)}}}
     for path, data in zip(paths, (source, wrapper, request)):
         path.write_text(json.dumps(data))
     run = subprocess.run([sys.executable, str(SCRIPTS / "family_parameter_transfer_preview.py"),
@@ -303,3 +303,113 @@ def test_native_mutation_applies_literal_before_formula_and_restores_current_typ
         ("formula", "Total Width", "Panel Width + 1"),
     ]
     assert manager.CurrentType.Name == "Target A"
+
+
+@pytest.fixture
+def decision_records(records, trial_states):
+    from copy import deepcopy
+    from probe_family_parameter_transfer import TRANSACTION_NAME
+
+    plan, state, changed, added = trial_states
+    source, target, request = seal(records)
+    transfer = {"source_read": source, "target_read": target, "request": request, "working_copy": {},
+                "preview_sha256": plan["preview_sha256"]}
+    baseline = {"preview_sha256": plan["preview_sha256"], "copy_sha256": manifest_digest({}), "owner": "20",
+                "inventory": {"20": ["owner", "original"]}, "state": state, "kept": False}
+
+    def envelope(mode, run_id, decision, result, effects=None, approval=None, status="ok"):
+        effects = effects or {"added": [], "modified": [], "deleted": []}
+        changes = {key: [{"id": value} for value in values] for key, values in effects.items()}
+        counts = {key + "_count": len(values) for key, values in effects.items()}
+        total = sum(counts.values())
+        return {"mode": mode, "run_id": str(run_id), "status": status, "decision": decision, "approval": approval,
+                "exit_code": 0, "result_truncated": False, "error": None, "engine": {"requested": "cpython"},
+                "failures": [], "dialogs": [], "blocked": [], "warnings": [], "result": result,
+                "changes": {**changes, **counts, "by_category": {"fixture": total} if total else {},
+                            "transactions": [result["transaction"]] if total else []}}
+
+    def query(run_id, snapshot, transaction=None):
+        return envelope("query", run_id, "no_changes", {"status": "ok", "audit_token": str(run_id) * 32,
+                                                       "snapshot_json": json.dumps(snapshot),
+                                                       "trial_transaction": transaction})
+
+    first_name = TRANSACTION_NAME + " " + "a" * 32
+    second_name = TRANSACTION_NAME + " " + "b" * 32
+    event = {"added": ["21"], "modified": ["20"], "deleted": []}
+    values = {type_name: {name: row["expected_values"][type_name] for name, row in plan["operations"].items()
+                          if row["action"] == "add"} for type_name in state["types"]}
+    result = {"status": "trial_rolled_back", "transaction": first_name, "audit_sha256": manifest_digest(baseline),
+              "added_ids": added, "values": values, "effects": [event], "rollback_verified": True,
+              "preview_sha256": plan["preview_sha256"]}
+    before = query(1, baseline)
+    trial = envelope("dry_run", 2, "rolled_back", result, event)
+    after = query(3, baseline, first_name)
+    replay = dict(result, status="awaiting_bridge_decision", transaction=second_name)
+    keep = envelope("modify", 4, "committed", replay, event, approval="user")
+    discard = envelope("modify", 4, "discarded", replay, event, approval="user", status="rejected")
+    kept_state = dict(baseline, state=changed, kept=True,
+                      inventory={"20": ["owner", "kept"], "21": ["definition-21", "new"]})
+    return (transfer, before, trial, after), (keep, query(5, kept_state, second_name)), (
+        discard, query(5, baseline, second_name))
+
+
+@pytest.mark.parametrize("kept", [True, False])
+def test_transfer_decision_requires_independent_readback(decision_records, kept):
+    from verify_family_parameter_transfer import verify_decision
+
+    trial_records, keep, discard = decision_records
+    receipt = verify_decision(*trial_records, *(keep if kept else discard))
+    assert receipt["status"] == ("family_transfer_kept" if kept else "family_transfer_discarded")
+    assert receipt["run_ids"] == ["1", "2", "3", "4", "5"]
+    assert receipt.pop("decision_sha256") == manifest_digest(receipt)
+
+
+@pytest.mark.parametrize("corruption", ["same_run", "changed_baseline", "missing_approval", "changed_kept_value"])
+def test_transfer_decision_rejects_invalid_evidence(decision_records, corruption):
+    from verify_family_parameter_transfer import verify_decision
+
+    trial_records, (keep, fresh), _ = decision_records
+    if corruption == "same_run":
+        fresh["run_id"] = keep["run_id"]
+    elif corruption == "changed_baseline":
+        result = trial_records[-1]["result"]
+        original = json.loads(result["snapshot_json"])
+        original["inventory"]["20"][1] = "changed"
+        result["snapshot_json"] = json.dumps(original)
+    elif corruption == "missing_approval":
+        keep["approval"] = None
+    elif corruption == "changed_kept_value":
+        current = json.loads(fresh["result"]["snapshot_json"])
+        current["state"]["types"]["Target A"]["21"]["value"] = 99.0
+        fresh["result"]["snapshot_json"] = json.dumps(current)
+    with pytest.raises(ValueError):
+        verify_decision(*trial_records, keep, fresh)
+
+
+def test_replay_must_match_values_and_logical_effects_before_handoff(decision_records, monkeypatch):
+    from apply_family_parameter_transfer import apply
+
+    (transfer, before, trial, after), _, _ = decision_records
+    requested = {"transfer": transfer, "before": before, "trial": trial, "after": after}
+    actions = []
+
+    def require_ask(context):
+        actions.append("ask checked")
+
+    def replay(ui, document, DB, inputs, *, handoff, expected_audit_sha256):
+        assert inputs is transfer
+        values = trial["result"]["values"]
+        added_ids = {"Panel Width": "43", "Total Width": "44"}
+        events = [{"added": ["43"], "modified": ["20"], "deleted": []}]
+        with pytest.raises(ValueError, match="differs"):
+            handoff({}, events, added_ids, expected_audit_sha256)
+        with pytest.raises(ValueError, match="differs"):
+            handoff(values, [dict(events[0], added=["44"])], added_ids, expected_audit_sha256)
+        handoff(values, events, added_ids, expected_audit_sha256)
+        return "verified"
+
+    import apply_family_parameter_transfer as module
+    monkeypatch.setattr(module, "require_ask", require_ask)
+    monkeypatch.setattr(module, "run_trial", replay)
+    assert apply(None, None, None, requested, None) == "verified"
+    assert actions == ["ask checked", "ask checked"]
