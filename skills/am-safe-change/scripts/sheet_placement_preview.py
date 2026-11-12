@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import sys
 
-from sheet_creation_preview import SHA256, bounded, element_id, encode, fields, load, text, token, uid
+from sheet_creation_preview import SHA256, bounded, checked_run, element_id, encode, fields, load, text, token, uid
 from view_duplicate_preview import read_payload
 
 MAX_ROWS = 50
@@ -245,17 +245,107 @@ def verify_layout(plan, snapshot, placements):
     return placements
 
 
+def receipt_ids(plan, receipt):
+    fields(receipt, ("document", "basis_sha256", "placements"))
+    placements = bounded(receipt["placements"], MAX_ROWS)
+    if (plan.get("recipe") != "sheet-placement" or plan["blocked"] or not plan["steps"]
+            or receipt["document"] != plan["document"] or receipt["basis_sha256"] != plan["basis_sha256"]
+            or len(placements) != len(plan["steps"])):
+        raise ValueError("The placement receipt does not belong to the approved batch.")
+    ids, identities = [], set()
+    for item, step in zip(placements, plan["steps"]):
+        fields(item, ("id", "uid", "sheet_id", "sheet_uid", "view_id", "view_uid", "kind",
+                      "point_ft", "rectangles_ft"))
+        ids.append(element_id(item["id"]))
+        identities.add(uid(item["uid"]))
+        placement_geometry(item)
+        if (any(item[key] != step[key] for key in ("sheet_id", "sheet_uid", "view_id", "view_uid", "kind"))
+                or not same_point(item["point_ft"], step["point_ft"])):
+            raise ValueError("A receipt placement differs from its reviewed source, destination, or anchor.")
+    if len(ids) != len(set(ids)) or len(ids) != len(identities):
+        raise ValueError("The receipt repeats placement identities.")
+    return ids
+
+
+def same_placement_batch(left, right, *, exact_ids=False):
+    if len(left) != len(right):
+        return False
+    keys = ("sheet_id", "sheet_uid", "view_id", "view_uid", "kind")
+    if exact_ids:
+        keys += ("id", "uid")
+    for first, second in zip(left, right):
+        if (any(first[key] != second[key] for key in keys)
+                or not same_point(first["point_ft"], second["point_ft"])):
+            return False
+        shapes_a, shapes_b = first["rectangles_ft"], second["rectangles_ft"]
+        if len(shapes_a) != len(shapes_b) or not all(same_point(a, b) for a, b in zip(shapes_a, shapes_b)):
+            return False
+    return True
+
+
+def check_receipt_record(plan, record, outcome):
+    changes = checked_run(record, outcome)
+    receipt = read_payload(record, "receipt_json")
+    ids = set(receipt_ids(plan, receipt))
+    added = changes.get("added_ids")
+    if added is None:
+        added = [item["id"] for item in changes["added"]]
+    if (not isinstance(added, list) or any(type(item) not in (int, str) for item in added)
+            or changes["added_count"] != len(added) or len(added) != len(ids)
+            or {element_id(str(item)) for item in added} != ids
+            or changes["modified_count"] or changes["deleted_count"] or changes.get("modified")
+            or changes.get("deleted") or sum(changes["by_category"].values()) != len(ids)):
+        raise ValueError("The runtime changes differ from the exact approved placement additions.")
+    return receipt
+
+
+def verify_outcome(plan, record, fresh, outcome, dry=None):
+    all_runs = (record, fresh) if dry is None else (record, fresh, dry)
+    identifiers = [text(run["run_id"], 200) for run in all_runs]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("Use distinct Revit runs for the dry run, real run, and independent read.")
+    receipt = check_receipt_record(plan, record, outcome)
+    changes = checked_run(fresh, "rolled_back")
+    if any(changes[key] for key in ("added_count", "modified_count", "deleted_count")):
+        raise ValueError("The independent Revit query reported model changes.")
+    if outcome != "rolled_back":
+        if dry is None:
+            raise ValueError("Supply the full approved dry-run record.")
+        dry_receipt = check_receipt_record(plan, dry, "rolled_back")
+        if not same_placement_batch(dry_receipt["placements"], receipt["placements"]):
+            raise ValueError("The real run differs from the dry run in placement properties.")
+    if outcome == "committed":
+        readback = read_payload(fresh, "verification_json")
+        receipt_ids(plan, readback)
+        if not same_placement_batch(readback["placements"], receipt["placements"], exact_ids=True):
+            raise ValueError("The independent read differs from the kept placement identities or bounds.")
+    elif compute(read_payload(fresh, "snapshot_json")) != plan:
+        raise ValueError("The independent sheet inventory differs from the approved baseline.")
+    return receipt
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("snapshot", type=Path)
+    parser.add_argument("source", type=Path, help="Snapshot or reviewed placement preview")
+    parser.add_argument("--run", type=Path, help="Full pyRevit placement run record")
+    parser.add_argument("--fresh", type=Path, help="Full independent Revit query record")
+    parser.add_argument("--decision", choices=("rolled_back", "discarded", "committed"))
+    parser.add_argument("--dry-run", type=Path, help="Full approved dry-run record for the real run")
     args = parser.parse_args(argv)
     try:
-        snapshot = load(args.snapshot, envelope=True)
-        if isinstance(snapshot, dict) and "result" in snapshot:
-            snapshot = read_payload(snapshot, "snapshot_json")
-        print(encode(compute(snapshot)))
+        if args.run or args.fresh or args.decision or args.dry_run:
+            if not all((args.run, args.fresh, args.decision)):
+                raise ValueError("Verification needs --run, --fresh, and --decision.")
+            result = verify_outcome(load(args.source), load(args.run, envelope=True), load(args.fresh, envelope=True),
+                                    args.decision, load(args.dry_run, envelope=True) if args.dry_run else None)
+        else:
+            snapshot = load(args.source, envelope=True)
+            if isinstance(snapshot, dict) and "result" in snapshot:
+                snapshot = read_payload(snapshot, "snapshot_json")
+            result = compute(snapshot)
+        print(encode(result))
     except (ValueError, TypeError, KeyError, AttributeError, OSError, RecursionError) as error:
-        print(f"Cannot plan sheet placement: {error}", file=sys.stderr)
+        print(f"Cannot plan or verify sheet placement: {error}", file=sys.stderr)
         return 2
     return 0
 

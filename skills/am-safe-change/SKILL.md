@@ -21,6 +21,8 @@ Recipes (the task-specific parts):
 
 - Batch duplicate views: [reviewed names and templates](../../docs/plans/2026-11-11-batch-view-duplication.md). Preview plain, detailing, or dependent copies and check exact names, template effects, and the native qualification steps.
 
+- [Place existing views on sheets](recipes/place-sheet-views.md). Place reviewed views and repeat a legend or schedule at the same coordinates.
+
 - [Create sheets from a list](recipes/create-sheets.md). Review numbers, title block types, and instance values before creating sheets.
 
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
