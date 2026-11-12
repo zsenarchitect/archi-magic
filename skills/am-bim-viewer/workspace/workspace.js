@@ -22,6 +22,7 @@ let closed = false;
 let refreshing = false;
 let refreshQueued = false;
 let pending;
+let conflictedEdit;
 let saving = false;
 
 function element(tag, text) {
@@ -61,8 +62,10 @@ function renderSelection() {
     byId("comments").replaceChildren(...(item.comments ?? []).map(comment =>
         element("li", comment.actor + " · " + comment.recorded_at + " · " + comment.text)));
     form.hidden = snapshot.role !== "editor" || row.freshness !== "ready";
-    if (!form.hidden && !saving && !pending &&
-        (selectedRevision === undefined || form.elements.status.value === form.elements.status.dataset.saved &&
+    const refreshedConflict = conflictedEdit && conflictedEdit.etag !== snapshot.etag;
+    if (!form.hidden && !saving && !pending && (!conflictedEdit || refreshedConflict) &&
+        (refreshedConflict || selectedRevision === undefined ||
+         form.elements.status.value === form.elements.status.dataset.saved &&
          form.elements.assignee.value === form.elements.assignee.dataset.saved)) {
         form.elements.status.value = status;
         form.elements.status.dataset.saved = status;
@@ -71,6 +74,14 @@ function renderSelection() {
         form.elements.assignee.value = item.assignee ?? "";
         form.elements.assignee.dataset.saved = form.elements.assignee.value;
         selectedRevision = snapshot.etag;
+        if (refreshedConflict) {
+            for (const [field, value] of Object.entries(conflictedEdit.patch)) {
+                const input = form.elements[field];
+                const proposed = value ?? "";
+                if (Array.from(input.options).some(option => option.value === proposed)) input.value = proposed;
+            }
+            conflictedEdit = undefined;
+        }
     }
 }
 
@@ -81,6 +92,7 @@ function selectRow(target) {
          form.elements.assignee.value !== (form.elements.assignee.dataset.saved ?? "")) &&
         !window.confirm("Leave this review item and discard its unsaved edits?")) return;
     pending = undefined;
+    conflictedEdit = undefined;
     selectedRevision = undefined;
     selected = target;
     form.elements.comment.value = "";
@@ -350,7 +362,7 @@ byId("sign-out").addEventListener("click", async () => {
 
 form.addEventListener("submit", async event => {
     event.preventDefault();
-    if (saving || form.hidden) return;
+    if (saving || form.hidden || conflictedEdit) return;
     const isComment = event.submitter?.value === "comment";
     const patch = isComment ? {comment: form.elements.comment.value} : {};
     for (const field of ["status", "assignee"]) {
@@ -376,8 +388,10 @@ form.addEventListener("submit", async event => {
     } catch (error) {
         if (error.status === 401) returnToSignIn();
         else if (error.status && error.status < 500) {
+            if (error.status === 412 && !isComment) {
+                conflictedEdit = {etag: pending.etag, patch: pending.body.patch};
+            }
             pending = undefined;
-            if (error.status === 412) selectedRevision = undefined;
             editMessage.textContent = error.status === 412 ?
                 "The review changed. Check the latest state and submit again." : error.message;
         } else {
