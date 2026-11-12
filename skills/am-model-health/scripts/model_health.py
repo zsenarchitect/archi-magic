@@ -369,7 +369,8 @@ def link_type_details(link_type):
         source_kind = next(iter(locations)) if len(locations) == 1 else None
     else:
         locations = {model_kind} if model_kind and not cache_hint else set()
-        if kind == "RVT" and str(path_type) == "Absolute" and model_kind not in ("cloud", "revit_server"):
+        if (kind == "RVT" and (path_type is None or str(path_type) == "Absolute")
+                and model_kind not in ("cloud", "revit_server")):
             saved_path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
             if personal_path_kind(saved_path)[0]:
                 locations.add("personal")
