@@ -7,7 +7,7 @@ from pyrevit.api import DB
 
 from read_linked_cad_layout import MM_PER_FOOT
 
-CATEGORIES = ("OST_Walls", "OST_Doors", "OST_Rooms", "OST_RoomSeparationLines",
+CATEGORIES = ("OST_Walls", "OST_Doors", "OST_Windows", "OST_Rooms", "OST_RoomSeparationLines",
               "OST_Columns", "OST_StructuralColumns", "OST_Floors", "OST_Ceilings",
               "OST_Roofs", "OST_Curtain_Systems", "OST_GenericModel", "OST_RvtLinks")
 MAX_VISITED = 5000
@@ -61,12 +61,11 @@ def overlaps(left, right):
     return all(a <= d and c <= b for a, b, c, d in zip(*left, *right))
 
 
-def scan_surroundings(document, proposal, wall_choices):
+def scan_surroundings(document, proposal, wall_choices, deadline):
     volumes = proposal_bounds(proposal, wall_choices)
     candidates, unavailable = [], []
     visited = unplaced_rooms = associations = 0
     limit = None
-    deadline = monotonic() + MAX_SECONDS
     for category in CATEGORIES:
         if monotonic() >= deadline:
             limit = "time"

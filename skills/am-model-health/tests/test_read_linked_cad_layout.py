@@ -1,6 +1,7 @@
 """Exercise linked CAD geometry extraction with a simulated Revit geometry tree."""
 
 from hashlib import sha256
+from itertools import product
 import json
 from pathlib import Path
 import runpy
@@ -25,6 +26,7 @@ def linked_dwg(monkeypatch):
     class Transform:
         def __init__(self, apply):
             self.OfPoint = apply
+            self.IsIdentity = False
 
         def Multiply(self, other):
             return Transform(lambda vertex: self.OfPoint(other.OfPoint(vertex)))
@@ -54,6 +56,10 @@ def linked_dwg(monkeypatch):
 
         def GetEndPoint(self, index):
             return self.points[index]
+
+        @staticmethod
+        def CreateBound(start, end):
+            return Record(start=start, end=end, Dispose=lambda: None)
 
     class Polyline:
         def __init__(self, layer, points):
@@ -102,6 +108,52 @@ def linked_dwg(monkeypatch):
         def Dispose(self):
             pass
 
+    class NativeList(list):
+        Add = list.append
+
+        @classmethod
+        def __class_getitem__(cls, _):
+            return cls
+
+    class CurveLoop(NativeList):
+        Append = list.append
+
+        def Dispose(self):
+            pass
+
+    class Solid(Record):
+        def __init__(self, low, high):
+            sizes = [max(0, b - a) for a, b in zip(low, high)]
+            super().__init__(low=low, high=high, Faces=Record(Size=6), Volume=sizes[0] * sizes[1] * sizes[2])
+
+        def Dispose(self):
+            pass
+
+    def xyz(x, y, z):
+        return Record(X=x, Y=y, Z=z)
+
+    xyz.BasisZ = xyz(0, 0, 1)
+
+    def enclosing_solid(points, height=0):
+        coordinates = list(zip(*[(p.X, p.Y, p.Z) for p in points]))
+        low = [min(values) for values in coordinates]
+        high = [max(values) for values in coordinates]
+        high[2] += height
+        return Solid(low, high)
+
+    def extrusion(profiles, axis, height):
+        assert axis == xyz.BasisZ
+        profile, = profiles
+        return enclosing_solid([edge.start for edge in profile], height)
+
+    def intersection(a, b, operation):
+        assert operation == "intersect"
+        return Solid(list(map(max, a.low, b.low)), list(map(min, a.high, b.high)))
+
+    def transform_solid(solid, transform):
+        corners = product(*zip(solid.low, solid.high))
+        return enclosing_solid([transform.OfPoint(xyz(*corner)) for corner in corners])
+
     class Collector:
         def __init__(self, document):
             self.document = document
@@ -139,11 +191,16 @@ def linked_dwg(monkeypatch):
            [(10, "WALL"), (11, "DOOR"), (12, "ROOM")]},
     }
     categories = {key: key for key in (
-        "OST_Walls", "OST_Doors", "OST_Rooms", "OST_RoomSeparationLines", "OST_Columns",
+        "OST_Walls", "OST_Doors", "OST_Windows", "OST_Rooms", "OST_RoomSeparationLines", "OST_Columns",
         "OST_StructuralColumns", "OST_Floors", "OST_Ceilings", "OST_Roofs", "OST_Curtain_Systems",
         "OST_GenericModel", "OST_RvtLinks")}
     db = Record(ElementId=element_id, Transform=Record(Identity=Transform(lambda v: v)),
                 GeometryInstance=Instance, Line=Line, PolyLine=Polyline, ImportInstance=Linked,
+                XYZ=xyz, CurveLoop=CurveLoop, Solid=Solid, Curve=Line, Point=type("Point", (), {}),
+                GeometryCreationUtilities=Record(CreateExtrusionGeometry=extrusion),
+                BooleanOperationsUtils=Record(ExecuteBooleanOperation=intersection),
+                BooleanOperationsType=Record(Intersect="intersect"), SolidUtils=Record(CreateTransformed=transform_solid),
+                ViewDetailLevel=Record(Fine="fine"),
                 Level=Level, GraphicsStyle=Style, Options=Options,
                 WallType=WallType, WallKind=Record(Basic="basic"), FamilySymbol=FamilySymbol,
                 BuiltInCategory=Record(**{**categories, "OST_Doors": -2000014}),
@@ -154,18 +211,22 @@ def linked_dwg(monkeypatch):
                 DesignOption=Record(GetActiveDesignOptionId=lambda doc: doc.active_option),
                 FilteredElementCollector=Collector,
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
-    api, system = ModuleType("pyrevit.api"), ModuleType("System")
-    api.DB, system.Int64 = db, int
+    api, system, generic = ModuleType("pyrevit.api"), ModuleType("System"), ModuleType("System.Collections.Generic")
+    api.DB, system.Int64, generic.List = db, int, NativeList
     monkeypatch.setitem(sys.modules, "pyrevit.api", api)
     monkeypatch.setitem(sys.modules, "System", system)
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", generic)
     monkeypatch.delitem(sys.modules, "read_linked_cad_layout", raising=False)
     monkeypatch.delitem(sys.modules, "read_cad_layout_surroundings", raising=False)
+    monkeypatch.delitem(sys.modules, "check_cad_wall_collisions", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
-    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt", existing={},
+    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt", existing={}, db=db,
                       ActiveView=view, active_option=element_id(-1), Application=Record(VersionNumber="2026"),
-                      ProjectInformation=Record(UniqueId="aa-3"), GetElement=lambda id: objects.get(id.Value))
+                      ProjectInformation=Record(UniqueId="aa-3"))
+    document.GetElement = lambda id: objects.get(id.Value) or next(
+        (item for rows in document.existing.values() for item in rows if item.Id.Value == id.Value), None)
     request = {"link_id": "1", "level_id": "2", "segment_layers": ["WALL", "DOOR"],
                "room_layers": ["ROOM"], "room_points_mm": {}}
     return document, request, primitives, Arc, element_id, reference
@@ -214,6 +275,7 @@ def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_d
     room, = preview["proposal"]["rooms"]
     assert [item["kind"] for item in room["boundary_edges"]].count("wall_face") == 1
     assert preview.pop("existing_model_scan")["status"] == "none_found"
+    assert preview.pop("wall_collision_scan")["status"] == "none_measured"
     digest = preview.pop("geometry_sha256")
     canonical = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
     assert digest == sha256(canonical.encode("ascii")).hexdigest()
@@ -273,6 +335,32 @@ def test_native_scan_reports_truncation_instead_of_empty_success(linked_dwg, mon
     scan = json.loads(native_preview(document, request)["preview_json"])["existing_model_scan"]
     assert scan["status"] == "incomplete" and scan["limit"] == "elements" and scan["visited"] == 1
     assert scan["candidates"] == []
+
+
+def test_native_wall_measurement_distinguishes_contact_overlap_and_unavailable_geometry(linked_dwg):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+    overlap = ((610, 0, 3000), (690, 100, 3100))
+    contact = ((610, 0, 2900), (690, 100, 3000))
+    elements = [existing_element(id_value, number, box)
+                for number, box in ((101, overlap), (102, contact), (103, overlap))]
+    to_feet = lambda point: [coordinate / 304.8 for coordinate in point]
+    transform = type(document.db.Transform.Identity)
+    shift_x = transform(lambda point: Record(X=point.X + 600 / 304.8, Y=point.Y, Z=point.Z))
+    shift_z = transform(lambda point: Record(X=point.X, Y=point.Y, Z=point.Z + 3000 / 304.8))
+    local = ((10, 0, 0), (90, 100, 100))
+    elements[0].get_Geometry = lambda _: [document.db.GeometryInstance(shift_x, [
+        document.db.GeometryInstance(shift_z, [document.db.Solid(*map(to_feet, local))])
+    ])]
+    elements[1].get_Geometry = lambda _: [document.db.Solid(*map(to_feet, contact))]
+    elements[2].get_Geometry = lambda _: [object()]
+    document.existing = {"OST_Walls": elements}
+    scan = json.loads(native_preview(document, request)["preview_json"])["wall_collision_scan"]
+    assert scan["status"] == "incomplete" and scan["overlap_count"] == 1
+    assert [row["id"] for row in scan["measured"]] == ["101", "102"]
+    assert scan["measured"][0]["maximum_overlap_mm3"] == pytest.approx(800000)
+    assert scan["measured"][1]["maximum_overlap_mm3"] == 0
+    assert scan["unresolved"] == [{"id": "103", "walls": ["wall-1"], "reason": "unsupported_geometry"}]
 
 
 def test_native_entry_point_shows_boundary_conflicts_without_a_geometry_digest(linked_dwg):

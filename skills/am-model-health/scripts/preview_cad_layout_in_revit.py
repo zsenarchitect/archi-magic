@@ -1,11 +1,13 @@
 """Build a read-only placement proposal from a reviewed linked DWG."""
 
 import json
+from time import monotonic
 
 from pyrevit.api import DB
 
 from cad_layout_preview import classify_room_boundaries, fields, number, propose
-from read_cad_layout_surroundings import scan_surroundings
+from check_cad_wall_collisions import check_wall_collisions
+from read_cad_layout_surroundings import MAX_SECONDS, scan_surroundings
 from read_linked_cad_layout import EVIDENCE_LIMIT, MM_PER_FOOT, element_id, encoded, read_snapshot, sha256
 
 REQUEST_LIMIT = 128 * 1024
@@ -77,7 +79,10 @@ def read_preview(document, request):
     result.update(status=status, model_write_approved=False)
     if status == "proposed":
         result["geometry_sha256"] = sha256(encoded(result, EVIDENCE_LIMIT))
-        result["existing_model_scan"] = scan_surroundings(document, proposal, walls)
+        deadline = monotonic() + MAX_SECONDS
+        scan = scan_surroundings(document, proposal, walls, deadline)
+        result["existing_model_scan"] = scan
+        result["wall_collision_scan"] = check_wall_collisions(document, proposal, walls, scan, deadline)
     return {"status": status, "preview_json": encoded(result, EVIDENCE_LIMIT)}
 
 

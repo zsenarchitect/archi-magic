@@ -207,6 +207,8 @@ To tie the geometry preview to the open model, activate the floor plan for the s
 
 Review the returned `preview_json` and keep its `geometry_sha256` when present. It identifies the geometry and choices for this model and view. The `existing_model_scan` checks model bounds around the proposed walls and door openings and at the room footprint elevation. It includes candidates from other phases. Review candidate bounds, phase IDs, and any unavailable records. A candidate needs a geometry check. An incomplete scan needs further evidence before placement. Existing model conflicts, room enclosure, and guarded placement still require separate checks.
 
+Read `wall_collision_scan` for measured overlaps between proposed wall bodies and existing host solids. The reported volume is the largest intersection with one solid from the candidate element. Check unresolved geometry, linked models, room boundaries, and the entries in `other_checks` separately. Verify these results in the disposable Revit model before using them for placement.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).
