@@ -288,9 +288,13 @@ def snapshot_payload(data):
     return data
 
 
-def checked_run(record, outcome):
+def checked_run(record, outcome, *, mode=None):
     expected = "rejected" if outcome == "discarded" else "ok"
+    exit_code = record.get("exit_code")
     if (record.get("decision") != outcome or record.get("status") != expected
+            or (mode is not None and (record.get("mode") != mode or record.get("result_truncated") is not False
+                                     or type(exit_code) is not int or exit_code != 0
+                                     or (mode != "modify" and record.get("approval") is not None)))
             or (outcome == "discarded" and record.get("approval") != "user")
             or (outcome == "committed" and record.get("approval") not in ("user", "auto"))
             or any(record.get(field) for field in ("error", "failures", "dialogs", "blocked", "warnings",
@@ -304,25 +308,36 @@ def checked_run(record, outcome):
 
 
 def runtime_receipt(plan, record, outcome):
-    changes = checked_run(record, outcome)
+    changes = checked_run(record, outcome, mode="dry_run" if outcome == "rolled_back" else "modify")
     receipt = read_payload(record, "receipt_json")
     ids = check_receipt(plan, receipt)
-    added = changes.get("added_ids")
-    if added is None:
-        added = [row["id"] for row in changes["added"]]
+    added = [row["id"] for row in changes.get("added", [])]
+    legacy_added = changes.get("added_ids")
+    if legacy_added is not None:
+        if "added" in changes and sorted(map(str, added)) != sorted(map(str, legacy_added)):
+            raise ValueError("The runtime change record has conflicting addition lists.")
+        added = legacy_added
     if (not isinstance(added, list) or any(type(item) not in (int, str) for item in added)
             or changes["added_count"] != len(added) or len(added) != len(ids)
             or {element_id(str(item)) for item in added} != ids
-            or changes["modified_count"] or changes["deleted_count"] or changes.get("modified")
-            or changes.get("deleted") or sum(changes["by_category"].values()) != len(ids)):
+            or changes["modified_count"] or changes["deleted_count"]
+            or any(changes.get(field) for field in ("modified", "deleted", "modified_ids", "deleted_ids"))
+            or any(type(value) is not int or value <= 0 for value in changes["by_category"].values())
+            or sum(changes["by_category"].values()) != len(ids)):
         raise ValueError("The runtime changes differ from the exact reviewed sheet and title block additions.")
     return receipt
 
 
 def verify_outcome(plan, record, fresh, outcome, dry=None):
+    runs = (record, fresh) if dry is None else (record, fresh, dry)
+    run_ids = [text(run.get("run_id")) for run in runs]
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("Use distinct Revit runs for the dry run, real run, and independent read.")
     receipt = runtime_receipt(plan, record, outcome)
-    changes = checked_run(fresh, "rolled_back")
-    if any(changes[key] for key in ("added_count", "modified_count", "deleted_count")):
+    changes = checked_run(fresh, "rolled_back", mode="query")
+    if (any(changes[key] for key in ("added_count", "modified_count", "deleted_count"))
+            or any(changes.get(key) for key in ("added", "modified", "deleted", "added_ids", "modified_ids",
+                                               "deleted_ids", "by_category"))):
         raise ValueError("The independent Revit query reported model changes.")
     if outcome == "committed":
         if dry is None:

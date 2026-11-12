@@ -295,7 +295,9 @@ def test_sheet_creation_rolls_back_if_commit_changes_unreviewed_state(sheet_host
 
 
 def runtime_record(payload, key, *, decision="rolled_back", added=()):
-    return {"status": "ok", "decision": decision, "approval": "user",
+    mode = "query" if key != "receipt_json" else "modify" if decision == "committed" else "dry_run"
+    return {"status": "ok", "decision": decision, "approval": "user" if mode == "modify" else None,
+            "mode": mode, "run_id": mode + "-sheet-run", "result_truncated": False, "exit_code": 0,
             "result": {"status": "ok", key: preview.encode(payload)},
             "changes": {"added_ids": list(added), "added_count": len(added),
                         "modified_count": 0, "deleted_count": 0,
@@ -312,6 +314,15 @@ def test_full_runtime_receipts_require_exact_additions_and_fresh_readback(sheet_
     dry = runtime_record(dry_receipt, "receipt_json", added=("700", "701"))
     fresh = runtime_record(baseline, "snapshot_json")
     assert preview.verify_outcome(plan, dry, fresh, "rolled_back") == dry_receipt
+    with pytest.raises(ValueError, match="distinct Revit runs"):
+        preview.verify_outcome(plan, dry, {**fresh, "run_id": dry["run_id"]}, "rolled_back")
+    with pytest.raises(ValueError, match="required outcome"):
+        preview.verify_outcome(plan, {**dry, "mode": "modify"}, fresh, "rolled_back")
+    with pytest.raises(ValueError, match="required outcome"):
+        preview.verify_outcome(plan, dry, {**fresh, "result_truncated": True}, "rolled_back")
+    hidden_changes = {**fresh["changes"], "deleted": [42]}
+    with pytest.raises(ValueError, match="reported model changes"):
+        preview.verify_outcome(plan, dry, {**fresh, "changes": hidden_changes}, "rolled_back")
     dry["changes"]["added_ids"][-1] = "999"
     with pytest.raises(ValueError, match="exact reviewed"):
         preview.verify_outcome(plan, dry, fresh, "rolled_back")
