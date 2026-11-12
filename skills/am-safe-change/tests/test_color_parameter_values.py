@@ -603,7 +603,7 @@ def fixture_verification_records(inventory, probe):
 
 
 @pytest.mark.parametrize("difference", [
-    None, "note_format", "swatch_color", "extra_element", "filter_pattern",
+    None, "note_format", "swatch_color", "extra_element", "filter_pattern", "filter_halftone", "filter_transparency",
     "competing_filter", "element_override", "legend_temporary_mode", "changed_readback", "changed_order",
 ])
 def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reader, monkeypatch, difference):
@@ -649,8 +649,16 @@ def test_repeat_color_preview_verifies_existing_legend_and_applied_filters(reade
         contents.append(dict(note, id="503", uid="note-503"))
     elif difference == "filter_pattern":
         graphics["graphics"]["CutForegroundPatternId"] = {"kind": "element", "id": "75"}
+    elif difference == "filter_halftone":
+        graphics["graphics"]["Halftone"] = True
+    elif difference == "filter_transparency":
+        graphics["graphics"]["Transparency"] = 100
 
     proposal, preview = build(inventory)
+    if difference in ("filter_halftone", "filter_transparency"):
+        assert proposal["legend_reuse"] and proposal["blocked"] and not proposal["no_change_candidate"]
+        assert any("Halftone or surface transparency" in warning["text"] for warning in preview["warnings"])
+        return
     if difference not in ("note_format", "swatch_color", "extra_element"):
         assert proposal["legend_reuse"] == {"view_id": "41", "view_uid": "legend-41", "placements": placements,
                                             "pairs": [{"value_key": row["value_key"], "region_id": "501",

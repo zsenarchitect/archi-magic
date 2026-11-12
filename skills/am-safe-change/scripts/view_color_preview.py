@@ -243,6 +243,12 @@ def build(inventory):
         if group_id in conflicts:
             warnings.append({"row": group_id, "text": "Two existing value filters use the same color.",
                              "blocking": True})
+        if selected and selected["applied"]:
+            graphics = selected["graphics"]
+            if graphics.get("Halftone") or (graphics.get("Transparency") or 0) > 0:
+                warnings.append({"row": group_id, "blocking": True,
+                                 "text": "Halftone or surface transparency changes the displayed color. "
+                                         "Review the existing override before comparing it with the legend."})
         old = applied_color(selected)
         rgb = colors[group_id]
         before.append([group_id, label, group["count"], selected["name"] if selected else None, None,
