@@ -119,6 +119,10 @@ class ReviewState:
             return {"etag": self._etag(state), "annotations": state["annotations"]}
 
     def update(self, actor, target, operation_id, if_match, patch):
+        result, _ = self.update_with_outcome(actor, target, operation_id, if_match, patch)
+        return result
+
+    def update_with_outcome(self, actor, target, operation_id, if_match, patch):
         with self._thread_lock:
             self._authorize(actor, edit=True)
             if not isinstance(operation_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{16,80}", operation_id) is None:
@@ -133,7 +137,7 @@ class ReviewState:
             if prior is not None:
                 if prior["fingerprint"] != fingerprint:
                     raise OperationConflict("The operation ID already identifies a different change.")
-                return prior["result"]
+                return prior["result"], False
             if if_match != self._etag(state):
                 raise RevisionConflict("The project review changed. Refresh before editing.")
             if target not in self.targets:
@@ -156,4 +160,4 @@ class ReviewState:
             result = {"etag": self._etag(state), "target": target}
             operations[operation_id] = {"fingerprint": fingerprint, "result": result}
             self._store(state)
-            return result
+            return result, True

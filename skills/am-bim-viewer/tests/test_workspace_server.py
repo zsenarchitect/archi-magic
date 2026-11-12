@@ -6,7 +6,7 @@ import sys
 from threading import Event
 
 import pytest
-from aiohttp import web
+from aiohttp import WSMsgType, WSServerHandshakeError, web
 from aiohttp.test_utils import TestClient, TestServer
 
 
@@ -142,5 +142,65 @@ def test_cancelled_request_keeps_worker_slot_until_storage_finishes(tmp_path, mo
             assert await workspace.storage(lambda: "available") == "available"
         finally:
             release.set()
+
+    asyncio.run(exercise())
+
+
+def test_project_events_only_publish_committed_revisions_to_members(tmp_path, monkeypatch):
+    accounts, projects = settings(tmp_path)
+    monkeypatch.setattr(server, "MAX_PROJECT_SOCKETS", 2)
+    events = "/projects/sample/events"
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                assert response.status == 200
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            def connect(path, cookies, headers=HEADERS):
+                cookie = "; ".join(f"{key}={value}" for key, value in cookies.items())
+                return client.ws_connect(path, headers=dict(headers, Cookie=cookie))
+
+            editor, viewer, outsider = [await login(actor) for actor in ("editor", "viewer", "outsider")]
+            for headers, cookies, status in ((HEADERS, {}, 401), (HEADERS, outsider, 404),
+                                             (dict(HEADERS, Origin="https://elsewhere.example.test"), viewer, 403)):
+                with pytest.raises(WSServerHandshakeError) as error:
+                    await connect(events, cookies, headers)
+                assert error.value.status == status
+
+            async with (
+                connect(events, editor) as editor_ws,
+                connect(events, viewer) as viewer_ws,
+                connect("/projects/other/events", outsider) as other_ws,
+            ):
+                with pytest.raises(WSServerHandshakeError) as error:
+                    await connect(events, viewer)
+                assert error.value.status == 503
+                prior = await client.get(REVIEW, headers=HEADERS, cookies=editor)
+                headers = dict(HEADERS, **{"If-Match": prior.headers["ETag"]})
+                body = {"target": TARGET, "operation_id": "operation-0000001", "patch": {"comment": "Private note"}}
+                response = await client.patch(REVIEW, headers=headers, cookies=editor, json=body)
+                assert response.status == 200
+                etag = response.headers["ETag"]
+                expected = {"type": "review", "etag": etag}
+                assert await editor_ws.receive_json(timeout=1) == expected
+                assert await viewer_ws.receive_json(timeout=1) == expected
+
+                replay = await client.patch(REVIEW, headers=headers, cookies=editor, json=body)
+                assert replay.status == 200
+                for socket in (editor_ws, viewer_ws, other_ws):
+                    with pytest.raises(asyncio.TimeoutError):
+                        await socket.receive(timeout=0.05)
+
+                await viewer_ws.close()
+                async with connect(events, viewer):
+                    snapshot = await client.get(REVIEW, headers=HEADERS, cookies=viewer)
+                    assert snapshot.headers["ETag"] == etag
+                    assert (await snapshot.json())["annotations"][TARGET]["comments"][0]["text"] == "Private note"
+
+                logout = await client.delete("/session", headers=HEADERS, cookies=editor)
+                assert logout.status == 204
+                assert (await editor_ws.receive(timeout=1)).type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
 
     asyncio.run(exercise())

@@ -183,6 +183,8 @@ Preserve the canonical Host at the office HTTPS proxy. Disable caching of privat
 
 Send `POST /session` with the token in a JSON body to start a browser session. Read state with `GET /projects/<project>/review`. Editors can send `PATCH` to the same route with `target`, `operation_id`, and `patch`. Send the current `ETag` as `If-Match`. Send `DELETE /session` to sign out.
 
+Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Read the current state after connecting and after each revision notice. The notice carries the revision. Read review details through the authenticated HTTP route.
+
 ## 3D-anchored labels, category framing, and hidden-pane screenshots (issue #199)
 
 - **Rhino navigation in custom three.js viewers**: `am-bim-viewer` uses Rhino mouse controls by default. When configuring a custom three.js `OrbitControls` viewer, set `controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }` (right-drag orbits, `Shift` + right-drag pans automatically, left-click selects, wheel zooms).

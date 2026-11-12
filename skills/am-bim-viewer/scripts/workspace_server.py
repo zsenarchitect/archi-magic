@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from collections import deque
 from contextlib import ExitStack
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
@@ -13,7 +14,7 @@ import secrets
 from time import monotonic
 from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
 
@@ -24,6 +25,13 @@ MAX_SESSIONS = 200
 MAX_LOGIN_ATTEMPTS = 60
 MAX_WORKERS = 4
 MAX_BODY_BYTES = 32 * 1024
+MAX_SOCKETS = 50
+MAX_PROJECT_SOCKETS = 10
+MAX_SOCKET_BYTES = 1024
+SOCKET_HEARTBEAT = 20
+SOCKET_WRITE_TIMEOUT = 2
+SECURITY_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"}
 LOG = logging.getLogger(__name__)
 
 
@@ -36,6 +44,19 @@ def canonical_origin(origin):
     if parts.port is not None and parts.port == 443:
         raise ValueError("Omit the default HTTPS port from the canonical origin.")
     return parts.netloc
+
+
+@dataclass
+class Subscription:
+    project: str
+    actor: str
+    session: str
+    pending: asyncio.Queue
+
+    def replace_pending(self, message):
+        if self.pending.full():
+            self.pending.get_nowait()
+        self.pending.put_nowait(message)
 
 
 class Workspace:
@@ -65,6 +86,8 @@ class Workspace:
         self.sessions = {}
         self.login_attempts = deque()
         self.workers = set()
+        self.sockets = {}
+        self.last_notified = {}
 
     async def lifecycle(self, _app):
         with ExitStack() as states:
@@ -75,7 +98,7 @@ class Workspace:
             finally:
                 await asyncio.gather(*self.workers, return_exceptions=True)
 
-    async def storage(self, function, *args):
+    async def storage(self, function, *args, on_success=None):
         if len(self.workers) >= MAX_WORKERS:
             raise web.HTTPServiceUnavailable(text="The workspace is busy. Retry shortly.")
         worker = asyncio.create_task(asyncio.to_thread(function, *args))
@@ -84,7 +107,9 @@ class Workspace:
         def finished(task):
             self.workers.discard(task)
             if not task.cancelled():
-                task.exception()
+                error = task.exception()
+                if error is None and on_success is not None:
+                    on_success(task.result())
 
         worker.add_done_callback(finished)
         return await asyncio.shield(worker)
@@ -96,6 +121,12 @@ class Workspace:
             self.sessions.pop(token, None)
             raise web.HTTPUnauthorized(text="Sign in to the office workspace.")
         return session[0]
+
+    def revoke_session(self, token):
+        if self.sessions.pop(token, None) is not None:
+            for subscriber in self.sockets.values():
+                if subscriber.session == token:
+                    subscriber.replace_pending(None)
 
     def project_member(self, request, edit=False):
         actor = self.session_actor(request)
@@ -121,7 +152,7 @@ class Workspace:
         if actor is None:
             raise web.HTTPUnauthorized(text="Invalid workspace credentials.")
         self.sessions = {key: session for key, session in self.sessions.items() if session[1] > now}
-        self.sessions.pop(request.cookies.get(COOKIE), None)
+        self.revoke_session(request.cookies.get(COOKIE))
         if len(self.sessions) >= MAX_SESSIONS:
             raise web.HTTPServiceUnavailable(text="The workspace session limit was reached.")
         session_token = secrets.token_urlsafe(32)
@@ -131,7 +162,7 @@ class Workspace:
         return response
 
     async def logout(self, request):
-        self.sessions.pop(request.cookies.get(COOKIE), None)
+        self.revoke_session(request.cookies.get(COOKIE))
         response = web.Response(status=204)
         response.set_cookie(COOKIE, "", secure=True, httponly=True, samesite="Strict", max_age=0)
         return response
@@ -157,7 +188,9 @@ class Workspace:
         if set(body) != {"target", "operation_id", "patch"}:
             raise web.HTTPBadRequest(text="Supply a target, operation ID and annotation change.")
         try:
-            result = await self.storage(project.update, actor, body["target"], body["operation_id"], tags[0], body["patch"])
+            result, _ = await self.storage(project.update_with_outcome, actor, body["target"],
+                                           body["operation_id"], tags[0], body["patch"],
+                                           on_success=lambda outcome: self.notify_review(project.project, outcome))
         except RevisionConflict as error:
             raise web.HTTPPreconditionFailed(text=str(error)) from error
         except OperationConflict as error:
@@ -168,6 +201,75 @@ class Workspace:
         except ValueError as error:
             raise web.HTTPBadRequest(text=str(error)) from error
         return web.json_response(result, headers={"ETag": result["etag"]})
+
+    def notify_review(self, project, outcome):
+        receipt, committed = outcome
+        if not committed:
+            return
+        etag = receipt["etag"]
+        revision = int(etag[:-1].rsplit("-", 1)[1])
+        if revision <= self.last_notified.get(project, 0):
+            return
+        self.last_notified[project] = revision
+        for subscriber in self.sockets.values():
+            if subscriber.project == project:
+                subscriber.replace_pending({"type": "review", "etag": etag})
+
+    def subscription_lifetime(self, subscriber):
+        session = self.sessions.get(subscriber.session)
+        if (session is None or session[0] != subscriber.actor
+                or subscriber.actor not in self.projects[subscriber.project].members):
+            return 0
+        return session[1] - monotonic()
+
+    async def send_updates(self, ws, subscriber):
+        while self.subscription_lifetime(subscriber) > 0:
+            timeout = min(SOCKET_HEARTBEAT, self.subscription_lifetime(subscriber))
+            try:
+                message = await asyncio.wait_for(subscriber.pending.get(), timeout)
+            except asyncio.TimeoutError:
+                continue
+            if message is None or self.subscription_lifetime(subscriber) <= 0:
+                break
+            payload = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
+            if len(payload) > MAX_SOCKET_BYTES:
+                break
+            try:
+                await asyncio.wait_for(ws.send_str(payload), SOCKET_WRITE_TIMEOUT)
+            except (asyncio.TimeoutError, ConnectionError):
+                break
+        await ws.close(code=WSCloseCode.POLICY_VIOLATION)
+
+    async def subscribe(self, request):
+        if request.headers.getall("Origin", []) != [self.origin]:
+            raise web.HTTPForbidden(text="Unexpected workspace origin.")
+        actor, project = self.project_member(request)
+        if (len(self.sockets) >= MAX_SOCKETS
+                or sum(item.project == project.project for item in self.sockets.values()) >= MAX_PROJECT_SOCKETS):
+            raise web.HTTPServiceUnavailable(text="The workspace connection limit was reached.")
+        ws = web.WebSocketResponse(heartbeat=SOCKET_HEARTBEAT, timeout=SOCKET_WRITE_TIMEOUT,
+                                   compress=False, max_msg_size=MAX_SOCKET_BYTES, writer_limit=MAX_SOCKET_BYTES)
+        ws.headers.update(SECURITY_HEADERS)
+        subscriber = Subscription(project.project, actor, request.cookies[COOKIE], asyncio.Queue(maxsize=1))
+        self.sockets[ws] = subscriber
+        sender = None
+        try:
+            await ws.prepare(request)
+            sender = asyncio.create_task(self.send_updates(ws, subscriber))
+            async for message in ws:
+                if message.type in (WSMsgType.TEXT, WSMsgType.BINARY):
+                    await ws.close(code=WSCloseCode.POLICY_VIOLATION)
+                    break
+        finally:
+            self.sockets.pop(ws, None)
+            if sender is not None:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+        return ws
+
+    async def shutdown(self, _app):
+        await asyncio.gather(*(ws.close(code=WSCloseCode.GOING_AWAY) for ws in tuple(self.sockets)),
+                             return_exceptions=True)
 
 
 async def read_json(request):
@@ -184,8 +286,6 @@ async def read_json(request):
 
 def create_app(origin, accounts, projects):
     workspace = Workspace(origin, accounts, projects)
-    security_headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
-                        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"}
 
     @web.middleware
     async def boundary(request, handler):
@@ -196,18 +296,20 @@ def create_app(origin, accounts, projects):
                 raise web.HTTPForbidden(text="Unexpected workspace origin.")
             response = await handler(request)
         except web.HTTPException as error:
-            error.headers.update(security_headers)
+            error.headers.update(SECURITY_HEADERS)
             raise
-        response.headers.update(security_headers)
+        response.headers.update(SECURITY_HEADERS)
         return response
 
     app = web.Application(client_max_size=MAX_BODY_BYTES, middlewares=[boundary])
     app.cleanup_ctx.append(workspace.lifecycle)
+    app.on_shutdown.append(workspace.shutdown)
     app.add_routes([
         web.post("/session", workspace.login),
         web.delete("/session", workspace.logout),
         web.get("/projects/{project}/review", workspace.read_review),
         web.patch("/projects/{project}/review", workspace.update_review),
+        web.get("/projects/{project}/events", workspace.subscribe, allow_head=False),
     ])
     return app
 
