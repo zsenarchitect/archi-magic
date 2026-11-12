@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Inventory selected room boundaries in Revit 2026 via run_query only."""
 
+import hashlib
 import json
+import math
 from pyrevit.api import DB
 from System import Int64
 from System.Collections.Generic import List
@@ -9,7 +11,11 @@ from System.Collections.Generic import List
 
 MAX_ROOMS = 20
 MAX_SEGMENTS = 2000
+MAX_WALL_SEGMENTS = 200
+MAX_INSERTS_PER_WALL = 100
 TOLERANCE_FT = 1e-6
+FINISH_FIELDS = {"horizontal_finishes", "wall_type_id", "wall_dimensions"}
+TEXT = (str, type(u""))
 
 
 def ids_from(values):
@@ -33,6 +39,286 @@ def xyz(point):
 
 def excluded(room_id, reason):
     return {"room_id": room_id, "status": "excluded", "reason": reason}
+
+
+def finish_types(document, request):
+    if not isinstance(request, dict) or not request or set(request) - {"floor", "ceiling"}:
+        raise ValueError("Select a floor finish, a ceiling finish, or both.")
+    selected = {}
+    for kind, entry in request.items():
+        if not isinstance(entry, dict) or set(entry) != {"type_id", "offset_ft"}:
+            raise ValueError("Supply a finish type ID and level-relative offset in feet.")
+        type_id, = ids_from([entry["type_id"]])
+        element = document.GetElement(DB.ElementId(Int64(type_id)))
+        expected = DB.FloorType if kind == "floor" else DB.CeilingType
+        offset = entry["offset_ft"]
+        if (not isinstance(element, expected) or not element.UniqueId
+                or (kind == "floor" and element.IsFoundationSlab)):
+            raise ValueError("Select a non-foundation floor type or an exact ceiling type.")
+        if type(offset) not in (int, float) or not finite(offset):
+            raise ValueError("The level-relative offset must be a finite number of feet.")
+        selected[kind] = {"type_id": str(type_id), "type_uid": str(element.UniqueId), "offset_ft": offset}
+    return selected
+
+
+def finite(value):
+    try:
+        return not math.isnan(value) and not math.isinf(value)
+    except OverflowError:
+        return False
+
+
+def visible_in_phase(element, phase_id):
+    return (element.DesignOption is None and element.GetPhaseStatus(phase_id) in
+            (DB.ElementOnPhaseStatus.New, DB.ElementOnPhaseStatus.Existing))
+
+
+def door_interval(door, start, axis):
+    box = door.get_BoundingBox(None)
+    if box is None or not box.Enabled or not box.Transform.IsIdentity:
+        return None
+    low, high = xyz(box.Min), xyz(box.Max)
+    if any(not (finite(a) and finite(b) and a <= b) for a, b in zip(low, high)):
+        return None
+    stations = [(x - start[0]) * axis[0] + (y - start[1]) * axis[1]
+                for x in (low[0], high[0]) for y in (low[1], high[1])]
+    return (min(stations), max(stations)) if all(finite(value) for value in stations) else None
+
+
+def boundary_cuts_footprint(edge, bounds):
+    """Test whether an outline edge crosses the interior of a local rectangle."""
+    start, end = edge
+    enter, leave = 0.0, 1.0
+    for a, b, limits in zip(start, end, bounds):
+        low, high = limits
+        if a == b:
+            if not low < a < high:
+                return False
+            continue
+        first, last = sorted(((low - a) / (b - a), (high - a) / (b - a)))
+        enter, leave = max(enter, first), min(leave, last)
+        if enter >= leave:
+            return False
+    return True
+
+
+def finish_centerlines(outline, start, axis, spans, width):
+    normal = (-axis[1], axis[0])
+
+    def local(point):
+        dx, dy = point[0] - start[0], point[1] - start[1]
+        return dx * axis[0] + dy * axis[1], dx * normal[0] + dy * normal[1]
+
+    edges = [(local(a), local(b)) for a, b in outline]
+    result = []
+    for low, high in spans:
+        fits = []
+        for side in (-1, 1):
+            y0, y1 = sorted((0.0, width * side))
+            bounds = ((low + TOLERANCE_FT, high - TOLERANCE_FT),
+                      (y0 + TOLERANCE_FT, y1 - TOLERANCE_FT))
+            if any(a >= b for a, b in bounds) or any(boundary_cuts_footprint(edge, bounds) for edge in edges):
+                continue
+            mid_x, mid_y = (low + high) / 2.0, width * side / 2.0
+            # Odd parity across all loops places the point in the room, including rooms with holes.
+            crossings = sum(1 for (ax, ay), (bx, by) in edges
+                            if (ay > mid_y) != (by > mid_y)
+                            and mid_x < ax + (mid_y - ay) * (bx - ax) / (by - ay))
+            if crossings % 2:
+                fits.append(side)
+        record = {"span_ft": [low, high]}
+        if len(fits) == 1:
+            offset = width * fits[0] / 2.0
+            points = [[start[i] + station * axis[i] + offset * normal[i] for i in (0, 1)] + [start[2]]
+                      for station in (low, high)]
+            record.update(status="footprint_previewed", centerline_ft=points)
+        else:
+            record.update(status="excluded", reason="finish_width_does_not_fit_on_one_side")
+        result.append(record)
+    return result
+
+
+def available_spans(start, end, blocked, short_curve):
+    spans, cursor = [], start
+    for low, high in sorted(blocked):
+        low, high = max(start, low), min(end, high)
+        if low >= high:
+            continue
+        if low - cursor > short_curve:
+            spans.append([cursor, low])
+        cursor = max(cursor, high)
+    if end - cursor > short_curve:
+        spans.append([cursor, end])
+    return spans
+
+
+def footprint_corners(centerline, half_width):
+    a, b = centerline
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    nx, ny = -dy * half_width / length, dx * half_width / length
+    return [(a[0] + nx, a[1] + ny), (b[0] + nx, b[1] + ny),
+            (b[0] - nx, b[1] - ny), (a[0] - nx, a[1] - ny)]
+
+
+def clip_footprint(points, boundary, direction):
+    clipped = []
+    for a, b in zip(points[-1:] + points[:-1], points):
+        inside_a = direction * (a[1] - boundary) >= 0
+        inside_b = direction * (b[1] - boundary) >= 0
+        if inside_a != inside_b:
+            fraction = (boundary - a[1]) / (b[1] - a[1])
+            clipped.append((a[0] + fraction * (b[0] - a[0]), boundary))
+        if inside_b:
+            clipped.append(b)
+    return clipped
+
+
+def overlapping_stations(corners, start, axis, half_width):
+    ux, uy = axis
+    offsets = [(x - start[0], y - start[1]) for x, y in corners]
+    points = [(x * ux + y * uy, -x * uy + y * ux) for x, y in offsets]
+    if (min(y for _, y in points) >= half_width - TOLERANCE_FT
+            or max(y for _, y in points) <= -half_width + TOLERANCE_FT):
+        return None
+    clipped = clip_footprint(clip_footprint(points, -half_width, 1), half_width, -1)
+    return (min(x for x, _ in clipped), max(x for x, _ in clipped)) if clipped else None
+
+
+def trim_overlapping_finishes(segments, width, short_curve):
+    rows = [segment["wall_finish"] for segment in segments if "finish_footprints" in segment["wall_finish"]]
+    candidates = [footprint for row in rows for footprint in row["finish_footprints"]
+                  if footprint["status"] == "footprint_previewed"]
+    if len(candidates) > MAX_WALL_SEGMENTS:
+        return False
+    # Favor longer pieces, with a geometry tie-break independent of room loop order.
+    candidates.sort(key=lambda item: (item["span_ft"][0] - item["span_ft"][1],
+                                      sorted(item["centerline_ft"])))
+    half_width = width / 2.0
+    accepted = []
+    replacements = {}
+    for candidate in candidates:
+        a, b = candidate["centerline_ft"]
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        axis = ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
+        blocked = []
+        for corners in accepted:
+            interval = overlapping_stations(corners, a, axis, half_width)
+            if interval and min(length, interval[1]) - max(0.0, interval[0]) > TOLERANCE_FT:
+                blocked.append(interval)
+        if not blocked:
+            if len(accepted) >= MAX_WALL_SEGMENTS:
+                return False
+            accepted.append(footprint_corners(candidate["centerline_ft"], half_width))
+            continue
+        pieces = []
+        for low, high in available_spans(0.0, length, blocked, short_curve):
+            if len(accepted) >= MAX_WALL_SEGMENTS:
+                return False
+            start = candidate["span_ft"][0]
+            points = [[a[0] + station * axis[0], a[1] + station * axis[1], a[2]] for station in (low, high)]
+            pieces.append(dict(candidate, span_ft=[start + low, start + high], centerline_ft=points,
+                               original_span_ft=candidate["span_ft"]))
+            accepted.append(footprint_corners(points, half_width))
+        replacements[id(candidate)] = pieces or [{
+            "status": "excluded", "reason": "overlap_consumes_finish_span", "span_ft": candidate["span_ft"],
+        }]
+    for row in rows:
+        row["finish_footprints"] = [piece for original in row["finish_footprints"]
+                                     for piece in replacements.get(id(original), [original])]
+        if any(piece["status"] == "excluded" for piece in row["finish_footprints"]):
+            row["status"] = "incomplete"
+    return True
+
+
+def wall_segment_preview(document, segment, phase_id, short_curve, outline, width):
+    if segment["linked_source_id"] > 0 or segment["curve_type"] != "Line" or segment["source_id"] <= 0:
+        return {"status": "excluded", "reason": "boundary_not_a_straight_host_wall"}
+    wall = document.GetElement(DB.ElementId(Int64(segment["source_id"])))
+    if (not isinstance(wall, DB.Wall) or not wall.UniqueId or wall.IsStackedWallMember
+            or wall.WallType.Kind != DB.WallKind.Basic or wall.CrossSection != DB.WallCrossSection.Vertical
+            or not visible_in_phase(wall, phase_id)):
+        return {"status": "excluded", "reason": "wall_geometry_or_phase_requires_review"}
+    start, end = segment["start_ft"], segment["end_ft"]
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if not finite(length) or length <= short_curve:
+        return {"status": "excluded", "reason": "wall_boundary_too_short"}
+    axis = (dx / length, dy / length)
+    insert_ids = wall.FindInserts(True, True, True, True)
+    if len(insert_ids) > MAX_INSERTS_PER_WALL:
+        return {"status": "excluded", "reason": "wall_insert_limit"}
+    doors = []
+    for identifier in insert_ids:
+        door = document.GetElement(identifier)
+        if (not isinstance(door, DB.FamilyInstance) or not door.UniqueId or door.Category is None
+                or door.Category.Id.Value != int(DB.BuiltInCategory.OST_Doors)
+                or door.Host is None or door.Host.Id.Value != wall.Id.Value or not visible_in_phase(door, phase_id)):
+            return {"status": "excluded", "reason": "wall_insert_requires_review"}
+        interval = door_interval(door, start, axis)
+        if interval is None or interval[1] - interval[0] <= TOLERANCE_FT:
+            return {"status": "excluded", "reason": "door_bounds_unavailable"}
+        low, high = interval
+        if high < -TOLERANCE_FT or low > length + TOLERANCE_FT:
+            continue
+        if low <= TOLERANCE_FT or high >= length - TOLERANCE_FT:
+            return {"status": "excluded", "reason": "door_crosses_or_touches_boundary_end"}
+        doors.append({"id": str(identifier.Value), "uid": str(door.UniqueId), "start_ft": low, "end_ft": high})
+    doors.sort(key=lambda item: (item["start_ft"], item["end_ft"], item["id"]))
+    spans = available_spans(0.0, length, [(door["start_ft"], door["end_ft"]) for door in doors], short_curve)
+    footprints = finish_centerlines(outline, start, axis, spans, width)
+    status = "incomplete" if any(item["status"] == "excluded" for item in footprints) else "spans_previewed"
+    return {"status": status, "wall_uid": str(wall.UniqueId), "door_envelopes": doors,
+            "boundary_spans_ft": spans, "finish_footprints": footprints}
+
+
+def room_finish_preview(document, room, row, types, wall_type):
+    if room.DesignOption is not None:
+        return excluded(row["room_id"], "room_design_option_requires_review")
+    level = document.GetElement(room.LevelId)
+    if not isinstance(level, DB.Level) or not level.UniqueId or not finite(level.ProjectElevation):
+        return excluded(row["room_id"], "room_level_identity_unavailable")
+    parameter = room.get_Parameter(DB.BuiltInParameter.ROOM_PHASE_ID)
+    phase = (document.GetElement(parameter.AsElementId())
+             if parameter is not None and parameter.StorageType == DB.StorageType.ElementId else None)
+    if not isinstance(phase, DB.Phase) or not phase.UniqueId:
+        return excluded(row["room_id"], "room_phase_identity_unavailable")
+    row["level"] = {"id": str(level.Id.Value), "uid": str(level.UniqueId),
+                    "project_elevation_ft": level.ProjectElevation}
+    row["phase"] = {"id": str(phase.Id.Value), "uid": str(phase.UniqueId)}
+    finishes = []
+    for kind, selected in sorted(types.items()):
+        elevation = level.ProjectElevation + selected["offset_ft"]
+        if not finite(elevation):
+            return excluded(row["room_id"], "finish_elevation_unavailable")
+        finishes.append(dict(selected, kind=kind, project_elevation_ft=elevation))
+    row["horizontal_finishes"] = finishes
+    if wall_type:
+        short_curve = document.Application.ShortCurveTolerance
+        segments = [segment for loop in row["boundary_loops"] for segment in loop]
+        if not finite(short_curve) or short_curve <= 0:
+            row["wall_finish"] = {"status": "excluded", "reason": "short_curve_tolerance_unavailable"}
+        elif len(segments) > MAX_WALL_SEGMENTS:
+            row["wall_finish"] = {"status": "excluded", "reason": "wall_boundary_segment_limit"}
+        elif any(segment["curve_type"] != "Line" for segment in segments):
+            row["wall_finish"] = {"status": "excluded", "reason": "curved_room_outline_requires_review"}
+        else:
+            row["wall_finish"] = dict(wall_type, status="reported")
+            outline = [(segment["start_ft"], segment["end_ft"]) for segment in segments]
+            for segment in segments:
+                try:
+                    result = wall_segment_preview(document, segment, phase.Id, short_curve, outline, wall_type["width_ft"])
+                except Exception as exc:
+                    result = {"status": "excluded", "reason": "wall_boundary_read_failed",
+                              "error_type": type(exc).__name__}
+                segment["wall_finish"] = result
+            if not trim_overlapping_finishes(segments, wall_type["width_ft"], short_curve):
+                row["wall_finish"].update(status="excluded", reason="wall_finish_piece_limit")
+                for segment in segments:
+                    segment["wall_finish"].pop("finish_footprints", None)
+            elif any(segment["wall_finish"]["status"] != "spans_previewed" for segment in segments):
+                row["wall_finish"]["status"] = "incomplete"
+    return row
 
 
 def inspect_room(room, room_id, options, remaining):
@@ -69,12 +355,17 @@ def inspect_room(room, room_id, options, remaining):
                 return excluded(room_id, "open_boundary_loop"), count
             for segment, curve, start, end in zip(segments, curves, starts, ends):
                 profile.Append(curve)
-                loop_facts.append({
+                facts_for_curve = {
                     "start_ft": xyz(start), "end_ft": xyz(end),
                     "curve_type": curve.GetType().Name,
                     "source_id": int(segment.ElementId.Value),
                     "linked_source_id": int(segment.LinkElementId.Value),
-                })
+                }
+                if facts_for_curve["curve_type"] == "Arc":
+                    facts_for_curve["midpoint_ft"] = xyz(curve.Evaluate(0.5, True))
+                    facts_for_curve["center_ft"] = xyz(curve.Center)
+                    facts_for_curve["radius_ft"] = curve.Radius
+                loop_facts.append(facts_for_curve)
             if not profile.HasPlane():
                 return excluded(room_id, "nonplanar_boundary_loop"), count
             plane = profile.GetPlane()
@@ -97,7 +388,80 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids):
+def review_finish_types(document, finish_request, wall_type_id, wall_dimensions):
+    wall_type = None
+    if wall_dimensions is not None:
+        if (wall_type_id is None or not isinstance(wall_dimensions, dict)
+                or set(wall_dimensions) != {"height_ft", "base_offset_ft"}
+                or any(type(value) not in (int, float) or not finite(value) for value in wall_dimensions.values())
+                or not 0 < wall_dimensions["height_ft"] <= 30000
+                or not -30000 <= wall_dimensions["base_offset_ft"] <= 30000):
+            raise ValueError("Supply a wall type, positive wall height, and level-relative base offset in feet.")
+    types = finish_types(document, finish_request) if finish_request is not None else {}
+    if wall_type_id is not None:
+        value, = ids_from([wall_type_id])
+        element = document.GetElement(DB.ElementId(Int64(value)))
+        if (not isinstance(element, DB.WallType) or not element.UniqueId or element.Kind != DB.WallKind.Basic
+                or not finite(element.Width) or element.Width <= 0):
+            raise ValueError("Select a basic finish wall type with a known positive width.")
+        wall_type = {"type_id": str(value), "type_uid": str(element.UniqueId), "width_ft": element.Width}
+        if wall_dimensions is not None:
+            wall_type.update({key: float(value) + 0.0 for key, value in wall_dimensions.items()})
+    return types, wall_type
+
+
+def read_finish_rules(document, rules):
+    if not isinstance(rules, dict) or set(rules) != {"parameter", "by_value"}:
+        raise ValueError("Supply a room text parameter and its explicit finish mapping.")
+    name, table = rules["parameter"], rules["by_value"]
+    if (not isinstance(name, TEXT) or not 1 <= len(name) <= 120 or name != name.strip()
+            or not isinstance(table, dict) or not 1 <= len(table) <= 100):
+        raise ValueError("Supply a parameter name and 1 to 100 finish mapping rows.")
+    reviewed = {}
+    for value, choice in table.items():
+        if (not isinstance(value, TEXT) or not 1 <= len(value) <= 120 or value != value.strip()
+                or not isinstance(choice, dict) or set(choice) - FINISH_FIELDS
+                or all(choice.get(field) is None for field in ("horizontal_finishes", "wall_type_id"))):
+            raise ValueError("Every mapping row needs an exact value and at least one finish type.")
+        reviewed[value] = review_finish_types(document, choice.get("horizontal_finishes"),
+                                               choice.get("wall_type_id"), choice.get("wall_dimensions"))
+    return name, reviewed
+
+
+def mapped_room_finish(document, room, row, name, table):
+    parameters = list(room.GetParameters(name))
+    if len(parameters) != 1:
+        reason = "finish_parameter_ambiguous" if parameters else "finish_parameter_missing"
+        return excluded(row["room_id"], reason)
+    parameter = parameters[0]
+    if parameter.StorageType != DB.StorageType.String or not parameter.HasValue:
+        return excluded(row["room_id"], "finish_parameter_value_unavailable")
+    value = (parameter.AsString() or "").strip()
+    if value not in table:
+        return excluded(row["room_id"], "finish_parameter_value_unmapped")
+    types, wall_type = table[value]
+    row = room_finish_preview(document, room, row, types, wall_type)
+    row["finish_rule"] = {"parameter": name, "parameter_id": str(parameter.Id.Value), "value": value}
+    return row
+
+
+def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False,
+                    wall_dimensions=None, finish_rules=None):
+    has_direct_types = finish_request is not None or wall_type_id is not None or wall_dimensions is not None
+    if finish_rules is not None and has_direct_types:
+        raise ValueError("Choose direct finish types or room parameter rules.")
+    finish_selected = has_direct_types or finish_rules is not None
+    if type(audit_existing) is not bool or (audit_existing and not finish_selected):
+        raise ValueError("Select finish types before requesting an existing-finish audit.")
+    identity = None
+    if finish_selected:
+        project = document.ProjectInformation
+        if not document.PathName or project is None or not project.UniqueId:
+            raise ValueError("Save the project before requesting a finish preview.")
+        identity = {"project_uid": str(project.UniqueId),
+                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+    name, table = read_finish_rules(document, finish_rules) if finish_rules is not None else (None, {})
+    types, wall_type = review_finish_types(document, finish_request, wall_type_id, wall_dimensions)
     rows = []
     remaining = MAX_SEGMENTS
     options = DB.SpatialElementBoundaryOptions()
@@ -108,22 +472,40 @@ def read_boundaries(document, room_ids):
                 room = document.GetElement(DB.ElementId(Int64(room_id)))
                 row, used = inspect_room(room, room_id, options, remaining)
                 remaining -= used
+                if finish_selected and row["status"] == "boundary_verified":
+                    row = (mapped_room_finish(document, room, row, name, table) if name else
+                           room_finish_preview(document, room, row, types, wall_type))
             except Exception as exc:
                 row = excluded(room_id, "boundary_read_failed")
                 row["error_type"] = type(exc).__name__
             rows.append(row)
     finally:
         options.Dispose()
-    return {
-        "status": "reported" if all(row["status"] == "boundary_verified" for row in rows) else "incomplete",
+    if audit_existing:
+        from room_finish_provenance import audit_existing_finishes
+        audit_existing_finishes(document, rows)
+    report = {
+        "status": "reported" if all(row["status"] == "boundary_verified"
+                                   and row.get("wall_finish", {}).get("status", "reported") == "reported"
+                                   and row.get("existing_finishes", {}).get("status") != "conflict"
+                                   and row.get("existing_finishes", {}).get("nearby", {}).get(
+                                       "status", "none_in_scope") == "none_in_scope"
+                                   for row in rows) else "incomplete",
         "rooms": rows,
         "boundary_location": "finish",
         "placement_available": False,
     }
+    if identity:
+        report["host_identity"] = identity
+    return report
 
 
-if doc is None or doc.IsFamilyDocument:
-    result = {"error": "Open a Revit project before reading room boundaries."}
-else:
-    report = read_boundaries(doc, ids_from(inputs.get("room_ids")))
-    result = {"payload": json.dumps(report, ensure_ascii=True)}
+if "inputs" in globals():
+    if doc is None or doc.IsFamilyDocument:
+        result = {"error": "Open a Revit project before reading room boundaries."}
+    else:
+        report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
+                                 inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
+                                 inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"),
+                                 inputs.get("finish_rules"))
+        result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

@@ -211,7 +211,41 @@ Run `scripts/read_room_finish_boundaries.py` with `run_query`. Pass `room_ids` f
 
 The query checks actual boundary loops on the finish face. It keeps separate loops and source IDs. Loop order alone does not establish which loops are holes. The endpoints are for inspection. Revit must read the original curves before it can build a finish.
 
-This query does not create finishes. Do not use its result as approval to change the model.
+Add `horizontal_finishes` to preview selected floor and ceiling types and their heights in a saved project. For example, pass `{"floor":{"type_id":"123","offset_ft":0},"ceiling":{"type_id":"456","offset_ft":9}}`. Set each offset relative to the room level, in Revit internal feet. Check the room level, phase, boundary loops, and proposed project elevation. Resolve rooms excluded for missing scope or design options before placement. This query is read-only.
+
+Pass `wall_type_id` to review a basic wall finish type and its width. Review each straight host-wall boundary for projected door envelopes and the remaining spans. The span distances start at the boundary segment's first endpoint. Segments with unclassified inserts or door envelopes that reach a boundary end are excluded with reasons.
+
+Pass `wall_dimensions` with `height_ft` and `base_offset_ft` to include wall height and base offset in the preview. Set the base offset relative to the room level. Use the same dimensions when checking a previous tagged set.
+
+To select finishes per room, pass `finish_rules` with the room text parameter and its mapping. Use this in place of the direct finish type inputs. The query trims outer spaces from parameter values and matches each value with case preserved. Missing, ambiguous, and unmapped values exclude the room from placement.
+
+```json
+{
+  "finish_rules": {
+    "parameter": "Finish Code",
+    "by_value": {
+      "OFFICE": {"horizontal_finishes": {"floor": {"type_id": "123", "offset_ft": 0}}},
+      "CORRIDOR": {"wall_type_id": "456", "wall_dimensions": {"height_ft": 9, "base_offset_ft": 0}}
+    }
+  }
+}
+```
+
+Review `finish_footprints` for the centerlines that fit inside the room outline at the selected width. The check accounts for holes in straight-edged outlines. Curved outlines need separate review. Within each room, longer pieces take priority when footprints overlap. Review `original_span_ft` and `span_ft` for any trim. Check oblique joints for gaps before placement.
+
+Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict.
+
+Review `nearby.candidates` for other walls, floors, and ceilings whose bounding boxes intersect a proposed finish scope. These are candidates for review. Check the actual geometry before deciding whether a candidate overlaps a finish. An unavailable scan leaves the report incomplete. This query registers no schema and writes no elements.
+
+### Qualify finish placement in Revit 2026
+
+Use the disposable model and acceptance cases in the [room-finish plan](../../docs/plans/2026-11-09-room-finishes.md). The guarded placement script still needs this native qualification.
+
+1. Use the scripts directory as the workspace. Run `room_finish_placement.py` with `run_query` and `mode: "schema-check"`. This checks a detached entity and registers the schema in Revit memory if needed.
+2. Run the same script with `run_query`, `mode: "preview"`, and the room and finish inputs under `request`. Decode `preview_json`. Review the proposed pieces, excluded rooms, and ownership. Verify the active view phase.
+3. Follow the safe-change steps with the exact preview as `plan` and `mode: "apply"`. Use the host's Dry Run and Keep or Discard. Compare the created piece keys and side effects with the preview. The placement receipt lists the created finishes and the added sketch element IDs.
+4. After Dry Run or Discard, make a separate query to `room_finish_placement.py` with `mode: "verify-rollback"`, the exact preview as `plan`, and the placement result as `receipt`. Require `rollback_verified`. This checks the original room scope and the absence of every provisional finish and sketch ID and UID. After Keep, make a separate query with `mode: "verify-keep"` and the same plan and receipt. Require `keep_verified`. This checks the exact saved finishes, sketches, geometry, tags, and original room scope. The repeat preview must offer zero new finishes.
+5. Save the four complete pyRevit responses. Run `python scripts/verify_room_finish_decision.py --plan preview.json --dry-run dry.json --dry-readback dry-query.json --decision decision.json --readback fresh.json`. Require a verified user decision. The command compares the exact additions with the bridge effect lists and checks both fresh queries. Keep the batch within the bridge's detailed effect-list limit.
 
 ## House rules (all am-* skills)
 
