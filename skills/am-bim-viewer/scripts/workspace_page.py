@@ -48,7 +48,7 @@ def describe_artifact(artifact):
             notices.append("This preview is blocked.")
         if data.get("review_only"):
             notices.append("This preview is review only.")
-        notices.extend(preview_deletion_lines(data))
+        notices.extend(preview_deletion_lines(data)[:1])
         notices.extend(warning["text"] for warning in data.get("warnings", []))
         rows = [
             {"title": f"Change {index}",
@@ -56,6 +56,9 @@ def describe_artifact(artifact):
                          for name, values in (("Before", before), ("After", after))]}
             for index, (before, after) in enumerate(pair_preview_rows(data), 1)
         ]
+        rows.extend({"title": f"Delete element {row['id']}",
+                     "details": [f"{row['category']} · {row['name']}"]}
+                    for row in data.get("deletions", ()))
     else:
         notices = [data["header"]["title"], *data["warnings"]]
         rows = [

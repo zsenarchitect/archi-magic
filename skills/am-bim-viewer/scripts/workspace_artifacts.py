@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+from itertools import chain
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -197,7 +198,8 @@ def review_targets(slot_name, artifact):
         lineage = artifact["board"]["lineage"]
         return [f"board:{lineage}:{issue['number']}" for issue in data["issues"]]
     prefix = f"{kind}:{slot_name}:{artifact['digest']}"
-    rows = collect_findings([data]) if kind == "audit" else pair_preview_rows(data)
+    rows = (collect_findings([data]) if kind == "audit"
+            else chain(pair_preview_rows(data), data.get("deletions", ())))
     return [f"{prefix}:{index}" for index, _ in enumerate(rows)]
 
 

@@ -331,19 +331,57 @@ def test_browser_workspace_serves_installed_shell_and_authorized_review_rows(tmp
                 artifact = result["artifacts"]["latest"]
                 assert artifact["freshness"] == "ready"
                 assert artifact["notices"] == [
-                    "This preview is review only.", "Delete: 1 element", f"ID {identifier} | Detail Lines | {message}",
+                    "This preview is review only.", "Delete: 1 element",
                 ]
                 published = await (await client.get(project + "/artifacts/latest", headers=HEADERS,
                                                     cookies=cookie)).json()
                 assert published["data"]["deletions"] == [
                     {"id": str(identifier), "category": "Detail Lines", "name": message},
                 ]
-                target, = published["targets"]
+                target, deletion_target = published["targets"]
                 assert artifact["rows"] == [{
                     "target": target, "title": "Change 1",
                     "details": [f"Before · Element ID = {identifier} · Text = Old",
                                 f"After · Element ID = {identifier} · Text = {message}"],
+                }, {
+                    "target": deletion_target, "title": f"Delete element {identifier}",
+                    "details": [f"Detail Lines · {message}"],
                 }]
+
+    asyncio.run(exercise())
+
+
+def test_deletion_only_preview_accepts_team_review_on_exact_element(tmp_path):
+    accounts, projects = settings(tmp_path)
+    root = projects["sample"]["root"]
+    slot = {"kind": "preview", "path": "preview.json"}
+    projects["sample"]["artifacts"] = {"latest": slot}
+    identifier = "9007199254740993"
+    publish(root, slot, 1, {"kind": "change-preview", "columns": ["Element ID"], "before": [], "after": [],
+                           "deletions": [{"id": identifier, "category": "Detail Lines", "name": "Grid line"}]})
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            cookies = {}
+            for actor in ("editor", "viewer"):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                assert response.status == 200
+                cookies[actor] = {COOKIE: response.cookies[COOKIE].value}
+            response = await client.get("/projects/sample/workspace", headers=HEADERS, cookies=cookies["editor"])
+            assert response.status == 200
+            snapshot = await response.json()
+            artifact = snapshot["artifacts"]["latest"]
+            row, = artifact["rows"]
+            assert row["title"] == "Delete element " + identifier
+            assert row["details"] == ["Detail Lines · Grid line"]
+            body = {"target": row["target"], "operation_id": "operation-delete-0001",
+                    "patch": {"comment": "Keep this grid line in the Revit model."}}
+            headers = dict(HEADERS, **{"If-Match": snapshot["etag"]})
+            assert (await client.patch(REVIEW, headers=headers, cookies=cookies["viewer"], json=body)).status == 403
+            assert (await client.patch(REVIEW, headers=headers, cookies=cookies["editor"], json=body)).status == 200
+            review = await client.get(REVIEW, headers=HEADERS, cookies=cookies["viewer"])
+            annotations = (await review.json())["annotations"]
+            assert annotations[row["target"]]["comments"][0]["text"] == body["patch"]["comment"]
 
     asyncio.run(exercise())
 
