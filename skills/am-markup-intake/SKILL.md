@@ -203,7 +203,7 @@ Example mapping for one product variant.
 }
 ```
 
-The confirmed report gives lengths as decimal strings in millimetres. It includes the PDF name and each value's page and table position. It authorizes no model writes. Family geometry, RFA load and project placement are separate Revit steps that still need live qualification.
+The confirmed report gives lengths as decimal strings in millimetres. It includes the PDF name and each value's page and table position. It authorizes no model writes. The [Revit qualification steps](../../docs/plans/2026-11-09-spec-family.md#rollback-only-family-geometry-probe) exercise family geometry, saved RFA readback, and placement in disposable files. Use them for rollback-only trials.
 
 
 ## House rules (all am-* skills)
