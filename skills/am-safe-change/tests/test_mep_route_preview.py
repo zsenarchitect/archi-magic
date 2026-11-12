@@ -1,0 +1,98 @@
+from copy import deepcopy
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "mep_route_preview.py"
+
+
+def fixture():
+    return {
+        "endpoints": {
+            "kind": "mep-route-endpoints", "version": 1,
+            "source": {"host_identity": {"project_uid": "fixture"}},
+            "endpoints": [
+                {"element_id": "41", "element_uid": "first", "connector_id": 1,
+                 "origin_ft": [0, 0, 0], "axes": [[0, 1, 0], [0, 0, 1], [1, 0, 0]],
+                 "domain": "DomainHvac", "shape": "Round", "dimensions_ft": [1]},
+                {"element_id": "42", "element_uid": "last", "connector_id": 2,
+                 "origin_ft": [10, 0, 0], "axes": [[0, 1, 0], [0, 0, -1], [-1, 0, 0]],
+                 "domain": "DomainHvac", "shape": "Round", "dimensions_ft": [1]},
+            ],
+        },
+        "minimum_segment_ft": 0.25, "clearance_ft": 0.25, "obstacles": [],
+    }
+
+
+def run(tmp_path, data):
+    source = tmp_path / "route-input.json"
+    source.write_text(json.dumps(data))
+    return subprocess.run([sys.executable, str(SCRIPT), str(source)], capture_output=True, text=True)
+
+
+def test_straight_route_respects_open_end_axes_and_renders(tmp_path):
+    result = run(tmp_path, fixture())
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    route = preview["route"]
+    assert route["points_ft"] == [[0, 0, 0], [10, 0, 0]]
+    assert route["length_ft"] == 10 and route["bends_degrees"] == []
+    assert preview["review_only"] and preview["steps"] == preview["ownership_ids"] == []
+    saved, rendered = tmp_path / "preview.json", tmp_path / "review.html"
+    saved.write_text(result.stdout)
+    project_page = SCRIPT.parents[2] / "am-bim-viewer" / "scripts" / "project_page.py"
+    view = subprocess.run([sys.executable, str(project_page), "--title", "Route fixture",
+                           "--preview", str(saved), "--out", str(rendered)], capture_output=True, text=True)
+    assert view.returncode == 0, view.stderr
+    assert "Waypoints (host ft)" in rendered.read_text()
+
+
+def test_detour_preserves_clearance_and_checks_diagonal_segments(tmp_path):
+    data = fixture()
+    data["obstacles"] = [{"min_ft": [4, -1, -1], "max_ft": [6, 1, 1]}]
+    result = run(tmp_path, data)
+    assert result.returncode == 0, result.stderr
+    route = json.loads(result.stdout)["route"]
+    assert route["length_ft"] > 10 and 45 in route["bends_degrees"]
+    assert set(route["bends_degrees"]) <= {45, 90}
+    # The swept segment crossing the middle of the obstruction must clear
+    # its one-foot half-width, half-foot connector radius and quarter-foot gap.
+    for a, b in zip(route["points_ft"], route["points_ft"][1:]):
+        if min(a[0], b[0]) < 5 < max(a[0], b[0]):
+            fraction = (5 - a[0]) / (b[0] - a[0])
+            y, z = (a[i] + fraction * (b[i] - a[i]) for i in (1, 2))
+            assert max(abs(y), abs(z)) > 1.75
+            break
+    else:
+        pytest.fail("No segment crosses the obstruction plane.")
+    assert run(tmp_path, data).stdout == result.stdout
+
+
+def test_obstacle_covering_endpoint_blocks_route_without_edit_steps(tmp_path):
+    data = fixture()
+    data["obstacles"] = [{"min_ft": [-0.2, -0.2, -0.2], "max_ft": [0.2, 0.2, 0.2]}]
+    result = run(tmp_path, data)
+    assert result.returncode == 1, result.stderr
+    preview = json.loads(result.stdout)
+    assert preview["route"] is None and preview["blocked"]
+    assert preview["steps"] == [] and preview["warnings"][0]["blocking"]
+
+
+@pytest.mark.parametrize("change", ["domain", "diameter", "normal", "bounds"])
+def test_malformed_or_incompatible_route_input_emits_no_preview(tmp_path, change):
+    data = deepcopy(fixture())
+    last = data["endpoints"]["endpoints"][1]
+    if change == "domain":
+        last["domain"] = "DomainPiping"
+    elif change == "diameter":
+        last["dimensions_ft"] = [2]
+    elif change == "normal":
+        last["axes"][2] = [0, 0, 0]
+    else:
+        data["obstacles"] = [{"min_ft": [3, 0, 0], "max_ft": [2, 1, 1]}]
+    result = run(tmp_path, data)
+    assert result.returncode == 2 and not result.stdout
