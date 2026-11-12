@@ -183,7 +183,9 @@ Preserve the canonical Host at the office HTTPS proxy. Disable caching of privat
 
 Send `POST /session` with the token in a JSON body to start a browser session. Read state with `GET /projects/<project>/review`. Editors can send `PATCH` to the same route with `target`, `operation_id`, and `patch`. Send the current `ETag` as `If-Match`. Send `DELETE /session` to sign out.
 
-Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Refresh the review state and configured artifacts after connecting and after each revision notice.
+Open the configured HTTPS origin, enter the project slug and sign in with your access token. The browser shows each publication’s freshness and review history. Editors can comment, assign a project member, or change the review status on current items. Revit board status is shown separately.
+
+API clients can fetch the current review revision and display rows together from `/projects/<project>/workspace`. Connect to `/projects/<project>/events` with the same session and exact office Origin. Forward WebSocket upgrades through the HTTPS proxy. Allow at least 75 seconds for an idle read. Refresh the review state and configured artifacts after connecting and after each revision notice.
 
 To publish a completed audit, preview, or board locally, configure an `artifacts` entry under the project. Each slot has a `kind` and a relative JSON `path`. Board slots also have a `board` identity with `lineage`, `host_identity`, and `note_uid`. Read the original Revit note with `include_identity` before publishing a board.
 

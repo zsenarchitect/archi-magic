@@ -283,3 +283,56 @@ def test_workspace_audit_updates_recover_and_cannot_regress_after_restart(tmp_pa
             assert restored.status == 200 and await restored.json() == newest_data
 
     asyncio.run(exercise())
+
+
+def test_browser_workspace_serves_installed_shell_and_authorized_review_rows(tmp_path):
+    import base64
+    import re
+
+    accounts, projects = settings(tmp_path)
+    root = projects["sample"]["root"]
+    slot = {"kind": "preview", "path": "preview.json"}
+    projects["sample"]["artifacts"] = {"latest": slot}
+    identifier = 9007199254740993
+    message = "</script><img src=x onerror=alert(1)>"
+    publish(root, slot, 1, {"columns": ["Element ID", "Text"], "before": [[identifier, "Old"]],
+                           "after": [[identifier, message]], "review_only": True})
+    project = "/projects/sample"
+    snapshot = project + "/workspace"
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            redirect = await client.get(project, headers=HEADERS, allow_redirects=False)
+            assert redirect.status == 302 and redirect.headers["Location"] == "/?project=sample"
+            assert (await client.get(snapshot, headers=HEADERS)).status == 401
+            for actor, expected in (("outsider", 404), ("viewer", 200)):
+                login = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                cookie = {COOKIE: login.cookies[COOKIE].value}
+                shell = await client.get(project, headers=HEADERS, cookies=cookie)
+                data = await client.get(snapshot, headers=HEADERS, cookies=cookie)
+                assert shell.status == data.status == expected
+                if expected != 200:
+                    continue
+                html = await shell.text()
+                assert message not in html
+                script, = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
+                digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+                policy = shell.headers["Content-Security-Policy"]
+                assert f"script-src 'sha256-{digest}'" in policy
+                assert f"connect-src {ORIGIN} wss://review.example.test;" in policy
+                assert "frame-ancestors 'none'" in policy
+                result = await data.json()
+                assert result["etag"] == data.headers["ETag"]
+                assert result["role"] == actor
+                artifact = result["artifacts"]["latest"]
+                assert artifact["freshness"] == "ready"
+                assert artifact["notices"] == ["This preview is review only."]
+                target = (await (await client.get(project + "/artifacts/latest", headers=HEADERS,
+                                                   cookies=cookie)).json())["targets"][0]
+                assert artifact["rows"] == [{
+                    "target": target, "title": "Change 1",
+                    "details": [f"Before · Element ID = {identifier} · Text = Old",
+                                f"After · Element ID = {identifier} · Text = {message}"],
+                }]
+
+    asyncio.run(exercise())

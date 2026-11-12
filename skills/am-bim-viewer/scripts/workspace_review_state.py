@@ -128,6 +128,13 @@ class ReviewState:
             state = self._load()
             return {"etag": self._etag(state), "annotations": state["annotations"]}
 
+    def read_workspace(self, actor):
+        with self._thread_lock:
+            self._authorize(actor)
+            state = self._load()
+            return {"etag": self._etag(state), "annotations": state["annotations"],
+                    "targets": sorted(self.targets)}, self._artifacts
+
     def read_artifact(self, actor, slot):
         with self._thread_lock:
             self._authorize(actor)

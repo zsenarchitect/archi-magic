@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from aiohttp import WSCloseCode, WSMsgType, web
 
 from workspace_artifacts import board_binding, read_published, review_targets, slot_path
+from workspace_page import describe_artifact, page
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
 
 
@@ -65,6 +66,7 @@ class Workspace:
     def __init__(self, origin, accounts, projects):
         self.authority = canonical_origin(origin)
         self.origin = origin
+        self.page_html, self.page_policy = page(origin)
         if (not isinstance(accounts, dict) or not accounts
                 or any(not isinstance(actor, str) or not actor.strip() or not isinstance(digest, str)
                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None for actor, digest in accounts.items())
@@ -188,6 +190,37 @@ class Workspace:
         response.set_cookie(COOKIE, "", secure=True, httponly=True, samesite="Strict", max_age=0)
         return response
 
+    async def sign_in_page(self, request):
+        return web.Response(text=self.page_html, content_type="text/html",
+                            headers={"Content-Security-Policy": self.page_policy})
+
+    async def project_page(self, request):
+        try:
+            self.project_member(request)
+        except web.HTTPUnauthorized:
+            slug = request.match_info["project"]
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", slug) is None:
+                raise web.HTTPNotFound(text="Project unavailable.")
+            raise web.HTTPFound(location=f"/?project={slug}")
+        return await self.sign_in_page(request)
+
+    def workspace_snapshot(self, actor, project):
+        review, artifacts = project.read_workspace(actor)
+        slots = self.artifact_slots[project.project]
+        return {**review, "role": project.members[actor], "members": sorted(project.members),
+                "artifacts": {name: describe_artifact(artifacts.get(name, {"freshness": "unavailable"}))
+                              for name in slots}}
+
+    async def read_workspace(self, request):
+        actor, project = self.project_member(request)
+        try:
+            await self.refresh_artifacts(project)
+            result = await self.storage(self.workspace_snapshot, actor, project)
+        except (OSError, ValueError) as error:
+            LOG.warning("Workspace snapshot could not be read (%s)", type(error).__name__)
+            raise web.HTTPServiceUnavailable(text="Project workspace is unavailable.") from error
+        return web.json_response(result, headers={"ETag": result["etag"]})
+
     async def read_review(self, request):
         actor, project = self.project_member(request)
         try:
@@ -209,6 +242,7 @@ class Workspace:
         if set(body) != {"target", "operation_id", "patch"}:
             raise web.HTTPBadRequest(text="Supply a target, operation ID and annotation change.")
         try:
+            await self.refresh_artifacts(project)
             result, _ = await self.storage(project.update_with_outcome, actor, body["target"],
                                            body["operation_id"], tags[0], body["patch"],
                                            on_success=lambda outcome: self.notify_review(project.project, outcome))
@@ -371,13 +405,17 @@ def create_app(origin, accounts, projects):
         except web.HTTPException as error:
             error.headers.update(SECURITY_HEADERS)
             raise
-        response.headers.update(SECURITY_HEADERS)
+        for name, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
         return response
 
     app = web.Application(client_max_size=MAX_BODY_BYTES, middlewares=[boundary])
     app.cleanup_ctx.append(workspace.lifecycle)
     app.on_shutdown.append(workspace.shutdown)
     app.add_routes([
+        web.get("/", workspace.sign_in_page),
+        web.get("/projects/{project}", workspace.project_page),
+        web.get("/projects/{project}/workspace", workspace.read_workspace),
         web.post("/session", workspace.login),
         web.delete("/session", workspace.logout),
         web.get("/projects/{project}/review", workspace.read_review),
