@@ -430,12 +430,15 @@ def test_only_reviewed_worksharing_borrowing_can_survive_recheck(writer):
 
 
 def wrap_query(result):
-    return {"status": "ok", "decision": "rolled_back", "result": result,
+    return {"status": "ok", "decision": "rolled_back", "result": result, "mode": "query",
+            "run_id": "fresh-query-run", "result_truncated": False,
             "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0}}
 
 
 def wrap_repair(result, decision):
     return {"status": "rejected" if decision == "discarded" else "ok", "decision": decision,
+            "mode": "dry_run" if decision == "rolled_back" else "modify",
+            "run_id": "warning-repair-run", "result_truncated": False,
             "approval": "user" if decision in ("discarded", "committed") else None, "result": result,
             "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 1, "deleted": [2],
                         "added": [], "modified": [], "by_category": {}},
@@ -482,6 +485,12 @@ def test_outcome_requires_fresh_restored_baseline_and_full_deletion_ids(writer, 
     observed = wrap_query(restored)
     result = preview.verify_outcome(command, plan, record, observed)
     assert result["status"] == ("verified_dry_run" if decision == "rolled_back" else "verified_discard")
+    for fields in ({"run_id": record["run_id"]}, {"mode": "modify"}, {"result_truncated": True},
+                   {"changes": {**observed["changes"], "modified": [{"id": 9}]}}):
+        with pytest.raises(ValueError, match="independent Revit query"):
+            preview.verify_outcome(command, plan, record, {**observed, **fields})
+    with pytest.raises(ValueError, match="full pyRevit record"):
+        preview.verify_outcome(command, plan, {**record, "result_truncated": True}, observed)
     record["changes"]["deleted"] = []
     with pytest.raises(ValueError, match="exactly the approved deletions"):
         preview.verify_outcome(command, plan, record, observed)

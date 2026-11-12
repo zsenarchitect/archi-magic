@@ -62,7 +62,7 @@ def snapshot_digest(snapshot):
 
 def read_payload(record, field):
     result = record["result"]
-    if result.get("status") != "ok":
+    if result.get("status") != "ok" or record.get("result_truncated", False) is not False:
         raise ValueError("The native warning repair script did not complete.")
     payload = result[field]
     if not isinstance(payload, TEXT) or len(payload) > MAX_BYTES or any(ord(char) > 127 for char in payload):
@@ -183,7 +183,11 @@ def load_record(path):
 
 def check_runtime_receipt(plan, record, outcome):
     expected_status = "rejected" if outcome == "discarded" else "ok"
+    expected_mode = "dry_run" if outcome == "rolled_back" else "modify"
+    run_id = record.get("run_id")
     if (record.get("decision") != outcome or record.get("status") != expected_status
+            or record.get("mode") != expected_mode or record.get("result_truncated") is not False
+            or not isinstance(run_id, TEXT) or not run_id.strip()
             or (outcome == "discarded" and record.get("approval") != "user")
             or (outcome == "committed" and record.get("approval") not in ("user", "auto"))):
         raise ValueError("The full pyRevit record does not establish the requested repair outcome.")
@@ -216,13 +220,17 @@ def verify_outcome(command, plan, record, fresh):
     outcomes = {"verify-dry-run": "rolled_back", "verify-discard": "discarded", "verify-keep": "committed"}
     receipt = check_runtime_receipt(plan, record, outcomes[command])
     changes = fresh["changes"]
+    fresh_id = fresh.get("run_id")
     if (fresh.get("status") != "ok" or fresh.get("decision") != "rolled_back"
+            or fresh.get("mode") != "query" or fresh.get("result_truncated") is not False
+            or not isinstance(fresh_id, TEXT) or not fresh_id.strip() or fresh_id == record["run_id"]
             or any(fresh.get(field) for field in ("error", "failures", "dialogs", "blocked", "warnings",
                                                   "unclosed_documents"))
             or any(type(changes[field]) is not int or changes[field] != 0
                    for field in ("added_count", "modified_count", "deleted_count"))
-            or changes.get("other_documents")):
-        raise ValueError("The independent Revit query did not finish without changes.")
+            or any(changes.get(field) for field in ("added", "modified", "deleted", "added_ids", "modified_ids",
+                                                    "deleted_ids", "by_category", "other_documents"))):
+        raise ValueError("Use a separate, complete independent Revit query without model changes.")
     if command == "verify-keep":
         observed = read_payload(fresh, "readback_json")
         expected = {field: receipt[field] for field in
