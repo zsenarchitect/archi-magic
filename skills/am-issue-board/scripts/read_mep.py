@@ -227,10 +227,11 @@ def read_element(source, identifier, categories, transform, clearance, clock, co
         raise ReadError("A selected element has an unsupported MEP category.")
     connectors, systems, evidence = read_connectors(source, element, transform, clock, coverage)
     rules = dimension_rules(category, connectors)
-    sizes = None if rules is None else {
-        key: read_value(lambda: numeric_evidence(element, rule)) or {"state": "unavailable"}
-        for key, rule in rules.items()
-    }
+    sizes = None
+    if rules is not None:
+        sizes = {}
+        for key, rule in rules.items():
+            sizes[key] = read_value(lambda: numeric_evidence(element, rule)) or {"state": "unavailable"}
     airflow = None
     if category in ("Ducts", "Flex Ducts"):
         airflow = {"state": "unavailable"}
