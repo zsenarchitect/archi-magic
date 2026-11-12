@@ -279,7 +279,7 @@ def route_connector_geometry(connector, transform):
             "axes": axes, "dimensions_ft": dimensions}
 
 
-def read_route_endpoints(source, transform, requested, clock, coverage):
+def read_route_endpoints(source, transform, requested, clock, coverage, require_open=True):
     if not isinstance(requested, list) or len(requested) != 2:
         raise ReadError("Supply exactly two reviewed connector endpoints.")
     rows = []
@@ -304,7 +304,7 @@ def read_route_endpoints(source, transform, requested, clock, coverage):
         if len(matches) != 1:
             raise ReadError("A reviewed connector is missing or ambiguous.")
         connector = matches[0]
-        if str(connector.ConnectorType) != "End" or connector.IsConnected:
+        if str(connector.ConnectorType) != "End" or (require_open and connector.IsConnected):
             raise ReadError("A reviewed connector is connected or is not a physical end.")
         rows.append(dict(selected, category_id=str(owner.Category.Id.Value),
                          **route_connector_geometry(connector, transform)))
@@ -434,8 +434,8 @@ def route_system_snapshot(source, system, clock, coverage):
                 base_equipment=route_element_identity(base) if base is not None else None)
 
 
-def read_route_trial_owners(source, transform, requested, clock, coverage):
-    endpoints = read_route_endpoints(source, transform, requested, clock, coverage)
+def read_route_trial_owners(source, transform, requested, clock, coverage, require_open=True):
+    endpoints = read_route_endpoints(source, transform, requested, clock, coverage, require_open=require_open)
     selected = [{"element_id": row["element_id"], "element_uid": row["element_uid"]} for row in endpoints]
     if selected[0]["element_id"] == selected[1]["element_id"]:
         raise ReadError("The route trial requires two distinct endpoint owners.")
@@ -482,7 +482,7 @@ def read_route_trial_owners(source, transform, requested, clock, coverage):
                                             references=[refs[key] for key in sorted(refs)])
         endpoint = connectors.get(reviewed["connector_id"])
         geometry = ("domain", "shape", "origin_ft", "axes", "dimensions_ft")
-        if (endpoint is None or endpoint["kind"] != "End" or endpoint["references"]
+        if (endpoint is None or endpoint["kind"] != "End" or (require_open and endpoint["references"])
                 or any(endpoint[field] != reviewed[field] for field in geometry)):
             raise ReadError("A selected endpoint owner no longer has the reviewed open end.")
         owners.append(dict(box, element_type=route_element_identity(owner_type),

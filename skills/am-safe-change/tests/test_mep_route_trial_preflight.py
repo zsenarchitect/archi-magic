@@ -129,3 +129,37 @@ def test_route_preflight_rejects_unreviewed_or_stale_inputs(reviewed_fixture, fa
 
     with pytest.raises(ValueError, match=expected):
         prepare(document, args, reader=NS(run_query=changed))
+
+
+def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(reviewed_fixture, tmp_path):
+    import subprocess
+    from mep_route_trial_preflight import TRANSACTION_NAME
+    from test_color_parameter_values import fixture_record
+
+    baseline = {"kind": "mep-route-trial-preflight", "version": 1, "owner_ids": ["41", "42"]}
+    query = {"status": "ok", "preflight_json": json.dumps(baseline)}
+    changes = {"added": ["63"], "modified": ["41", "42"], "deleted": []}
+    measured = {"status": "mep_route_trial_rolled_back", "receipt": {
+        "preflight": baseline, "changes": changes, "measurements": [{"id": "63"}],
+    }}
+    original = fixture_record("a00000000001", "query", query)
+    trial = fixture_record("a00000000002", "dry_run", measured, changes)
+    trial["changes"]["transactions"] = [TRANSACTION_NAME]
+    fresh = fixture_record("a00000000003", "query", dict(query, confirmed_absent_ids=["63"]))
+    paths = [tmp_path / name for name in ("original.json", "trial.json", "fresh.json")]
+    cli = [sys.executable, str(SCRIPTS / "mep_route_trial_preflight.py"), *map(str, paths)]
+
+    def verify(records):
+        for path, value in zip(paths, records):
+            path.write_text(json.dumps(value))
+        return subprocess.run(cli, capture_output=True, text=True)
+
+    accepted = verify([original, trial, fresh])
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["changes"] == changes
+    bad_fresh = dict(fresh, result=dict(query, confirmed_absent_ids=["64"]))
+    assert verify([original, trial, bad_fresh]).returncode == 2
+    truncated = deepcopy(trial)
+    truncated["changes"]["added"] = []
+    assert verify([original, truncated, fresh]).returncode == 2
+    assert verify([original, trial, dict(fresh, run_id=original["run_id"])]).returncode == 2

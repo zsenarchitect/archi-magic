@@ -1,5 +1,6 @@
 """Bind a reviewed route to a fresh disposable Revit fixture before a trial."""
 
+import argparse
 from hashlib import sha256
 import importlib
 import json
@@ -9,7 +10,11 @@ from pathlib import Path
 import sys
 
 import mep_route_preview as route_preview
-from view_duplicate_preview import snapshot_digest
+from view_duplicate_preview import element_id, read_payload, read_record as load_record, snapshot_digest
+from view_filter_transfer_preview import MAX_SAVED_RECORD, checked_changes, checked_record
+
+
+TRANSACTION_NAME = "Test reviewed MEP route"
 
 
 def installed_reader():
@@ -112,11 +117,71 @@ def prepare(document, args, reader=None):
         "kind": "mep-route-trial-preflight", "version": 1, "source": source,
         "route_input_sha256": computed["basis_sha256"], "review_sha256": snapshot_digest(reviewed_preview),
         "owners_sha256": snapshot_digest(owners_record), "types_sha256": snapshot_digest(types_record),
+        "owner_ids": sorted((row["element_id"] for row in endpoints), key=int),
     }
+
+
+def verify_trial(original_record, trial_record, fresh_record):
+    original = checked_record(original_record, "query")
+    trial = checked_record(trial_record, "dry_run")
+    fresh = checked_record(fresh_record, "query")
+    if len({record["run_id"] for record in (original, trial, fresh)}) != 3:
+        raise ValueError("Use three independent pyRevit run records.")
+    checked_changes(original, [])
+    checked_changes(fresh, [])
+    baseline = read_payload(original, "preflight_json")
+    if read_payload(fresh, "preflight_json") != baseline:
+        raise ValueError("The fresh route baseline differs after rollback.")
+    result = trial["result"]
+    if result["status"] != "mep_route_trial_rolled_back":
+        raise ValueError("The native trial did not report a clean route rollback.")
+    receipt = result["receipt"]
+    if receipt["preflight"] != baseline:
+        raise ValueError("The native trial used a different reviewed route.")
+    changes = receipt["changes"]
+    observed = [element_id(item["id"]) for item in receipt["measurements"]]
+    expected = sorted(set(observed), key=int)
+    if (not 1 <= len(observed) <= 49 or len(expected) != len(observed) or changes["added"] != expected
+            or changes["modified"] != baseline["owner_ids"] or changes["deleted"]
+            or fresh["result"].get("confirmed_absent_ids") != expected):
+        raise ValueError("The complete change list and independent absence check disagree.")
+    checked_changes(trial, changes["modified"], changes["added"], TRANSACTION_NAME)
+    return {"status": "verified_mep_route_trial_rollback", "preflight": baseline, "changes": changes,
+            "original_run_id": original["run_id"], "trial_run_id": trial["run_id"], "fresh_run_id": fresh["run_id"]}
+
+
+def query(document, args):
+    reader = installed_reader()
+    prepared = prepare(document, args, reader)
+    result = {"status": "ok", "preflight_json": json.dumps(prepared, ensure_ascii=True)}
+    if "check_absent_ids" in args:
+        ids = args["check_absent_ids"]
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 49
+                or ids != sorted({element_id(item) for item in ids}, key=int)):
+            raise ValueError("Use the trial's exact sorted addition IDs for the absence check.")
+        if any(document.GetElement(reader.element_id(item)) is not None for item in ids):
+            raise ValueError("Revit still resolves a trial addition.")
+        result["confirmed_absent_ids"] = ids
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify a Revit MEP route rollback from three saved records.")
+    parser.add_argument("records", type=Path, nargs=3, metavar="RECORD")
+    args = parser.parse_args()
+    try:
+        result = verify_trial(*(load_record(path, MAX_SAVED_RECORD) for path in args.records))
+    except (AttributeError, KeyError, TypeError, ValueError, OSError) as error:
+        print(f"MEP route verification stopped. {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=True, indent=2))
+    return 0
 
 
 if "inputs" in globals():
     try:
-        result = {"status": "ok", "preflight_json": json.dumps(prepare(doc, inputs), ensure_ascii=True)}
+        result = query(doc, inputs)
     except (AttributeError, KeyError, TypeError, ValueError, OSError, ImportError, RecursionError) as error:
         result = {"status": "stopped", "message": str(error)}
+elif __name__ == "__main__":
+    sys.exit(main())
