@@ -142,7 +142,8 @@ try {
 
     $t = Write-Transcript 'activity.jsonl' @(
         '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"mcp__pyrevit__run_modify","input":{"model":"Private project"}}]}}',
-        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","is_error":true,"content":"revit_busy"}]}}'
+        '{"type":"user","timestamp":"2026-11-06T15:38:47-05:00","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","is_error":true,"content":"revit_busy"}]}}',
+        '{"type":"user","timestamp":"2026-11-06T19:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unknown","is_error":true,"content":"revit_busy"}]}}'
     )
     $f = Join-Path $Root 'activity.json'
     $r = Invoke-Hook $t $f
@@ -150,6 +151,16 @@ try {
     Assert-True 'activity: failing tool is captured without its input' (
         $n.activity -eq 'revit_modify' -and $n.body -notmatch 'Private project'
     ) $r.Out
+    Assert-True 'activity: capture the actual incident time in UTC' (
+        $n.occurred_at -and [DateTimeOffset]$n.occurred_at -eq [DateTimeOffset]'2026-11-06T20:38:47Z' -and
+        [DateTimeOffset]$n.ended_at -ne [DateTimeOffset]$n.occurred_at
+    ) ($n | ConvertTo-Json -Compress)
+    $f2 = Join-Path $Root 'activity-after-resume.json'
+    $r = Invoke-Hook $t $f2
+    $n2 = Read-Note $f2
+    Assert-True 'activity: reopening the same incident keeps the incident time' (
+        $n2.occurred_at -eq $n.occurred_at
+    ) ($n2 | ConvertTo-Json -Compress)
 
     $t = Write-Transcript 'prior-note.jsonl' @('{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"note_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, revit_busy"}]}}')
     $f = Join-Path $Root 'prior-note.json'

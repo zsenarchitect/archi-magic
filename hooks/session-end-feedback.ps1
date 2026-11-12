@@ -83,6 +83,7 @@ try {
     $found = New-Object System.Collections.Generic.List[string]
     $toolActivities = @{}
     $failureActivities = @{}
+    $failureTimes = @{}
     foreach ($line in ($tail -split "`r?`n")) {
         if ($line -match 'note_sha256.{0,12}[0-9a-f]{64}') { continue }
         if ($line -match '"type"\s*:\s*"tool_(use|result)"') {
@@ -95,15 +96,32 @@ try {
                         '(^|__)run_modify$' { $toolActivities[$block.id] = 'revit_modify' }
                         '(^|__)(get_context|list_revit_instances)$' { $toolActivities[$block.id] = 'revit_context' }
                     }
-                } elseif ($block.type -eq 'tool_result' -and $block.tool_use_id -and
-                          $toolActivities.ContainsKey($block.tool_use_id)) {
+                } elseif ($block.type -eq 'tool_result') {
                     $content = $block.content | ConvertTo-Json -Compress -Depth 4
-                    $activity = $toolActivities[$block.tool_use_id]
-                    if ($content -match 'pipe_error') { $failureActivities.pipe_error = $activity }
-                    if ($content -match 'revit_busy') { $failureActivities.revit_busy = $activity }
-                    if ($content -match 'no instances found') { $failureActivities.no_instances_found = $activity }
-                    if ($block.is_error -eq $true -or $content -match 'invalid_params') {
-                        $failureActivities.tool_failed = $activity
+                    $activity = if ($block.tool_use_id) { $toolActivities[$block.tool_use_id] }
+                    $stamp = [DateTimeOffset]::MinValue
+                    $timestamp = $event.timestamp
+                    if ($timestamp -is [DateTime] -and $timestamp.Kind -ne [DateTimeKind]::Unspecified) {
+                        $stamp = [DateTimeOffset]$timestamp
+                    } elseif ($timestamp -is [DateTimeOffset]) {
+                        $stamp = $timestamp
+                    } elseif ($timestamp -is [string] -and $timestamp -match '(Z|[+-][0-9]{2}:[0-9]{2})$') {
+                        [void][DateTimeOffset]::TryParse($timestamp, [ref]$stamp)
+                    }
+                    $matched = @(
+                        if ($content -match 'pipe_error') { 'pipe_error' }
+                        if ($content -match 'revit_busy') { 'revit_busy' }
+                        if ($content -match 'no instances found') { 'no_instances_found' }
+                        if ($block.is_error -eq $true -or $content -match 'invalid_params') { 'tool_failed' }
+                    )
+                    foreach ($signal in $matched) {
+                        if ($stamp -ne [DateTimeOffset]::MinValue -and
+                            (-not $failureTimes.ContainsKey($signal) -or $stamp -gt $failureTimes[$signal])) {
+                            $failureTimes[$signal] = $stamp
+                            $failureActivities[$signal] = $activity
+                        } elseif (-not $failureTimes.ContainsKey($signal) -and $activity) {
+                            $failureActivities[$signal] = $activity
+                        }
                     }
                 }
             }
@@ -129,6 +147,7 @@ try {
     if (-not $activity) { $activity = 'unknown' }
 
     $when = (Get-Date).ToUniversalTime().ToString('o')
+    $incident = if ($failureTimes.ContainsKey($primary)) { $failureTimes[$primary].ToUniversalTime().ToString('o') }
     $body = "Signals seen at the end of the session: " + ($found -join ', ') + ".`n" +
             "Session ended (UTC): $when.`n" +
             "File it at https://github.com/zsenarchitect/archi-magic/issues/new or with: gh issue create --repo zsenarchitect/archi-magic --title `"$title`""
@@ -146,6 +165,7 @@ try {
         body       = $body
         session_id = $sessionId
         ended_at   = $when
+        occurred_at = $incident
         transcript = $TranscriptPath
     }
     try {

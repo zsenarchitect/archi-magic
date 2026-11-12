@@ -59,6 +59,19 @@ try {
     Assert-True 'read: reports the saved activity' ($note.activity -eq 'The session tried a Revit modification.') $result.Out
     Assert-True 'read: omits private body and transcript' ($result.Out -notmatch 'Private|transcript') $result.Out
     Assert-True 'read: does not claim note' (Test-Path -LiteralPath $file) 'pending file missing'
+    Assert-True 'legacy note: do not present the session end as the incident time' (
+        -not $note.occurred_at -and -not $note.incident_line
+    ) $result.Out
+
+    $incidentFile = Write-Note 'incident.json' 'revit_busy' '2026-11-07T02:00:00Z'
+    $incident = [IO.File]::ReadAllText($incidentFile) | ConvertFrom-Json
+    $incident | Add-Member -NotePropertyName occurred_at -NotePropertyValue '2026-11-06T15:38:47-05:00'
+    [IO.File]::WriteAllText($incidentFile, ($incident | ConvertTo-Json -Compress))
+    $incidentResult = Invoke-Hook $incidentFile @('-Read')
+    $incidentRead = $incidentResult.Out | ConvertFrom-Json
+    Assert-True 'read: stable incident line uses event time in UTC' (
+        $incidentRead.incident_line -ceq 'Archi Magic incident: revit_busy at 2026-11-06T20:38:47.0000000+00:00'
+    ) $incidentResult.Out
 
     $file = Write-Note 'note.json' 'pipe_error' '2026-11-12T18:00:00Z'
     $result = Invoke-Hook $file @('-Claim', $note.note_sha256)

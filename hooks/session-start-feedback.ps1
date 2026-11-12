@@ -41,6 +41,11 @@ function Read-SavedNote([string]$Path) {
     $signals = @($titles.Keys | Where-Object { @($note.signals) -ccontains $_ })
     if ($signals.Count -eq 0 -or -not $note.ended_at) { throw 'Feedback signal or date is missing.' }
     $date = [DateTimeOffset]$note.ended_at
+    $incident = $null
+    if ($note.occurred_at) {
+        $occurred = [DateTimeOffset]$note.occurred_at
+        $incident = $occurred.ToUniversalTime().ToString('o')
+    }
     $hash = [Security.Cryptography.SHA256]::Create()
     try { $digest = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
     finally { $hash.Dispose() }
@@ -55,6 +60,8 @@ function Read-SavedNote([string]$Path) {
         title = $titles[$signals[0]]
         signals = $signals
         ended_at = $date.ToUniversalTime().ToString('o')
+        occurred_at = $incident
+        incident_line = if ($incident) { 'Archi Magic incident: ' + $signals[0] + ' at ' + $incident }
         note_sha256 = $digest
     }
 }
