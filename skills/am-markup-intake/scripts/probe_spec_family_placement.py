@@ -13,6 +13,9 @@ import tempfile
 from System import Int64
 from pyrevit.api import DB
 
+from probe_spec_family_box import AXES
+from spec_family_box_constraints import PARAMETER_NAMES
+
 
 TEXT = (str, type(u""))
 MAX_RFA_BYTES = 32 * 1024 * 1024
@@ -77,7 +80,7 @@ def local_rfa_bytes(path):
     return data
 
 
-def load_and_place(document, path, baseline, type_name, coordinates, source_digest, created):
+def load_and_place(document, path, baseline, type_name, coordinates, verified, created):
     if not document.LoadFamilySymbol(path, type_name):
         raise ValueError("Revit did not load the exact reviewed RFA type.")
     families = [family for family in loaded_families(document)
@@ -95,10 +98,26 @@ def load_and_place(document, path, baseline, type_name, coordinates, source_dige
             or family.FamilyCategory.Id.Value != DB.ElementId(DB.BuiltInCategory.OST_GenericModel).Value):
         raise ValueError("The loaded family, type, placement mode or category differs from the reviewed RFA.")
     symbol = candidates[0]
-    provenance = list(symbol.GetParameters("PDF Source SHA256"))
-    if (len(provenance) != 1 or provenance[0].StorageType != DB.StorageType.String
-            or provenance[0].AsString() != source_digest):
-        raise ValueError("The loaded type PDF source digest differs from the verified RFA.")
+    measured_dimensions = {}
+    for axis, name in zip(AXES, PARAMETER_NAMES):
+        parameters = list(symbol.GetParameters(name))
+        if (len(parameters) != 1 or parameters[0].StorageType != DB.StorageType.Double
+                or parameters[0].Definition.GetDataType() != DB.SpecTypeId.Length):
+            raise ValueError("The loaded type lacks the reviewed length parameter {}.".format(name))
+        actual = float(parameters[0].AsDouble())
+        if not abs(actual - verified["dimensions_ft"][axis]) <= TOLERANCE_FT:
+            raise ValueError("The loaded type dimension {} differs from the verified RFA.".format(name))
+        measured_dimensions[axis] = actual
+    measured_source = {}
+    for name, expected in sorted(verified["source_parameters"].items()):
+        parameters = list(symbol.GetParameters(name))
+        if (len(parameters) != 1 or parameters[0].StorageType != DB.StorageType.String
+                or parameters[0].Definition.GetDataType() != DB.SpecTypeId.String.Text):
+            raise ValueError("The loaded type lacks the reviewed PDF parameter {}.".format(name))
+        actual = parameters[0].AsString()
+        if actual != expected:
+            raise ValueError("The loaded type PDF parameter {} differs from the verified RFA.".format(name))
+        measured_source[name] = actual
     if not symbol.IsActive:
         symbol.Activate()
         document.Regenerate()
@@ -117,7 +136,8 @@ def load_and_place(document, path, baseline, type_name, coordinates, source_dige
            for value, target in zip(actual, expected)):
         raise ValueError("The candidate world position differs from the reviewed level-relative placement.")
     return {"family_uid": str(family.UniqueId), "symbol_uid": str(symbol.UniqueId),
-            "instance_uid": str(instance.UniqueId), "position_ft": actual}
+            "instance_uid": str(instance.UniqueId), "position_ft": actual,
+            "dimensions_ft": measured_dimensions, "source_parameters": measured_source}
 
 
 def probe(document, args):
@@ -140,6 +160,15 @@ def probe(document, args):
             or not isinstance(verified.get("pdf_source_sha256"), TEXT)
             or not re.match(r"[0-9a-f]{64}\Z", verified["pdf_source_sha256"])):
         raise ValueError("Supply the matching saved RFA verification receipt from this Revit build.")
+    dimensions, metadata = verified.get("dimensions_ft"), verified.get("source_parameters")
+    required = {"PDF Source File", "PDF Source Pages", "PDF Source SHA256", "PDF Product", "PDF Variant"}
+    if (not isinstance(dimensions, dict) or set(dimensions) != set(AXES)
+            or any(type(value) not in (int, float) or not 0 < value <= 100 for value in dimensions.values())
+            or not isinstance(metadata, dict) or not required.issubset(metadata) or len(metadata) > 37
+            or any(not valid_text(name) or not isinstance(value, TEXT) or not 0 < len(value) <= 500
+                   for name, value in metadata.items())
+            or metadata["PDF Source SHA256"] != verified["pdf_source_sha256"]):
+        raise ValueError("The saved RFA verification receipt lacks complete dimensions or PDF provenance.")
     data = local_rfa_bytes(args["rfa_path"])
     if hashlib.sha256(data).hexdigest() != args["rfa_sha256"]:
         raise ValueError("The RFA does not match the reviewed SHA-256.")
@@ -154,8 +183,7 @@ def probe(document, args):
         try:
             if transaction.Start() != DB.TransactionStatus.Started:
                 raise ValueError("Revit did not confirm the placement transaction started.")
-            result = load_and_place(document, path, baseline, type_name, coordinates,
-                                    verified["pdf_source_sha256"], created)
+            result = load_and_place(document, path, baseline, type_name, coordinates, verified, created)
         except ValueError as error:
             failure = {"message": str(error)}
         except Exception as error:

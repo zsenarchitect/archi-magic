@@ -28,6 +28,10 @@ def setup(monkeypatch, tmp_path, fault):
     records = {1: level}
     calls = []
     copies = []
+    dimensions = {"width": 1.0, "depth": 2.0, "height": 3.0}
+    metadata = {"PDF Source File": "Equipment.pdf", "PDF Source Pages": "1, 2", "PDF Source SHA256": "a" * 64,
+                "PDF Product": "Equipment", "PDF Variant": "Standard", "PDF Connector service": "Supply"}
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
 
     class Transaction:
         def __init__(self, *_):
@@ -62,8 +66,22 @@ def setup(monkeypatch, tmp_path, fault):
             FamilyCategory=NS(Id=NS(Value=-1)), GetFamilySymbolIds=lambda: [NS(Value=3)])
         symbol = Symbol(Id=NS(Value=3), UniqueId="symbol", IsActive=False, Name="Reviewed")
         symbol.Activate = lambda: calls.append("activate")
-        symbol.GetParameters = lambda _: [NS(StorageType="string", AsString=lambda: (
-            "b" * 64 if fault == "provenance" else "a" * 64))]
+        def parameters(name):
+            if name in metadata:
+                actual = metadata[name]
+                if (fault, name) == ("provenance", "PDF Source SHA256"):
+                    actual = "b" * 64
+                if (fault, name) == ("source_pages", "PDF Source Pages"):
+                    actual = "3"
+                return [NS(StorageType="string", AsString=lambda: actual,
+                           Definition=NS(GetDataType=lambda: "text"))]
+            actual = dimensions[name.removeprefix("Equipment ").lower()]
+            if (fault, name) == ("width", "Equipment Width"):
+                actual += 0.5
+            return [NS(StorageType="double", AsDouble=lambda: actual,
+                       Definition=NS(GetDataType=lambda: "length"))]
+
+        symbol.GetParameters = parameters
         records.update({2: family, 3: symbol})
         return True
 
@@ -86,7 +104,7 @@ def setup(monkeypatch, tmp_path, fault):
         Level=Level, Family=Family, FamilySymbol=Symbol, LocationPoint=LocationPoint,
         FilteredElementCollector=collector, FamilyPlacementType=NS(OneLevelBased="level"),
         BuiltInCategory=NS(OST_GenericModel=-1), Element=NS(Name=NS(GetValue=lambda symbol: symbol.Name)),
-        StorageType=NS(String="string"), XYZ=lambda x, y, z: NS(X=x, Y=y, Z=z), Structure=NS(StructuralType=NS(NonStructural="non-structural")),
+        StorageType=NS(String="string", Double="double"), SpecTypeId=NS(Length="length", String=NS(Text="text")), XYZ=lambda x, y, z: NS(X=x, Y=y, Z=z), Structure=NS(StructuralType=NS(NonStructural="non-structural")),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
@@ -110,7 +128,10 @@ def setup(monkeypatch, tmp_path, fault):
     args["verified_rfa"] = {"status": "verified", "kind": "verified-spec-family-rfa",
                             "family_name": "Equipment", "type_name": "Reviewed",
                             "rfa_sha256": args["rfa_sha256"], "pdf_source_sha256": "a" * 64,
-                            "revit_build": "different-build" if fault == "receipt" else "fixture-build"}
+                            "revit_build": "different-build" if fault == "receipt" else "fixture-build",
+                            "dimensions_ft": dimensions, "source_parameters": metadata}
+    if fault == "incomplete_receipt":
+        del args["verified_rfa"]["dimensions_ft"]
     if fault == "digest":
         source.write_bytes(b"other file")
     if fault == "collision":
@@ -123,6 +144,8 @@ def test_placement_uses_pinned_copy_and_reads_level_relative_world_position(monk
     result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": args})["result"]
     assert result["status"] == "measured", result
     assert result["placement"]["position_ft"] == [3, 4, 52.5]
+    assert result["placement"]["dimensions_ft"] == args["verified_rfa"]["dimensions_ft"]
+    assert result["placement"]["source_parameters"] == args["verified_rfa"]["source_parameters"]
     assert result["rollback_verified"] and list(records) == [1]
     assert calls == ["transaction", ("load", "Reviewed"), "activate", "regenerate",
                      ("place", 3, 4, 2.5), "regenerate", "rollback"]
@@ -132,13 +155,15 @@ def test_placement_uses_pinned_copy_and_reads_level_relative_world_position(monk
 @pytest.mark.parametrize(("fault", "status"), [
     ("load_false", "stopped"), ("late", "stopped"), ("world_z", "stopped"), ("wrong_name", "stopped"),
     ("retained", "transaction_unresolved"), ("wrong_retained", "transaction_unresolved"),
-    ("provenance", "stopped"),
+    ("provenance", "stopped"), ("source_pages", "stopped"), ("width", "stopped"),
 ])
 def test_late_failure_or_wrong_family_still_requires_verified_rollback(monkeypatch, tmp_path, fault, status):
     doc, args, calls, records, copies = setup(monkeypatch, tmp_path, fault)
     result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": args})["result"]
     assert result["status"] == status
     assert calls[-1] == "rollback"
+    if fault in ("provenance", "source_pages", "width"):
+        assert not any(isinstance(call, tuple) and call[0] == "place" for call in calls)
     assert not copies[0].exists()
     if status == "stopped":
         assert result["rollback_verified"] and list(records) == [1]
@@ -146,6 +171,7 @@ def test_late_failure_or_wrong_family_still_requires_verified_rollback(monkeypat
 
 @pytest.mark.parametrize(("fault", "message"), [
     ("digest", "reviewed SHA-256"), ("collision", "already exists"), ("receipt", "verification receipt"),
+    ("incomplete_receipt", "lacks complete dimensions"),
 ])
 def test_changed_file_or_existing_family_stops_before_load(monkeypatch, tmp_path, fault, message):
     doc, args, calls, _, copies = setup(monkeypatch, tmp_path, fault)
