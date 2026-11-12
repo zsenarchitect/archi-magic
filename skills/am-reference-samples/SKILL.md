@@ -17,6 +17,13 @@ Check these categories: line styles, text types, dimension types, filled region 
 
 Call `get_context` before the first Revit call. If Revit answers `revit_busy`, stop and tell the user which dialog blocks Revit.
 
+### Inventory placed door and window types
+
+Use `scripts/read_opening_types.py` with `run_query` in a saved host project. Decode `snapshot_json`. It lists each placed door or window type once, with its placement count, type mark, and nominal width and height. Unused types and linked documents are outside this inventory.
+
+Review missing nominal sizes and any measured variation before choosing a label. A repeated type mark does not combine two types. This query prepares the type list for a legend.
+
+
 ### 2. Run the coverage check first (read only)
 
 Read the model. For each category, read the type names in the model. For each sample view, read each row: the label text and the type the sample itself uses. Do not fix anything yet. Feed the read result into `scripts/check_samples.py` as JSON (see Data shapes). Show the report to the user. The report lists four findings:
