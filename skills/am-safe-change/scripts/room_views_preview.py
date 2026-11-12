@@ -220,14 +220,47 @@ def compute(snapshot):
     return preview
 
 
+def preflight_inputs(snapshot, preview):
+    if preview["blocked"] or not preview["proposal"]["views"]:
+        raise ValueError("Resolve the blocked room views before native preflight.")
+    return {
+        "room_views": {
+            "padding_feet": snapshot["padding_feet"],
+            "rooms": [
+                {
+                    "room_id": room["id"],
+                    "host_plan_id": room["host_plan"]["id"],
+                    "families": {
+                        kind: {"type_id": family["type"]["id"], "template_id": family["template"]["id"]}
+                        for kind, family in room["families"].items()
+                        if any(request.get("kind") == kind for request in room["requests"])
+                    },
+                    "requests": room["requests"],
+                }
+                for room in snapshot["rooms"]
+            ],
+        },
+        "room_view_preflight": {
+            "snapshot_json": encode(snapshot).decode("ascii"),
+            "proposal_json": encode(preview["proposal"]).decode("ascii"),
+            "proposal_sha256": preview["proposal_sha256"],
+        },
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--preflight-out", type=Path,
+                        help="Write the read-only native preflight inputs for an unblocked preview.")
     args = parser.parse_args(argv)
     try:
-        if args.snapshot.resolve() == args.out.resolve():
-            raise ValueError("Choose a different output path from the source snapshot.")
+        paths = [args.snapshot.resolve(), args.out.resolve()]
+        if args.preflight_out is not None:
+            paths.append(args.preflight_out.resolve())
+        if len(set(paths)) != len(paths):
+            raise ValueError("Use distinct paths for the snapshot and each output.")
         with args.snapshot.open("rb") as source:
             raw = source.read(MAX_BRIDGE_BYTES + 1)
         if len(raw) > MAX_BRIDGE_BYTES:
@@ -249,6 +282,9 @@ def main(argv=None):
         with args.out.open("wb") as output:
             output.write(encode(preview))
             output.write(b"\n")
+        if args.preflight_out is not None:
+            native_inputs = {"status": "blocked"} if preview["blocked"] else preflight_inputs(snapshot, preview)
+            args.preflight_out.write_bytes(encode(native_inputs) + b"\n")
     except (OSError, ValueError, RecursionError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

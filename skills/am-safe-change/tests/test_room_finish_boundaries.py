@@ -1,4 +1,5 @@
 import json
+import hashlib
 from math import dist
 from pathlib import Path
 import runpy
@@ -25,6 +26,15 @@ class Point:
     def DistanceTo(self, other):
         return dist((self.X, self.Y, self.Z), (other.X, other.Y, other.Z))
 
+    def Add(self, other):
+        return Point(self.X + other.X, self.Y + other.Y, self.Z + other.Z)
+
+    def Multiply(self, scalar):
+        return Point(self.X * scalar, self.Y * scalar, self.Z * scalar)
+
+    def GetLength(self):
+        return self.DistanceTo(Point(0, 0, 0))
+
 
 class Curve:
     IsBound = True
@@ -37,6 +47,13 @@ class Curve:
 
     def GetType(self):
         return NS(Name="Line")
+
+    @staticmethod
+    def CreateBound(a, b):
+        return Curve((a.X, a.Y, a.Z), (b.X, b.Y, b.Z))
+
+    def Dispose(self):
+        pass
 
 
 class CurveLoop(list):
@@ -212,6 +229,7 @@ def snapshot_query(monkeypatch):
     room.Number = "101"
     room.VersionGuid = "room-version"
     room.DesignOption = None
+    room.IsPointInRoom = lambda point: 0 < point.X < 8 and 0 < point.Y < 6 and 2 < point.Z < 11
     room.get_Parameter = lambda _: NS(StorageType="id", AsElementId=lambda: NS(Value=8))
     level = Element(101)
     host = ViewPlan(2, GenLevel=level, Name="Fixture Floor Plan", parameters={"view phase": NS(Value=8)})
@@ -221,6 +239,8 @@ def snapshot_query(monkeypatch):
     elements = {
         101: level, 2: host, 3: view_family_type(3, ViewFamily="elevation"),
         4: template, 8: Phase(8), 9: Phase(9), room.Id.Value: room,
+        10: view_family_type(10, ViewFamily="section"),
+        11: View(11, IsTemplate=True, ViewType="section", Name="Fixture Section Template"),
         **{50 + i: Element(50 + i) for i in range(4)},
     }
     faces = [PlanarFace(top, 1), PlanarFace(bottom, -1)]
@@ -235,8 +255,26 @@ def snapshot_query(monkeypatch):
             GetSubface=lambda: face, Dispose=lambda: None,
         )])
 
+    def intersect(line, options):
+        assert options.ResultType == "inside"
+        a, b = line.ends
+        segment_start, segment_end = 0.0, 1.0
+        for start, end, lower, upper in ((a.X, b.X, 0, 8), (a.Y, b.Y, 0, 6), (a.Z, b.Z, 2, 11)):
+            delta = end - start
+            if delta:
+                first, second = sorted(((lower - start) / delta, (upper - start) / delta))
+                segment_start = max(segment_start, first)
+                segment_end = min(segment_end, second)
+        vector = Point(b.X - a.X, b.Y - a.Y, b.Z - a.Z)
+        return NS(SegmentCount=1, GetCurveSegment=lambda _: Curve.CreateBound(
+            a.Add(vector.Multiply(segment_start)), a.Add(vector.Multiply(segment_end)),
+        ), Dispose=lambda: None)
+
+    solid = NS(Faces=None, Volume=432, IntersectWithCurve=intersect)
+
     def calculate(_):
-        return NS(GetGeometry=lambda: NS(Faces=Faces(faces), Volume=432),
+        solid.Faces = Faces(faces)
+        return NS(GetGeometry=lambda: solid,
                   GetBoundaryFaceInfo=subfaces, Dispose=lambda: None)
 
     class Faces(list):
@@ -252,6 +290,8 @@ def snapshot_query(monkeypatch):
         ViewType=NS(FloorPlan="floor plan", Elevation="elevation", Section="section"),
         StorageType=NS(ElementId="id"), BuiltInParameter=NS(ROOM_PHASE_ID="room phase", VIEW_PHASE="view phase"),
         RevitLinkInstance=type("RevitLinkInstance", (), {}), PlanarFace=PlanarFace, Line=Curve,
+        XYZ=Point, SolidCurveIntersectionOptions=lambda: NS(Dispose=lambda: None),
+        SolidCurveIntersectionMode=NS(CurveSegmentsInside="inside"),
         SubfaceType=NS(Side="side"), FilteredElementCollector=Collector,
         SpatialElementGeometryCalculator=lambda document, options: NS(
             CalculateSpatialElementGeometry=calculate, Dispose=lambda: None,
@@ -276,12 +316,13 @@ def snapshot_query(monkeypatch):
         }],
     }
 
-    def execute():
+    def execute(query_inputs=None):
         return runpy.run_path(str(SCRIPT), init_globals={
-            "doc": document, "inputs": {"room_views": selection},
+            "doc": document, "inputs": query_inputs or {"room_views": selection},
         })["result"]
 
-    return NS(execute=execute, faces=faces, host=host, segments=segments, template=template)
+    return NS(execute=execute, faces=faces, host=host, segments=segments, template=template,
+              room=room, solid=solid, selection=selection)
 
 
 def test_snapshot_native_finish_evidence_flows_to_preview(snapshot_query, tmp_path):
@@ -323,3 +364,72 @@ def test_native_reader_blocks_incomplete_or_inconsistent_evidence(snapshot_query
     assert result["status"] == "blocked", result
     assert reason in result["reason"]
     assert "payload" not in result
+
+
+@pytest.fixture
+def preflight_inputs(snapshot_query, tmp_path):
+    room = snapshot_query.selection["rooms"][0]
+    room["families"]["section"] = {"type_id": "10", "template_id": "11"}
+    room["requests"].append({"kind": "section", "cut": [[2, -1], [2, 7]], "look": [1, 0]})
+    report = snapshot_query.execute()
+    assert report["status"] == "reported", report
+    source = tmp_path / "query.json"
+    source.write_text(json.dumps({"result": report}), encoding="utf-8")
+    output = tmp_path / "preview.json"
+    preflight = tmp_path / "preflight.json"
+    run = subprocess.run([
+        sys.executable, str(SCRIPT.with_name("room_views_preview.py")), "--snapshot", str(source),
+        "--out", str(output), "--preflight-out", str(preflight),
+    ], capture_output=True, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(preflight.read_text(encoding="utf-8"))
+
+
+def test_native_preflight_measures_first_hit_and_section_slice(snapshot_query, preflight_inputs):
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "verified", result
+    assert result["placement_available"] is False
+    assert result["proposal_sha256"] == preflight_inputs["room_view_preflight"]["proposal_sha256"]
+    elevation, section = result["checks"]
+    assert elevation["first_hit"] == pytest.approx([4, 0, 6.5])
+    assert section["slice_start"] == pytest.approx([2, 6, 6.5])
+    assert section["slice_end"] == pytest.approx([2, 0, 6.5])
+
+
+def test_native_preflight_rejects_stale_snapshot(snapshot_query, preflight_inputs):
+    snapshot_query.host.Name = "Changed Name"
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "blocked"
+    assert "evidence has changed" in result["reason"]
+
+
+def test_native_preflight_requires_marker_to_be_in_room(snapshot_query, preflight_inputs):
+    snapshot_query.room.IsPointInRoom = lambda _: False
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "blocked"
+    assert "outside the native room" in result["reason"]
+
+
+def test_native_preflight_rejects_earlier_native_exit(snapshot_query, preflight_inputs):
+    snapshot_query.solid.IntersectWithCurve = lambda line, _: NS(
+        SegmentCount=1, GetCurveSegment=lambda index: Curve.CreateBound(line.ends[0], Point(4, 1, 6.5)),
+        Dispose=lambda: None,
+    )
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "blocked"
+    assert "different native room boundary first" in result["reason"]
+
+
+def test_native_preflight_rejects_a_reversed_direction_even_with_matching_digest(snapshot_query, preflight_inputs):
+    evidence = preflight_inputs["room_view_preflight"]
+    proposal = json.loads(evidence["proposal_json"])
+    proposal["views"][1]["look"] = [-1, 0, 0]
+    proposal["views"][1]["right"] = [0, 1, 0]
+    evidence["proposal_json"] = json.dumps(proposal)
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "blocked"
+    assert "proposal digest" in result["reason"]
+    evidence["proposal_sha256"] = hashlib.sha256(evidence["proposal_json"].encode()).hexdigest()
+    result = snapshot_query.execute(preflight_inputs)
+    assert result["status"] == "blocked"
+    assert "reviewed direction" in result["reason"]

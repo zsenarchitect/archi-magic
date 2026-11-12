@@ -6,6 +6,7 @@ Each room selection specifies room_id, host_plan_id, families and requests.
 Set families.elevation or families.section to type_id and template_id.
 Set each request to kind=elevation and side (a zero-based finish edge), or
 kind=section with cut (two XY points in feet) and look (a perpendicular XY vector).
+For native preflight, pass the inputs emitted by room_views_preview.py.
 """
 
 import hashlib
@@ -230,7 +231,115 @@ def face_signature(vertices, footprint, bottom, top, budget):
     return corners
 
 
-def measure_prism(calculator, room, footprint, sources, budget):
+def coordinates(values, size):
+    if (not isinstance(values, list) or len(values) != size
+            or any(type(value) not in (int, float) or not -1e9 <= value <= 1e9 for value in values)):
+        raise ValueError("The reviewed geometry has invalid coordinates.")
+    return values
+
+
+def inside_segment(solid, start, end):
+    options = DB.SolidCurveIntersectionOptions()
+    try:
+        options.ResultType = DB.SolidCurveIntersectionMode.CurveSegmentsInside
+        line = DB.Line.CreateBound(start, end)
+        try:
+            intersection = solid.IntersectWithCurve(line, options)
+            try:
+                if intersection.SegmentCount != 1:
+                    raise ValueError("The proposed line has no unique interior segment.")
+                segment = intersection.GetCurveSegment(0)
+                try:
+                    endpoints = [segment.GetEndPoint(0), segment.GetEndPoint(1)]
+                    endpoints.sort(key=start.DistanceTo)
+                    return endpoints
+                finally:
+                    segment.Dispose()
+            finally:
+                intersection.Dispose()
+        finally:
+            line.Dispose()
+    finally:
+        options.Dispose()
+
+
+def check_elevation_ray(room, solid, view, footprint, sources, padding, budget):
+    source = view.get("source")
+    index = source.get("side") if isinstance(source, dict) else None
+    if type(index) is not int or not 0 <= index < len(footprint):
+        raise ValueError("The reviewed elevation has no valid finish side.")
+    if source.get("finish_source") != {"id": sources[index]["id"], "uid": sources[index]["uid"]}:
+        raise ValueError("The reviewed elevation finish identity has changed.")
+    origin, look, _ = view_frame(view)
+    if not room.IsPointInRoom(origin):
+        raise ValueError("The proposed elevation marker is outside the native room.")
+    first, second = footprint[index], footprint[(index + 1) % len(footprint)]
+    target = DB.XYZ((first[0] + second[0]) / 2, (first[1] + second[1]) / 2, origin.Z)
+    depth = target.DistanceTo(origin)
+    edge = [second[0] - first[0], second[1] - first[1]]
+    if (depth <= TOLERANCE_FT or abs(edge[0] * look.X + edge[1] * look.Y) > TOLERANCE_FT
+            or origin.Add(look.Multiply(depth)).DistanceTo(target) > TOLERANCE_FT
+            or abs(coordinates([view.get("far_extent")], 1)[0] - padding - depth) > TOLERANCE_FT):
+        raise ValueError("The proposed elevation ray does not point at the reviewed finish side.")
+    half_width = math.hypot(*edge) / 2
+    if (abs(coordinates(view.get("crop_min"), 2)[0] + padding + half_width) > TOLERANCE_FT
+            or abs(coordinates(view.get("crop_max"), 2)[0] - padding - half_width) > TOLERANCE_FT):
+        raise ValueError("The elevation crop does not match the native finish width.")
+    spend(budget, "intersection pairs", 1)
+    start, exit_point = inside_segment(solid, origin, target.Add(look.Multiply(0.01)))
+    if start.DistanceTo(origin) > TOLERANCE_FT or exit_point.DistanceTo(target) > TOLERANCE_FT:
+        raise ValueError("The proposed elevation ray hits a different native room boundary first.")
+    return {"kind": "elevation", "name": view["name"], "room_id": view["room_id"],
+            "side": index, "finish_source": source["finish_source"], "first_hit": xyz(exit_point)}
+
+
+def view_frame(view):
+    origin = DB.XYZ(*coordinates(view.get("origin"), 3))
+    look = DB.XYZ(*coordinates(view.get("look"), 3))
+    right = DB.XYZ(*coordinates(view.get("right"), 3))
+    if (abs(look.Z) > TOLERANCE_FT or abs(look.GetLength() - 1) > TOLERANCE_FT
+            or right.DistanceTo(DB.XYZ(look.Y, -look.X, 0)) > TOLERANCE_FT):
+        raise ValueError("The reviewed view needs a consistent horizontal frame.")
+    return origin, look, right
+
+
+def check_section_slice(room, solid, view, footprint, padding, budget):
+    origin, look, right = view_frame(view)
+    source = view["source"]
+    cut = source.get("cut")
+    if not isinstance(cut, list) or len(cut) != 2:
+        raise ValueError("The section has no reviewed cut line.")
+    reviewed_look = DB.XYZ(*(coordinates(source.get("look"), 2) + [0]))
+    if reviewed_look.GetLength() <= TOLERANCE_FT or look.DistanceTo(
+            reviewed_look.Multiply(1 / reviewed_look.GetLength())) > TOLERANCE_FT:
+        raise ValueError("The section looks away from the reviewed direction.")
+    offsets = []
+    for point in cut:
+        x, y = coordinates(point, 2)
+        delta_x, delta_y = x - origin.X, y - origin.Y
+        if abs(delta_x * look.X + delta_y * look.Y) > TOLERANCE_FT:
+            raise ValueError("The section is off the reviewed cut plane.")
+        offsets.append(delta_x * right.X + delta_y * right.Y)
+    lower = coordinates(view.get("crop_min"), 2)[0] + padding
+    upper = coordinates(view.get("crop_max"), 2)[0] - padding
+    if (not lower < 0 < upper or min(offsets) > lower + TOLERANCE_FT
+            or max(offsets) < upper - TOLERANCE_FT or not room.IsPointInRoom(origin)):
+        raise ValueError("The proposed section has no interior room slice.")
+    depths = [(x - origin.X) * look.X + (y - origin.Y) * look.Y for x, y in footprint]
+    if (min(depths) >= -TOLERANCE_FT or max(depths) <= TOLERANCE_FT
+            or abs(coordinates([view.get("far_extent")], 1)[0] - padding - max(depths)) > TOLERANCE_FT):
+        raise ValueError("The section depth does not match the native room on the reviewed side.")
+    spend(budget, "intersection pairs", 1)
+    start, end = inside_segment(solid, origin.Add(right.Multiply(lower - 0.01)),
+                                origin.Add(right.Multiply(upper + 0.01)))
+    if (start.DistanceTo(origin.Add(right.Multiply(lower))) > TOLERANCE_FT
+            or end.DistanceTo(origin.Add(right.Multiply(upper))) > TOLERANCE_FT):
+        raise ValueError("The section crop does not match the measured native room slice.")
+    return {"kind": "section", "name": view["name"], "room_id": view["room_id"],
+            "slice_start": xyz(start), "slice_end": xyz(end)}
+
+
+def measure_prism(calculator, room, footprint, sources, budget, views, padding):
     evidence = calculator.CalculateSpatialElementGeometry(room)
     try:
         solid = evidence.GetGeometry()
@@ -291,12 +400,25 @@ def measure_prism(calculator, room, footprint, sources, budget):
                         subface.Dispose()
         if len(seen) != len(footprint):
             raise ValueError("The room solid is missing a finish side.")
-        return [bottom, top]
+        checks = []
+        for view in views:
+            origin_z = coordinates(view.get("origin"), 3)[2]
+            lower = coordinates(view.get("crop_min"), 2)[1]
+            upper = coordinates(view.get("crop_max"), 2)[1]
+            if (abs(origin_z + lower + padding - bottom) > TOLERANCE_FT
+                    or abs(origin_z + upper - padding - top) > TOLERANCE_FT):
+                raise ValueError("The proposed crop height does not match the native room solid.")
+            if view["kind"] == "elevation":
+                check = check_elevation_ray(room, solid, view, footprint, sources, padding, budget)
+            else:
+                check = check_section_slice(room, solid, view, footprint, padding, budget)
+            checks.append(check)
+        return [bottom, top], checks
     finally:
         evidence.Dispose()
 
 
-def measure_room_view_source(document, calculator, room, boundary, selection, budget):
+def measure_room_view_source(document, calculator, room, boundary, selection, budget, views, padding):
     loops = boundary["boundary_loops"]
     if len(loops) != 1 or len(loops[0]) < 3:
         raise ValueError("Room views need one closed footprint with at least three sides.")
@@ -333,16 +455,29 @@ def measure_room_view_source(document, calculator, room, boundary, selection, bu
     ):
         if any(request["kind"] == kind for request in requests):
             families[kind] = view_family(document, selected.get(kind), family, view_type)
-    heights = measure_prism(calculator, room, footprint, sources, budget)
-    return dict(element_identity(room, True), number=room.Number,
+    for view in views:
+        kind = view["kind"]
+        source = view.get("source")
+        expected = families.get(kind)
+        if (view.get("room_uid") != room.UniqueId or expected is None
+                or view.get("type") != expected["type"] or view.get("template") != expected["template"]
+                or not isinstance(source, dict)):
+            raise ValueError("The reviewed room or view family identity has changed.")
+        keys = ("side",) if kind == "elevation" else ("cut", "look")
+        if not any(request["kind"] == kind and all(request.get(key) == source.get(key) for key in keys)
+                   for request in requests):
+            raise ValueError("The reviewed view has no matching source request.")
+    heights, checks = measure_prism(calculator, room, footprint, sources, budget, views, padding)
+    snapshot = dict(element_identity(room, True), number=room.Number,
                 level=element_identity(level), phase=element_identity(phase),
                 design_option=None, host_plan=element_identity(host, True),
                 families=families, footprint=footprint, heights=heights,
                 finish_sources=sources, requests=requests,
                 geometry_status="prismatic_finish_verified")
+    return snapshot, checks
 
 
-def read_room_view_snapshot(document, options):
+def read_room_view_snapshot(document, options, requested_views=None):
     from System.Diagnostics import Stopwatch
 
     clock = Stopwatch.StartNew()
@@ -394,6 +529,7 @@ def read_room_view_snapshot(document, options):
     boundary_options.SpatialElementBoundaryLocation = DB.SpatialElementBoundaryLocation.Finish
     boundary_options.StoreFreeBoundaryFaces = True
     rooms = []
+    checks = []
     seen = set()
     budget = {"geometry visits": MAX_SEGMENTS, "intersection pairs": MAX_GEOMETRY_PAIRS}
     try:
@@ -410,14 +546,18 @@ def read_room_view_snapshot(document, options):
                 spend(budget, "geometry visits", used)
                 if boundary["status"] != "boundary_verified":
                     raise ValueError("Room %s boundary evidence: %s." % (room.Id.Value, boundary["reason"]))
-                rooms.append(measure_room_view_source(document, calculator, room, boundary, selection, budget))
+                views_for_room = requested_views.get(str(room.Id.Value), []) if requested_views else []
+                snapshot, room_checks = measure_room_view_source(
+                    document, calculator, room, boundary, selection, budget, views_for_room, padding)
+                rooms.append(snapshot)
+                checks.extend(room_checks)
         finally:
             calculator.Dispose()
     finally:
         boundary_options.Dispose()
     if clock.ElapsedMilliseconds >= MAX_READ_MILLISECONDS:
         raise ValueError("Room view evidence exceeds the read time limit.")
-    return {
+    snapshot = {
         "document_identity": {
             "project_uid": project_uid,
             "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest(),
@@ -427,6 +567,49 @@ def read_room_view_snapshot(document, options):
         "padding_feet": padding,
         "rooms": rooms,
     }
+    return snapshot, checks
+
+
+def native_preflight(document, selection, preflight):
+    if not isinstance(preflight, dict):
+        raise ValueError("Supply the reviewed room view preflight input.")
+    snapshot_json = preflight.get("snapshot_json")
+    proposal_json = preflight.get("proposal_json")
+    if (not hasattr(snapshot_json, "encode") or not hasattr(proposal_json, "encode")
+            or len(snapshot_json) > MAX_BYTES or len(proposal_json) > MAX_BYTES):
+        raise ValueError("The reviewed room view input exceeds the byte limit or is missing.")
+    snapshot_bytes = snapshot_json.encode("utf-8")
+    proposal_bytes = proposal_json.encode("utf-8")
+    if len(snapshot_bytes) > MAX_BYTES or len(proposal_bytes) > MAX_BYTES:
+        raise ValueError("The reviewed room view input exceeds the byte limit.")
+    proposal_sha256 = hashlib.sha256(proposal_bytes).hexdigest()
+    if proposal_sha256 != preflight.get("proposal_sha256"):
+        raise ValueError("The reviewed room view proposal digest does not match.")
+    proposal = json.loads(proposal_json)
+    if not isinstance(proposal, dict) or proposal.get("snapshot_sha256") != hashlib.sha256(snapshot_bytes).hexdigest():
+        raise ValueError("The reviewed room view snapshot digest does not match.")
+    views = proposal.get("views")
+    if not isinstance(views, list) or not 1 <= len(views) <= MAX_VIEWS:
+        raise ValueError("The reviewed room view proposal has an invalid view count.")
+    grouped = {}
+    names = set()
+    for view in views:
+        if (not isinstance(view, dict) or view.get("kind") not in ("elevation", "section")
+                or not hasattr(view.get("room_id"), "strip") or not view["room_id"].strip()
+                or not hasattr(view.get("name"), "strip") or not view["name"].strip()
+                or view["name"] in names):
+            raise ValueError("The reviewed room view proposal contains an invalid or duplicate view.")
+        grouped.setdefault(view["room_id"], []).append(view)
+        names.add(view["name"])
+    if any(len(group) > MAX_ROOM_VIEWS for group in grouped.values()):
+        raise ValueError("The reviewed proposal exceeds the per-room view limit.")
+    current, checks = read_room_view_snapshot(document, selection, grouped)
+    if current != json.loads(snapshot_json):
+        raise ValueError("The saved project room view evidence has changed. Rebuild the preview.")
+    if len(checks) != len(views):
+        raise ValueError("The native query did not verify every reviewed room view.")
+    return {"status": "verified", "proposal_sha256": proposal_sha256,
+            "checks": checks, "placement_available": False}
 
 
 if doc is None or doc.IsFamilyDocument:
@@ -436,11 +619,17 @@ elif inputs.get("room_views") is not None:
         selection = inputs["room_views"]
         if not isinstance(selection, dict):
             raise ValueError("Provide room view selections as an object.")
-        snapshot = read_room_view_snapshot(doc, selection)
-        payload = json.dumps(snapshot, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        preflight = inputs.get("room_view_preflight")
+        if preflight is None:
+            snapshot, _ = read_room_view_snapshot(doc, selection)
+            payload = json.dumps(snapshot, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            response = {"status": "reported", "payload": payload}
+        else:
+            response = native_preflight(doc, selection, preflight)
+            payload = json.dumps(response, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
         if len(payload) > MAX_BYTES:
             raise ValueError("Room view evidence exceeds the read byte limit.")
-        result = {"status": "reported", "payload": payload}
+        result = response
     except ValueError as exc:
         result = {"status": "blocked", "reason": str(exc)}
     except Exception as exc:
