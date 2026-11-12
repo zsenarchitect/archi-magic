@@ -36,13 +36,17 @@ For a change with no recipe yet, follow the same 8 steps. Write the read query, 
      `powershell -NoProfile -ExecutionPolicy Bypass -File "<this skill dir>\..\am-schedule-view\scripts\render-table.ps1" -Json <preview.json> -Out <preview.html>`
      If that script is missing or fails, say so in one line, and continue with the chat table.
    - Always also print a compact table in chat: the first 10 and last 10 changed rows, the counts (changed, unchanged, warnings) and every warning. Always show the ownership line from step 4 and, when it is not 0, the table of owners. The recipe's compute command prints this table. The preview table shows the planned change. The dry run in step 7 adds the side-effect counts: elements edited on purpose, and dependent elements Revit regenerated.
+   - For a deletion, add one `deletions` entry per element. Include dependent elements and annotation. Run `python scripts/delete_approval.py <preview.json>`. Show its full **Delete** list in chat and render the same preview in the viewer. Keep every deletion visible when the edit table is shortened.
 6. **Confirm.** Ask with AskUserQuestion: **Apply (Recommended)** / **Change scope** / **Cancel**. If the preview has a blocking warning, do not offer Apply. Explain the warning and offer Change scope or Cancel.
+   - Ask one decision per question, including when you coordinate child sessions. Ask separately about deleting a parameter and editing a table. Ask a separate question for each deletion the user did not name. Include its ID, category, and name. Relay the exact choices and IDs to the child.
+   - If the user refers to an unclear prior approval, show the complete pending Delete list and ask which deletion they mean. Wait for the answer. Invalidate approval when the delete list changes.
    - When another user owns some targets, ask this question in place of the one above: **Leave them out (Recommended)** / **Wait for the owner** / **Cancel**. Name each owner. "Leave them out" means compute again without those elements, for example with the recipe's skip option, then do step 4 again. Offer it only if the recipe can drop elements and the new compute does not block. A sheet shift often cannot drop a sheet in the middle of a chain. "Wait for the owner" means the owner synchronizes and relinquishes, then you start again at step 3. Never ask the user to take an element from its owner.
    - When central has updated a target, tell the user to click **Collaborate > Reload Latest**. Then start again at step 3.
 7. **Execute.**
    - Before each `run_modify`, check `get_context`. If the document title differs from the step 1 title, stop. Ask the user to switch windows to the step 1 model. Do not run the change on another model.
    - Baseline drift guard (issue #191): before the real run, re-check target elements against the baseline snapshot. If elements changed, were deleted, or were borrowed by another user since approval, stop and show the diff. Note that dry-run summaries can report dozens of regenerated derived elements (such as schedule parts) that do not appear in the real run.
    - First run the apply script with `run_modify` and `dry_run: true`. Compare the dry-run result with the preview. It must match exactly. If it does not match, stop, show the differences, and do not run the real change.
+   - If the plan or dry run includes a deletion, save the complete dry-run result. Run `python scripts/delete_approval.py <preview.json> --dry-run <dry-run.json>`. Stop on a missing or extra deletion ID. Read the affected elements again, name each new deletion, and obtain separate approval before a new dry run.
    - Then show the side-effect counts. Run the recipe's `<preview>.py side-effects --preview <preview.json> --dryrun <dryrun.json` command. Show two numbers in chat: elements the script edited on purpose, and dependent elements Revit regenerated. Say in one sentence why dependents change. If the command warns about an unexpected category, tell the user and ask whether to continue before you apply.
    - Then run the same script with `run_modify` (not dry run). Revit shows the user a Keep/Discard prompt. Tell the user to check the isolated elements and click Keep or Discard. The change is one undo entry named "Agent: <title>".
    - If the policy is `auto`, Revit shows no Keep/Discard prompt. The real run commits at once. Do not run it on the step 6 approval alone. First run the dry run and compare it with the preview, as above. Then show the change table again, with the side-effect counts, and get a "yes" in this chat. Only then run the real change. Then do step 8.
@@ -112,8 +116,15 @@ An agent run cannot synchronize with central. Revit blocks Synchronize with Cent
 
 - `before` and `after` have the same rows in the same order. Row N of `after` is row N of `before` after the change.
 - `warnings[].row` is the key column value, as text.
+- `deletions` lists elements the transaction will delete. Use one object per element with `id`, `category`, and `name`. Keep edits in the before and after rows. Include all deletion IDs in ownership scope.
 - This skill adds extra keys. The renderer ignores them: `blocked` (true when a blocking warning exists), `params` (the chosen scope), `steps` (the exact ordered list of assignments that the apply script replays), and `expected_dependent_categories` (categories Revit may regenerate as a side effect of this change, for example the categories that use a changed material). The `side-effects` command warns when the dry run lists a category that is neither edited nor expected. `ownership` (written by `ownership.py check`: the number of checked targets, the elements owned by others with their owners, and the elements updated in central). `ownership_ids` (optional: the ids the apply script edits, when the steps do not name them).
 - A real example is in [assets/fixtures/snowdon-sheet-shift.preview.json](assets/fixtures/snowdon-sheet-shift.preview.json).
+
+## Edit a row in a text-note table
+
+Read the drafting view and identify the target row by its Y position in the view. Find every column note that contributes text at that position. Read all grid lines affected by the row.
+
+Show each note's exact before and after text. List every line that will move or shorten. Put any line or other element that will be deleted in the separate Delete list. Ask about the table edits separately from deletion of the source parameter.
 
 ## Running the scripts from a terminal
 
