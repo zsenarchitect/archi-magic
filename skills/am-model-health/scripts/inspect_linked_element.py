@@ -123,12 +123,21 @@ def stable_refs(host, items):
 
 def target_for(host, view, link, linked, element):
     host_identity, linked_identity = model_identity(host), model_identity(linked)
-    if not host_identity or not linked_identity:
+    if not host_identity or not linked_identity or not all((view.UniqueId, link.UniqueId, element.UniqueId)):
+        return None
+    try:
+        transform = link.GetTransform()
+        points = (transform.Origin, transform.BasisX, transform.BasisY, transform.BasisZ)
+        placement = [float(value) for point in points for value in (point.X, point.Y, point.Z)]
+    except Exception:
+        return None
+    if any(math.isnan(value) or math.isinf(value) for value in placement):
         return None
     return {
         "host": host_identity, "linked_document": linked_identity,
         "view_id": key(view.Id), "view_uid": str(view.UniqueId),
         "link_instance_id": key(link.Id), "link_instance_uid": str(link.UniqueId),
+        "link_placement_sha256": hashlib.sha256(encode(placement).encode("ascii")).hexdigest(),
         "linked_element_id": key(element.Id), "linked_element_uid": str(element.UniqueId),
     }
 
@@ -272,7 +281,7 @@ def inspect(host, ui, view, args):
         "missing_parameter_names": missing, "parameters_limited": limited, "selection_target": target,
     }
     if target is None:
-        result["selection_unavailable"] = "Revit did not expose an exact identity for both models."
+        result["selection_unavailable"] = "Revit did not expose the exact model, element, or link placement identity."
     while len(encode(result)) > MAX_RESULT and params:
         params.pop()
         result["parameters_limited"] = True

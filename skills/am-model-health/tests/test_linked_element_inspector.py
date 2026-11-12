@@ -50,6 +50,11 @@ class Link:
     def __init__(self, eid, document):
         self.Id, self.UniqueId, self.Name = Id(eid), f"placement-{eid}", f"Placement {eid}"
         self.document = document
+        self.origin = NS(X=float(eid), Y=0.0, Z=0.0)
+
+    def GetTransform(self):
+        return NS(Origin=self.origin, BasisX=NS(X=1.0, Y=0.0, Z=0.0),
+                  BasisY=NS(X=0.0, Y=1.0, Z=0.0), BasisZ=NS(X=0.0, Y=0.0, Z=1.0))
 
     def GetTypeId(self):
         return Id(40)
@@ -158,6 +163,20 @@ def test_picked_id_parameters_and_exact_repeated_link_selection(fixture):
     fixture.ui.ActiveView.UniqueId = "other-view"
     assert fixture.run(mode="select", target=target)["status"] == "stopped"
     assert len(fixture.calls) == 1
+
+
+def test_moved_link_requires_reinspection_even_when_element_ids_are_unchanged(fixture):
+    target = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))["selection_target"]
+    fixture.host.items[5].origin.X += 1
+    assert fixture.run(mode="select", target=target)["status"] == "selected"
+    fixture.host.items[6].origin.X += 1
+    assert fixture.run(mode="select", target=target)["status"] == "stopped"
+    assert len(fixture.calls) == 1
+    fresh = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))["selection_target"]
+    assert fixture.run(mode="select", target=fresh)["status"] == "selected"
+    fixture.host.items[6].origin.X = float("nan")
+    inspected = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))
+    assert inspected["linked_element_id"] == str(LARGE) and inspected["selection_target"] is None
 
 
 def test_name_ambiguity_unresolved_and_cloud_identity(fixture):

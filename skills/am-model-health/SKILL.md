@@ -86,7 +86,7 @@ Use Revit 2024 through 2026. Open the host view and load the RVT link. Call `get
 | Select the inspected element | Pass `{"mode":"select","target":{...}}`. Use the exact `selection_target` returned by inspection. |
 | Verify the selection | Pass `{"mode":"selection"}` in a new query after the select call returns. |
 
-The IDs are decimal strings. Two placements of one link can contain the same linked element ID. Check the link instance ID before selecting. If the name search returns several matches, ask the user which ID to inspect. Use the linked ID when a search is incomplete.
+The IDs are decimal strings. Two placements of one link can contain the same linked element ID. Check the link instance ID before selecting. If that placement moves or rotates, inspect it again before selecting. If the name search returns several matches, ask the user which ID to inspect. Use the linked ID when a search is incomplete.
 
 Decode the result's `payload` JSON. Recover a truncated tool result with `get_run`. Report the element ID, category, link and parameters. Add `parameter_names` to request up to 20 exact parameter names. The default reads visible instance parameters. Keep parameter data private. It can contain project text or file paths.
 
