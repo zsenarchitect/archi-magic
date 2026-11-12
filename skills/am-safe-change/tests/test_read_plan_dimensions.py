@@ -461,9 +461,17 @@ def test_saved_dimension_probe_requires_independent_absence_and_exact_measuremen
     wrong_measurement["result"]["measurements"]["grid"]["segments_ft"] = [4, 3]
     wrong_view = deepcopy(dry)
     wrong_view["result"]["measurements"]["grid"]["owner_view_id"] = "42"
+    wrong_witness = deepcopy(dry)
+    measured = wrong_witness["result"]["measurements"]["grid"]
+    measured["reference_sources"][1]["uid"] = "different-grid-with-the-same-spacing"
+    reversed_read = deepcopy(dry)
+    reversed_measurement = reversed_read["result"]["measurements"]["grid"]
+    for field in ("references", "reference_sources", "segments_ft"):
+        reversed_measurement[field].reverse()
+    assert verify(plan, original, reversed_read, fresh).returncode == 0
     wrong_build = deepcopy(dry)
     wrong_build["result"]["revit"]["build"] = "different-build"
-    for invalid in (wrong_effect, wrong_transaction, wrong_measurement, wrong_view, wrong_build):
+    for invalid in (wrong_effect, wrong_transaction, wrong_measurement, wrong_view, wrong_witness, wrong_build):
         assert verify(plan, original, invalid, fresh).returncode == 2
 
     missing_absence = deepcopy(fresh)

@@ -87,6 +87,12 @@ def verify_measurements(plan, measurements, baseline):
         expected = proposal_signature(proposal, context)
         if compare(expected, measured) != "match":
             raise ValueError("A native dimension line, type, reference, or segment value differs from the plan.")
+        sources = measurement.get("reference_sources")
+        expected_sources = {witness["stable_ref"]: {"id": witness["source_id"], "uid": witness["source_uid"]}
+                            for witness in proposal["witnesses"]}
+        if (not isinstance(sources, list) or len(sources) != len(measurement["references"])
+                or dict(zip(measurement["references"], sources)) != expected_sources):
+            raise ValueError("A native dimension witness belongs to a different or unverified source element.")
         ids.add(element_id(measurement["id"]))
         uids.add(label(measurement["uid"]))
     if len(ids) != len(proposals) or len(uids) != len(proposals) or ids.intersection(

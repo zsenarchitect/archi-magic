@@ -201,7 +201,7 @@ def opening_witnesses(document, opening, candidate, refs, evidence, frame):
 def read_dimension(document, dimension, frame):
     if not dimension.AreReferencesAvailable:
         raise ValueError("The linear dimension reference inventory is incomplete.")
-    references = []
+    references, reference_sources = [], []
     for reference in dimension.References:
         if len(references) == MAX_WITNESSES:
             raise ValueError("An existing dimension exceeds the reference limit.")
@@ -209,12 +209,13 @@ def read_dimension(document, dimension, frame):
         if owner is None:
             raise ValueError("An existing dimension reference has no resolved owner.")
         references.append(stable(document, owner, reference))
+        reference_sources.append(identity(owner))
     values = [float(segment.Value) for segment in dimension.Segments] if dimension.NumberOfSegments else [float(dimension.Value)]
     curve = dimension.Curve
     if not isinstance(curve, DB.Line):
         raise ValueError("An existing linear dimension does not expose a straight support line.")
     row = dict(identity(dimension), owner_view_id=key(dimension.OwnerViewId), type_id=key(dimension.GetTypeId()),
-               references=references, segments_ft=values)
+               references=references, reference_sources=reference_sources, segments_ft=values)
     if curve.IsBound:
         row["line"] = line_points(curve, frame)
     else:
