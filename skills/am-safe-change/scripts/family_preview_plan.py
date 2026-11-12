@@ -115,24 +115,114 @@ def preview(snapshot, intent, desired, previous, existing, action):
             "warnings": [], "blocked": False, "basis": snapshot, "intent": intent, "proposed": desired}
 
 
-def snapshot_from_record(record):
+def checked_plan(plan, snapshot):
+    if plan.get("blocked") is not False or any(item.get("blocking") for item in plan.get("warnings", [])):
+        raise ValueError("Resolve the blocking warnings before changing the family.")
+    if plan["basis"] != snapshot:
+        raise ValueError("The staged family changed after preview. Read and preview again.")
+    expected = review(snapshot, plan["intent"])
+    fields = ("kind", "recipe", "proposed", "steps", "ownership_ids", "before", "after",
+              "columns", "keyColumn", "changedColumns")
+    if any(plan.get(key) != expected[key] for key in fields) or not expected["steps"]:
+        raise ValueError("Use the reviewed preview with a real change.")
+    return expected
+
+
+def check_view_result(plan, identity, view, forced):
+    desired = plan["proposed"]
+    step = plan["steps"][0]
+    if (identity != plan["basis"]["identity"] or not view or not decimal_id(view["id"]) or not view["uid"]
+            or (step["action"] == "reuse" and view["uid"] != step["view_uid"])):
+        raise ValueError("The thumbnail readback identifies a different family or view.")
+    if (view["name"] != desired["name"] or view["view_type_id"] != desired["view_type"]["id"]
+            or view["template"] or view["perspective"] or view["locked"]
+            or view["crop_box"] or view["section_box"] or view["view_template_id"] != "-1"
+            or view["display_style"] != desired["display_style"] or view["background"] != desired["background"]
+            or forced is not True or not view["saved_orientation"]
+            or not all(close_values(desired["orientation"][key], view["saved_orientation"][key])
+                       for key in ("eye_ft", "forward", "up"))):
+        raise ValueError("The saved thumbnail view settings differ from the preview.")
+
+
+def runtime_result(record):
     response = record.get("response", record)
     if "result" in response:
         if response.get("status", "ok") != "ok" or response.get("error"):
-            raise ValueError("The family query failed.")
+            raise ValueError("The family operation failed.")
         response = response["result"]
     if response.get("status") != "ok":
-        raise ValueError("Read the staged family again before computing a preview.")
-    return json.loads(response["snapshot_json"])
+        raise ValueError("The family operation did not produce a successful result.")
+    return response
+
+
+def verify_run(plan, record, kept=False):
+    envelope = record.get("response", record)
+    expected = ("modify", "committed") if kept else ("dry_run", "rolled_back")
+    approvals = ("user", "auto") if kept else (None,)
+    if ((envelope.get("mode"), envelope.get("decision")) != expected
+            or envelope.get("approval") not in approvals or not envelope.get("run_id")
+            or any(envelope.get(key) for key in ("reckless", "failures", "dialogs", "blocked", "closed_documents",
+                                                 "unclosed_documents"))):
+        raise ValueError("The guarded pyRevit record does not establish the requested outcome.")
+    response = runtime_result(record)
+    receipt = json.loads(response["receipt_json"])
+    check_view_result(plan, receipt["identity"], receipt["preview_view"], receipt["force_preview_update"])
+    changes = envelope.get("changes") or response.get("changes") or {}
+    view_id = receipt["preview_view"]["id"]
+    created = plan["steps"][0]["action"] == "create"
+    added = [str(value) for value in changes.get("added_ids", [row["id"] for row in changes.get("added", [])])]
+    modified = [str(row["id"]) for row in changes.get("modified", [])]
+    categories = changes.get("by_category")
+    if (changes.get("added_count") != int(created) or changes.get("deleted_count") != 0
+            or changes.get("other_documents") or changes.get("deleted") != []
+            or added != ([view_id] if created else [])
+            or type(changes.get("modified_count")) is not int or len(modified) != changes["modified_count"]
+            or modified not in ([], [view_id]) or not isinstance(categories, dict)
+            or any(type(value) is not int or value < 0 for value in categories.values())
+            or sum(categories.values()) != len(added) + len(modified)):
+        raise ValueError("The runtime changes do not match the reviewed view scope.")
+    return receipt, len(added), len(modified)
+
+
+def snapshot_from_record(record):
+    return json.loads(runtime_result(record)["snapshot_json"])
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("read")
     parser.add_argument("intent")
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument("--baseline", action="store_true")
+    checks.add_argument("--verify-run", action="store_true")
+    checks.add_argument("--verify-kept", metavar="KEPT_RUN")
     args = parser.parse_args(argv)
     try:
-        plan = review(snapshot_from_record(load(args.read)), load(args.intent))
+        evidence, supplied = load(args.read), load(args.intent)
+        if args.baseline:
+            checked_plan(supplied, snapshot_from_record(evidence))
+            print("The staged family matches the reviewed baseline.")
+            return 0
+        if args.verify_run:
+            checked_plan(supplied, supplied["basis"])
+            _receipt, added, modified = verify_run(supplied, evidence)
+            print("Verified the thumbnail settings and runtime scope (%d added, %d modified)." % (added, modified))
+            return 0
+        if args.verify_kept:
+            checked_plan(supplied, supplied["basis"])
+            kept_run = load(args.verify_kept)
+            receipt, _added, _modified = verify_run(supplied, kept_run, kept=True)
+            fresh = evidence.get("response", evidence)
+            kept = kept_run.get("response", kept_run)
+            if fresh.get("mode") != "query" or not fresh.get("run_id") or fresh["run_id"] == kept["run_id"]:
+                raise ValueError("Read the kept view again with a separate Revit query.")
+            actual = snapshot_from_record(evidence)
+            check_view_result(supplied, actual["identity"], actual["preview_view"], actual["force_preview_update"])
+            if actual["preview_view"]["uid"] != receipt["preview_view"]["uid"]:
+                raise ValueError("The independently read view does not match the kept run.")
+            print("The kept thumbnail view matches the reviewed settings.")
+            return 0
+        plan = review(snapshot_from_record(evidence), supplied)
         print(json.dumps(plan, ensure_ascii=True, allow_nan=False, indent=2))
         return 0
     except ValueError as error:

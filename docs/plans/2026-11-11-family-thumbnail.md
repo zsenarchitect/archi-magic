@@ -18,23 +18,9 @@ Baseline `0c523067c4313bd9e8c3898be4ffd32d874463d7`. The filed gap is confirmed.
 5. Open and activate the kept dedicated view in the staged family. Check the preview source and regeneration option in the Save As dialog. Save only to a new reviewed output path. Stop at an overwrite prompt. Hash the original again and record the output fingerprint. Keep separate outcomes for kept but unsaved, saved but unverified, verified, unsupported, refused, and failed. Resume verification only when the source hash, preset and output fingerprint match. If Save As was interrupted before a receipt was recorded, inspect the output and reconcile its identity or choose a new path. Keep any output with an unresolved conflict outside the verified set.
 6. Reopen the output and verify the persistent view settings. Inspect its actual thumbnail in a fresh Revit process using [Load Family](https://help.autodesk.com/cloudhelp/2024/ENU/Revit-Model/files/GUID-2A6C26DE-63D7-48E8-A986-CAB6C362049A.htm) at the new output path. Compare the embedded thumbnail with the source when the stream is available. Use a contrasting orientation or color on a known asymmetric family, and include an unchanged control. Record Revit build, runtime and source revision. Require at least one supported 3D family and a verified output for every supported candidate. Keep #164 open while any candidate has unresolved eligibility. Report unsupported and unresolved candidates with distinct reasons. Preserve the sources so a wrong output can be set aside. Keep library replacement, global display preferences, automatic upgrades and geometry changes outside this workflow.
 
-## Prepare working copies
+## Workflow
 
-Run these commands from the repository root on the machine that will open the families. Use a staging parent inside your private user directory. Create an empty output folder before staging. Save the manifest locally.
-
-```text
-python skills/am-model-health/scripts/stage_family_previews.py inventory C:/work/library
-python skills/am-model-health/scripts/stage_family_previews.py stage C:/work/library --staging-parent C:/work/private-stage --output C:/work/exports --family "Example A.rfa" --family "Example B.rfa"
-python skills/am-model-health/scripts/stage_family_previews.py verify <manifest-path> --family "Example A.rfa"
-```
-
-Verify each family immediately before opening its staged file. The same command checks for an existing output with that name. After Save As, add `--source-only` to confirm the library source still matches the manifest.
-
-Call `get_context` and `get_skill("revit-scripting")` on the disposable host. Open the verified staged family and activate an uncropped orthographic 3D view if one is available. Run `skills/am-model-health/scripts/read_family_preview.py` with `run_query`. Pass the two fields from `revit_inputs` as the query inputs. Read `snapshot_json` for the current thumbnail view, active view settings, and solid extents in internal feet. The solid check uses geometry returned for that view. It does not establish the final rendered thumbnail. Leave clipped, missing, or unexamined geometry unresolved.
-
-Save the query response as `read.json`. Save `{"view_type_id":"123"}` as `intent.json` using a 3D view type ID from the query. Run `python skills/am-safe-change/scripts/family_preview_plan.py read.json intent.json > preview.json`. Use the standard schedule viewer to review the change. The preset uses an isometric direction, Revit Shading, and a uniform light gray background. Revit determines the saved image framing. Reuse an existing named preview only with a prior receipt containing `view_uid`, `family_uid`, and `saved_file_sha256` for that staged output. Stop if the preview contains no steps.
-
-
+Use the [family thumbnail recipe](../../skills/am-safe-change/recipes/family-thumbnails.md).
 
 ## Test fixtures and remaining evidence
 

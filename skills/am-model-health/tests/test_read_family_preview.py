@@ -1,4 +1,5 @@
 import hashlib
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -59,14 +60,28 @@ class View:
         return NS(Value=4)
 
     def GetBackground(self):
-        color = NS(Red=238, Green=238, Blue=238)
+        color = getattr(self, "color", NS(Red=238, Green=238, Blue=238))
         return NS(Type="Gradient", SkyColor=color, BackgroundColor=color, GroundColor=color,
                   Dispose=lambda: None)
 
     def GetOrientation(self):
-        return NS(EyePosition=xyz(1, 2, 3), UpDirection=xyz(0, 0, 1), ForwardDirection=xyz(-1, -1, -1))
+        return getattr(self, "orientation", NS(EyePosition=xyz(1, 2, 3), UpDirection=xyz(0, 0, 1),
+                                               ForwardDirection=xyz(-1, -1, -1)))
 
-    GetSavedOrientation = GetOrientation
+    def SetOrientation(self, value):
+        self.orientation = value
+
+    def CanSaveOrientation(self):
+        return True
+
+    def SaveOrientation(self):
+        self.saved = self.GetOrientation()
+
+    def GetSavedOrientation(self):
+        return getattr(self, "saved", self.GetOrientation())
+
+    def SetBackground(self, background):
+        self.color = background.SkyColor
 
 
 @pytest.fixture
@@ -78,12 +93,59 @@ def host(tmp_path, monkeypatch):
     request = {"staged_path_sha256": hashlib.sha256(os.path.normcase(str(staged)).encode()).hexdigest(),
                "staged_file_sha256": hashlib.sha256(staged.read_bytes()).hexdigest()}
     view = View()
+    view_type = NS(ViewFamily="3D", Id=NS(Value=4), UniqueId="fixture-type")
+    views = [view]
+    settings = NS(PreviewViewId=view.Id, IsViewUpdateForced=True, Dispose=lambda: None,
+                  IsViewIdValidForPreview=lambda _id: True)
+    settings.ForceViewUpdate = lambda value: setattr(settings, "IsViewUpdateForced", value)
+
+    def get_element(identifier):
+        if getattr(identifier, "Value", None) == 4:
+            return view_type
+        return next((item for item in views if identifier == item.UniqueId
+                     or getattr(identifier, "Value", None) == item.Id.Value), None)
+
+    def create(_doc, _type):
+        new_view = View()
+        new_view.Id = NS(Value=56)
+        new_view.UniqueId = "new-view"
+        views.append(new_view)
+        return new_view
+
+    monkeypatch.setattr(View, "CreateIsometric", staticmethod(create), raising=False)
     family = NS(UniqueId="fixture-family", FamilyCategory=NS(CategoryType="Model"))
     doc = NS(PathName=str(staged), IsFamilyDocument=True, IsLinked=False, OwnerFamily=family,
              ActiveView=view, IsModified=False, IsReadOnly=False,
-             FamilyManager=NS(CurrentType=NS(Name="Café")), GetElement=lambda _id: view,
-             GetDocumentPreviewSettings=lambda: NS(PreviewViewId=view.Id, IsViewUpdateForced=True,
-                                                    Dispose=lambda: None))
+             FamilyManager=NS(CurrentType=NS(Name="Café")), GetElement=get_element,
+             GetDocumentPreviewSettings=lambda: settings, transactions=[], Regenerate=lambda: None)
+
+    class Transaction:
+        def __init__(self, document, _title):
+            document.transactions.append(self)
+            self.state = None
+            self.settings = settings.PreviewViewId, settings.IsViewUpdateForced
+            self.views = [(item, deepcopy(item.__dict__)) for item in views]
+
+        def Start(self):
+            self.state = "started"
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def Commit(self):
+            self.state = "committed"
+            doc.IsModified = True
+            return self.state
+
+        def RollBack(self):
+            self.state = "rolled_back"
+            settings.PreviewViewId, settings.IsViewUpdateForced = self.settings
+            views[:] = [item for item, _ in self.views]
+            for item, values in self.views:
+                item.__dict__.clear()
+                item.__dict__.update(values)
+            return self.state
 
     class Collector:
         IsViewValidForElementIteration = staticmethod(lambda document, view_id: view_id.Value == 55)
@@ -95,9 +157,9 @@ def host(tmp_path, monkeypatch):
         def OfClass(self, kind):
             assert self.view_id is None
             if kind == "view":
-                return [view]
-            assert kind == "view type"
-            return [NS(ViewFamily="3D", Id=NS(Value=4), UniqueId="fixture-type")]
+                return list(views)
+            assert kind is NS
+            return [view_type]
 
         def WhereElementIsNotElementType(self):
             assert self.view_id.Value == 55
@@ -106,7 +168,15 @@ def host(tmp_path, monkeypatch):
         def Dispose(self):
             pass
 
-    db = NS(View3D=View, View="view", ViewFamilyType="view type", ViewFamily=NS(ThreeDimensional="3D"), XYZ=xyz,
+    db = NS(View3D=View, View="view", ViewFamilyType=NS, ViewFamily=NS(ThreeDimensional="3D"), XYZ=xyz,
+            ElementId=lambda value: NS(Value=value), DisplayStyle=NS(Shading="Shading"),
+            Color=lambda r, g, b: NS(Red=r, Green=g, Blue=b),
+            ViewDisplayBackground=NS(CreateGradient=lambda sky, horizon, ground: NS(
+                Type="Gradient", SkyColor=sky, BackgroundColor=horizon, GroundColor=ground, Dispose=lambda: None)),
+            ViewOrientation3D=lambda eye, up, forward: NS(EyePosition=eye, UpDirection=up,
+                                                         ForwardDirection=forward, Dispose=lambda: None),
+            Transaction=Transaction, TransactionStatus=NS(Started="started", RolledBack="rolled_back",
+                                                          Committed="committed"),
             Options=lambda: NS(Dispose=lambda: None), FilteredElementCollector=Collector,
             Transform=NS(Identity=Shift()), GeometryInstance=GeometryInstance, Solid=Solid,
             CategoryType=NS(Annotation="Annotation"), TemporaryViewMode=NS(
@@ -114,6 +184,10 @@ def host(tmp_path, monkeypatch):
     stopwatch = NS(StartNew=lambda: NS(ElapsedMilliseconds=0))
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(Stopwatch=stopwatch))
+    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
+    monkeypatch.setitem(sys.modules, "read_family_preview", None)
+    monkeypatch.delitem(sys.modules, "read_family_preview")
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
 
     def execute(inputs=request):
         return runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": inputs})["result"]
@@ -208,3 +282,64 @@ def test_review_camera_and_deny_reuse_without_saved_family_receipt(host, tmp_pat
     assert same.returncode == 0, same.stderr
     no_change = json.loads(same.stdout)
     assert no_change["steps"] == [] and no_change["before"] == no_change["after"]
+
+
+def apply_preview(doc, plan):
+    script = SCRIPT.with_name("apply_family_preview.py")
+    return runpy.run_path(str(script), init_globals={"doc": doc, "inputs": {"preview": plan}})["result"]
+
+
+def test_writer_validates_run_scope_and_reads_kept_thumbnail_independently(host, tmp_path):
+    execute, doc, _, _, _ = host
+    plan = json.loads(run_preview(tmp_path, execute(), {"view_type_id": "4"}).stdout)
+    response = apply_preview(doc, plan)
+    assert response["status"] == "ok"
+    view = json.loads(response["receipt_json"])["preview_view"]
+    assert view["id"] == "56" and view["uid"] == "new-view"
+    assert [txn.state for txn in doc.transactions] == ["committed"]
+    assert doc.ActiveView.Id.Value == 55
+    planner = SCRIPT.parents[2] / "am-safe-change" / "scripts" / "family_preview_plan.py"
+    record_path, plan_path, fresh_path = [tmp_path / name for name in ("run.json", "plan.json", "fresh.json")]
+    changes = {"added_count": 1, "deleted_count": 0, "deleted": [], "modified_count": 0, "modified": [],
+               "added": [{"id": 56}], "by_category": {"Views": 1}}
+    run = {"mode": "dry_run", "decision": "rolled_back", "status": "ok", "run_id": "dry",
+           "changes": changes, "result": response}
+    plan_path.write_text(json.dumps(plan))
+    record_path.write_text(json.dumps(run))
+    dry = [sys.executable, str(planner), str(record_path), str(plan_path), "--verify-run"]
+    valid = subprocess.run(dry, capture_output=True, text=True)
+    assert valid.returncode == 0, valid.stderr
+    changes["added"] = [{"id": 57}]
+    record_path.write_text(json.dumps(run))
+    invalid = subprocess.run(dry, capture_output=True, text=True)
+    assert invalid.returncode == 2 and "reviewed view scope" in invalid.stderr
+    changes["added"] = [{"id": 56}]
+    run.update(mode="modify", decision="committed", run_id="kept", approval="user")
+    record_path.write_text(json.dumps(run))
+    fresh_path.write_text(json.dumps({"mode": "query", "status": "ok", "run_id": "fresh", "result": execute()}))
+    verify = [sys.executable, str(planner), str(fresh_path), str(plan_path), "--verify-kept", str(record_path)]
+    kept = subprocess.run(verify, capture_output=True, text=True)
+    assert kept.returncode == 0, kept.stderr
+
+
+def test_writer_refuses_stale_plan_and_rolls_back_wrong_preview_setting(host, tmp_path, monkeypatch):
+    execute, doc, _, _, _ = host
+    before = execute()
+    plan = json.loads(run_preview(tmp_path, before, {"view_type_id": "4"}).stdout)
+    plan["proposed"]["display_style"] = "Wireframe"
+    with pytest.raises(ValueError, match="reviewed preview"):
+        apply_preview(doc, plan)
+    assert doc.transactions == []
+    plan["proposed"]["display_style"] = "Shading"
+    original_type = doc.FamilyManager.CurrentType.Name
+    doc.FamilyManager.CurrentType.Name = "Changed since review"
+    with pytest.raises(ValueError, match="changed after preview"):
+        apply_preview(doc, plan)
+    assert doc.transactions == []
+    doc.FamilyManager.CurrentType.Name = original_type
+    monkeypatch.setattr(doc.GetDocumentPreviewSettings(), "ForceViewUpdate",
+                        lambda _value: setattr(doc.GetDocumentPreviewSettings(), "IsViewUpdateForced", False))
+    with pytest.raises(ValueError, match="settings differ"):
+        apply_preview(doc, plan)
+    assert [txn.state for txn in doc.transactions] == ["rolled_back"]
+    assert execute() == before
