@@ -41,6 +41,7 @@ class Entity:
 
 @pytest.mark.parametrize("outcome", [
     "committed", "offset_mismatch", "provenance_missing", "unqualified_schema", "stale_profile",
+    "modified_existing", "unrelated_add", "missing_root", "commit_changed",
     "workflow_commit", "workflow_stale", "workflow_existing", "workflow_owned", "workflow_mapping_changed",
 ])
 def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(monkeypatch, outcome):
@@ -52,18 +53,33 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
     ceiling_type = type("CeilingType", (), {"UniqueId": "ceiling-type"})
     wall_type = type("WallType", (), {"UniqueId": "wall-type", "Kind": "basic"})
     sketch_class = type("Sketch", (), {})
+    model_curve = type("ModelCurve", (), {})
     schema = NS(SchemaName="ArchiMagicRoomFinishV1", ListFields=lambda: [
         NS(FieldName="Payload", ValueType=NS(FullName="System.String"), ContainerType="simple"),
     ])
     ext = NS(Entity=Entity, ContainerType=NS(Simple="simple"), ExtensibleStorageFilter=str,
              Schema=NS(Lookup=lambda _guid: None if outcome == "unqualified_schema" else schema))
-    status = NS(Started="started", Committed="committed", RolledBack="rolled-back")
+    status = NS(Started="started", Committed="committed", RolledBack="rolled-back", Pending="pending")
     events = []
+    group_events = []
     created = []
 
+    class ChangeEvent:
+        def __init__(self):
+            self.handlers = []
+
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
+        def __isub__(self, handler):
+            self.handlers.remove(handler)
+            return self
+
     class Transaction:
-        def __init__(self, document, _name):
+        def __init__(self, document, name):
             self.document = document
+            self.name = name
 
         def Start(self):
             events.append(status.Started)
@@ -71,6 +87,20 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
 
         def Commit(self):
             events.append(status.Committed)
+            original_ids = {10, 20, 30, 40, 50, 1}
+            added = set(self.document.elements) - original_ids
+            if outcome == "unrelated_add":
+                added.add(999)
+            if outcome == "missing_root":
+                added.remove(created[0].Id.Value)
+            if outcome == "commit_changed":
+                created[0].values["floor-offset"] += 1
+            event = NS(GetDocument=lambda: self.document, GetTransactionNames=lambda: [self.name],
+                       GetAddedElementIds=lambda: [ElementId(value) for value in added],
+                       GetModifiedElementIds=lambda: [ElementId(50)] if outcome == "modified_existing" else [],
+                       GetDeletedElementIds=lambda: [])
+            for handler in self.document.Application.DocumentChanged.handlers:
+                handler(None, event)
             return status.Committed
 
         def GetStatus(self):
@@ -78,11 +108,29 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
 
         def RollBack(self):
             events.append(status.RolledBack)
-            for item in created:
-                if hasattr(item, "SketchId"):
-                    del self.document.elements[item.SketchId.Value]
+            return status.RolledBack
+
+    class Group:
+        def __init__(self, document, _name):
+            self.document = document
+            self.original = dict(document.elements)
+
+        def Start(self):
+            group_events.append(status.Started)
+            return status.Started
+
+        def GetStatus(self):
+            return group_events[-1]
+
+        def RollBack(self):
+            group_events.append(status.RolledBack)
+            self.document.elements = self.original
             created[:] = []
             return status.RolledBack
+
+        def Assimilate(self):
+            group_events.append(status.Committed)
+            return status.Committed
 
     class Finish:
         DesignOption = None
@@ -108,8 +156,13 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
                 assert not wall_args
                 item.SketchId = ElementId(item.Id.Value + 10)
                 sketch = sketch_class()
-                sketch.OwnerId, sketch.Profile = item.Id, geometry
+                sketch.Id, sketch.OwnerId, sketch.Profile = item.SketchId, item.Id, geometry
+                sketch.SketchPlane = None
+                curve_id = ElementId(item.Id.Value + 100)
+                sketch.GetAllElements = lambda: [curve_id]
                 document.elements[item.SketchId.Value] = sketch
+                document.elements[curve_id.Value] = model_curve()
+            document.elements[item.Id.Value] = item
             created.append(item)
             return item
 
@@ -138,7 +191,8 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
                WALL_ATTR_ROOM_BOUNDING="bounding")
     db = NS(ElementId=ElementId, Level=level, FloorType=floor_type, CeilingType=ceiling_type, WallType=wall_type,
             Floor=floor, Ceiling=ceiling, Wall=wall, Sketch=sketch_class, Line=Line, XYZ=xyz, WallKind=NS(Basic="basic"),
-            Transaction=Transaction, TransactionStatus=status, BuiltInParameter=names,
+            Transaction=Transaction, TransactionGroup=Group, TransactionStatus=status, BuiltInParameter=names,
+            ModelCurve=model_curve, ReferencePlane=type("ReferencePlane", (), {}), Dimension=type("Dimension", (), {}),
             BoundaryValidation=NS(IsValidHorizontalBoundary=lambda profiles: len(profiles) == 1),
             StorageType=NS(Integer="integer", Double="double", ElementId="id"),
             WallUtils=NS(DisallowWallJoinAtEnd=lambda item, end: item.joins.__setitem__(end, False),
@@ -152,9 +206,10 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
     placement = importlib.import_module("room_finish_placement")
     provenance = importlib.import_module("room_finish_provenance")
     document = NS(IsFamilyDocument=False, IsReadOnly=False, IsModifiable=False,
-                  Application=NS(ShortCurveTolerance=0.01), Regenerate=lambda: None,
+                  Application=NS(ShortCurveTolerance=0.01, DocumentChanged=ChangeEvent()), Regenerate=lambda: None,
                   elements={10: level(), 20: NS(UniqueId="phase"), 30: floor_type(), 40: ceiling_type(), 50: wall_type()})
     document.GetElement = lambda element_id: document.elements.get(element_id.Value)
+    document.Equals = lambda other: other is document
     points = [xyz(0, 0, 25), xyz(4, 0, 25), xyz(4, 4, 25), xyz(0, 4, 25)]
     profile = [Line(a, b) for a, b in zip(points, points[1:] + points[:1])]
     profile_key = [sorted(provenance.native_edge(curve) for curve in profile)]
@@ -261,6 +316,7 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
         receipt = execute(mode="apply", plan=preview)
         if outcome == "workflow_commit":
             assert events == ["started", "committed"] and receipt["status"] == "ok"
+            assert group_events == ["started", "committed"] and receipt["added_sketch_element_ids"] == ["210", "300"]
             assert receipt["created"][0]["piece_key"] == preview["steps"][0]["piece_key"]
         else:
             assert receipt["status"] == "stopped" and not events and not created
@@ -273,11 +329,17 @@ def test_room_finish_batch_checks_native_geometry_and_rolls_back_as_one_unit(mon
         assert events == [] and created == []
         return
     receipt = placement.place_room_finishes(document, pieces)
+    assert not document.Application.DocumentChanged.handlers
     if outcome == "committed":
         assert events == ["started", "committed"] and receipt["status"] == "ok"
+        assert group_events == ["started", "committed"]
+        assert receipt["added_sketch_element_ids"] == ["210", "211", "300", "301"]
         assert [item["piece_key"] for item in receipt["created"]] == [piece["piece_key"] for piece in pieces]
         assert [json.loads(item.record.value)["kind"] for item in created] == ["floor", "ceiling", "wall"]
         assert created[-1].values["bounding"] == 0 and created[-1].joins == [False, False]
     else:
-        assert receipt["target_rollback_verified"] is True and events == ["started", "rolled-back"] and created == []
+        post_commit = outcome in ("modified_existing", "unrelated_add", "missing_root", "commit_changed")
+        assert receipt["target_rollback_verified"] is True and not created
+        assert events == ["started", "committed" if post_commit else "rolled-back"]
+        assert group_events == ["started", "rolled-back"]
         assert sorted(document.elements) == [10, 20, 30, 40, 50]

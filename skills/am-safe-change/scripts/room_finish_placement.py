@@ -12,6 +12,7 @@ from room_finish_provenance import SCHEMA_GUID, SCHEMA_NAME, digest, edge_key, e
 
 
 MAX_PIECES = 200
+TRANSACTION_NAME = "Place reviewed room finishes"
 HEIGHT_PARAMETERS = {"floor": "FLOOR_HEIGHTABOVELEVEL_PARAM", "ceiling": "CEILING_HEIGHTABOVELEVEL_PARAM"}
 
 
@@ -90,7 +91,65 @@ def write_provenance(document, element, piece, schema, field):
     fresh = element.GetEntity(schema)
     if not fresh.IsValid() or fresh.Get[String](field) != encoded:
         raise ValueError("Revit did not retain the new finish provenance.")
-    return {"id": str(element.Id.Value), "uid": record["element_uid"], "piece_key": piece["piece_key"]}
+    receipt = {"id": str(element.Id.Value), "uid": record["element_uid"], "piece_key": piece["piece_key"],
+               "observed_sha256": record["observed_sha256"]}
+    return receipt, encoded
+
+
+def finish_sketch_dependencies(document, element):
+    sketch = document.GetElement(element.SketchId)
+    if not isinstance(sketch, DB.Sketch) or sketch.OwnerId.Value != element.Id.Value:
+        raise ValueError("The new finish sketch does not belong to the reviewed piece.")
+    ids = {str(sketch.Id.Value)}
+    for identifier in sketch.GetAllElements():
+        member = document.GetElement(identifier)
+        if isinstance(member, (DB.ModelCurve, DB.ReferencePlane, DB.Dimension)):
+            ids.add(str(identifier.Value))
+    plane = sketch.SketchPlane
+    if plane is not None:
+        ids.add(str(plane.Id.Value))
+    return ids
+
+
+def checked_commit(document, pieces, receipts, changes, schema, field):
+    if len(changes) != 1 or changes[0] is None:
+        raise ValueError("Revit did not report the reviewed finish transaction.")
+    added, modified, deleted = changes[0]
+    if (modified - added) or deleted:
+        raise ValueError("The finish transaction changed an existing element.")
+    roots = {receipt["id"] for receipt, _ in receipts}
+    dependencies = set()
+    if len(roots) != len(pieces) or not roots <= added:
+        raise ValueError("Revit did not report every reviewed finish as a new element.")
+    for piece, (receipt, encoded) in zip(pieces, receipts):
+        element = document.GetElement(native_id(receipt["id"]))
+        kind = piece["intended"]["kind"]
+        if (element is None or str(element.UniqueId) != receipt["uid"]
+                or digest(observed_piece(document, element, kind)) != receipt["observed_sha256"]):
+            raise ValueError("Revit changed a reviewed finish during commit.")
+        entity = element.GetEntity(schema)
+        if not entity.IsValid() or entity.Get[String](field) != encoded:
+            raise ValueError("Revit changed finish provenance during commit.")
+        if kind != "wall":
+            dependencies.update(finish_sketch_dependencies(document, element))
+    if not (added - roots) <= dependencies:
+        raise ValueError("The finish transaction created an element outside the reviewed pieces and their sketches.")
+    return sorted(added - roots, key=int)
+
+
+def rollback_group(transaction, group):
+    try:
+        state = transaction.GetStatus()
+        if state == DB.TransactionStatus.Started:
+            state = transaction.RollBack()
+        if state == DB.TransactionStatus.Pending:
+            return False
+        group_state = group.GetStatus()
+        if group_state == DB.TransactionStatus.Started:
+            group_state = group.RollBack()
+        return group_state == DB.TransactionStatus.RolledBack
+    except Exception:
+        return False
 
 
 def place_room_finishes(document, pieces):
@@ -104,28 +163,49 @@ def place_room_finishes(document, pieces):
         raise ValueError("The room-finish provenance schema must be qualified before placement.")
     field = payload_field(schema)
     prepared = [check_geometry(document, piece) for piece in pieces]
-    transaction = DB.Transaction(document, "Place reviewed room finishes")
-    if transaction.Start() != DB.TransactionStatus.Started:
-        return {"status": "transaction_unresolved", "message": "Revit did not start the finish transaction."}
-    try:
-        elements = [create_piece(document, entry, piece["intended"]) for entry, piece in zip(prepared, pieces)]
-        document.Regenerate()
-        receipt = [write_provenance(document, element, piece, schema, field)
-                   for element, piece in zip(elements, pieces)]
-        state = transaction.Commit()
-        if state == DB.TransactionStatus.Committed:
-            return {"status": "ok", "created": receipt}
-        if state == DB.TransactionStatus.RolledBack:
-            return {"status": "stopped", "target_rollback_verified": True}
-    except Exception as error:
+    application = document.Application
+    changes = []
+
+    def changed(_sender, event):
         try:
-            state = transaction.GetStatus()
-            if state == DB.TransactionStatus.Started:
-                state = transaction.RollBack()
+            if not event.GetDocument().Equals(document) or list(event.GetTransactionNames()) != [TRANSACTION_NAME]:
+                changes.append(None)
+                return
+            changes.append(tuple({str(identifier.Value) for identifier in ids} for ids in (
+                event.GetAddedElementIds(), event.GetModifiedElementIds(), event.GetDeletedElementIds(),
+            )))
         except Exception:
-            return {"status": "transaction_unresolved", "message": "Revit could not confirm finish rollback."}
-        if state == DB.TransactionStatus.RolledBack:
-            return {"status": "stopped", "target_rollback_verified": True, "error_type": type(error).__name__}
+            changes.append(None)
+
+    transaction = DB.Transaction(document, TRANSACTION_NAME)
+    group = DB.TransactionGroup(document, TRANSACTION_NAME)
+    if group.Start() != DB.TransactionStatus.Started:
+        return {"status": "transaction_unresolved", "message": "Revit did not start the finish transaction group."}
+    try:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise ValueError("Revit did not start the finish transaction.")
+        application.DocumentChanged += changed
+        try:
+            elements = [create_piece(document, entry, piece["intended"]) for entry, piece in zip(prepared, pieces)]
+            document.Regenerate()
+            receipts = [write_provenance(document, element, piece, schema, field)
+                        for element, piece in zip(elements, pieces)]
+            state = transaction.Commit()
+        finally:
+            application.DocumentChanged -= changed
+        if state != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not commit the finish transaction.")
+        dependent_ids = checked_commit(document, pieces, receipts, changes, schema, field)
+        if group.Assimilate() != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not finish the placement transaction group.")
+        return {"status": "ok", "created": [receipt for receipt, _ in receipts],
+                "added_sketch_element_ids": dependent_ids}
+    except Exception as error:
+        if rollback_group(transaction, group):
+            result = {"status": "stopped", "target_rollback_verified": True, "error_type": type(error).__name__}
+            if isinstance(error, ValueError):
+                result["message"] = str(error)
+            return result
     return {"status": "transaction_unresolved", "message": "Check the finish transaction in Revit."}
 
 
