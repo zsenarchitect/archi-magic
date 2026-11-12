@@ -426,6 +426,7 @@ tr.fold button:hover { color: var(--ink); }
 
 <script type="application/json" id="data">__DATA_JSON__</script>
 <script type="application/json" id="data2">__DATA2_JSON__</script>
+<script type="application/json" id="deletions">__DELETIONS_JSON__</script>
 <script>
 (function () {
   "use strict";
@@ -850,7 +851,7 @@ tr.fold button:hover { color: var(--ink); }
     $("banner").innerHTML = blocked + status + chips;
 
     var pre = "";
-    var deletions = !opt.compareMode && Array.isArray(cp.deletions) ? cp.deletions : [];
+    var deletions = opt.compareMode ? [] : parse("deletions") || [];
     if (deletions.length) {
       pre += '<div class="notes"><h2>Delete: ' + deletions.length +
         (deletions.length === 1 ? " element" : " elements") + '</h2><ul>' +

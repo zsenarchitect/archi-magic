@@ -1,11 +1,14 @@
 import json
+from html.parser import HTMLParser
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "delete_approval.py"
+RENDERER = SCRIPT.parents[2] / "am-schedule-view" / "scripts" / "render-table.ps1"
 
 
 @pytest.fixture
@@ -75,3 +78,35 @@ def test_accepts_named_deletion_rows_in_saved_evidence(tmp_path, preview):
     run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
            "changes": {"deleted_count": 2, "deleted": [{"id": 300}, {"id": "301"}]}}
     assert run_cli(tmp_path, preview, run).returncode == 0
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="The HTML renderer requires PowerShell.")
+def test_renderer_preserves_exact_int64_ids_and_inert_labels(tmp_path, preview):
+    class DeletionData(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.reading = False
+            self.payload = []
+
+        def handle_starttag(self, tag, attrs):
+            self.reading = tag == "script" and dict(attrs).get("id") == "deletions"
+
+        def handle_endtag(self, tag):
+            self.reading = False
+
+        def handle_data(self, data):
+            if self.reading:
+                self.payload.append(data)
+
+    preview["deletions"][1].update(id=9007199254740993, name="</script><img src=x> __DATA_JSON__")
+    source = tmp_path / "preview.json"
+    target = tmp_path / "preview.html"
+    source.write_text(json.dumps(preview), encoding="utf-8")
+    run = subprocess.run(["pwsh", "-NoProfile", "-File", str(RENDERER),
+                          "-Json", str(source), "-Out", str(target)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    parser = DeletionData()
+    parser.feed(target.read_text(encoding="utf-8"))
+    assert json.loads("".join(parser.payload)) == [
+        dict(row, id=str(row["id"])) for row in preview["deletions"]
+    ]
