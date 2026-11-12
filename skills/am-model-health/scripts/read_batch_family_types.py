@@ -119,12 +119,14 @@ def project_query(document, DB, request):
     if (not isinstance(ids, list) or len(ids) > MAX_ROWS + MAX_BATCH_FAMILIES or len(set(ids)) != len(ids)
             or bool(ids) != bool(transaction)):
         raise ValueError("Use the exact transaction name with its provisional element IDs.")
+    from System import Int64
+
     elements = inventory(document, DB)
     for key in ids:
         number = int(key)
-        if number <= 0 or str(number) != key:
+        if not 0 < number < 2**63 or str(number) != key:
             raise ValueError("Use canonical positive Revit effect IDs.")
-        element = document.GetElement(DB.ElementId(number))
+        element = document.GetElement(DB.ElementId(Int64(number)))
         if (element is not None) != kept or (key in elements) != kept:
             raise ValueError("A provisional element's presence differs from the reviewed decision.")
     preserved = {key: value for key, value in elements.items() if key not in ids}

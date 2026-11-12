@@ -132,6 +132,7 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
         import read_batch_family_types as reader
         import verify_batch_family_load as verifier
 
+        monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Int64=int))
         monkeypatch.setattr(reader, "inventory", inventory)
         monkeypatch.setattr(reader, "read_project", snapshot)
         monkeypatch.setattr(verifier, "build_load_preview", lambda *args: preview)
@@ -219,3 +220,28 @@ def test_exact_multi_type_load_restores_baseline_after_trial(monkeypatch, failur
         fresh = audit("discard-read", replay["transaction"], replay["effects"]["added"])
         checked = verifier.verify_decision({}, {}, preview, before, trial, after, modify, fresh)
         assert checked["status"] == "batch_family_load_discard_verified"
+
+
+def test_project_audit_reads_full_width_revit_element_ids(monkeypatch):
+    import read_batch_family_types as reader
+
+    class Int64(int):
+        pass
+
+    def element_id(value):
+        assert isinstance(value, Int64)
+        return value
+
+    number = 9007199254740993
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Int64=Int64))
+    monkeypatch.setattr(reader, "read_project", lambda *args, **kwargs: {})
+    monkeypatch.setattr(reader, "inventory", lambda *args: {str(number): ["element-uid", "version"]})
+    doc = SimpleNamespace(GetElement=lambda key: object() if key == number else None)
+    db = SimpleNamespace(ElementId=element_id)
+    request = {"lookup": {}, "audit_inventory": True, "kept": True,
+               "transaction": "Fixture transaction", "effect_ids": [str(number)]}
+
+    assert reader.project_query(doc, db, request)["present_ids"] == [str(number)]
+    request["effect_ids"] = [str(2**63)]
+    with pytest.raises(ValueError, match="canonical positive Revit effect IDs"):
+        reader.project_query(doc, db, request)
