@@ -5,6 +5,7 @@ import json
 from pyrevit.api import DB
 
 from cad_layout_preview import classify_room_boundaries, fields, number, propose
+from read_cad_layout_surroundings import scan_surroundings
 from read_linked_cad_layout import EVIDENCE_LIMIT, MM_PER_FOOT, element_id, encoded, read_snapshot, sha256
 
 REQUEST_LIMIT = 128 * 1024
@@ -76,6 +77,7 @@ def read_preview(document, request):
     result.update(status=status, model_write_approved=False)
     if status == "proposed":
         result["geometry_sha256"] = sha256(encoded(result, EVIDENCE_LIMIT))
+        result["existing_model_scan"] = scan_surroundings(document, proposal, walls)
     return {"status": status, "preview_json": encoded(result, EVIDENCE_LIMIT)}
 
 

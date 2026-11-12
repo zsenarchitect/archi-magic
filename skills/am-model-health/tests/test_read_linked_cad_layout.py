@@ -102,6 +102,20 @@ def linked_dwg(monkeypatch):
         def Dispose(self):
             pass
 
+    class Collector:
+        def __init__(self, document):
+            self.document = document
+
+        def OfCategory(self, category):
+            self.category = category
+            return self
+
+        def WhereElementIsNotElementType(self):
+            return iter(self.document.existing.get(self.category, ()))
+
+        def Dispose(self):
+            pass
+
     mirror = Transform(lambda v: Record(X=-v.X, Y=v.Y + feet(250), Z=v.Z))
     rotate = Transform(lambda v: Record(X=feet(1000) - v.Y, Y=feet(2000) + v.X, Z=feet(3000) + v.Z))
     wall_a = Line(10, (0, 0), (4000, 0))
@@ -124,26 +138,32 @@ def linked_dwg(monkeypatch):
         **{id: Style(GraphicsStyleCategory=Record(Name=label)) for id, label in
            [(10, "WALL"), (11, "DOOR"), (12, "ROOM")]},
     }
+    categories = {key: key for key in (
+        "OST_Walls", "OST_Doors", "OST_Rooms", "OST_RoomSeparationLines", "OST_Columns",
+        "OST_StructuralColumns", "OST_Floors", "OST_Ceilings", "OST_Roofs", "OST_Curtain_Systems",
+        "OST_GenericModel", "OST_RvtLinks")}
     db = Record(ElementId=element_id, Transform=Record(Identity=Transform(lambda v: v)),
                 GeometryInstance=Instance, Line=Line, PolyLine=Polyline, ImportInstance=Linked,
                 Level=Level, GraphicsStyle=Style, Options=Options,
                 WallType=WallType, WallKind=Record(Basic="basic"), FamilySymbol=FamilySymbol,
-                BuiltInCategory=Record(OST_Doors=-2000014),
+                BuiltInCategory=Record(**{**categories, "OST_Doors": -2000014}),
                 BuiltInParameter=Record(DOOR_WIDTH="door-width", VIEW_PHASE="view-phase"),
                 FamilyPlacementType=Record(OneLevelBasedHosted="hosted"),
                 StorageType=Record(Double="double", ElementId="element-id"),
                 ViewPlan=ViewPlan, ViewType=Record(FloorPlan="floor"), Phase=Phase,
                 DesignOption=Record(GetActiveDesignOptionId=lambda doc: doc.active_option),
+                FilteredElementCollector=Collector,
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
     api, system = ModuleType("pyrevit.api"), ModuleType("System")
     api.DB, system.Int64 = db, int
     monkeypatch.setitem(sys.modules, "pyrevit.api", api)
     monkeypatch.setitem(sys.modules, "System", system)
     monkeypatch.delitem(sys.modules, "read_linked_cad_layout", raising=False)
+    monkeypatch.delitem(sys.modules, "read_cad_layout_surroundings", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
-    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt",
+    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt", existing={},
                       ActiveView=view, active_option=element_id(-1), Application=Record(VersionNumber="2026"),
                       ProjectInformation=Record(UniqueId="aa-3"), GetElement=lambda id: objects.get(id.Value))
     request = {"link_id": "1", "level_id": "2", "segment_layers": ["WALL", "DOOR"],
@@ -193,11 +213,66 @@ def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_d
     assert preview["door_choices"]["dwg-1.1.3"] == {"hand_flipped": True, "facing_flipped": False}
     room, = preview["proposal"]["rooms"]
     assert [item["kind"] for item in room["boundary_edges"]].count("wall_face") == 1
+    assert preview.pop("existing_model_scan")["status"] == "none_found"
     digest = preview.pop("geometry_sha256")
     canonical = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
     assert digest == sha256(canonical.encode("ascii")).hexdigest()
     document.ActiveView.VersionGuid = "plan-v2"
     assert json.loads(native_preview(document, request)["preview_json"])["geometry_sha256"] != digest
+
+
+def existing_element(id_value, identifier, bounds, *, placed=True, created=96, demolished=-1):
+    def xyz(xyz_mm):
+        return Record(**{key: value / 304.8 for key, value in zip("XYZ", xyz_mm)})
+
+    def get_bounding_box(view):
+        assert view is None
+        if bounds is None:
+            return None
+        return Record(Min=xyz(bounds[0]), Max=xyz(bounds[1]), Enabled=True, Dispose=lambda: None)
+
+    return Record(Id=id_value(identifier), UniqueId=f"existing-{identifier}", VersionGuid="existing-v1",
+                  CreatedPhaseId=id_value(created), DemolishedPhaseId=id_value(demolished),
+                  Location=object() if placed else None, get_BoundingBox=get_bounding_box)
+
+
+def test_native_scan_finds_model_candidates_including_later_phases_and_reports_unknowns(linked_dwg):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+    document.existing = {
+        "OST_Rooms": [
+            existing_element(id_value, 103, ((0, -100, 3100), (600, 100, 3400))),
+            existing_element(id_value, 104, None, placed=False),
+        ],
+        "OST_RvtLinks": [existing_element(id_value, 101, ((490, -100, 3000), (720, 100, 3100)))],
+        "OST_Walls": [
+            existing_element(id_value, 105, ((540, -500, 7200), (720, 100, 7300))),
+            existing_element(id_value, 107, None),
+        ],
+    }
+    result = native_preview(document, request)
+    assert result["status"] == "proposed"
+    scan = json.loads(result["preview_json"])["existing_model_scan"]
+    assert scan["status"] == "incomplete" and scan["unplaced_rooms"] == 1
+    assert scan["unavailable"] == [{"id": "107", "category": "OST_Walls", "reason": "no_model_bounds"}]
+    assert [row["id"] for row in scan["candidates"]] == ["101", "103"]
+    link, room = scan["candidates"]
+    assert link["category"] == "OST_RvtLinks" and "wall-1" in link["near"]
+    assert room["created_phase_id"] == "96" and "wall-1" in room["near"]
+
+
+def test_native_scan_reports_truncation_instead_of_empty_success(linked_dwg, monkeypatch):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+    native_preview(document, request)
+    scan_module = sys.modules["read_cad_layout_surroundings"]
+    monkeypatch.setattr(scan_module, "MAX_VISITED", 1)
+    document.existing = {"OST_Walls": [
+        existing_element(id_value, identifier, ((0, 0, 9000), (10, 10, 9010))) for identifier in (101, 102)
+    ]}
+    scan = json.loads(native_preview(document, request)["preview_json"])["existing_model_scan"]
+    assert scan["status"] == "incomplete" and scan["limit"] == "elements" and scan["visited"] == 1
+    assert scan["candidates"] == []
 
 
 def test_native_entry_point_shows_boundary_conflicts_without_a_geometry_digest(linked_dwg):

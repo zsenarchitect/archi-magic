@@ -205,7 +205,7 @@ Add `--room-bounding all` to preview which room edges a proposed wall face suppo
 
 To tie the geometry preview to the open model, activate the floor plan for the selected level and phase. Run `scripts/preview_cad_layout_in_revit.py` with `run_query` and the scripts directory as workspace. Supply the reviewed DWG request under `source`, including `mapping` and `expected_evidence_sha256`. Supply the selected `view_id` and `phase_id` as decimal strings. In `walls`, key each choice by the proposed wall ID and supply `height_mm` and `room_bounding`. In `doors`, key each choice by its DWG source marker ID and supply the desired Revit `hand_flipped` and `facing_flipped` states as Booleans. Use an empty object for a category with no proposals. Recover a truncated response with `get_run`.
 
-Review the returned `preview_json` and keep its `geometry_sha256` when present. It identifies the geometry and choices for this model and view. Existing model conflicts, room enclosure, and guarded placement still require separate checks.
+Review the returned `preview_json` and keep its `geometry_sha256` when present. It identifies the geometry and choices for this model and view. The `existing_model_scan` checks model bounds around the proposed walls and door openings and at the room footprint elevation. It includes candidates from other phases. Review candidate bounds, phase IDs, and any unavailable records. A candidate needs a geometry check. An incomplete scan needs further evidence before placement. Existing model conflicts, room enclosure, and guarded placement still require separate checks.
 
 ## Area scheme cross-dependent standing check (issue #197)
 
