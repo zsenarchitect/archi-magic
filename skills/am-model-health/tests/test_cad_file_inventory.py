@@ -28,6 +28,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
     doc.header["$INSUNITS"] = 4
     doc.header["$MEASUREMENT"] = 1
     doc.layers.new("NonStandard", dxfattribs={"color": 3})
+    for name in ("A", "A-WALL-", "A-WALL-FULL"):
+        doc.layers.new(name)
     model = doc.modelspace()
     model.add_line((0, 0), (1, 0), dxfattribs={"layer": "NonStandard"})
     xref.define(doc, "Missing", "xref/missing.dwg")
@@ -42,7 +44,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
     assert result.returncode == 3, result.stderr
     report = json.loads(result.stdout)
     assert report["status"] == "incomplete"
-    assert ("CAD-LAY-01", "NonStandard") in {(f["ruleId"], f["target"]) for f in report["findings"]}
+    layer_findings = {f["target"] for f in report["findings"] if f["ruleId"] == "CAD-LAY-01"}
+    assert layer_findings == {"0", "A", "A-WALL-", "NonStandard"}
     assert ("CAD-XREF-01", "Missing") in {(f["ruleId"], f["target"]) for f in report["findings"]}
     drawing = report["inventory"]
     assert drawing["sha256"] == hashlib.sha256(original).hexdigest()
