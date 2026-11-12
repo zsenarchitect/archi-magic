@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read reviewed host or direct-link clash bounds through pyRevit run_query."""
+"""Read clash bounds and create a reviewed Revit clash section view."""
 import itertools
 import json
 import re
@@ -10,8 +10,8 @@ from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 import issue_board as ib
+from clash_section import FRAME, section_view_preview
 
-FRAME = "revit_host_internal_feet"
 LIMIT = 2 * 1024 * 1024
 TEXT = (str, type(u""))
 
@@ -165,11 +165,131 @@ def main(host, request):
     return {"status": "ok", "snapshot_json": encoded}
 
 
+TRANSACTION_NAME = "Create reviewed Navisworks clash view"
+
+
+def approved_view(host, plan, display):
+    fresh = json.loads(main(host, plan["request"])["snapshot_json"])
+    clash = {"guid": plan["view"]["clash_guid"], "objects": plan["clash_objects"]}
+    current, expected = section_view_preview(clash["guid"], [clash], fresh, plan["padding_ft"], plan["report_sha256"])
+    if current["blocked"] or plan != current or display.get("blocked") is not False:
+        raise ValueError("The approved view plan no longer matches Revit.")
+    if any(warning.get("blocking") for warning in display["warnings"]):
+        raise ValueError("The displayed clash preview is blocked.")
+    for field, value in expected.items():
+        if field != "warnings" and display.get(field) != value:
+            raise ValueError("The displayed clash preview differs from the approved plan.")
+    return current
+
+
+def view_receipt(host, view, plan):
+    expected = plan["view"]
+    if (not isinstance(view, DB.View3D) or view.IsTemplate or view.IsPerspective
+            or view.ViewTemplateId.Value != -1 or view.Name != expected["name"]
+            or str(view.GetTypeId().Value) != expected["view_type_id"]
+            or not view.IsSectionBoxActive or not view.UniqueId
+            or ib.saved_document_identity(host) != plan["host_identity"]):
+        raise ValueError("The new view differs from its approved identity or type.")
+    box = view.GetSectionBox()
+    low, high = xyz(box.Min), xyz(box.Max)
+    if (not box.Transform.IsIdentity
+            or any(not abs(actual - intended) <= 1e-7 for actual, intended in zip(low, plan["box"]["min"]))
+            or any(not abs(actual - intended) <= 1e-7 for actual, intended in zip(high, plan["box"]["max"]))):
+        raise ValueError("The section box differs from its approved coordinates.")
+    return {"clash_guid": expected["clash_guid"], "view_id": str(view.Id.Value), "view_uid": str(view.UniqueId),
+            "view_name": view.Name, "view_type_id": str(view.GetTypeId().Value),
+            "box_min": low, "box_max": high, "basis_sha256": plan["basis_sha256"],
+            "host_identity": plan["host_identity"]}
+
+
+def rollback(transaction, group):
+    try:
+        state = transaction.GetStatus()
+        if state == DB.TransactionStatus.Started:
+            state = transaction.RollBack()
+        if state == DB.TransactionStatus.Pending:
+            return False
+        group_state = group.GetStatus()
+        if group_state == DB.TransactionStatus.Started:
+            group_state = group.RollBack()
+        return group_state == DB.TransactionStatus.RolledBack
+    except Exception:
+        return False
+
+
+def apply_view(host, plan, display):
+    plan = approved_view(host, plan, display)
+    application = host.Application
+    events = []
+
+    def changed(_sender, event):
+        try:
+            if (events or not event.GetDocument().Equals(host)
+                    or list(event.GetTransactionNames()) != [TRANSACTION_NAME]):
+                events.append(None)
+                return
+            added, modified, deleted = (event.GetAddedElementIds(), event.GetModifiedElementIds(),
+                                        event.GetDeletedElementIds())
+            if len(added) != 1 or len(modified) or len(deleted):
+                events.append(None)
+                return
+            events.append(str(next(iter(added)).Value))
+        except Exception:
+            events.append(None)
+
+    group = DB.TransactionGroup(host, TRANSACTION_NAME)
+    transaction = DB.Transaction(host, TRANSACTION_NAME)
+    if group.Start() != DB.TransactionStatus.Started:
+        return {"status": "transaction_unresolved", "message": "Revit did not start the clash view group."}
+    try:
+        if transaction.Start() != DB.TransactionStatus.Started:
+            raise ValueError("Revit did not start the clash view transaction.")
+        application.DocumentChanged += changed
+        try:
+            view = DB.View3D.CreateIsometric(host, element_id(plan["view"]["view_type_id"]))
+            view.Name = plan["view"]["name"]
+            box = DB.BoundingBoxXYZ()
+            box.Transform = DB.Transform.Identity
+            box.Min = DB.XYZ(*plan["box"]["min"])
+            box.Max = DB.XYZ(*plan["box"]["max"])
+            view.SetSectionBox(box)
+            view.IsSectionBoxActive = True
+            host.Regenerate()
+            receipt = view_receipt(host, view, plan)
+            state = transaction.Commit()
+        finally:
+            application.DocumentChanged -= changed
+        if state != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not commit the clash view transaction.")
+        if events != [receipt["view_id"]]:
+            raise ValueError("Revit did not report exactly one new view with no other model changes.")
+        actual = host.GetElement(element_id(receipt["view_id"]))
+        if view_receipt(host, actual, plan) != receipt:
+            raise ValueError("Revit changed the new section view during commit.")
+        payload = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if group.Assimilate() != DB.TransactionStatus.Committed:
+            raise ValueError("Revit did not complete the clash view group.")
+        return {"status": "ok", "receipt_json": payload}
+    except Exception as error:
+        if rollback(transaction, group):
+            return {"status": "stopped", "message": str(error), "target_rollback_verified": True}
+        return {"status": "transaction_unresolved", "message": "Check the clash view transaction before continuing."}
+
+
+def run(host, args):
+    mode = args.get("mode", "read")
+    if mode == "apply":
+        return apply_view(host, args["plan"], args["preview"])
+    if mode != "read":
+        raise ValueError("Choose read or apply for the clash view.")
+    return main(host, args)
+
+
 if "inputs" in globals():
     try:
-        result = main(doc, inputs)  # noqa: F821
+        result = run(doc, inputs)  # noqa: F821
     except (KeyError, TypeError, ValueError) as error:
         result = {"status": "stopped", "message": str(error)}
     except Exception as error:
-        result = {"status": "stopped", "message": "Revit clash bounds could not be read (%s)."
+        result = {"status": "stopped", "message": "Revit clash evidence could not be read (%s)."
                   % type(error).__name__}

@@ -120,8 +120,7 @@ def test_reader_reports_missing_visibility_and_refuses_stale_identity(runtime):
         reader(host, request)
 
 
-@pytest.mark.parametrize("state", ["ready", "name_collision", "default_template", "unresolved"])
-def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_path, state):
+def prepare_view(runtime, state="ready"):
     reader, host, request, links = runtime
     guid = "11111111-0000-4000-8000-000000000001"
     view_name = "Clash " + guid
@@ -141,6 +140,13 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
     host.GetElement = lambda item: family_type if item.Value == 8 else get_element(item)
     if state == "unresolved":
         links[1].hidden = True
+    return reader, host, request, db, guid, named
+
+
+@pytest.mark.parametrize("state", ["ready", "name_collision", "default_template", "unresolved"])
+def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_path, state):
+    reader, host, request, _, guid, _ = prepare_view(runtime, state)
+    view_name = "Clash " + guid
     native = reader(host, request)
     record = tmp_path / "full-run.json"
     record.write_text(json.dumps({"result": native}))
@@ -173,3 +179,136 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
     else:
         assert plan["blocked"] and display["blocked"] and plan["steps"] == []
         assert display["warnings"][0]["blocking"]
+
+
+class ChangeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+
+class Transaction:
+    status = "uninitialized"
+
+    def __init__(self, host, name):
+        self.host, self.name = host, name
+
+    def Start(self):
+        self.status = "started"
+        return self.status
+
+    def GetStatus(self):
+        return self.status
+
+    def RollBack(self):
+        self.status = "rolled_back"
+        return self.status
+
+    def Commit(self):
+        self.status = "committed"
+        for handler in self.host.Application.DocumentChanged.handlers:
+            event = NS(GetDocument=lambda: self.host, GetTransactionNames=lambda: [self.name],
+                       GetAddedElementIds=lambda: self.host.added, GetModifiedElementIds=lambda: self.host.modified,
+                       GetDeletedElementIds=lambda: [])
+            handler(None, event)
+        return self.status
+
+
+class Group(Transaction):
+    def Start(self):
+        self.original = list(self.host.views)
+        return super().Start()
+
+    def RollBack(self):
+        self.host.views[:] = self.original
+        return super().RollBack()
+
+    def Assimilate(self):
+        return "committed"
+
+
+class View3D:
+    IsTemplate = IsPerspective = IsSectionBoxActive = False
+
+    def __init__(self, type_id):
+        self.Id, self.UniqueId, self.type_id, self.ViewTemplateId = Id(100), "view-kept", type_id, Id(-1)
+        self.Name = "Default"
+
+    @classmethod
+    def CreateIsometric(cls, host, type_id):
+        view = cls(type_id)
+        host.views.append(view)
+        host.added.append(view.Id)
+        return view
+
+    def GetTypeId(self):
+        return self.type_id
+
+    def SetSectionBox(self, box):
+        self.box = box
+
+    def GetSectionBox(self):
+        return self.box
+
+
+@pytest.fixture
+def view_writer(runtime):
+    from clash_section import section_view_preview
+
+    reader, host, request, db, guid, views = prepare_view(runtime)
+    host.views, host.added, host.modified = views, [], []
+    host.Application = NS(DocumentChanged=ChangeEvent())
+    host.Equals = lambda other: other is host
+    host.Regenerate = lambda: None
+    db.Transaction, db.TransactionGroup, db.View3D = Transaction, Group, View3D
+    db.BoundingBoxXYZ = NS
+    db.Transform.Identity.IsIdentity = True
+    db.TransactionStatus = NS(Started="started", Pending="pending", Committed="committed", RolledBack="rolled_back")
+    get_element = host.GetElement
+    host.GetElement = lambda item: next((view for view in host.views if view.Id.Value == item.Value), get_element(item))
+    snapshot = json.loads(reader(host, request)["snapshot_json"])
+    clash = {"guid": guid, "objects": [{"element_id": "42", "selection_path": ["Rotated", "Fixture"]},
+                                      {"element_id": "42", "selection_path": ["Mirrored", "Fixture"]}]}
+    plan, display = section_view_preview(guid, [clash], snapshot, 1.0, "a" * 64)
+    return reader.__globals__["run"], host, plan, display
+
+
+def test_guarded_view_creation_verifies_exact_kept_candidate(view_writer):
+    run, host, plan, display = view_writer
+    result = run(host, {"mode": "apply", "plan": plan, "preview": display})
+    assert result["status"] == "ok"
+    receipt = json.loads(result["receipt_json"])
+    assert receipt["view_id"] == "100" and receipt["view_uid"] == "view-kept"
+    assert receipt["view_name"] == plan["view"]["name"]
+    assert receipt["box_min"] == plan["box"]["min"] and receipt["box_max"] == plan["box"]["max"]
+    assert host.Application.DocumentChanged.handlers == []
+    with pytest.raises(ValueError, match="no longer matches"):
+        run(host, {"mode": "apply", "plan": plan, "preview": display})
+    assert len(host.views) == 1
+
+
+def test_guarded_view_rolls_back_on_unapproved_change(view_writer):
+    run, host, plan, display = view_writer
+    host.modified = [Id(1)]
+    result = run(host, {"mode": "apply", "plan": plan, "preview": display})
+    assert result["status"] == "stopped" and result["target_rollback_verified"]
+    assert host.views == [] and host.Application.DocumentChanged.handlers == []
+
+
+def test_guarded_view_rejects_changed_mapping_or_display_before_writes(view_writer):
+    run, host, plan, display = view_writer
+    display["after"][-1][-1] = [999, 999, 999]
+    with pytest.raises(ValueError, match="displayed clash preview differs"):
+        run(host, {"mode": "apply", "plan": plan, "preview": display})
+    assert host.views == []
+    plan["clash_objects"][0]["selection_path"] = ["Mirrored", "Fixture"]
+    with pytest.raises(ValueError, match="no longer matches"):
+        run(host, {"mode": "apply", "plan": plan, "preview": display})
+    assert host.views == []
