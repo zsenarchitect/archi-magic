@@ -87,18 +87,32 @@ def measure_box(extrusion):
     return [min(values) for values in axes], [max(values) for values in axes]
 
 
+def verify_box(extrusion, dimensions):
+    minimum, maximum = measure_box(extrusion)
+    if max(abs(value) for value in minimum) > TOLERANCE_FT or any(
+            abs(actual - expected) > TOLERANCE_FT for actual, expected in zip(maximum, dimensions)):
+        raise ValueError("The Revit extrusion bounds differ from the reviewed box.")
+    return {"min_ft": minimum, "max_ft": maximum}
+
+
 def probe(document, args):
     before = snapshot(document)
-    if not isinstance(args, dict) or set(args) != {"baseline", "specification_json", "specification_sha256"}:
+    required = {"baseline", "specification_json", "specification_sha256"}
+    if not isinstance(args, dict) or set(args) not in (required, required | {"constraint_view"}):
         raise ValueError("Supply the approved family baseline and confirmed specification bytes and digest.")
     if before != args["baseline"]:
         raise ValueError("The active family differs from the reviewed disposable fixture.")
     dimensions = specification(args["specification_json"], args["specification_sha256"])
     if min(dimensions) <= document.Application.ShortCurveTolerance:
         raise ValueError("A reviewed box dimension is below Revit's short-curve limit.")
+    view = original_parameters = None
+    if "constraint_view" in args:
+        from spec_family_box_constraints import add_plan_constraints, family_parameters, plan_view
+        view = plan_view(document, args["constraint_view"])
+        original_parameters = family_parameters(document)
     width, depth, height = dimensions
     transaction = DB.Transaction(document, "Try reviewed equipment extrusion and roll back")
-    created, failure, bounds = [], None, None
+    created, failure, bounds, flexed = [], None, None, {}
     try:
         if transaction.Start() != DB.TransactionStatus.Started:
             raise ValueError("Revit did not confirm the family fixture transaction started.")
@@ -113,11 +127,20 @@ def probe(document, args):
         extrusion = document.FamilyCreate.NewExtrusion(True, profile, sketch_plane, height)
         created.append(extrusion.Id)
         document.Regenerate()
-        minimum, maximum = measure_box(extrusion)
-        bounds = {"min_ft": minimum, "max_ft": maximum}
-        if max(abs(value) for value in minimum) > TOLERANCE_FT or any(
-                abs(actual - expected) > TOLERANCE_FT for actual, expected in zip(maximum, dimensions)):
-            raise ValueError("The Revit extrusion bounds differ from the reviewed box.")
+        bounds = verify_box(extrusion, dimensions)
+        if view is not None:
+            parameters = add_plan_constraints(document, view, extrusion, dimensions, created)
+            verify_box(extrusion, dimensions)
+            manager = document.FamilyManager
+            for index, (axis, parameter) in enumerate(zip(AXES, parameters)):
+                trial = list(dimensions)
+                trial[index] *= 1.1
+                manager.Set(parameter, trial[index])
+                document.Regenerate()
+                flexed[axis] = verify_box(extrusion, trial)
+                manager.Set(parameter, dimensions[index])
+                document.Regenerate()
+                verify_box(extrusion, dimensions)
     except ValueError as error:
         failure = {"message": str(error)}
     except Exception as error:
@@ -130,7 +153,8 @@ def probe(document, args):
             rolled_back = ((status == DB.TransactionStatus.Uninitialized
                             or status == DB.TransactionStatus.RolledBack == transaction.GetStatus())
                            and all(document.GetElement(element_id) is None for element_id in created)
-                           and snapshot(document) == before)
+                           and snapshot(document) == before
+                           and (original_parameters is None or family_parameters(document) == original_parameters))
         except Exception:
             rolled_back = False
     if not rolled_back:
@@ -138,7 +162,7 @@ def probe(document, args):
     if failure:
         return dict(failure, status="stopped", rollback_verified=True)
     return {"status": "measured", "rollback_verified": True, "geometry": bounds,
-            "reviewed_dimensions_ft": dict(zip(AXES, dimensions)), "fixture": before,
+            "reviewed_dimensions_ft": dict(zip(AXES, dimensions)), "flexed_geometry": flexed, "fixture": before,
             "specification_sha256": args["specification_sha256"],
             "revit_build": str(document.Application.VersionBuild), "python_engine": platform.python_implementation()}
 

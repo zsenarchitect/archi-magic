@@ -28,8 +28,20 @@ def setup(monkeypatch, fault=None):
     class Extrusion:
         pass
 
+    class ViewPlan(NS):
+        pass
+
+    class Solid(NS):
+        pass
+
+    class Face(NS):
+        pass
+
     XYZ.BasisZ, XYZ.Zero = XYZ(0, 0, 1), XYZ(0, 0, 0)
     elements, calls = {}, []
+    manager = NS(Parameters=[], Types=[], CurrentType=None)
+    geometry = []
+    view = ViewPlan(Id=NS(Value=20), UniqueId="plan-uid", IsTemplate=False, GenLevel=NS(ProjectElevation=0))
     states = NS(Uninitialized="new", Started="started", RolledBack="rolled_back")
 
     def make(cls, number):
@@ -56,6 +68,9 @@ def setup(monkeypatch, fault=None):
             self.state = states.RolledBack
             if fault != "rollback":
                 elements.clear()
+                manager.Parameters.clear()
+                manager.Types.clear()
+                manager.CurrentType = None
             return self.state
 
     class Collector:
@@ -79,10 +94,58 @@ def setup(monkeypatch, fault=None):
         width, depth = profile[0][1][1].X, profile[0][1][1].Y
         calls.append(("box", width, depth, height))
         extrusion = make(Extrusion, 11)
+        geometry[:] = [width, depth, height]
         extrusion.get_BoundingBox = lambda _: NS(
             Enabled=True, Transform=NS(OfPoint=lambda point: point),
-            Min=XYZ.Zero, Max=XYZ(width, depth, height + (1 if fault == "bounds" else 0)))
+            Min=XYZ.Zero, Max=XYZ(geometry[0], geometry[1], geometry[2] + (1 if fault == "bounds" else 0)))
+        extrusion.get_Geometry = lambda _: [Solid(Faces=[
+            Face(FaceNormal=XYZ(-1, 0, 0), Origin=XYZ.Zero, Reference="left"),
+            Face(FaceNormal=XYZ(1, 0, 0), Origin=XYZ(width, 0, 0), Reference="right"),
+            Face(FaceNormal=XYZ(0, -1, 0), Origin=XYZ.Zero, Reference="front"),
+            Face(FaceNormal=XYZ(0, 1, 0), Origin=XYZ(0, depth, 0), Reference="back"),
+        ])]
+        extrusion.get_Parameter = lambda _: "end"
         return extrusion
+
+    def new_type(name):
+        manager.CurrentType = NS(Name=name)
+        manager.Types.append(manager.CurrentType)
+
+    def add_parameter(name, group, storage, instance):
+        assert (group, storage, instance) == ("geometry", "length", False)
+        parameter = NS(Id=NS(Value=30 + len(manager.Parameters)), Definition=NS(Name=name))
+        manager.Parameters.append(parameter)
+        return parameter
+
+    def set_parameter(parameter, value):
+        axis = manager.Parameters.index(parameter)
+        if fault != "flex_inert" or axis != 0:
+            geometry[axis] = value
+        if fault == "flex_coupled" and axis == 0 and value > 1:
+            geometry[1] += 0.5
+
+    manager.NewType, manager.AddParameter, manager.Set = new_type, add_parameter, set_parameter
+    manager.CanElementParameterBeAssociated = lambda element: element == "end"
+    manager.AssociateElementParameterToFamilyParameter = lambda element, parameter: calls.append(("height", element))
+
+    def native_item():
+        return make(NS, len(elements) + 100)
+
+    def reference_plane(start, end, normal, active_view):
+        assert normal == XYZ.BasisZ and active_view is view
+        result = native_item()
+        result.GetReference = lambda: "plane-{}".format(result.Id.Value)
+        return result
+
+    def align(active_view, plane, face):
+        assert active_view is view
+        calls.append(("align", plane, face))
+        return native_item()
+
+    def dimension(active_view, line, references):
+        assert active_view is view and len(references) == 2
+        calls.append(("dimension", tuple(references)))
+        return native_item()
 
     category = -2000151
     db = NS(
@@ -91,17 +154,24 @@ def setup(monkeypatch, fault=None):
         Line=NS(CreateBound=lambda start, end: (start, end)),
         FamilyPlacementType=NS(OneLevelBased=1), BuiltInCategory=NS(OST_GenericModel=category),
         ElementId=lambda value: NS(Value=value), FilteredElementCollector=Collector,
-        Transaction=Transaction, TransactionStatus=states,
+        Transaction=Transaction, TransactionStatus=states, ViewPlan=ViewPlan, Solid=Solid, PlanarFace=Face,
+        Options=NS, ReferenceArray=Array, GroupTypeId=NS(Geometry="geometry"), SpecTypeId=NS(Length="length"),
+        BuiltInParameter=NS(EXTRUSION_END_PARAM=1),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
+    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    monkeypatch.delitem(sys.modules, "spec_family_box_constraints", raising=False)
     document = NS(
         PathName="fixture.rfa", IsFamilyDocument=True, IsReadOnly=False, IsWorkshared=False, IsModelInCloud=False,
         OwnerFamily=NS(UniqueId="fixture", FamilyPlacementType=2 if fault == "hosted" else 1,
                        FamilyCategory=NS(Id=NS(Value=category))),
         Application=NS(VersionNumber="2026", VersionBuild="fixture-build",
                        ShortCurveTolerance=2 if fault == "short" else 0.001),
-        FamilyCreate=NS(NewExtrusion=create), Regenerate=lambda: calls.append("regenerate"),
-        GetElement=lambda identifier: elements.get(identifier.Value),
+        FamilyCreate=NS(NewExtrusion=create, NewReferencePlane=reference_plane, NewAlignment=align,
+                        NewDimension=dimension), FamilyManager=manager,
+        Regenerate=lambda: calls.append("regenerate"),
+        GetElement=lambda identifier: view if identifier.Value == view.Id.Value else elements.get(identifier.Value),
     )
     dimensions = {"width": "304.8", "depth": "609.6", "height": "914.4"}
     spec = json.dumps({
@@ -148,3 +218,35 @@ def test_family_probe_distinguishes_failed_geometry_and_failed_rollback(monkeypa
     result = runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": args})["result"]
     assert result["status"] == expected
     assert calls[-1] == "rollback"
+
+
+
+def run_constrained(monkeypatch, fault=None):
+    document, args, calls, elements = setup(monkeypatch, fault)
+    args["constraint_view"] = {"id": "20", "uid": "plan-uid"}
+    try:
+        result = runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": args})["result"]
+    finally:
+        sys.modules.pop("spec_family_box_constraints", None)
+    return result, calls, elements, document.FamilyManager
+
+
+def test_probe_flexes_each_dimension_separately_and_restores_original_family(monkeypatch):
+    result, calls, elements, manager = run_constrained(monkeypatch)
+    assert result["status"] == "measured", result
+    expected = {"width": [1.1, 2, 3], "depth": [1, 2.2, 3], "height": [1, 2, 3.3]}
+    for axis, dimensions in expected.items():
+        assert result["flexed_geometry"][axis]["max_ft"] == pytest.approx(dimensions)
+    assert [call[-1] for call in calls if isinstance(call, tuple) and call[0] == "align"] == [
+        "left", "right", "front", "back",
+    ]
+    assert sum(1 for call in calls if isinstance(call, tuple) and call[0] == "dimension") == 2
+    assert ("height", "end") in calls and calls[-1] == "rollback"
+    assert not elements and not manager.Parameters and not manager.Types
+
+
+@pytest.mark.parametrize("fault", ["flex_inert", "flex_coupled"])
+def test_probe_requires_actual_independent_axis_geometry_changes(monkeypatch, fault):
+    result, calls, elements, _ = run_constrained(monkeypatch, fault)
+    assert result["status"] == "stopped" and "extrusion bounds differ" in result["message"]
+    assert result["rollback_verified"] and calls[-1] == "rollback" and not elements
