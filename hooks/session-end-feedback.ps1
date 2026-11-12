@@ -143,6 +143,9 @@ try {
                 continue
             }
         }
+        # Assistant prose can recap a previously filed error. Only tool results
+        # above can identify a new incident in a structured assistant message.
+        if ($line -match '"role"\s*:\s*"assistant"') { continue }
         if (($line -match 'revit_busy') -and -not $found.Contains('revit_busy')) { $found.Add('revit_busy') }
         if (($line -match 'pipe_error') -and -not $found.Contains('pipe_error')) { $found.Add('pipe_error') }
         if (($line -match 'no instances found') -and -not $found.Contains('no_instances_found')) { $found.Add('no_instances_found') }
