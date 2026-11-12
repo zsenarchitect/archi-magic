@@ -200,9 +200,10 @@ def assess(points, first_axis, last_axis, minimum, boxes, bounds):
 
 
 def preview(data):
-    required = {"endpoints", "minimum_segment_ft", "clearance_ft", "obstacles"}
-    if not required <= set(data) <= required | {"routing_bounds_ft"}:
-        raise ValueError("Supply the reviewed endpoints, minimum segment, clearance and obstacle boxes.")
+    required = {"endpoints", "minimum_segment_ft", "clearance_ft"}
+    if (not required <= set(data) <= required | {"obstacles", "obstacle_records", "routing_bounds_ft"}
+            or not {"obstacles", "obstacle_records"} & set(data)):
+        raise ValueError("Supply the reviewed endpoints, minimum segment, clearance and obstacle evidence.")
     evidence = data["endpoints"]
     if (evidence["kind"] != "mep-route-endpoints" or type(evidence["version"]) is not int
             or evidence["version"] != 1 or len(evidence["endpoints"]) != 2
@@ -227,9 +228,26 @@ def preview(data):
     clearance = number(data["clearance_ft"])
     if minimum <= EPSILON or clearance < 0:
         raise ValueError("Supply a positive minimum segment length and a nonnegative clearance.")
-    obstacles = data["obstacles"]
-    if not isinstance(obstacles, list) or len(obstacles) > 32:
+    manual, records = data.get("obstacles", []), data.get("obstacle_records", [])
+    if not isinstance(manual, list) or not isinstance(records, list) or len(manual) > 32 or len(records) > 32:
         raise ValueError("Supply up to 32 reviewed obstacle boxes.")
+    obstacles, seen_sources = list(manual), set()
+    for record in records:
+        source = record["source"]
+        instance = source["link_instance_id"]
+        if (record["kind"] != "mep-route-obstacles" or type(record["version"]) is not int
+                or record["version"] != 1 or source["host_identity"] != evidence["source"]["host_identity"]
+                or (instance == evidence["source"].get("link_instance_id") and source != evidence["source"])
+                or instance in seen_sources or not isinstance(record["obstacles"], list) or not record["obstacles"]
+                or len(obstacles) + len(record["obstacles"]) > 32):
+            raise ValueError("Use distinct reviewed obstacle sources from the same host, with up to 32 total boxes.")
+        seen_sources.add(instance)
+        ids = set()
+        for item in record["obstacles"]:
+            if set(item) != {"element_id", "element_uid", "min_ft", "max_ft"} or item["element_id"] in ids:
+                raise ValueError("Each recorded obstacle needs a distinct element identity and bounds.")
+            ids.add(item["element_id"])
+            obstacles.append({"min_ft": item["min_ft"], "max_ft": item["max_ft"]})
     padding = math.hypot(*size) / 2 + clearance
     boxes = []
     for obstacle in obstacles:
@@ -282,7 +300,8 @@ def preview(data):
     else:
         length, _, path, bends = best
         route = {"source": evidence["source"], "endpoints": evidence["endpoints"],
-                 "points_ft": path, "length_ft": length, "bends_degrees": bends}
+                 "points_ft": path, "length_ft": length, "bends_degrees": bends,
+                 "obstacle_records": records}
         after = [["candidate", length, ", ".join(map(str, bends)), str(path)]]
     return {"kind": "change-preview", "recipe": "mep-route", "title": "MEP route",
             "keyColumn": "Route", "columns": COLUMNS, "changedColumns": COLUMNS[1:],

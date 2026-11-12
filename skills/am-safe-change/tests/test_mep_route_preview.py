@@ -126,3 +126,22 @@ def test_alternating_obstacles_require_multiple_detours_inside_routing_area(tmp_
     blocked = run(tmp_path, data)
     assert blocked.returncode == 1, blocked.stderr
     assert json.loads(blocked.stdout)["route"] is None
+
+
+def test_native_obstacle_record_is_used_and_bound_to_the_endpoint_host(tmp_path):
+    data = fixture()
+    del data["obstacles"]
+    record = {
+        "kind": "mep-route-obstacles", "version": 1,
+        "source": {"host_identity": data["endpoints"]["source"]["host_identity"], "link_instance_id": "12"},
+        "obstacles": [{"element_id": "100", "element_uid": "wall", "min_ft": [4, -1, -1], "max_ft": [6, 1, 1]}],
+    }
+    data["obstacle_records"] = [record]
+    result = run(tmp_path, data)
+    assert result.returncode == 0, result.stderr
+    route = json.loads(result.stdout)["route"]
+    assert route["length_ft"] > 10 and route["obstacle_records"] == [record]
+    record["source"]["host_identity"] = {"project_uid": "other"}
+    mismatch = run(tmp_path, data)
+    assert mismatch.returncode == 2 and "same host" in mismatch.stderr
+    assert mismatch.stdout == ""

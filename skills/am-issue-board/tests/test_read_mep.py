@@ -135,7 +135,7 @@ class Collector:
 @pytest.fixture
 def runtime(monkeypatch):
     db = NS(
-        BuiltInCategory=Enum, ElementId=ElementId, ElementType=type("ElementType", (), {}),
+        BuiltInCategory=Enum, ElementId=ElementId, XYZ=point, ElementType=type("ElementType", (), {}),
         MEPCurve=Duct, RevitLinkInstance=Link, Transform=NS(Identity=transform(0)),
         FilteredElementCollector=Collector, ElementMulticategoryFilter=lambda values: values,
         BuiltInParameter=NS(RBS_CURVE_DIAMETER_PARAM=-1114103, RBS_DUCT_FLOW_PARAM=-1013405),
@@ -226,6 +226,44 @@ def test_read_reviewed_route_endpoints(runtime, scenario):
         assert a["axes"] == [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
     else:
         assert a["origin_ft"] == [1.0, 2.0, 3.0] and a["axes"][2] == [0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("scenario", ["host", "rotated_link", "wrong_uid", "missing_box", "moved"])
+def test_read_reviewed_obstacle_boxes(runtime, scenario):
+    low, high = point(1, 2, 3), point(4, 6, 8)
+    observed_boxes = iter([NS(Min=low, Max=high), NS(Min=point(2, 2, 3), Max=high)])
+    def bounds(view):
+        assert view is None
+        if scenario == "missing_box":
+            return None
+        if scenario == "moved":
+            return next(observed_boxes)
+        return NS(Min=low, Max=high)
+
+    source_doc = model("obstacles", {42: NS(UniqueId="wall-uid", get_BoundingBox=bounds)})
+    host, link_request = source_doc, {}
+    if scenario == "rotated_link":
+        link = Link(source_doc, 10)
+        link.GetTotalTransform = lambda: NS(
+            Origin=point(10, 20, 30), BasisX=point(0, 1, 0), BasisY=point(-1, 0, 0),
+            BasisZ=point(0, 0, 1), OfPoint=lambda value: point(10 - value.Y, 20 + value.X, 30 + value.Z),
+        )
+        host = model("host", {41: link})
+        link_request = {"link_instance_id": "41", "link_instance_uid": link.UniqueId}
+    identity = execute(host, describe=True, **link_request)["source"]
+    selected = {"element_id": "42", "element_uid": "stale" if scenario == "wrong_uid" else "wall-uid"}
+    result = execute(host, source=identity, route_obstacles=[selected], **link_request)
+    errors = {"wrong_uid": "changed identity", "missing_box": "no model bounding box",
+              "moved": "changed while being read"}
+    if scenario in errors:
+        assert result["status"] == "incomplete" and errors[scenario] in result["message"]
+        assert "obstacles_json" not in result
+        return
+    low, high = ([4, 21, 33], [8, 24, 38]) if scenario == "rotated_link" else ([1, 2, 3], [4, 6, 8])
+    assert json.loads(result["obstacles_json"]) == {
+        "kind": "mep-route-obstacles", "version": 1, "source": identity,
+        "obstacles": [dict(selected, min_ft=low, max_ft=high)],
+    }
 
 
 def test_link_query_uses_source_ids_transforms_and_native_flow(runtime):

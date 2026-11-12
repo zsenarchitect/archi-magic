@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Extract bounded MEP evidence using pyRevit run_query."""
 
+from itertools import product
 import json
 import math
 import re
@@ -308,6 +309,34 @@ def read_route_endpoints(source, transform, requested, clock, coverage):
     return rows
 
 
+def read_route_obstacles(source, transform, requested, clock):
+    if not isinstance(requested, list) or not 1 <= len(requested) <= 32:
+        raise ReadError("Supply one to 32 reviewed obstacle elements.")
+    rows, seen = [], set()
+    for selected in requested:
+        check_time(clock)
+        if set(selected) != {"element_id", "element_uid"}:
+            raise ReadError("Each obstacle needs an element ID and UID.")
+        raw_id = selected["element_id"]
+        element = source.GetElement(element_id(raw_id))
+        uid = selected["element_uid"]
+        if (raw_id in seen or element is None or isinstance(element, (DB.ElementType, DB.RevitLinkInstance))
+                or not isinstance(uid, TEXT) or not 1 <= len(uid) <= 160 or str(element.UniqueId) != uid):
+            raise ReadError("A reviewed obstacle is repeated, missing or changed identity.")
+        seen.add(raw_id)
+        box = element.get_BoundingBox(None)
+        if box is None:
+            raise ReadError("A reviewed obstacle has no model bounding box.")
+        minimum, maximum = xyz(box.Min), xyz(box.Max)
+        if any(low >= high for low, high in zip(minimum, maximum)):
+            raise ReadError("A reviewed obstacle has degenerate model bounds.")
+        # Element model boxes already align to the source model axes.
+        corners = [xyz(transform.OfPoint(DB.XYZ(*corner))) for corner in product(*zip(minimum, maximum))]
+        axes = list(zip(*corners))
+        rows.append(dict(selected, min_ft=[min(axis) for axis in axes], max_ft=[max(axis) for axis in axes]))
+    return rows
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -319,8 +348,8 @@ def run_query(host, request):
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
         if "route_endpoints" in request:
-            if "element_ids" in request or "clearance" in request:
-                raise ReadError("Use a separate query for route endpoints and audit scope.")
+            if any(field in request for field in ("route_obstacles", "element_ids", "clearance")):
+                raise ReadError("Use a separate query for route obstacles, endpoints and audit scope.")
             endpoints = read_route_endpoints(source, transform, request["route_endpoints"], clock, coverage)
             current_source, current_transform, current_identity = resolve_source(host, link_id, link_uid)
             if (current_identity != identity or read_route_endpoints(
@@ -329,6 +358,17 @@ def run_query(host, request):
             check_time(clock)
             payload = {"kind": "mep-route-endpoints", "version": 1, "source": identity, "endpoints": endpoints}
             return {"status": "ok", "endpoints_json": json.dumps(payload, ensure_ascii=True, allow_nan=False)}
+        if "route_obstacles" in request:
+            if "element_ids" in request or "clearance" in request:
+                raise ReadError("Use a separate query for route obstacles, endpoints and audit scope.")
+            obstacles = read_route_obstacles(source, transform, request["route_obstacles"], clock)
+            current_source, current_transform, current_identity = resolve_source(host, link_id, link_uid)
+            if (current_identity != identity or read_route_obstacles(
+                    current_source, current_transform, request["route_obstacles"], clock) != obstacles):
+                raise ReadError("The source or route obstacles changed while being read.")
+            check_time(clock)
+            payload = {"kind": "mep-route-obstacles", "version": 1, "source": identity, "obstacles": obstacles}
+            return {"status": "ok", "obstacles_json": json.dumps(payload, ensure_ascii=True, allow_nan=False)}
         clearance = None
         if request.get("clearance") is not None:
             config = request["clearance"]
