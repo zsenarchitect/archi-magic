@@ -65,6 +65,7 @@ class Room:
     Area = 80
     LevelId = NS(Value=101)
     UniqueId = "synthetic-room"
+    DesignOption = None
 
     def __init__(self, boundary):
         self.boundary = boundary
@@ -72,6 +73,30 @@ class Room:
     def GetBoundarySegments(self, options):
         assert options.SpatialElementBoundaryLocation == "finish"
         return self.boundary
+
+    def get_Parameter(self, name):
+        assert name == "room-phase"
+        return NS(StorageType="element-id", AsElementId=lambda: 102)
+
+
+class Level:
+    Id = NS(Value=101)
+    UniqueId = "synthetic-level"
+    ProjectElevation = 25.0
+
+
+class Phase:
+    Id = NS(Value=102)
+    UniqueId = "synthetic-phase"
+
+
+class FloorType:
+    UniqueId = "synthetic-floor-type"
+    IsFoundationSlab = False
+
+
+class CeilingType:
+    UniqueId = "synthetic-ceiling-type"
 
 
 def loop(points, closed=True, source=50, linked=-1):
@@ -96,15 +121,19 @@ def run(monkeypatch):
         SpatialElementBoundaryOptions=lambda: NS(Dispose=lambda: None),
         SpatialElementBoundaryLocation=NS(Finish="finish"),
         BoundaryValidation=NS(IsValidHorizontalBoundary=lambda profiles: bool(profiles)),
+        Level=Level, Phase=Phase, FloorType=FloorType, CeilingType=CeilingType,
+        BuiltInParameter=NS(ROOM_PHASE_ID="room-phase"), StorageType=NS(ElementId="element-id"),
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
     monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=ListFactory()))
 
-    def execute(rooms, ids):
+    def execute(rooms, ids, **extra):
         # The document stand-in has no transaction or write APIs.
-        doc = NS(IsFamilyDocument=False, GetElement=rooms.get)
-        result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": {"room_ids": ids}})
+        doc = NS(IsFamilyDocument=False, GetElement=lambda item: rooms.get(getattr(item, "Value", item)),
+                 PathName="fixture.rvt",
+                 ProjectInformation=NS(UniqueId="synthetic-project"))
+        result = runpy.run_path(str(SCRIPT), init_globals={"doc": doc, "inputs": dict(extra, room_ids=ids)})
         return json.loads(result["result"]["payload"])
 
     return execute
@@ -143,3 +172,37 @@ def test_excludes_missing_unplaced_open_and_non_coplanar_rooms(run):
 def test_rejects_excessive_room_selection_before_query(run):
     with pytest.raises(ValueError, match="1 to 20"):
         run({}, list(range(1, 22)))
+
+
+def test_horizontal_finish_preview_binds_project_room_level_phase_and_type(run):
+    room = Room(Seq([loop(rectangle(0, 0, 8, 8, z=25)), loop(rectangle(2, 2, 3, 3, z=25))]))
+    report = run({1: room, 101: Level(), 102: Phase(), 103: FloorType(), 104: CeilingType()}, ["1"],
+                 horizontal_finishes={"floor": {"type_id": "103", "offset_ft": -0.125},
+                                      "ceiling": {"type_id": "104", "offset_ft": 9.0}})
+    assert report["status"] == "reported" and report["placement_available"] is False
+    assert report["host_identity"]["project_uid"] == "synthetic-project"
+    assert len(report["host_identity"]["path_sha256"]) == 64
+    row, = report["rooms"]
+    assert row["level"] == {"id": "101", "uid": "synthetic-level", "project_elevation_ft": 25.0}
+    assert row["phase"] == {"id": "102", "uid": "synthetic-phase"}
+    assert len(row["boundary_loops"]) == 2
+    assert row["horizontal_finishes"] == [
+        {"kind": "ceiling", "type_id": "104", "type_uid": "synthetic-ceiling-type", "offset_ft": 9.0,
+         "project_elevation_ft": 34.0},
+        {"kind": "floor", "type_id": "103", "type_uid": "synthetic-floor-type", "offset_ft": -0.125,
+         "project_elevation_ft": 24.875},
+    ]
+
+
+def test_horizontal_finish_preview_excludes_room_without_native_scope(run):
+    room = Room(Seq([loop(rectangle(0, 0, 8, 8))]))
+    room.DesignOption = object()
+    report = run({1: room, 103: FloorType()}, ["1"],
+                 horizontal_finishes={"floor": {"type_id": "103", "offset_ft": 0}})
+    assert report["rooms"] == [{"room_id": 1, "status": "excluded", "reason": "room_design_option_requires_review"}]
+
+
+@pytest.mark.parametrize("offset", [True, float("inf"), "0"])
+def test_horizontal_finish_preview_rejects_invalid_offset(run, offset):
+    with pytest.raises(ValueError, match="finite number"):
+        run({103: FloorType()}, ["1"], horizontal_finishes={"floor": {"type_id": "103", "offset_ft": offset}})

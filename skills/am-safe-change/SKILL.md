@@ -211,7 +211,7 @@ Run `scripts/read_room_finish_boundaries.py` with `run_query`. Pass `room_ids` f
 
 The query checks actual boundary loops on the finish face. It keeps separate loops and source IDs. Loop order alone does not establish which loops are holes. The endpoints are for inspection. Revit must read the original curves before it can build a finish.
 
-This query does not create finishes. Do not use its result as approval to change the model.
+Add `horizontal_finishes` to preview selected floor and ceiling types and their heights in a saved project. For example, pass `{"floor":{"type_id":"123","offset_ft":0},"ceiling":{"type_id":"456","offset_ft":9}}`. Set each offset relative to the room level, in Revit internal feet. Check the room level, phase, boundary loops, and proposed project elevation. Resolve rooms excluded for missing scope or design options before placement. This query is read-only.
 
 ## House rules (all am-* skills)
 

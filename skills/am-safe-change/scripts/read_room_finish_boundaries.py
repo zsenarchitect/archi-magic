@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Inventory selected room boundaries in Revit 2026 via run_query only."""
 
+import hashlib
 import json
+import math
 from pyrevit.api import DB
 from System import Int64
 from System.Collections.Generic import List
@@ -33,6 +35,57 @@ def xyz(point):
 
 def excluded(room_id, reason):
     return {"room_id": room_id, "status": "excluded", "reason": reason}
+
+
+def finish_types(document, request):
+    if not isinstance(request, dict) or not request or set(request) - {"floor", "ceiling"}:
+        raise ValueError("Select a floor finish, a ceiling finish, or both.")
+    selected = {}
+    for kind, entry in request.items():
+        if not isinstance(entry, dict) or set(entry) != {"type_id", "offset_ft"}:
+            raise ValueError("Supply a finish type ID and level-relative offset in feet.")
+        type_id, = ids_from([entry["type_id"]])
+        element = document.GetElement(DB.ElementId(Int64(type_id)))
+        expected = DB.FloorType if kind == "floor" else DB.CeilingType
+        offset = entry["offset_ft"]
+        if (not isinstance(element, expected) or not element.UniqueId
+                or (kind == "floor" and element.IsFoundationSlab)):
+            raise ValueError("Select a non-foundation floor type or an exact ceiling type.")
+        if type(offset) not in (int, float) or not finite(offset):
+            raise ValueError("The level-relative offset must be a finite number of feet.")
+        selected[kind] = {"type_id": str(type_id), "type_uid": str(element.UniqueId), "offset_ft": offset}
+    return selected
+
+
+def finite(value):
+    try:
+        return not math.isnan(value) and not math.isinf(value)
+    except OverflowError:
+        return False
+
+
+def room_finish_preview(document, room, row, types):
+    if room.DesignOption is not None:
+        return excluded(row["room_id"], "room_design_option_requires_review")
+    level = document.GetElement(room.LevelId)
+    if not isinstance(level, DB.Level) or not level.UniqueId or not finite(level.ProjectElevation):
+        return excluded(row["room_id"], "room_level_identity_unavailable")
+    parameter = room.get_Parameter(DB.BuiltInParameter.ROOM_PHASE_ID)
+    phase = (document.GetElement(parameter.AsElementId())
+             if parameter is not None and parameter.StorageType == DB.StorageType.ElementId else None)
+    if not isinstance(phase, DB.Phase) or not phase.UniqueId:
+        return excluded(row["room_id"], "room_phase_identity_unavailable")
+    row["level"] = {"id": str(level.Id.Value), "uid": str(level.UniqueId),
+                    "project_elevation_ft": level.ProjectElevation}
+    row["phase"] = {"id": str(phase.Id.Value), "uid": str(phase.UniqueId)}
+    finishes = []
+    for kind, selected in sorted(types.items()):
+        elevation = level.ProjectElevation + selected["offset_ft"]
+        if not finite(elevation):
+            return excluded(row["room_id"], "finish_elevation_unavailable")
+        finishes.append(dict(selected, kind=kind, project_elevation_ft=elevation))
+    row["horizontal_finishes"] = finishes
+    return row
 
 
 def inspect_room(room, room_id, options, remaining):
@@ -97,7 +150,16 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids):
+def read_boundaries(document, room_ids, finish_request=None):
+    types = None
+    identity = None
+    if finish_request is not None:
+        project = document.ProjectInformation
+        if not document.PathName or project is None or not project.UniqueId:
+            raise ValueError("Save the project before requesting a finish preview.")
+        identity = {"project_uid": str(project.UniqueId),
+                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+        types = finish_types(document, finish_request)
     rows = []
     remaining = MAX_SEGMENTS
     options = DB.SpatialElementBoundaryOptions()
@@ -108,22 +170,27 @@ def read_boundaries(document, room_ids):
                 room = document.GetElement(DB.ElementId(Int64(room_id)))
                 row, used = inspect_room(room, room_id, options, remaining)
                 remaining -= used
+                if types and row["status"] == "boundary_verified":
+                    row = room_finish_preview(document, room, row, types)
             except Exception as exc:
                 row = excluded(room_id, "boundary_read_failed")
                 row["error_type"] = type(exc).__name__
             rows.append(row)
     finally:
         options.Dispose()
-    return {
+    report = {
         "status": "reported" if all(row["status"] == "boundary_verified" for row in rows) else "incomplete",
         "rooms": rows,
         "boundary_location": "finish",
         "placement_available": False,
     }
+    if identity:
+        report["host_identity"] = identity
+    return report
 
 
 if doc is None or doc.IsFamilyDocument:
     result = {"error": "Open a Revit project before reading room boundaries."}
 else:
-    report = read_boundaries(doc, ids_from(inputs.get("room_ids")))
-    result = {"payload": json.dumps(report, ensure_ascii=True)}
+    report = read_boundaries(doc, ids_from(inputs.get("room_ids")), inputs.get("horizontal_finishes"))
+    result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}
