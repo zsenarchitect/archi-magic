@@ -53,7 +53,7 @@ class Worker:
                 self.Documents.remove(document)
             return self.close_ok
 
-        family = SimpleNamespace(Name="Fixture Family",
+        family = SimpleNamespace(Name="Fixture Family", FamilyPlacementType="OneLevelBased",
                                  FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-2000011), Name="Walls"))
         manager = SimpleNamespace(Parameters=[
             parameter("Manufacturer", 42, "String", "Fixture"),
@@ -327,7 +327,7 @@ def test_catalog_pair_reports_previews_pending_without_opening_scratch(staged):
 
 
 def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypatch):
-    from family_library_index import begin, publish, search
+    from family_library_index import begin, publish, search, select_for_placement
     from family_library_thumbnails import png_record
 
     root = tmp_path.resolve() / "library"
@@ -361,6 +361,12 @@ def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypa
         fixture_png(0), fixture_png(1),
     ]
     assert search(index, parameter="Width")["ambiguous_parameter_paths"] == paths
+    selection = select_for_placement(index, token, paths[0], "600 × 900")
+    assert selection["source"]["path"] == paths[0]
+    assert selection["type_values"]["43"] == {"state": "value", "value": 2.0}
+    assert selection["placement_type"] == "OneLevelBased"
+    with pytest.raises(ValueError, match="exact embedded type"):
+        select_for_placement(index, token, paths[0], "600 x 900")
     first = Path(found["matches"][0]["thumbnail"]["path"])
     first.write_bytes(fixture_png(200))
     assert search(index)["matches"][0]["thumbnail"] == {"status": "asset_unavailable"}
@@ -372,6 +378,9 @@ def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypa
     with pytest.raises(ValueError, match="does not belong"):
         publish(index, newer, workers)
     (root / "A" / "Fixture.rfa").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="changed after indexing"):
+        select_for_placement(index, token, paths[0], "600 × 900")
+    assert select_for_placement(index, token, paths[1], "600 × 900")["source"]["path"] == paths[1]
     with pytest.raises(ValueError, match="discovery changed"):
         publish(index, newer, [])
     assert search(index)["generation"] == token

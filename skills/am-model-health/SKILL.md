@@ -196,6 +196,13 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 3. Run `python scripts/family_library_index.py publish <private-index-directory> <token> --worker <worker-directory>`. Repeat `--worker` for each completed receipt. Read the coverage for sources without a receipt.
 4. Run `python scripts/family_library_index.py search <private-index-directory> --name window --category windows`. Add `--parameter <ID-or-name> --equals <value>` to filter by a type parameter. Numeric filters use the stored Revit internal value. Use the source path to distinguish equal family and type names.
 
+### Review a family placement
+
+1. Select the exact path and type from the search results. Run `python scripts/family_library_index.py select <index> <token> --path "<path>" --type "<type>"`. Save the selection as JSON.
+2. Call `get_context` first. Open a saved standalone project in the same Revit build. Run `read_family_placement.py` in query mode. Pass the selection object as `selection` and the reviewed level ID string as `level_id`.
+3. Run `python scripts/family_placement_preview.py --index <index> --selection selection.json --project-read project.json --xyz 1 2 23 --rotation 90`. Supply absolute model coordinates in internal feet. Review type reuse, loading, parameter differences, and activation in the change preview.
+4. Use the preview for review only. Native placement, dependency checks, and Keep/Discard still require qualification.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

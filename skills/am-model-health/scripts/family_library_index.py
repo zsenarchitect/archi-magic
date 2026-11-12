@@ -228,7 +228,7 @@ def publish(raw_index, token, workers):
                     or result["runtime"]["pyrevit_build"] != refresh["pyrevit_build"]
                     or metadata["rfa"] != source["rfa"] or metadata["catalog"] != source["catalog"]):
                 raise ValueError("A worker does not belong to this refresh and source pair.")
-            entry = {"status": "indexed", "metadata": metadata, "thumbnails": result["thumbnails"]}
+            entry = {"status": "indexed", "source": source, "metadata": metadata, "thumbnails": result["thumbnails"]}
             row_count = len(metadata["embedded_types"])
             entry_size = len(json.dumps({relative: entry}, ensure_ascii=True, separators=(",", ":")))
             if count + row_count > MAX_ROWS or size + entry_size > MAX_INDEX_BYTES - 2 * 1024 * 1024:
@@ -349,6 +349,36 @@ def search(raw_index, *, name="", category="", parameter=None, equals=None, limi
     }
 
 
+def select_for_placement(raw_index, generation, relative, type_name):
+    """Bind a published, still-current source and exact embedded type."""
+    path = root_path(raw_index)
+    with pinned_root(path) as parent, index_lock(path, parent):
+        index = read_record(parent, "index.json", "family-library-index")
+        if generation != index["token"]:
+            raise ValueError("The search result is from a superseded generation.")
+        entry = index["entries"].get(relative)
+        if not entry or entry["status"] != "indexed":
+            raise ValueError("This family source is unavailable in the published index.")
+        metadata = entry["metadata"]
+        matches = [row for row in metadata["embedded_types"] if row["name"] == type_name]
+        if len(matches) != 1:
+            raise ValueError("Select an exact embedded type from the published family.")
+        live = discover(index["root"])
+        current = [row for row in live["files"] if row["path"] == relative]
+        if live["root_identity"] != index["root_identity"] or current != [entry["source"]]:
+            raise ValueError("The selected family source, catalog, or ancestry changed after indexing.")
+        selection = {
+            "kind": "family-library-placement-selection", "version": 1,
+            "generation": generation, "index_sha256": index["sha256"],
+            "root": index["root"], "root_identity": index["root_identity"],
+            "source": current[0], "family": metadata["family"], "category": metadata["category"],
+            "type": type_name, "placement_type": metadata["placement_type"],
+            "revit_build": metadata["revit_build"], "parameters": metadata["parameters"],
+            "type_values": matches[0]["values"],
+        }
+        return dict(selection, selection_sha256=manifest_digest(selection))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -369,6 +399,11 @@ def main():
     find.add_argument("--parameter")
     find.add_argument("--equals")
     find.add_argument("--limit", type=int, default=100)
+    select = commands.add_parser("select", help=select_for_placement.__doc__)
+    select.add_argument("index")
+    select.add_argument("generation")
+    select.add_argument("--path", required=True)
+    select.add_argument("--type", required=True)
     args = parser.parse_args()
     try:
         if args.command == "begin":
@@ -378,6 +413,8 @@ def main():
             result = begin(args.index, data, args.parameter, args.revit_build, args.pyrevit_build)
         elif args.command == "publish":
             result = publish(args.index, args.generation, args.worker)
+        elif args.command == "select":
+            result = select_for_placement(args.index, args.generation, args.path, args.type)
         else:
             result = search(args.index, name=args.name, category=args.category, parameter=args.parameter,
                             equals=args.equals, limit=args.limit)

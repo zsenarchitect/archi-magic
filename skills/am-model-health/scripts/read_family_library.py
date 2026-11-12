@@ -150,6 +150,7 @@ def family_metadata(document, parameter_names):
         types[name] = values
     return {
         "family": bounded_text(family.Name),
+        "placement_type": bounded_text(family.FamilyPlacementType),
         "category": {"id": str(category.Id.Value), "name": bounded_text(category.Name)},
         "parameters": [record for _, record in parameters],
         "embedded_type_coverage": coverage,
