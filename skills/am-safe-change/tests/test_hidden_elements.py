@@ -230,12 +230,20 @@ def test_diagnosis_distinguishes_template_direct_and_disabled_filter(host):
     ]
     assert diagnostic["rows"][1]["matching_filter_order"] == ["202"]
     assert diagnostic["rows"][2]["reasons"] == []
+    plan = preview.compute(read(run), {"kind": "element", "ids": ["101"]})
+    assert plan["warnings"] == [{
+        "row": "101", "blocking": False,
+        "text": "Other configured hides remain for category -11 (template), filter 201 (template).",
+    }]
+    assert run({"mode": "apply", "plan": plan})["status"] == "ok"
+    remaining = preview.report(read(run))["rows"][0]["reasons"]
+    assert remaining == diagnostic["rows"][0]["reasons"][1:]
     with pytest.raises(ValueError, match="editable local"):
         preview.compute(read(run, ("filter", "201")),
                         {"kind": "filter", "ids": ["201"], "allow_whole_view": True})
     template.categories[-11] = False
     diagnostic = preview.report(read(run))
-    assert diagnostic["rows"][0]["reasons"][1]["origin"] == "unknown"
+    assert diagnostic["rows"][0]["reasons"][0]["origin"] == "unknown"
     assert diagnostic["rows"][0]["incomplete_evidence"]
 
 
