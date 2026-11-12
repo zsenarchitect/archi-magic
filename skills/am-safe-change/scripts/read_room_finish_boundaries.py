@@ -136,6 +136,99 @@ def finish_centerlines(outline, start, axis, spans, width):
     return result
 
 
+def available_spans(start, end, blocked, short_curve):
+    spans, cursor = [], start
+    for low, high in sorted(blocked):
+        low, high = max(start, low), min(end, high)
+        if low >= high:
+            continue
+        if low - cursor > short_curve:
+            spans.append([cursor, low])
+        cursor = max(cursor, high)
+    if end - cursor > short_curve:
+        spans.append([cursor, end])
+    return spans
+
+
+def footprint_corners(centerline, half_width):
+    a, b = centerline
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    nx, ny = -dy * half_width / length, dx * half_width / length
+    return [(a[0] + nx, a[1] + ny), (b[0] + nx, b[1] + ny),
+            (b[0] - nx, b[1] - ny), (a[0] - nx, a[1] - ny)]
+
+
+def clip_footprint(points, boundary, direction):
+    clipped = []
+    for a, b in zip(points[-1:] + points[:-1], points):
+        inside_a = direction * (a[1] - boundary) >= 0
+        inside_b = direction * (b[1] - boundary) >= 0
+        if inside_a != inside_b:
+            fraction = (boundary - a[1]) / (b[1] - a[1])
+            clipped.append((a[0] + fraction * (b[0] - a[0]), boundary))
+        if inside_b:
+            clipped.append(b)
+    return clipped
+
+
+def overlapping_stations(corners, start, axis, half_width):
+    ux, uy = axis
+    offsets = [(x - start[0], y - start[1]) for x, y in corners]
+    points = [(x * ux + y * uy, -x * uy + y * ux) for x, y in offsets]
+    if (min(y for _, y in points) >= half_width - TOLERANCE_FT
+            or max(y for _, y in points) <= -half_width + TOLERANCE_FT):
+        return None
+    clipped = clip_footprint(clip_footprint(points, -half_width, 1), half_width, -1)
+    return (min(x for x, _ in clipped), max(x for x, _ in clipped)) if clipped else None
+
+
+def trim_overlapping_finishes(segments, width, short_curve):
+    rows = [segment["wall_finish"] for segment in segments if "finish_footprints" in segment["wall_finish"]]
+    candidates = [footprint for row in rows for footprint in row["finish_footprints"]
+                  if footprint["status"] == "footprint_previewed"]
+    if len(candidates) > MAX_WALL_SEGMENTS:
+        return False
+    # Favor longer pieces, with a geometry tie-break independent of room loop order.
+    candidates.sort(key=lambda item: (item["span_ft"][0] - item["span_ft"][1],
+                                      sorted(item["centerline_ft"])))
+    half_width = width / 2.0
+    accepted = []
+    replacements = {}
+    for candidate in candidates:
+        a, b = candidate["centerline_ft"]
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        axis = ((b[0] - a[0]) / length, (b[1] - a[1]) / length)
+        blocked = []
+        for corners in accepted:
+            interval = overlapping_stations(corners, a, axis, half_width)
+            if interval and min(length, interval[1]) - max(0.0, interval[0]) > TOLERANCE_FT:
+                blocked.append(interval)
+        if not blocked:
+            if len(accepted) >= MAX_WALL_SEGMENTS:
+                return False
+            accepted.append(footprint_corners(candidate["centerline_ft"], half_width))
+            continue
+        pieces = []
+        for low, high in available_spans(0.0, length, blocked, short_curve):
+            if len(accepted) >= MAX_WALL_SEGMENTS:
+                return False
+            start = candidate["span_ft"][0]
+            points = [[a[0] + station * axis[0], a[1] + station * axis[1], a[2]] for station in (low, high)]
+            pieces.append(dict(candidate, span_ft=[start + low, start + high], centerline_ft=points,
+                               original_span_ft=candidate["span_ft"]))
+            accepted.append(footprint_corners(points, half_width))
+        replacements[id(candidate)] = pieces or [{
+            "status": "excluded", "reason": "overlap_consumes_finish_span", "span_ft": candidate["span_ft"],
+        }]
+    for row in rows:
+        row["finish_footprints"] = [piece for original in row["finish_footprints"]
+                                     for piece in replacements.get(id(original), [original])]
+        if any(piece["status"] == "excluded" for piece in row["finish_footprints"]):
+            row["status"] = "incomplete"
+    return True
+
+
 def wall_segment_preview(document, segment, phase_id, short_curve, outline, width):
     if segment["linked_source_id"] > 0 or segment["curve_type"] != "Line" or segment["source_id"] <= 0:
         return {"status": "excluded", "reason": "boundary_not_a_straight_host_wall"}
@@ -170,13 +263,7 @@ def wall_segment_preview(document, segment, phase_id, short_curve, outline, widt
             return {"status": "excluded", "reason": "door_crosses_or_touches_boundary_end"}
         doors.append({"id": str(identifier.Value), "uid": str(door.UniqueId), "start_ft": low, "end_ft": high})
     doors.sort(key=lambda item: (item["start_ft"], item["end_ft"], item["id"]))
-    spans, cursor = [], 0.0
-    for door in doors:
-        if door["start_ft"] - cursor > short_curve:
-            spans.append([cursor, door["start_ft"]])
-        cursor = max(cursor, door["end_ft"])
-    if length - cursor > short_curve:
-        spans.append([cursor, length])
+    spans = available_spans(0.0, length, [(door["start_ft"], door["end_ft"]) for door in doors], short_curve)
     footprints = finish_centerlines(outline, start, axis, spans, width)
     status = "incomplete" if any(item["status"] == "excluded" for item in footprints) else "spans_previewed"
     return {"status": status, "wall_uid": str(wall.UniqueId), "door_envelopes": doors,
@@ -223,8 +310,12 @@ def room_finish_preview(document, room, row, types, wall_type):
                     result = {"status": "excluded", "reason": "wall_boundary_read_failed",
                               "error_type": type(exc).__name__}
                 segment["wall_finish"] = result
-                if result["status"] != "spans_previewed":
-                    row["wall_finish"]["status"] = "incomplete"
+            if not trim_overlapping_finishes(segments, wall_type["width_ft"], short_curve):
+                row["wall_finish"].update(status="excluded", reason="wall_finish_piece_limit")
+                for segment in segments:
+                    segment["wall_finish"].pop("finish_footprints", None)
+            elif any(segment["wall_finish"]["status"] != "spans_previewed" for segment in segments):
+                row["wall_finish"]["status"] = "incomplete"
     return row
 
 
