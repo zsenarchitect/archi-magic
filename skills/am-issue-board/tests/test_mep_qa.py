@@ -169,3 +169,30 @@ def test_cli_execution_with_output_file(tmp_path, seeded_error_mep_elements):
         saved_data = json.load(f)
     assert saved_data["total_findings"] > 0
     assert "findings" in saved_data
+
+
+@pytest.mark.parametrize("flow", [None, "", "unavailable", "NaN CFM", float("inf"), True])
+def test_active_duct_reports_missing_or_unreadable_flow(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    findings = run_mep_audit([duct])["findings"]
+    assert [(finding["ruleId"], finding["severity"], finding["elementId"]) for finding in findings] == [
+        ("MEP-FLOW-01", "warning", 101)
+    ]
+    assert "no readable calculated flow" in findings[0]["message"]
+
+
+@pytest.mark.parametrize("flow", ["125 l/s", "1.4 m³/s", "40 Cfm", 0.5])
+def test_positive_flow_is_clean(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    assert run_mep_audit([duct])["findings"] == []
+
+
+@pytest.mark.parametrize("flow", ["0 L/s", "-2 m³/h"])
+def test_nonpositive_flow_keeps_its_diagnostic(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    findings = run_mep_audit([duct])["findings"]
+    assert [(finding["ruleId"], finding["elementId"]) for finding in findings] == [("MEP-FLOW-01", 101)]
+    assert "zero or negative calculated flow" in findings[0]["message"]

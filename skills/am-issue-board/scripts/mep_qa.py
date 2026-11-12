@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 VALID_SYSTEM_PREFIXES = (
@@ -91,8 +93,23 @@ def check_open_connectors(element: Dict[str, Any]) -> List[Dict[str, Any]]:
     return findings
 
 
+AIRFLOW = re.compile(
+    r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)"
+    r"(?:\s*(?:cfm|l/s|m(?:3|³|\^3)/[sh]))?",
+    re.IGNORECASE,
+)
+
+
+def read_airflow(value):
+    match = AIRFLOW.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    flow = float(match.group(1))
+    return flow if math.isfinite(flow) else None
+
+
 def check_sizing_and_flow(element: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Check missing sizing or zero flow on active distribution runs (MEP-FLOW-01)."""
+    """Check missing sizing and missing or nonpositive airflow (MEP-FLOW-01)."""
     findings: List[Dict[str, Any]] = []
     category = str(element.get("category", ""))
     params = element.get("parameters", {})
@@ -125,25 +142,25 @@ def check_sizing_and_flow(element: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "location": element.get("location"),
             })
 
-    # Flow check on active supply/return ducts
-    sys_type = str(params.get("System Type", ""))
-    if any(k in sys_type for k in ("Supply", "Return", "Exhaust")):
-        flow = params.get("Flow")
-        if flow is not None:
-            try:
-                flow_val = float(str(flow).replace("CFM", "").replace("cfm", "").strip())
-                if flow_val <= 0:
-                    findings.append({
-                        "ruleId": "MEP-FLOW-01",
-                        "severity": "warning",
-                        "elementId": element.get("id"),
-                        "category": category,
-                        "level": element.get("level", "Unassigned"),
-                        "message": f"{category} ID {element.get('id')} has zero or negative calculated flow ({flow}).",
-                        "location": element.get("location"),
-                    })
-            except (ValueError, TypeError):
-                pass
+    system_type = str(params.get("System Type") or params.get("System Classification") or "")
+    if any(kind in system_type.lower() for kind in ("supply", "return", "exhaust")):
+        raw_flow = params.get("Flow")
+        flow = read_airflow(raw_flow)
+        message = None
+        if flow is None and category in ("Ducts", "Flex Ducts"):
+            message = "has no readable calculated flow"
+        elif flow is not None and flow <= 0:
+            message = f"has zero or negative calculated flow ({raw_flow})"
+        if message is not None:
+            findings.append({
+                "ruleId": "MEP-FLOW-01",
+                "severity": "warning",
+                "elementId": element.get("id"),
+                "category": category,
+                "level": element.get("level", "Unassigned"),
+                "message": f"{category} ID {element.get('id')} {message}.",
+                "location": element.get("location"),
+            })
 
     return findings
 
