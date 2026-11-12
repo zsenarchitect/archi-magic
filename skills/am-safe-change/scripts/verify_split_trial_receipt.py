@@ -9,13 +9,13 @@ import re
 import sys
 
 import element_split_preview as planner
+from split_replay_comparison import TRANSACTION, match_replay, stable_effects
 from verify_element_split import read_json, verify as verify_pieces
 
 
 EFFECTS = ("added", "modified", "deleted")
 MAX_IDS = 1002
 MAX_BRIDGE_BYTES = 8 * 1024 * 1024
-TRANSACTION = re.compile(r"Archi Magic element split trial [0-9a-f]{32}")
 AUDIT = re.compile(r"[0-9a-f]{32}")
 
 
@@ -119,6 +119,7 @@ def verify(before_raw, trial_raw, after_raw, approval, approval_sha, cascade=Non
     if comparison["status"] != "matched" or comparison != receipt["comparison"]:
         raise ValueError("The saved result pieces do not match the independently recomputed preview.")
 
+    stable_effects(receipt)
     inner = receipt["inner_effects"]
     planner.fields(inner, set(EFFECTS))
     inner = {key: exact_ids(inner[key]) for key in EFFECTS}
@@ -176,12 +177,23 @@ def main():
     for name in ("before", "trial", "after", "approval"):
         parser.add_argument(name, type=Path)
     parser.add_argument("--floor-cascade", type=Path)
+    parser.add_argument("--replay-measurement", type=Path)
     args = parser.parse_args()
     try:
         before, trial, after = (read_json(path, MAX_BRIDGE_BYTES)[0] for path in (args.before, args.trial, args.after))
         approval, approval_sha = read_json(args.approval)
         cascade, cascade_sha = read_json(args.floor_cascade) if args.floor_cascade else (None, None)
         result = verify(before, trial, after, approval, approval_sha, cascade, cascade_sha)
+        if args.replay_measurement:
+            replay, _ = read_json(args.replay_measurement)
+            original = decode(run_record(trial, "dry_run")["result"]["trial_json"])
+            baseline = run_record(before, "query")["result"]
+            comparison = verify_pieces(decode(baseline["snapshot_json"]), result["snapshot_sha256"],
+                                       decode(baseline["inventory_json"]), original["inventory_sha256"],
+                                       approval, decode(replay["readback_json"]))
+            if comparison != replay["comparison"]:
+                raise ValueError("The replay measurement differs from the independently recomputed pieces.")
+            result["replay"] = match_replay(original, replay)
     except (ArithmeticError, AttributeError, KeyError, OSError, TypeError, ValueError, RecursionError) as error:
         print(f"Split rollback verification stopped. {error}", file=sys.stderr)
         return 2

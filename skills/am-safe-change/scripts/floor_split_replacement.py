@@ -145,18 +145,43 @@ def replace(document, floor, basis, expected, created, budget):
     return pieces
 
 
+def sketch_effect(document, member_id, floor_id, sketch_id):
+    if member_id == floor_id:
+        return {"role": "floor"}
+    if member_id == sketch_id:
+        return {"role": "sketch"}
+    element = document.GetElement(eid(member_id))
+    if isinstance(element, DB.CurveElement):
+        return {"role": "profile_curve", "ends_ft": sorted(reader.line_points(element.GeometryCurve))}
+    if isinstance(element, DB.SketchPlane):
+        plane = element.GetPlane()
+        normal, origin = reader.xyz(plane.Normal), reader.xyz(plane.Origin)
+        if min(math.dist(normal, [0, 0, 1]), math.dist(normal, [0, 0, -1])) > reader.TOLERANCE_FT:
+            raise ValueError("A new floor sketch plane is not horizontal.")
+        return {"role": "sketch_plane", "elevation_ft": origin[2]}
+    raise ValueError("An added sketch element has no supported geometric signature.")
+
+
 def effects(document, pieces, basis):
-    owned = set()
+    owned, signatures = set(), {}
     budget = reader.ReadBudget()
     for piece in pieces:
         source, sketch, members = floor_members(document, piece["result"])
         if source["id"] in basis["inventory"] or sketch["id"] in basis["inventory"]:
             raise ValueError("A replacement floor or sketch reused an existing element.")
         owned.update(members)
+        for member_id in members.keys() - basis["inventory"]:
+            budget.visit("dependencies")
+            signature = sketch_effect(document, member_id, source["id"], sketch["id"])
+            record = signatures.setdefault(member_id, {"geometry": signature, "piece_ids": []})
+            if record["geometry"] != signature:
+                raise ValueError("A sketch member has conflicting creation evidence.")
+            record["piece_ids"].append(source["id"])
     current = fixture_ids(document, budget)
-    if current - basis["inventory"] != owned - basis["inventory"] or basis["inventory"] - current != basis["approved"].keys():
+    additions = current - basis["inventory"]
+    if additions != owned - basis["inventory"] or basis["inventory"] - current != basis["approved"].keys():
         raise ValueError("The trial created or deleted model elements outside the reviewed floor and owned sketches.")
-    return current - basis["inventory"]
+    return additions, [{"id": value, **signatures[value]} for value in sorted(additions, key=int)]
 
 
 def verify_solids(document, requests, measured, basis):

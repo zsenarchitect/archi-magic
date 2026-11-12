@@ -402,7 +402,7 @@ def run(document, args):
 
     application = document.Application
     failure = readback_text = comparison = None
-    wall_measurements, floor_measurements, column_cuts = {}, {}, []
+    wall_measurements, floor_measurements, column_cuts, floor_effects = {}, {}, [], []
     rolled_back = regeneration_failed = False
     application.DocumentChanged += record
     try:
@@ -433,7 +433,8 @@ def run(document, args):
             raise ValueError("The provisional column transaction did not finish.")
         if floor_basis is not None:
             try:
-                created.update(floor_trial.effects(document, requests, floor_basis))
+                additions, floor_effects = floor_trial.effects(document, requests, floor_basis)
+                created.update(additions)
             except Exception:
                 invalid_event = True
                 raise
@@ -512,7 +513,8 @@ def run(document, args):
     if audit_context is not None:
         report.update(baseline_audit_token=audit_context["audit_token"], controls_sha256=audit_context["controls_sha256"])
     if floor_basis is not None:
-        report.update(floor_measurements=floor_measurements, floor_cascade_sha256=args["floor_cascade_sha256"])
+        report.update(floor_measurements=floor_measurements, floor_effects=floor_effects,
+                      floor_cascade_sha256=args["floor_cascade_sha256"])
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False)
     if len(encoded) > planner.MAX_BYTES:
         return {"status": "stopped_and_rolled_back", "reason": "The native trial receipt exceeds 2 MiB.",

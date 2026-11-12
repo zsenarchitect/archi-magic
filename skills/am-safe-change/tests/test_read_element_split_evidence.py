@@ -419,6 +419,38 @@ def check_independent_trial(tmp_path, document, audit, baseline, result, approva
             verified = json.loads(checked.stdout)
             assert verified["status"] == "verified_split_trial_rollback"
             assert verified["run_ids"] == ["before-1", "trial-2", "after-3"]
+            replay = json.loads(result["trial_json"])
+            replay["transaction"] = "Archi Magic element split trial " + "f" * 32
+            id_map = {value: str(int(value) + 1000) for value in replay["inner_effects"]["added"]}
+            replay["inner_effects"]["added"] = list(id_map.values())
+            for row in replay["comparison"]["matches"]:
+                row["result_id"] = id_map.get(row["result_id"], row["result_id"])
+            measured = json.loads(replay["readback_json"])
+            for row in measured["pieces"]:
+                if row["id"] in id_map:
+                    row["id"] = id_map[row["id"]]
+                    row["uid"] = f"allocated-{row['id']}"
+            replay["readback_json"] = json.dumps(measured)
+            for key in ("wall_measurements", "floor_measurements"):
+                if key in replay:
+                    replay[key] = {id_map.get(value, value): data for value, data in replay[key].items()}
+            for row in replay.get("floor_effects", []):
+                row["id"] = id_map[row["id"]]
+                row["piece_ids"] = [id_map[value] for value in row["piece_ids"]]
+            measured_path = tmp_path / "replay-measurement.json"
+            measured_path.write_text(json.dumps(replay))
+            replay_command = [*command, "--replay-measurement", str(measured_path)]
+            compared = subprocess.run(replay_command, capture_output=True, text=True)
+            assert compared.returncode == 0, compared.stderr
+            assert json.loads(compared.stdout)["replay"]["status"] == "split_replay_matched"
+            if cascade is not None:
+                member = next(row for row in replay["floor_effects"] if row["geometry"]["role"] == "profile_curve")
+                member["geometry"]["ends_ft"][0][0] += 0.01
+            else:
+                replay["column_cuts"][0]["normalized"] += 0.01
+            measured_path.write_text(json.dumps(replay))
+            different = subprocess.run(replay_command, capture_output=True, text=True)
+            assert different.returncode == 2 and not different.stdout, different
         else:
             assert checked.returncode == 2 and not checked.stdout, checked
 
@@ -837,6 +869,8 @@ def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, mo
     db.XYZ = point
     db.Options = lambda: NS(Dispose=lambda: None)
     db.Solid = type("Solid", (NS,), {})
+    db.CurveElement = ModelLine
+    db.SketchPlane = type("SketchPlane", (NS,), {})
     db.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM = "offset"
     db.BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL = "structural"
     db.HostObjectUtils.GetBottomFaces = lambda floor: ["bottom"]
@@ -913,7 +947,8 @@ def test_floor_replacement_rechecks_cascade_and_rolls_back_every_piece(model, mo
         elements[sketch_id] = native(Sketch, sketch_id, OwnerId=Id(identifier), Profile=[loop(vertices, 0)],
                                      GetAllElements=lambda: [Id(member_id)],
                                      GetDependentElements=lambda _: [Id(member_id)])
-        elements[member_id] = native(ModelLine, member_id)
+        elements[member_id] = native(ModelLine, member_id,
+                                     GeometryCurve=Line((*vertices[0], 0), (*vertices[1], 0)))
         return floor
 
     make_floor(13, 20, 23, original_vertices, -0.5, "Reviewed")
