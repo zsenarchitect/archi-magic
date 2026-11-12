@@ -316,3 +316,91 @@ def test_reuse_blocks_ambiguous_hidden_or_unverified_matches(reader, scenario, e
     assert match["status"] == "blocked" and match["reason"] == expected and match["selected_id"] is None
     if scenario == "observed_only":
         assert match["exact"] == [] and match["uncertain_filter_ids"] == ["201"]
+
+
+def existing_graphics(rgb):
+    from view_color_preview import COLOR_FIELDS
+
+    result = {name: list(rgb) for name in COLOR_FIELDS}
+    result.update(IsSurfaceForegroundPatternVisible=True, IsCutForegroundPatternVisible=True)
+    return result
+
+
+def test_color_proposal_keeps_existing_color_and_binds_matching_legend(reader, tmp_path):
+    import subprocess
+    from view_color_preview import build, color_text
+
+    mock_rules(reader)
+    rows = [candidate(101, parameter("String", "North"), "North"),
+            candidate(102, parameter("String", "South"), "South")]
+    inventory = qualifying_inventory(reader, rows, existing=[existing_filter(201, "North")],
+                                      applied=[(201, (True, True))], reuse=True)
+    inventory["link_candidate_ids"] = []
+    match = reuse_by_value(inventory)["North"]["exact"][0]
+    match["graphics"] = existing_graphics([30, 90, 160])
+    proposal, preview = build(inventory)
+    assert not proposal["blocked"] and preview["review_only"] and preview["steps"] == []
+    legend = {row["label"]: row for row in proposal["legend_rows"]}
+    assert legend["North"]["rgb"] == [30, 90, 160] and legend["North"]["filter_id"] == "201"
+    assert legend["South"]["filter_id"] is None
+    assert len({tuple(row["rgb"]) for row in legend.values()}) == 2
+    assert [(row[1], row[5]) for row in preview["after"]] == [
+        (row["label"], color_text(row["rgb"])) for row in proposal["legend_rows"]
+    ]
+
+    file = tmp_path / "native-inventory.json"
+    file.write_text(json.dumps({"result": {"status": "ok", "inventory_json": json.dumps(inventory)}}))
+    result = subprocess.run([sys.executable, str(SCRIPTS / "view_color_preview.py"), str(file)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"proposal": proposal, "preview": preview}
+
+
+def test_color_preview_disambiguates_equal_display_labels_and_fails_on_name_collision(reader):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    rows = [candidate(101, parameter("Integer", 4), 4), candidate(102, parameter("Integer", 5), 5)]
+    inventory = qualifying_inventory(reader, rows, reuse=True)
+    inventory["link_candidate_ids"] = []
+    proposal, _ = build(inventory)
+    legend = proposal["legend_rows"]
+    assert {row["label"] for row in legend} == {"label [Integer 4]", "label [Integer 5]"}
+    inventory["existing_filters"]["existing_parameter_filter_names"].append(
+        {"id": "201", "name": legend[0]["filter_name"].lower()}
+    )
+    blocked, preview = build(inventory)
+    assert blocked["blocked"]
+    assert preview["warnings"] == [{
+        "row": legend[0]["value_key"], "text": "The proposed filter name is already in use.", "blocking": True,
+    }]
+
+
+def test_color_preview_flags_link_scope_and_conflicting_applied_colors(reader):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    rows = [candidate(101, parameter("String", "North"), "North"),
+            candidate(102, parameter("String", "South"), "South")]
+    inventory = qualifying_inventory(reader, rows, existing=[existing_filter(201, "North"), existing_filter(202, "South")],
+                                      applied=[(201, (True, True)), (202, (True, True))], reuse=True)
+    for group in reuse_by_value(inventory).values():
+        group["exact"][0]["graphics"] = existing_graphics([30, 90, 160])
+    proposal, preview = build(inventory)
+    assert proposal["blocked"]
+    assert len({tuple(row["rgb"]) for row in proposal["legend_rows"]}) == 2
+    assert len(preview["warnings"]) == 2
+    assert all(warning["blocking"] for warning in preview["warnings"])
+
+
+def test_color_preview_rejects_duplicate_element_membership(reader):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    rows = [candidate(101, parameter("String", "North"), "North"),
+            candidate(102, parameter("String", "South"), "South")]
+    inventory = qualifying_inventory(reader, rows, reuse=True)
+    groups = inventory["native_rules"]["groups"]
+    groups[1]["member_ids"] = list(groups[0]["member_ids"])
+    with pytest.raises(ValueError, match="every observed element exactly once"):
+        build(inventory)
