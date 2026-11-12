@@ -189,6 +189,28 @@ Use the local geometry planner to review a CAD layout before any model work. It 
 3. Run `python scripts/cad_layout_preview.py snapshot.json --mapping mapping.json`. Review the wall axes, maximum face errors, uncovered lengths, door spans, and room outlines. The door marker must lie along its proposed host wall. Check each unresolved item. Exit 1 means geometry needs review. Exit 2 means the input or calculation failed.
 4. Treat this JSON as a proposal. It contains no Revit write instructions. The linked DWG reader and guarded Revit creation still require live qualification.
 
+## Model cleanup inventory (issue #140)
+
+- Open a Revit 2026 project. Call `get_context` before starting the query.
+- Pass the full text of `scripts/read_model_cleanup.py` to `run_query`. No inputs are required.
+- Review the reported views, templates, filters, scope boxes, and CAD imports.
+- Check drafting views for examples of owned or graphical content. Check CAD imports for views where graphics may appear.
+- Read `graphic_coverage` before using the observations. Confirm the rendered views in Revit before drawing conclusions about use.
+- Treat `purge_unused` as Revit's exact ID match. A null value means the query has no Purge Unused result for that row.
+- Report all incomplete groups and their reasons. Use the inventory for review only. It cannot approve or perform any deletion.
+- For a shorter report, pass `selected_ids` with up to 20 exact IDs. Revit still checks model-wide protection references.
+- Save the query response. Run `python scripts/cleanup_preview.py inventory.json <element-id> [...] > preview.json` from this skill folder.
+- Render `preview.json` with am-schedule-view. Review the protected items and the selected identities before any native verification.
+- For qualification, open a saved, writable, non-workshared disposable project in Revit 2026. Keep the runtime in ask policy.
+- Confirm the exact selection. Call `get_context` again. Run `scripts/probe_model_cleanup_in_revit.py` with `run_modify`, `dry_run: true`, and the scripts folder as workspace.
+- Pass `mode: "rollback_probe"`, the preview's `cleanup_selection.selected_ids`, and its `basis_sha256` as inputs.
+- Include `scope: "selected"` if the preview shows it under `cleanup_selection`. Use the same inventory inputs for the fresh query.
+- Check `temporary_deleted_ids` and `rollback_verified`. Run the inventory again. Confirm that the selected items and protected references remain.
+- Save all three full Revit run records. Run `python scripts/verify_model_cleanup_probe.py preview.json before.json probe.json fresh.json` from this skill folder.
+- The verifier requires three separate CPython runs and no lasting changes. The dry run can report temporary effects for the selected IDs.
+- Treat any mismatch or effect outside the selected IDs as unresolved.
+- Stop on `transaction_unresolved`. Inspect the disposable model in Revit before any further operation. This probe still needs native qualification.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).

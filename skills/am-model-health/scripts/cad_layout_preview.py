@@ -16,7 +16,7 @@ INPUT_LIMIT = 1024 * 1024
 FRAME = "revit_internal_axes_mm"
 
 
-def read_input(path):
+def read_input(path, limit=INPUT_LIMIT):
     source = local_path(path)
     original = source.lstat()
     if link_or_reparse(original) or not stat.S_ISREG(original.st_mode):
@@ -25,9 +25,9 @@ def read_input(path):
              | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(os.open(source, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > INPUT_LIMIT:
-            raise ValueError("Use a regular JSON file up to 1 MiB.")
-        raw = stream.read(INPUT_LIMIT + 1)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"Use a regular JSON file up to {limit // (1024 * 1024)} MiB.")
+        raw = stream.read(limit + 1)
         after = os.fstat(stream.fileno())
         current = source.lstat()
         if not (
