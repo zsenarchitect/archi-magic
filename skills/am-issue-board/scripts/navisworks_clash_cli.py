@@ -1,6 +1,7 @@
 """Preview Navisworks clash intake and optional Revit section bounds."""
 
 import argparse
+from collections import Counter
 import hashlib
 from html.parser import HTMLParser
 import io
@@ -91,6 +92,7 @@ def parse_report(data):
     path = []
     report = []
     seen = set()
+    group_names = []
     nodes = 0
     tests = 0
     units = ""
@@ -106,6 +108,8 @@ def parse_report(data):
                 units = text(node.get("units", ""))
             if tuple(path) == RESULT[:-1]:
                 tests += 1
+            if node.tag == "clashgroup":
+                group_names.append(text(node.get("name", "")))
             continue
         if node.tag == "clashresult":
             if not valid_result_path(path) or len(report) >= 300:
@@ -129,6 +133,10 @@ def parse_report(data):
                 "source_point": coordinates,
                 "objects": [object_side(item) for item in objects] if len(objects) == 2 else [],
             })
+            if group_names and group_names[-1]:
+                report[-1]["source_group"] = group_names[-1]
+        if node.tag == "clashgroup":
+            group_names.pop()
         path.pop()
     if not tests:
         raise ValueError("No Clash Detective test found in this exchange file.")
@@ -484,6 +492,51 @@ def parse_html_report(data):
     return "html_sequential", reader.clashes, reader.warnings
 
 
+def paired_clashes(html_rows, xml_rows):
+    translated = {"nouveau": "new", "activé": "active", "vérifié": "reviewed",
+                  "approuvé": "approved", "résolu": "resolved"}
+
+    def key(row):
+        sides = tuple(item["element_id"] for item in row["objects"])
+        status = translated.get(row["source_status"], row["source_status"])
+        if row["name"] and status in STATUSES and len(sides) == 2 and all(sides):
+            return row["name"], status, sides
+        return None
+
+    counts = Counter(key(row) for row in html_rows)
+    indexed = {}
+    for row in xml_rows:
+        match_key = key(row)
+        if match_key is not None:
+            indexed.setdefault(match_key, []).append(row)
+    result = []
+    for row in html_rows:
+        match_key = key(row)
+        candidates = indexed.get(match_key, [])
+        status = "unmatched"
+        paired = dict(row)
+        if match_key is None:
+            status = "incomplete_html_identity"
+        elif counts[match_key] != 1 or len(candidates) > 1:
+            status = "ambiguous"
+        elif candidates:
+            match = candidates[0]
+            if row.get("source_group") and row["source_group"] != match.get("source_group"):
+                status = "different_group"
+            elif not match["guid"] or not all(
+                item["selection_path"] and all(item["selection_path"]) for item in match["objects"]
+            ):
+                status = "incomplete_xml_identity"
+            else:
+                paired.update(guid=match["guid"], objects=match["objects"], source_point=match["source_point"],
+                              source_status=match_key[1])
+                if row["source_status"] != match_key[1]:
+                    paired["html_source_status"] = row["source_status"]
+                status = "matched"
+        result.append(dict(paired, xml_identity=status))
+    return result
+
+
 def snapshot_document(raw):
     doc = json_input(raw)
     doc = doc.get("response", doc)
@@ -715,11 +768,12 @@ def verify_board_run(plan, outcome, run, readback):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
+    parser.add_argument("--matching-xml", help="XML export from the same test as the HTML report")
     parser.add_argument("--snapshot")
     parser.add_argument("--padding-ft", type=float, default=1.0)
     parser.add_argument("--board")
     parser.add_argument("--archive")
-    parser.add_argument("--view-clash", help="Preview one section view for an XML clash GUID")
+    parser.add_argument("--view-clash", help="Preview one section view for a verified Navisworks clash GUID")
     parser.add_argument("--verify-view", choices=("dry-run", "keep", "discard"))
     parser.add_argument("--view-run", help="Complete guarded pyRevit run record")
     parser.add_argument("--view-readback", help="Complete independent pyRevit query record")
@@ -737,8 +791,10 @@ def main(argv=None):
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
-        if args.view_clash and (is_html or not args.snapshot):
-            raise ValueError("Use XML and a Revit snapshot for a section-view preview.")
+        if args.matching_xml and (not is_html or Path(args.matching_xml).suffix.lower() != ".xml"):
+            raise ValueError("Pair one HTML report with an XML export of the same test.")
+        if args.view_clash and ((is_html and not args.matching_xml) or not args.snapshot):
+            raise ValueError("Use verified XML clash identity and a Revit snapshot for a section-view preview.")
         if any((args.verify_view, args.view_run, args.view_readback)) and not all(
                 (args.verify_view, args.view_run, args.view_readback, args.view_clash)):
             raise ValueError("Supply the view GUID, outcome, full run record and independent readback together.")
@@ -749,10 +805,20 @@ def main(argv=None):
                 (kept_board, args.verify_board, args.board_run, args.board_readback)):
             raise ValueError("Supply a kept-view board handoff and both board run records.")
         raw = local_bytes(args.report)
+        report_digest = hashlib.sha256(raw).hexdigest()
+        identity_digest = None
         source_warnings = []
         if is_html:
             source_format, clashes, source_warnings = parse_html_report(raw)
             units = ""
+            if args.matching_xml:
+                identity_raw = local_bytes(args.matching_xml)
+                identity_digest = hashlib.sha256(identity_raw).hexdigest()
+                units, xml_rows = parse_report(identity_raw)
+                clashes = paired_clashes(clashes, xml_rows)
+                unresolved = sum(row["xml_identity"] != "matched" for row in clashes)
+                if unresolved:
+                    source_warnings.append(f"{unresolved} HTML clash rows could not be bound uniquely to XML identity.")
         else:
             source_format = "xml"
             units, clashes = parse_report(raw)
@@ -779,16 +845,21 @@ def main(argv=None):
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
             "source_format": source_format,
-            "report_sha256": hashlib.sha256(raw).hexdigest(), "source_units": units,
+            "report_sha256": report_digest, "source_units": units,
             "snapshot_sha256": hashlib.sha256(snapshot).hexdigest() if snapshot is not None else None,
             "host_id": host, "coordinate_frame": FRAME if host else None,
             "clashes": clashes, "plan": plan, "skipped_guids": skipped,
             "warnings": source_warnings + (
                 ["Archive note not checked for duplicates."] if args.board and not args.archive else []),
         }
+        if identity_digest is not None:
+            report["identity_report_sha256"] = identity_digest
         if args.view_clash:
+            plan_report_digest = report_digest if identity_digest is None else hashlib.sha256(
+                ("navisworks-html+xml:" + report_digest + ":" + identity_digest).encode("ascii")
+            ).hexdigest()
             report["view_plan"], report["view_preview"] = section_view_preview(
-                args.view_clash, clashes, snapshot_data, args.padding_ft, report["report_sha256"]
+                args.view_clash, clashes, snapshot_data, args.padding_ft, plan_report_digest
             )
         if args.verify_view:
             report["view_verification"] = verify_view_run(
@@ -803,7 +874,7 @@ def main(argv=None):
             report["board_verification"] = verify_board_run(
                 report["plan"], args.verify_board, runtime_record(args.board_run), runtime_record(args.board_readback)
             )
-        if is_html:
+        if is_html and not args.matching_xml:
             report["warnings"].append("HTML review has no mapped clash identity. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)
         if len(encoded) > LIMIT:

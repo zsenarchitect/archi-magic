@@ -326,6 +326,75 @@ def test_sequential_html_reports_coverage_per_test(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("layout", ["sequential", "tabular"])
+def test_paired_html_uses_verified_xml_identity_for_view_preview(inputs, tmp_path, layout):
+    xml, snapshot, _ = inputs
+    html = tmp_path / "paired.html"
+    raw = sequential_report(group=sequential_pair("Clash Group", "Group A")) if layout == "sequential" else (
+        tabular_report())
+    title = "Wall &amp; pipe" if layout == "sequential" else "Fixture clash"
+    html.write_text(raw, encoding="utf-8")
+    rows = clash(FIRST, item("A.rvt") + item("B.rvt", 9007199254740993), title=title)
+    if layout == "sequential":
+        rows = f'<clashgroup name="Group A"><clashresults>{rows}</clashresults></clashgroup>'
+    xml.write_text(report(rows))
+    data = json.loads(snapshot.read_text())
+    data["sources"][1]["elements"]["9007199254740993"] = data["sources"][1]["elements"].pop("42")
+    data.update(kind="navisworks-revit-snapshot", host_identity={"fixture": "host"},
+                active_view_uid="fixture-active-view", request={},
+                view_target={"clash_guid": FIRST, "name": "Clash " + FIRST, "view_type_uid": "fixture-view-type",
+                             "default_template_id": "-1", "name_conflicts": []})
+    for index, source in enumerate(data["sources"], 1):
+        source.update(document_identity={"fixture": source["model_id"]},
+                      link_instance_id=str(index), link_instance_uid="fixture-link-" + str(index))
+    snapshot.write_text(json.dumps(data))
+    result = invoke(html, "--matching-xml", xml, "--snapshot", snapshot, "--view-clash", FIRST)
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    row, = preview["clashes"]
+    assert (row["guid"], row["xml_identity"]) == (FIRST, "matched")
+    if layout == "tabular":
+        assert row["html_source_status"] == "nouveau" and row["source_status"] == "new"
+    assert row["section_box"]["min"] == [0, 0, 2] and row["section_box"]["max"] == [5, 5, 8]
+    assert preview["model_write_approved"] is False and preview["view_plan"]["blocked"] is False
+    assert [target["element_id"] for target in preview["view_plan"]["targets"]] == ["42", "9007199254740993"]
+    html_sha, xml_sha = sha256(html.read_bytes()).hexdigest(), sha256(xml.read_bytes()).hexdigest()
+    assert preview["report_sha256"] == html_sha and preview["identity_report_sha256"] == xml_sha
+    assert preview["view_plan"]["report_sha256"] == sha256(
+        f"navisworks-html+xml:{html_sha}:{xml_sha}".encode("ascii")).hexdigest()
+
+
+@pytest.mark.parametrize("scenario,status", [
+    ("duplicate_xml", "ambiguous"), ("swapped_ids", "unmatched"),
+    ("wrong_group", "different_group"), ("missing_xml_paths", "incomplete_xml_identity"),
+])
+def test_paired_html_refuses_unverified_identity(inputs, tmp_path, scenario, status):
+    xml, snapshot, board = inputs
+    html = tmp_path / "unpaired.html"
+    group = sequential_pair("Clash Group", "Group A") if scenario == "wrong_group" else ""
+    html.write_text(sequential_report(group=group), encoding="utf-8")
+    sides = item("A.rvt") + item("B.rvt", 9007199254740993)
+    title = "Wall &amp; pipe"
+    if scenario == "duplicate_xml":
+        rows = clash(FIRST, sides, title) + clash(SECOND, sides, title)
+    elif scenario == "swapped_ids":
+        rows = clash(FIRST, item("A.rvt", 9007199254740993) + item("B.rvt"), title)
+    elif scenario == "wrong_group":
+        rows = '<clashgroup name="Group B"><clashresults>' + clash(FIRST, sides, title) + (
+            "</clashresults></clashgroup>")
+    else:
+        rows = clash(FIRST, sides.replace("<pathlink>", "<other>").replace("</pathlink>", "</other>"), title)
+    xml.write_text(report(rows))
+    result = invoke(html, "--matching-xml", xml, "--snapshot", snapshot, "--board", board)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    row, = data["clashes"]
+    assert row["xml_identity"] == status and row["guid"] is None and row["section_box"] is None
+    assert data["plan"] is None
+    refused = invoke(html, "--matching-xml", xml, "--snapshot", snapshot, "--view-clash", FIRST)
+    assert refused.returncode == 2 and not refused.stdout
+
+
 @pytest.mark.parametrize("html", [
     sequential_report(side="Item 1"),
     sequential_report().replace("</body>", ""),
