@@ -60,6 +60,19 @@ def verify_board_target(guard, note_id):
         if (not isinstance(note, DB.TextNote) or str(note.UniqueId) != expected["unique_id"]
                 or ib.text_sha1(note.GetFormattedText().GetPlainText()) != expected["sha1"]):
             raise ValueError("The board or archive changed. Read it again and rebuild the plan.")
+    if "view" in guard:
+        expected = guard["view"]
+        view = doc.GetElement(eid(expected["view_id"]))
+        if (not isinstance(view, DB.View3D) or view.IsTemplate or view.IsPerspective
+                or not view.IsSectionBoxActive or str(view.UniqueId) != expected["view_uid"]
+                or view.Name != expected["view_name"]):
+            raise ValueError("The verified clash view changed. Read it again before updating the board.")
+        box = view.GetSectionBox()
+        if (not box.Transform.IsIdentity
+                or any(not abs(actual - approved) <= 1e-7
+                       for point, bound in ((box.Min, expected["box_min"]), (box.Max, expected["box_max"]))
+                       for actual, approved in zip((point.X, point.Y, point.Z), bound))):
+            raise ValueError("The verified clash section box changed. Read it again before updating the board.")
 
 
 if "structural_target" in plan:
