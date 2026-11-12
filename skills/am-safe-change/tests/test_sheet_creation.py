@@ -322,3 +322,67 @@ def test_full_runtime_receipts_require_exact_additions_and_fresh_readback(sheet_
                                   "committed", dry) == receipt
     with pytest.raises(ValueError, match="independently read"):
         preview.verify_outcome(plan, kept, runtime_record(dry_receipt, "verification_json"), "committed", dry)
+
+
+def test_title_block_catalog_is_read_only_and_uses_exact_loaded_type(sheet_host):
+    doc, main, _ = sheet_host
+    result = main(doc, {"mode": "title-blocks"})
+    catalog = json.loads(result["catalog_json"])
+    assert catalog["title_blocks"] == [{"id": "80", "uid": "aa-80", "family": "Standard", "name": "A1"}]
+    assert doc.groups == 0
+
+
+def test_workbook_to_preview_rechecks_source_bytes_mapping_and_typed_values(tmp_path):
+    from openpyxl import Workbook
+
+    workbook = tmp_path / "Drawing Index.xlsx"
+    mapping_path = tmp_path / "mapping.json"
+    plan_path = tmp_path / "plan.json"
+    source = Workbook()
+    tab = source.active
+    tab.title = "Drawing Index"
+    tab.append(("Number", "Name", "Title Block", "Issued", "Scale offset", "Text"))
+    tab.append(("001", "Cover", "A1 sheet", "Yes", 25, "Issued for review"))
+    tab.append(("A-101", "Plan", "A1 sheet", None, None, None))
+    source.save(workbook)
+
+    def parameter(column, kind, identity, **options):
+        return {"column": column, "kind": kind, "scope": "title_block",
+                "parameter": {"kind": "guid", "id": identity}, **options}
+
+    mapping = {
+        "sheet": "Drawing Index",
+        "header_row": 1,
+        "columns": {"number": "Number", "name": "Name", "title_block": "Title Block"},
+        "title_block_types": {"A1 sheet": "80"},
+        "parameters": [
+            parameter("Issued", "yes_no", "12345678-1234-1234-1234-123456789ab1"),
+            parameter("Scale offset", "double", "12345678-1234-1234-1234-123456789ab2", unit="millimeters"),
+            parameter("Text", "string", "12345678-1234-1234-1234-123456789ab3"),
+        ],
+    }
+    mapping_path.write_text(json.dumps(mapping))
+    command = [sys.executable, SCRIPTS / "sheet_workbook.py", workbook, mapping_path]
+    request = json.loads(subprocess.check_output(command))["request"]
+    assert request["source"]["sha256"] == hashlib.sha256(workbook.read_bytes()).hexdigest()
+    assert [assignment["value"] for assignment in request["rows"][0]["parameters"]] == [True, 25, "Issued for review"]
+    assert request["rows"][1]["parameters"] == []
+    data = snapshot(request["rows"], [sheet("001", "Reserved", "11", placeholder=True)])
+    data["request"] = request
+    plan = preview.compute(data)
+    assert [(entry[1], entry[-1]) for entry in plan["after"]] == [("001", "Skip number conflict"), ("A-101", "Create")]
+    plan_path.write_text(preview.encode(plan))
+    check = [*command, "--check", plan_path]
+    assert subprocess.run(check, capture_output=True).returncode == 0
+
+    mapping["title_block_types"]["unused label"] = "81"
+    mapping_path.write_text(json.dumps(mapping))
+    result = subprocess.run(check, capture_output=True, text=True)
+    assert result.returncode == 2 and "changed after review" in result.stderr
+    del mapping["title_block_types"]["unused label"]
+    mapping_path.write_text(json.dumps(mapping))
+    tab["F2"].value = "Changed title block value"
+    source.save(workbook)
+    result = subprocess.run(check, capture_output=True, text=True)
+    assert result.returncode == 2 and "changed after review" in result.stderr
+    source.close()

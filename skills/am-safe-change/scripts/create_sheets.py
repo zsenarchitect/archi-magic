@@ -110,17 +110,23 @@ def matches_parameter(parameter, kind, value):
     return parameter.HasValue and element_key(parameter.AsElementId()) == element_key(value)
 
 
-def read_snapshot(document, request, excluded=()):
-    identity = document_identity(document)
-    request = preview.normalize_request(request)
-    requested = {row["number"]: row for row in request["rows"]}
-    types, sheets = [], []
+def title_block_types(document):
+    types = []
     collector = DB.FilteredElementCollector(document).OfClass(DB.FamilySymbol).OfCategory(DB.BuiltInCategory.OST_TitleBlocks)
     for symbol in collector:
         if len(types) >= preview.MAX_TYPES:
             raise ValueError("The complete title block type inventory exceeds its limit.")
         types.append({"id": element_key(symbol.Id), "uid": str(symbol.UniqueId), "family": symbol.FamilyName,
                       "name": DB.Element.Name.GetValue(symbol)})
+    return sorted(types, key=lambda item: int(item["id"]))
+
+
+def read_snapshot(document, request, excluded=()):
+    identity = document_identity(document)
+    request = preview.normalize_request(request)
+    requested = {row["number"]: row for row in request["rows"]}
+    types = title_block_types(document)
+    sheets = []
     for sheet in DB.FilteredElementCollector(document).OfClass(DB.ViewSheet):
         key = element_key(sheet.Id)
         if key in excluded:
@@ -142,7 +148,7 @@ def read_snapshot(document, request, excluded=()):
                 row["parameters"] = None
         sheets.append(row)
     return {"kind": "sheet-creation-snapshot", "complete": True, "document": identity, "request": request,
-            "title_blocks": sorted(types, key=lambda item: int(item["id"])),
+            "title_blocks": types,
             "sheets": sorted(sheets, key=lambda item: int(item["id"]))}
 
 
@@ -255,12 +261,15 @@ def verify_kept(document, plan, receipt):
 
 def main(document, args):
     mode = args.get("mode", "read")
+    if mode == "title-blocks":
+        catalog = {"document": document_identity(document), "title_blocks": title_block_types(document)}
+        return {"status": "ok", "catalog_json": preview.encode(catalog)}
     if mode == "apply":
         return apply(document, args["plan"])
     if mode == "verify":
         return verify_kept(document, args["plan"], args["receipt"])
     if mode != "read":
-        raise ValueError("Choose read, apply, or verify for sheet creation.")
+        raise ValueError("Choose title-blocks, read, apply, or verify for sheet creation.")
     snapshot = read_snapshot(document, args["request"])
     return {"status": "ok", "snapshot_json": preview.encode(snapshot)}
 

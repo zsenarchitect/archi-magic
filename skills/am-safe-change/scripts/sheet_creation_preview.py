@@ -117,8 +117,10 @@ def normalize_request(request):
         raise ValueError("Request at least one sheet.")
     source = request.get("source")
     if "source" in request:
-        fields(source, ("sha256", "file", "sheet", "header_row", "mapping"))
+        fields(source, ("sha256", "file", "sheet", "header_row", "mapping"), ("mapping_sha256",))
         token(source["sha256"], SHA256)
+        if "mapping_sha256" in source:
+            token(source["mapping_sha256"], SHA256)
         text(source["file"])
         text(source["sheet"])
         if type(source["header_row"]) is not int or not 1 <= source["header_row"] <= 5000:
