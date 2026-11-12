@@ -180,6 +180,47 @@ This is a development workflow for standalone Revit 2026 files. Use only disposa
 3. Collect only after the qualified host has exited. Use `python scripts/batch_model_audit.py collect --plan batch-plan.json --host-exited > batch-report.json`. The report checks the original file identities and the original and staged hashes again. Each original gets a row, including missing, failed, and partial audits.
 4. Read the status and coverage for each row. The report gives health metric counts and parameter offender counts. Keep the workspace until the host exits. Keep model files, plan, and reports private.
 
+## Qualify family metadata reads (issue #153)
+
+Use this development workflow in a disposable Windows Revit 2026 host. Use ordinary local test families. The first native run must confirm the worker and file handles.
+
+1. Run `family_library_discovery.py` to create a discovery manifest. Run `stage_family_library.py` with that manifest and the exact family path to create a staging receipt. Use Python 3.13 or newer for Windows staging.
+2. Prepare one native request with `python scripts/read_family_library.py prepare staging.json --path "Fixtures/Example.rfa" --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use the expected loaded build identifiers. Keep the printed worker directory private.
+3. Set `ARCHI_MAGIC_FAMILY_WORKER_DIR` to the printed directory in the shell that launches the worker. Run `pyrevit run scripts/read_family_library.py --revit=2026` with no model arguments. Use a CPython-capable batch runner. Set a timeout outside Revit and confirm the disposable process exits.
+4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt lists thumbnails and catalog coverage. The worker confirms catalog types in an empty scratch project. Add `--metadata-only` during preparation to qualify the metadata read alone. Prepare a new request for any retry.
+
+### Publish and search a local family index
+
+1. Run `python scripts/family_library_index.py begin <private-index-directory> discovery.json --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use a separate index folder outside the library.
+2. Stage the exact sources from that manifest. Prepare each worker with the same parameter selection and builds. Pass the refresh token as `--generation` to the worker's prepare command. Run one worker at a time.
+3. Run `python scripts/family_library_index.py publish <private-index-directory> <token> --worker <worker-directory>`. Repeat `--worker` for each completed receipt. Read the coverage for sources without a receipt.
+4. Run `python scripts/family_library_index.py search <private-index-directory> --name window --category windows`. Add `--parameter <ID-or-name> --equals <value>` to filter by a type parameter. Numeric filters use the stored Revit internal value. Use the source path to distinguish equal family and type names. Check `selectable` for types with catalog conflicts.
+
+### Review a family placement
+
+1. Select the exact path and type from the search results. Run `python scripts/family_library_index.py select <index> <token> --path "<path>" --type "<type>"`. Save the selection as JSON.
+2. Call `get_context` first. Open a saved standalone project in the same Revit build. Run `read_family_placement.py` in query mode. Pass the selection object as `selection` and the reviewed level ID string as `level_id`.
+3. Run `python scripts/family_placement_preview.py --index <index> --selection selection.json --project-read project.json --xyz 1 2 23 --rotation 90`. Supply absolute model coordinates in internal feet. Review type reuse, loading, parameter differences, and activation in the change preview.
+4. Review the preview and its ownership scope. Use the probe below only to qualify placement in a disposable project.
+
+### Test family placement with mandatory rollback
+
+1. Use a saved, standalone disposable project in Revit 2026. Use a reviewed nonzero level and rotation. Call `get_context` and check the active project, Revit build, CPython engine, and ask policy.
+2. Run the placement query with `audit_inventory: true`. Save its full bridge record as `before.json`. Review the placement preview and check ownership for its `ownership_ids`.
+3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`. Pass the baseline query's `audit_token` as `baseline_audit_token`. For a missing type, also pass the exact `staging` receipt.
+4. Save the full trial record as `trial.json`. For a successful rollback, run the placement query again with `audit_inventory: true`. Pass the trial's `effects.added` as `expect_absent_ids` and its `transaction` as `trial_transaction`. Save the full bridge record as `after.json`.
+5. Run `python scripts/verify_family_placement_probe.py preview.json before.json trial.json after.json`. Stop on any unexpected effect or unresolved rollback.
+6. The missing-type trial allows one new family, one new type, and one new instance. Use a worker-verified catalog type for a paired trial. Existing siblings and Keep/Discard require separate native qualification.
+
+### Qualify the Keep/Discard handoff
+
+1. Complete the independent rollback check first. Recheck `get_context` and review the same placement and ownership scope.
+2. Use `apply_family_placement.py` in guarded CPython modify mode on the disposable project. Pass the same probe inputs as `placement`. Pass the three full records as `before`, `trial`, and `after`.
+3. Check the active model and result in Revit. Use the Revit prompt to Keep or Discard. Save the full modify record. Check for `approval: user` and the matching `committed` or `discarded` decision.
+4. Read the project again with `read_family_placement.py` in query mode. Pass the same selection and level. Add a `decision_audit` object. Set `kept` from the bridge decision. Pass the modify result's `transaction`, `placement.id` as `instance_id`, and its `effects.added` and `effects.modified` as `added_ids` and `modified_ids`.
+5. Save the full fresh query record. Run `python scripts/verify_family_placement_decision.py preview.json before.json trial.json after.json modify.json fresh.json`. Check the result for the exact retained instance or the restored project.
+6. This handoff requires native qualification with the loaded bridge. It stops if the script cannot read the live ask policy.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
