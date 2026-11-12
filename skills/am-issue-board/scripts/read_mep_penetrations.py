@@ -4,10 +4,11 @@ from itertools import product
 import json
 import math
 from time import monotonic
+from types import SimpleNamespace
 
 from issue_board import saved_document_identity
 from mep_penetration_preview import fingerprint
-from mep_penetration_spacing import point_to_segment, scalar
+from mep_penetration_spacing import profile, scalar, spacing_conflicts, vertices
 from structural_compare_cli import LIMIT, bounded_list, checked_id, uid
 
 
@@ -100,20 +101,173 @@ def face_uv(face, point):
     return [relative.DotProduct(face.XVector), relative.DotProduct(face.YVector)]
 
 
-def face_edges(DB, face, budget):
-    loops = list(face.EdgeLoops)
-    if len(loops) != 1:
-        raise ValueError("The host face contains an existing cut or ambiguous loops.")
-    edges = []
-    for edge in loops[0]:
-        budget.visit()
-        curve = edge.AsCurve()
-        if not isinstance(curve, DB.Line) or not curve.IsBound:
-            raise ValueError("The host face boundary is not a straight-edge outline.")
-        edges.append([curve.GetEndPoint(0), curve.GetEndPoint(1)])
-    if len(edges) != 4:
-        raise ValueError("The host face is outside the supported rectangular scope.")
+def loops(DB, face, budget):
+    result = []
+    for loop in face.EdgeLoops:
+        curves = []
+        for edge in loop:
+            budget.visit()
+            curves.append(edge.AsCurve())
+        if not curves:
+            raise ValueError("The host face contains an empty trim loop.")
+        result.append(curves)
+    return result
+
+
+def rectangle_edges(DB, curves, tolerance):
+    if len(curves) != 4 or not all(isinstance(curve, DB.Line) and curve.IsBound for curve in curves):
+        raise ValueError("The host outline is outside the supported rectangular scope.")
+    edges = [(curve.GetEndPoint(0), curve.GetEndPoint(1)) for curve in curves]
+    for index, (a, b) in enumerate(edges):
+        if a.DistanceTo(b) <= tolerance:
+            raise ValueError("The measured host outline has a degenerate edge.")
+        for vertex, other_end in ((a, b), (b, a)):
+            neighbors = [end.Subtract(vertex) for other_index, edge in enumerate(edges) if other_index != index
+                         for near, end in (edge, edge[::-1]) if near.DistanceTo(vertex) <= tolerance]
+            direction = other_end.Subtract(vertex).Normalize()
+            if len(neighbors) != 1 or abs(direction.DotProduct(neighbors[0].Normalize())) > 1e-9:
+                raise ValueError("The measured host outline has an ambiguous corner.")
     return edges
+
+
+def loop_profile(DB, curves, frame, tolerance):
+    if all(isinstance(curve, DB.Arc) for curve in curves):
+        first = curves[0]
+        radius = scalar(first.Radius)
+        length = sum(curve.ApproximateLength for curve in curves)
+        if (radius <= tolerance or abs(length - 2 * math.pi * radius) > tolerance
+                or any(abs(curve.Radius - radius) > tolerance or curve.Center.DistanceTo(first.Center) > tolerance
+                       or abs(curve.Normal.DotProduct(frame.Normal)) < 1 - 1e-9 for curve in curves)):
+            raise ValueError("A host trim does not form a supported circular cut.")
+        return {"shape": "round", "center": face_uv(frame, first.Center), "diameter": 2 * radius}, None
+
+    edges = rectangle_edges(DB, curves, tolerance)
+    points = sorted(face_uv(frame, point) for edge in edges for point in edge)
+    a, b = sorted(sorted(face_uv(frame, point) for point in edge) for edge in edges)[0]
+    center = [(a + b) / 2 for a, b in zip(points[0], points[-1])]
+    width = math.dist(a, b)
+    height = next(math.dist(*edge) for edge in ([face_uv(frame, point) for point in edge] for edge in edges)
+                  if any(math.dist(a, point) <= tolerance for point in edge)
+                  and not any(math.dist(b, point) <= tolerance for point in edge))
+    angle = math.remainder(math.atan2(b[1] - a[1], b[0] - a[0]), math.pi)
+    return {"shape": "rectangular", "center": center, "width": width, "height": height,
+            "angle_rad": angle}, edges
+
+
+def area(outline):
+    if outline["shape"] == "round":
+        return math.pi * (outline["diameter"] / 2) ** 2
+    return outline["width"] * outline["height"]
+
+
+def margin(outline, point):
+    center, size = profile(outline)
+    dx, dy = point[0] - center[0], point[1] - center[1]
+    if outline["shape"] == "round":
+        return size - math.hypot(dx, dy)
+    width, height, cos, sin = size
+    return min(width - abs(dx * cos + dy * sin), height - abs(-dx * sin + dy * cos))
+
+
+def matches_outline(first, second, tolerance):
+    if first["shape"] != second["shape"] or math.dist(first["center"], second["center"]) > tolerance:
+        return False
+    if first["shape"] == "round":
+        return abs(first["diameter"] - second["diameter"]) <= tolerance
+    a = vertices(*profile(first))
+    b = vertices(*profile(second))
+    return all(sum(math.dist(point, other) <= tolerance for other in b) == 1 for point in a)
+
+
+def host_face_profiles(DB, face_loops, frame, tolerance, budget):
+    profiles = [loop_profile(DB, curves, frame, tolerance) for curves in face_loops]
+    if not profiles:
+        raise ValueError("The host has no complete face boundaries.")
+    profiles.sort(key=lambda row: area(row[0]), reverse=True)
+    outer, edges = profiles[0]
+    if edges is None:
+        raise ValueError("The host outer outline is not rectangular.")
+    holes = [outline for outline, _ in profiles[1:]]
+    for hole in holes:
+        center, size = profile(hole)
+        if hole["shape"] == "round":
+            fits = margin(outer, center) > size + tolerance
+        else:
+            fits = all(margin(outer, point) > tolerance for point in vertices(center, size))
+        if not fits:
+            raise ValueError("An existing cut reaches the outer host boundary.")
+    keyed = [dict(hole, key=str(index)) for index, hole in enumerate(holes)]
+    budget.visit(len(keyed) * (len(keyed) - 1) // 2)
+    if spacing_conflicts(keyed, [], tolerance):
+        raise ValueError("Existing cuts overlap or cannot be measured independently.")
+    budget.visit(0)
+    return outer, edges, holes
+
+
+def world_point(frame, uv, depth):
+    return frame.Origin.Add(frame.XVector.Multiply(uv[0])).Add(frame.YVector.Multiply(uv[1])).Add(
+        frame.Normal.Multiply(depth))
+
+
+def verify_prism(DB, solid, faces, frame, depth, outer, holes, tolerance, budget):
+    rectangles = [outer] + [hole for hole in holes if hole["shape"] == "rectangular"]
+    circles = [hole for hole in holes if hole["shape"] == "round"]
+    side_corners = []
+    for rectangle in rectangles:
+        corners = vertices(*profile(rectangle))
+        for a, b in zip(corners, corners[1:] + corners[:1]):
+            side_corners.append([world_point(frame, point, z) for point in (a, b) for z in (0, depth)])
+    cylindrical_areas = [0.0] * len(circles)
+    principal = 0
+    for face in solid.Faces:
+        budget.visit()
+        if isinstance(face, DB.PlanarFace):
+            if abs(face.FaceNormal.DotProduct(frame.Normal)) >= 1 - 1e-9:
+                station = face.Origin.Subtract(frame.Origin).DotProduct(frame.Normal)
+                if min(abs(station), abs(station - depth)) > tolerance:
+                    raise ValueError("The host has an internal or stepped planar face.")
+                principal += 1
+                continue
+            boundaries = loops(DB, face, budget)
+            if len(boundaries) != 1:
+                raise ValueError("The host side face has an unsupported trim.")
+            actual = [point for edge in rectangle_edges(DB, boundaries[0], tolerance) for point in edge]
+            budget.visit(len(side_corners))
+            candidates = [index for index, expected in enumerate(side_corners)
+                          if all(any(point.DistanceTo(corner) <= tolerance for point in actual) for corner in expected)
+                          and all(any(point.DistanceTo(corner) <= tolerance for corner in expected) for point in actual)]
+            if len(candidates) != 1:
+                raise ValueError("The host side does not match one measured through profile.")
+            side_corners.pop(candidates[0])
+        elif isinstance(face, DB.CylindricalFace):
+            if abs(face.Axis.DotProduct(frame.Normal)) < 1 - 1e-9:
+                raise ValueError("A circular cut is not perpendicular to the host.")
+            center = face_uv(frame, face.Origin)
+            radius = face.get_Radius(0).GetLength()
+            budget.visit(len(circles))
+            candidates = [index for index, circle in enumerate(circles) if math.dist(center, circle["center"]) <= tolerance
+                          and abs(2 * radius - circle["diameter"]) <= tolerance]
+            if len(candidates) != 1 or abs(face.get_Radius(1).GetLength() - radius) > tolerance:
+                raise ValueError("The cylindrical side does not match one measured through cut.")
+            points = []
+            for loop in loops(DB, face, budget):
+                for curve in loop:
+                    if isinstance(curve, DB.Arc):
+                        points.append(curve.Center)
+                    elif isinstance(curve, DB.Line) and curve.IsBound:
+                        points.extend(curve.GetEndPoint(index) for index in (0, 1))
+                    else:
+                        raise ValueError("The cylindrical side has an unsupported trim.")
+            stations = [point.Subtract(frame.Origin).DotProduct(frame.Normal) for point in points]
+            if not stations or abs(min(stations)) > tolerance or abs(max(stations) - depth) > tolerance:
+                raise ValueError("The cylindrical side does not span the full host depth.")
+            cylindrical_areas[candidates[0]] += face.Area
+        else:
+            raise ValueError("The host has an unsupported solid face.")
+    if (principal != len(faces) or side_corners or
+            any(abs(actual - math.pi * cut["diameter"] * depth) > tolerance * (depth + cut["diameter"])
+                for actual, cut in zip(cylindrical_areas, circles))):
+        raise ValueError("The host solid does not match the complete through-cut inventory.")
 
 
 def element_scope(element):
@@ -146,34 +300,38 @@ def principal_host(DB, element, minimum_web, tolerance, budget):
             or (kind == "wall" and abs(normal.Z) > 1e-9) or (kind == "floor" and abs(normal.Z) < 1 - 1e-9)):
         raise ValueError("The host faces are sloped, nonparallel, or have no verified thickness.")
 
-    outlines = [face_edges(DB, face, budget) for face in faces]
-    sizes = [math.dist(face_uv(first, a), face_uv(first, b)) for a, b in outlines[0]]
-    if (min(sizes) <= tolerance or abs(first.Area - sizes[0] * sizes[1]) > tolerance * max(sizes)
-            or abs(second.Area - first.Area) > tolerance * max(sizes)):
-        raise ValueError("The host principal outlines are not congruent rectangles.")
-    for edge in outlines[0]:
-        a, b = edge
-        neighbors = [end.Subtract(a) for other in outlines[0] if other is not edge
-                     for near, end in (other, other[::-1]) if near.DistanceTo(a) <= tolerance]
-        direction = b.Subtract(a).Normalize()
-        if len(neighbors) != 1 or abs(direction.DotProduct(neighbors[0].Normalize())) > 1e-9:
-            raise ValueError("The measured host outline has an ambiguous corner.")
-    first_uv = [face_uv(first, point) for edge in outlines[0] for point in edge]
-    second_uv = [face_uv(first, point) for edge in outlines[1] for point in edge]
-    if any(math.dist(a, b) > tolerance for a, b in zip(sorted(first_uv), sorted(second_uv))):
-        raise ValueError("The host principal outlines differ in the same face frame.")
+    first_loops, second_loops = [loops(DB, face, budget) for face in faces]
+    initial = SimpleNamespace(Origin=first.Origin, XVector=first.XVector, YVector=first.YVector, Normal=normal)
+    _, outer_edges, _ = host_face_profiles(DB, first_loops, initial, tolerance, budget)
+    origin, neighbor = min(((point, other) for edge in outer_edges for point, other in (edge, edge[::-1])),
+                           key=lambda pair: (xyz(pair[0]), xyz(pair[1])))
+    x = neighbor.Subtract(origin).Normalize()
+    frame = SimpleNamespace(Origin=origin, XVector=x, YVector=normal.CrossProduct(x), Normal=normal)
+    outer, outer_edges, holes = host_face_profiles(DB, first_loops, frame, tolerance, budget)
+    other_outer, other_edges, other_holes = host_face_profiles(DB, second_loops, frame, tolerance, budget)
+    if not matches_outline(outer, other_outer, tolerance) or len(holes) != len(other_holes):
+        raise ValueError("The host face outlines differ across its depth.")
+    for hole in holes:
+        budget.visit(len(other_holes))
+        matches = [index for index, other in enumerate(other_holes) if matches_outline(hole, other, tolerance)]
+        if len(matches) != 1:
+            raise ValueError("A host cut cannot be matched uniquely across its depth.")
+        other_holes.pop(matches[0])
 
     solids = native_solids(DB, element, budget)
-    if (len(solids) != 1 or solids[0].Faces.Size != 6
-            or not all(isinstance(face, DB.PlanarFace) for face in solids[0].Faces)
-            or abs(solids[0].Volume - first.Area * depth) > tolerance * first.Area):
-        raise ValueError("The host has a cut or solid outside the supported uncut prism scope.")
+    net_area = area(outer) - sum(area(hole) for hole in holes)
+    if (len(solids) != 1 or net_area <= 0 or abs(solids[0].Volume - net_area * depth) > tolerance * net_area
+            or any(abs(face.Area - net_area) > tolerance * max(outer["width"], outer["height"]) for face in faces)):
+        raise ValueError("The host area and volume do not match the measured profiles.")
+    verify_prism(DB, solids[0], faces, frame, depth, outer, holes, tolerance, budget)
 
-    corners = sorted(xyz(point) for outline in outlines for edge in outline for point in edge)
+    corners = sorted(xyz(point) for outline in (outer_edges, other_edges) for edge in outline for point in edge)
+    holes.sort(key=lambda row: (row["center"], row["shape"]))
+    existing = [dict(hole, key=f"measured-cut-{index + 1}") for index, hole in enumerate(holes)]
     row = dict(element_record(element), kind=kind, normal=xyz(normal), depth_ft=scalar(depth),
-               gross_sha256=fingerprint(corners), cuts_complete=True, minimum_web_ft=minimum_web, existing=[],
+               gross_sha256=fingerprint(corners), cuts_complete=True, minimum_web_ft=minimum_web, existing=existing,
                **scope)
-    return row, (faces, outlines, normal, solids[0], bounds(DB, element, DB.Transform.Identity))
+    return row, (faces, frame, outer, holes, solids[0], bounds(DB, element, DB.Transform.Identity))
 
 
 def physical_ends(DB, element, curve, tolerance, budget):
@@ -278,12 +436,28 @@ def measured_run(DB, document, element, transform, tolerance, budget):
 
 
 def measured_pair(DB, host, run, clearance, tolerance, budget):
-    faces, outlines, normal, solid, host_box = host
+    faces, frame, outer, holes, solid, host_box = host
     line, ends, width_axis, run_box = run
     padding = clearance + tolerance
     if any(low > r_high + padding or r_low - padding > high
            for (low, high), (r_low, r_high) in zip(host_box, run_box)):
-        return {"status": "no_crossing"}
+        return {"status": "no_crossing", "gross_verified": True}
+
+    normal = frame.Normal
+    first, second = ends
+    delta = second.Subtract(first)
+    along = delta.DotProduct(normal)
+    if abs(along) <= tolerance or delta.Subtract(normal.Multiply(along)).GetLength() > tolerance:
+        raise ValueError("The run is not perpendicular to the host faces.")
+    start = first.Subtract(frame.Origin).DotProduct(normal)
+    depth = faces[1].Origin.Subtract(frame.Origin).DotProduct(normal)
+    if min(start, start + along) >= -tolerance or max(start, start + along) <= depth + tolerance:
+        raise ValueError("The finite run does not extend past both faces.")
+    points = [first.Add(delta.Multiply((station - start) / along)) for station in (0, depth)]
+    centers = [face_uv(frame, point) for point in points]
+    edge_distance = min(margin(outer, center) for center in centers)
+    if edge_distance <= tolerance:
+        raise ValueError("The crossing coincides with or lies outside the outer host edge.")
 
     options = DB.SolidCurveIntersectionOptions()
     intersection = None
@@ -292,41 +466,35 @@ def measured_pair(DB, host, run, clearance, tolerance, budget):
         intersection = solid.IntersectWithCurve(line, options)
         budget.visit()
         if intersection.SegmentCount == 0:
-            raise ValueError("The swept bounds overlap but the centerline does not prove a crossing.")
-        if intersection.SegmentCount != 1:
+            covering = [hole for hole in holes if all(margin(hole, center) > tolerance for center in centers)]
+            if len(covering) != 1:
+                raise ValueError("The measured gross crossing has no uniquely verified existing cut.")
+            status = "gross_crossing"
+        elif intersection.SegmentCount == 1:
+            segment = intersection.GetCurveSegment(0)
+            measured = sorted((segment.GetEndPoint(0), segment.GetEndPoint(1)),
+                              key=lambda point: point.Subtract(frame.Origin).DotProduct(normal))
+            if any(a.DistanceTo(b) > tolerance for a, b in zip(measured, points)):
+                raise ValueError("The solid crossing does not span both principal faces.")
+            for face, point in zip(faces, points):
+                budget.visit()
+                projected = face.Project(point)
+                if projected is None or projected.Distance > tolerance or not face.IsInside(projected.UVPoint):
+                    raise ValueError("The crossing does not meet both trimmed face interiors.")
+            status = "solid_crossing"
+        else:
             raise ValueError("The solid produced multiple crossing segments.")
-        segment = intersection.GetCurveSegment(0)
-        points = sorted((segment.GetEndPoint(0), segment.GetEndPoint(1)),
-                        key=lambda point: point.Subtract(faces[0].Origin).DotProduct(normal))
     finally:
         if intersection is not None:
             intersection.Dispose()
         options.Dispose()
 
-    delta = points[1].Subtract(points[0])
-    along = delta.DotProduct(normal)
-    if along <= tolerance or delta.Subtract(normal.Multiply(along)).GetLength() > tolerance:
-        raise ValueError("The run is not perpendicular to the host faces.")
-    stations = [point.Subtract(faces[0].Origin).DotProduct(normal) for point in ends]
-    depth = faces[1].Origin.Subtract(faces[0].Origin).DotProduct(normal)
-    if min(stations) >= -tolerance or max(stations) <= depth + tolerance:
-        raise ValueError("The finite run does not extend past both faces.")
-
-    distances = []
-    for face, outline, point in zip(faces, outlines, points):
-        budget.visit()
-        projected = face.Project(point)
-        if projected is None or projected.Distance > tolerance or not face.IsInside(projected.UVPoint):
-            raise ValueError("The crossing does not meet both principal face interiors.")
-        center = face_uv(face, point)
-        distances.extend(point_to_segment(center, face_uv(face, a), face_uv(face, b)) for a, b in outline)
-    edge_distance = min(distances)
-    if edge_distance <= tolerance:
-        raise ValueError("The crossing coincides with or touches a host edge.")
-    row = {"status": "solid_crossing", "entry_ft": xyz(points[0]), "exit_ft": xyz(points[1]),
-           "center_uv_ft": face_uv(faces[0], points[0]), "edge_distance_ft": edge_distance}
+    row = {"status": status, "entry_ft": xyz(points[0]), "exit_ft": xyz(points[1]),
+           "center_uv_ft": centers[0], "edge_distance_ft": edge_distance, "gross_verified": True}
+    if status == "gross_crossing":
+        row["existing_cut_verified"] = True
     if width_axis is not None:
-        row["angle_rad"] = math.atan2(width_axis.DotProduct(faces[0].YVector), width_axis.DotProduct(faces[0].XVector))
+        row["angle_rad"] = math.atan2(width_axis.DotProduct(frame.YVector), width_axis.DotProduct(frame.XVector))
     return row
 
 

@@ -190,7 +190,7 @@ Save the host project and call `get_context`. Run `scripts/read_mep_penetrations
 
 Pass `link_instance_id`, `host_ids`, and `run_ids` as exact decimal strings. Use one loaded link and up to 100 selected IDs per model. Pass `clearance_ft`, `tolerance_ft`, and `minimum_web_ft` from the reviewed scope.
 
-Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The first native read covers uncut rectangular host solids and finite straight runs with measured exterior profiles. It reports unsupported or ambiguous geometry as unresolved.
+Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The reader covers rectangular host solids and finite straight runs with measured exterior profiles. It checks round and rectangular cuts against both face outlines and the full host depth. It reports an existing cut without a tracking record as untracked. Unsupported or ambiguous geometry stays unresolved.
 
 Verify this reader on a disposable Revit fixture before use. Native tracking storage and guarded placement are pending.
 
