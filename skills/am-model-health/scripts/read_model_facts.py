@@ -143,14 +143,19 @@ def host_facts(doc, app, facts, title, path):
     if location == "unknown":
         facts.issues.add("model_location_unavailable")
     file_name = filename(path)
-    if location not in ("unsaved", "detached") and not (file_name or filename(cloud_path)):
+    central_file_name = filename(central_path)
+    cloud_file_name = filename(cloud_path)
+    observed_name = file_name or cloud_file_name
+    if location == "revit_server" and not path:
+        observed_name = central_file_name
+    if location not in ("unsaved", "detached") and not observed_name:
         facts.issues.add("file_name_unavailable")
     return {
         "title": title, "file_name": file_name, "current_path": path, "location": location,
         "workshared": workshared, "detached": detached, "is_cloud": cloud,
-        "central_path": central_path, "central_file_name": filename(central_path),
+        "central_path": central_path, "central_file_name": central_file_name,
         "central_state": central_state, "cloud_path": cloud_path,
-        "cloud_file_name": filename(cloud_path),
+        "cloud_file_name": cloud_file_name,
         "revit_year": facts.text(lambda: app.VersionNumber, "revit_year_unavailable"),
         "revit_build": facts.text(lambda: app.VersionBuild, "revit_build_unavailable"),
     }
