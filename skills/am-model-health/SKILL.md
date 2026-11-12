@@ -230,6 +230,13 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 3. Call `get_context`. Run `read_batch_family_types.py` in CPython query mode in the saved project. Pass the lookup object as `lookup`. Save the full project read.
 4. Run `python scripts/batch_family_type_preview.py preview --lookup lookup.json --project-read project.json`. Review the skipped, blocked, and ready rows. A ready row still needs a derivation preview and native qualification.
 
+### Prepare a writable family copy for derivation
+
+1. Save the reviewed batch preview as `preview.json`. Use `prepare_batch_family_derivation.py` with the lookup, project read, preview, staging receipt, exact source path, and destination parent. Use a private local destination outside the library and protected staging.
+2. Prepare one source at a time. The script returns no working file when every type for that source already exists. Save the derivation receipt when it creates a copy.
+3. Open only the working RFA named in the receipt. Call `get_context`. Run `read_batch_family_derivation.py` in CPython query mode with the receipt as `derivation`. Use the skill's scripts folder as the query workspace.
+4. Check the exact embedded seeds, type names, and writable size definitions. Save the family read for the derivation preview. Native type edits still require a separate reviewed dry run and Keep/Discard.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

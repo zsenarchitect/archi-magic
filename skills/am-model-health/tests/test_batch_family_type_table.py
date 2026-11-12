@@ -151,3 +151,114 @@ B.rfa,Seed,New type,6
     snapshot = read_project(document, db, lookup)
     assert "not dimensionless" in snapshot["rows"][2]["issues"][0]
     assert preview.build_preview(lookup, snapshot)["review"]["outcomes"][2]["status"] == "blocked"
+
+
+@pytest.fixture
+def derivation_input(discovery, tmp_path, monkeypatch):
+    import prepare_batch_family_derivation as derivation
+    import stage_family_library as staging
+    from batch_family_type_preview import build_preview
+
+    stage_parent = tmp_path.resolve() / "staging"
+    work_parent = tmp_path.resolve() / "work"
+    stage_parent.mkdir()
+    work_parent.mkdir()
+    monkeypatch.setattr(staging, "free_bytes", lambda parent: 10 * staging.HEADROOM)
+    monkeypatch.setattr(derivation, "free_bytes", lambda parent: 10 * staging.HEADROOM)
+    path = "A/Fixture.rfa"
+    request = bind_table(b"source_path,seed_type,type,Width[ft]\nA/Fixture.rfa,Seed,New,4\n", discovery)
+    field = {"id": "42", "name": "Width", "storage": "Double", "data_type": "length", "shared_guid": None,
+             "read_only": False, "formula_driven": False, "reporting": False}
+    sizes = [dict(request["rows"][0]["sizes"][0], definition=field)]
+    rows = [{"line": 2, "source_path": path, "seed_type": "Seed", "type": "New",
+             "family": "Fixture", "category": {"id": "-1000"}, "build": "fixture", "sizes": sizes, "issues": []}]
+    lookup = {"kind": "batch-family-type-lookup", "version": 1, "request": request, "rows": rows}
+    lookup["lookup_sha256"] = manifest_digest(lookup)
+    read = {"kind": "batch-family-type-project-read", "version": 1, "lookup_sha256": lookup["lookup_sha256"],
+            "project": {"project_uid": "fixture"}, "revit_year": "2026", "revit_build": "fixture",
+            "rows": [{"line": 2, "existing": None, "sizes": [dict(sizes[0], internal_value=4.0)],
+                      "differences": [], "issues": []}]}
+    preview = build_preview(lookup, read)
+    staged = staging.stage(discovery, [path], str(stage_parent))
+    return lookup, read, preview, staged, path, str(work_parent)
+
+
+def test_working_copy_preserves_source_and_excludes_companion(derivation_input):
+    from prepare_batch_family_derivation import create_working_copy, verified_working_copy
+
+    lookup, _, preview, staged, source_path, _ = derivation_input
+    result = create_working_copy(*derivation_input)
+    assert result["preview_sha256"] == manifest_digest(preview)
+    assert result["rows"][0]["sizes"][0]["internal_value"] == 4.0
+    protected = Path(staged["workspace"]) / staged["pairs"][0]["directory"]
+    original = Path(lookup["request"]["root"]) / source_path
+    with verified_working_copy(result) as copy:
+        assert copy.name == original.name
+        assert {item.name for item in copy.parent.iterdir()} == {"Fixture.rfa"}
+        assert copy.read_bytes() == original.read_bytes()
+        assert copy.stat().st_ino != (protected / copy.name).stat().st_ino
+    copy.with_suffix(".txt").write_bytes(b"unexpected catalog")
+    with pytest.raises(ValueError, match="unexpected files"):
+        with verified_working_copy(result):
+            pytest.fail("Unreviewed sidecar reached the native handoff.")
+    assert (protected / "Fixture.txt").read_bytes() == b"reviewed catalog"
+    assert original.read_bytes() == b"reviewed family"
+
+
+def test_stale_library_source_and_changed_preview_cannot_create_a_copy(derivation_input):
+    from prepare_batch_family_derivation import create_working_copy
+
+    lookup, read, preview, staged, source_path, destination = derivation_input
+    with pytest.raises(ValueError, match="matching unblocked preview"):
+        create_working_copy(lookup, read, dict(preview, title="Changed"), staged, source_path, destination)
+    (Path(lookup["request"]["root"]) / source_path).write_bytes(b"changed RFA")
+    with pytest.raises(ValueError, match="source, catalog, or ancestry changed"):
+        create_working_copy(*derivation_input)
+    assert list(Path(destination).iterdir()) == []
+
+
+def test_existing_only_does_not_create_working_copy(derivation_input):
+    from batch_family_type_preview import build_preview
+    from prepare_batch_family_derivation import create_working_copy
+
+    lookup, read, _, staged, source_path, destination = derivation_input
+    read["rows"][0]["existing"] = {"family_id": "40", "symbol_id": "41"}
+    preview = build_preview(lookup, read)
+    result = create_working_copy(lookup, read, preview, staged, source_path, destination)
+    assert result["status"] == "no_derivation_needed"
+    assert list(Path(destination).iterdir()) == []
+
+
+def test_working_family_read_binds_exact_seed_and_writable_definition(derivation_input):
+    from types import SimpleNamespace
+    from prepare_batch_family_derivation import create_working_copy
+    from read_batch_family_derivation import read_working_family
+
+    plan = create_working_copy(*derivation_input)
+    family_type = SimpleNamespace(Name="Seed", HasValue=lambda _: True, AsDouble=lambda _: 3.0,
+                                  AsString=lambda _: None, AsInteger=lambda _: None, AsElementId=lambda _: None)
+    parameter = SimpleNamespace(Id=SimpleNamespace(Value=42), IsShared=False, StorageType="Double",
+                                Definition=SimpleNamespace(Name="Width", GetDataType=lambda: SimpleNamespace(TypeId="length")),
+                                IsReadOnly=False, IsDeterminedByFormula=False, IsReporting=False, IsInstance=False)
+    family = SimpleNamespace(Name="Fixture", FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-1000)))
+    document = SimpleNamespace(PathName=str(Path(plan["workspace"]) / "Fixture.rfa"), IsFamilyDocument=True,
+                               IsReadOnly=False, IsModified=False, IsWorkshared=False, IsModelInCloud=False,
+                               IsModifiable=False, Application=SimpleNamespace(VersionNumber="2026", VersionBuild="fixture"),
+                               OwnerFamily=family,
+                               FamilyManager=SimpleNamespace(Parameters=[parameter], Types=[family_type],
+                                                             CurrentType=family_type))
+    record = read_working_family(document, plan)
+    assert record["derivation_sha256"] == plan["derivation_sha256"]
+    assert record["state"]["types"] == {"Seed": {"42": {"state": "value", "value": 3.0}}}
+    assert record["state"]["current_type"] == "Seed"
+    family_type.Name = "Different seed"
+    with pytest.raises(ValueError, match="reviewed seed is missing"):
+        read_working_family(document, plan)
+    family_type.Name = "Seed"
+    parameter.IsDeterminedByFormula = True
+    parameter.Formula = "Height / 2"
+    with pytest.raises(ValueError, match="changed or is not writable"):
+        read_working_family(document, plan)
+    document.PathName = str(Path(derivation_input[0]["request"]["root"]) / plan["source"]["path"])
+    with pytest.raises(ValueError, match="exact saved writable family copy"):
+        read_working_family(document, plan)
