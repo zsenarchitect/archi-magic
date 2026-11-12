@@ -131,7 +131,10 @@ def model(monkeypatch):
         ("FAMILY_BASE_LEVEL_PARAM", "e", Id(1)), ("FAMILY_TOP_LEVEL_PARAM", "e", Id(4)),
         ("FAMILY_BASE_LEVEL_OFFSET_PARAM", "d", 0), ("FAMILY_TOP_LEVEL_OFFSET_PARAM", "d", 0)))}
     columns = [native(FamilyInstance, i, Category=NS(Id=Id(category)), CanSplit=True, IsSlantedColumn=False,
-                      Symbol=NS(Family=NS(IsInPlace=False)), SuperComponent=None, Location=LocationPoint(),
+                      Symbol=NS(Family=NS(IsInPlace=False)), SuperComponent=None,
+                      Location=LocationPoint(Point=point(0, 0, 0)),
+                      GetTransform=lambda: NS(Origin=point(0, 0, 0), BasisX=point(1, 0, 0), BasisY=point(0, 1, 0),
+                                              BasisZ=point(0, 0, 1)),
                       get_Parameter=column_values.get, get_BoundingBox=get_bounds, **source_fields)
                for i, category in ((11, -5), (12, -6))]
     vertices = [(0, 0), (8, 0), (8, 4), (0, 4)]
@@ -402,6 +405,10 @@ def install_trial_transactions(db, document, elements, created, changes, status,
     ("extra_edit", "transaction_unresolved"),
     ("no_rollback_event", "transaction_unresolved"),
     ("residual", "transaction_unresolved"),
+    ("point_up", "trial_rolled_back"),
+    ("point_down", "trial_rolled_back"),
+    ("wrong_point_native", "stopped_and_rolled_back"),
+    ("point_twist", "stopped_and_rolled_back"),
 ])
 def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, monkeypatch, fault, expected):
     document, elements, _ = model
@@ -416,11 +423,13 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
     status = db.TransactionStatus = NS(Uninitialized="new", Started="started", Committed="committed",
                                        RolledBack="rolled_back")
     original_parameters = elements[12].Parameters
+    point_based = fault in ("point_up", "point_down", "wrong_point_native", "point_twist")
+    forward = fault != "point_down"
 
     def column(identifier, low, high):
         original = elements[12]
         common = {key: value for key, value in vars(original).items()
-                  if key not in ("Id", "UniqueId", "get_Parameter", "get_BoundingBox", "Location", "Split", "Parameters")}
+                  if key not in ("Id", "UniqueId", "get_Parameter", "get_BoundingBox",  "Location", "Split", "Parameters", "GetTransform")}
         segment = Line((0, 0, high), (0, 0, low))
         segment.Project = lambda target: NS(Parameter=target.Z, Distance=0)
         segment.ComputeNormalizedParameter = lambda z: (high - z) / (high - low)
@@ -433,7 +442,8 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
 
         def split(normalized):
             ratios.append(normalized)
-            cut = high - (high - low) * normalized
+            cut = (low + (high - low) * normalized if point_based and forward and fault != "wrong_point_native"
+                   else high - (high - low) * normalized)
             new = 200 + len(created)
             created.append(new)
             elements[identifier] = column(identifier, low, cut)
@@ -441,7 +451,12 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
             document.IsModified = True
             return Id(new)
 
-        return native(FamilyInstance, identifier, **common, Location=LocationCurve(Curve=segment),
+        anchor = point(0, 0, low if forward else high)
+        location = LocationPoint(Point=anchor) if point_based else LocationCurve(Curve=segment)
+        twist = -1 if fault == "point_twist" and identifier != 12 else 1
+        return native(FamilyInstance, identifier, **common, Location=location,
+                      GetTransform=lambda: NS(Origin=anchor, BasisX=point(twist, 0, 0),
+                                              BasisY=point(0, twist, 0), BasisZ=point(0, 0, 1 if forward else -1)),
                       Parameters=[*original_parameters, parameters["FAMILY_BASE_LEVEL_OFFSET_PARAM"],
                                   parameters["FAMILY_TOP_LEVEL_OFFSET_PARAM"]], get_Parameter=parameters.get,
                       get_BoundingBox=lambda _: NS(Min=point(0, 0, low), Max=point(1, 2, high),
@@ -472,7 +487,13 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
     if fault == "digest":
         assert started == []
         return
-    assert ratios == pytest.approx([0.6, 5 / 12])
+    normalized = [0.4] if fault in ("wrong_point_native", "point_twist") else (
+        [0.4, 7 / 12] if fault == "point_up" else [0.6, 5 / 12])
+    assert ratios == pytest.approx(normalized)
+    if fault == "wrong_point_native":
+        assert "reviewed elevation" in result["reason"] and len(created) == 1
+    if fault == "point_twist":
+        assert "insertion orientation" in result["reason"] and len(created) == 1
     assert started == ["Group", "Transaction"]
     assert (200 not in elements and 201 not in elements) == (fault != "residual")
     if expected == "trial_rolled_back":
@@ -480,6 +501,8 @@ def test_column_trial_checks_normalization_effects_and_terminal_rollback(model, 
         assert receipt["inner_effects"] == {"added": ["200", "201"], "modified": ["12"], "deleted": []}
         assert receipt["rollback_events"][0]["deleted"] == ["200", "201"]
         assert receipt["comparison"]["status"] == "matched"
+        assert [row["location"] for row in receipt["column_cuts"]] == ["point" if point_based else "curve"] * 2
+        assert [row["spans_ft"] for row in receipt["column_cuts"]] == [[[0, 8], [8, 20]], [[8, 15], [15, 20]]]
         assert invoke(document, before_request) == before
 
 

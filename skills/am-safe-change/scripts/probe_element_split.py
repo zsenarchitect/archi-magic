@@ -73,44 +73,55 @@ def preflight(document, args):
                 raise ValueError("Wall end joins require separate native qualification.")
             facts[row["id"]]["wall_top"] = wall_constraints(document, element, expected[row["id"]])
             facts[row["id"]]["wall_faces"] = wall_face_evidence(element, row["geometry"], budget)
-        elif row["category"] != "floor" and not isinstance(element.Location, DB.LocationCurve):
-            raise ValueError("Point-located columns require a separately qualified normalized split direction.")
+        elif row["category"] != "floor":
+            if not isinstance(element.Location, DB.LocationCurve) and facts[row["id"]]["column_point_axis"] is None:
+                raise ValueError("The selected column has no reviewed defining axis.")
     return source, snapshot, inventory, approved, expected, facts, floor_basis
 
 
-def ordered_axis(element):
-    if not isinstance(element, DB.FamilyInstance) or not isinstance(element.Location, DB.LocationCurve):
+def ordered_axis(document, element, budget):
+    budget.visit()
+    if not isinstance(element, DB.FamilyInstance):
+        raise ValueError("The current result is not a native column instance.")
+    if isinstance(element.Location, DB.LocationPoint):
+        geometry, _ = reader.vertical_geometry(document, element, False, budget, require_split_eligible=False)
+        axis = reader.column_point_axis(element, geometry)
+        return None, axis["first_ft"], axis["last_ft"], axis["basis"]
+    if not isinstance(element.Location, DB.LocationCurve):
         raise ValueError("The current result lacks a readable defining column curve.")
     curve = element.Location.Curve
     first, last = reader.line_points(curve)
-    tolerance = reader.TOLERANCE_FT
-    if abs(first[0] - last[0]) > tolerance or abs(first[1] - last[1]) > tolerance:
+    if math.dist(first[:2], last[:2]) > reader.TOLERANCE_FT:
         raise ValueError("The current result does not have a vertical defining curve.")
-    return curve, first, last
+    return curve, first, last, None
 
 
-def split_piece(document, pieces, elevation, created):
+def split_piece(document, pieces, elevation, created, budget):
     tolerance = reader.TOLERANCE_FT
     candidate = None
     for identifier in pieces:
         element = document.GetElement(identifier)
-        if element is None:
-            raise ValueError("A trial piece no longer resolves.")
-        curve, first, last = ordered_axis(element)
+        curve, first, last, basis = ordered_axis(document, element, budget)
         low, high = sorted((first[2], last[2]))
         if low + tolerance < elevation < high - tolerance:
             if candidate is not None:
                 raise ValueError("Two pieces contain the same cut elevation.")
-            candidate = element, curve, first
+            candidate = element, curve, first, last, low, high, basis
     if candidate is None:
         raise ValueError("No piece contains the reviewed cut elevation.")
-    element, curve, point = candidate
-    projected = curve.Project(DB.XYZ(point[0], point[1], elevation))
-    if not element.CanSplit or projected is None or projected.Distance > tolerance:
-        raise ValueError("The reviewed cut cannot be projected onto the eligible column.")
-    normalized = curve.ComputeNormalizedParameter(projected.Parameter)
+    element, curve, first, last, low, high, basis = candidate
+    if not element.CanSplit:
+        raise ValueError("The native column cannot be split at this cut.")
+    if curve is None:
+        normalized = (elevation - first[2]) / (last[2] - first[2])
+    else:
+        projected = curve.Project(DB.XYZ(first[0], first[1], elevation))
+        if projected is None or projected.Distance > tolerance:
+            raise ValueError("The reviewed cut cannot be projected onto the eligible column.")
+        normalized = curve.ComputeNormalizedParameter(projected.Parameter)
     if not 0 < normalized < 1:
         raise ValueError("The native normalized cut is outside the piece.")
+    original = element.Id
     identifier = element.Split(normalized)
     new_id = planner.identifier(str(identifier.Value))
     if identifier in pieces or new_id in created:
@@ -118,6 +129,22 @@ def split_piece(document, pieces, elevation, created):
     created.add(new_id)
     pieces.append(identifier)
     document.Regenerate()
+
+    spans = []
+    for result_id in (original, identifier):
+        _, start, end, measured_basis = ordered_axis(document, document.GetElement(result_id), budget)
+        if basis is not None and (measured_basis is None or any(
+                math.dist(a, b) > tolerance for a, b in zip(basis, measured_basis))):
+            raise ValueError("A split column changed its reviewed insertion orientation.")
+        if any(math.dist(point[:2], first[:2]) > tolerance for point in (start, end)):
+            raise ValueError("A split column moved off its reviewed axis.")
+        spans.append(sorted((start[2], end[2])))
+    spans.sort()
+    if any(abs(a - b) > tolerance for actual, intended in zip(spans, ((low, elevation), (elevation, high)))
+           for a, b in zip(actual, intended)):
+        raise ValueError("The native split did not land at the reviewed elevation.")
+    return {"location": "point" if curve is None else "curve", "elevation_ft": elevation,
+            "normalized": normalized, "spans_ft": spans}
 
 
 def integer_parameter(element, name):
@@ -365,7 +392,7 @@ def run(document, args):
 
     application = document.Application
     failure = readback_text = comparison = None
-    wall_measurements, floor_measurements = {}, {}
+    wall_measurements, floor_measurements, column_cuts = {}, {}, []
     rolled_back = regeneration_failed = False
     application.DocumentChanged += record
     try:
@@ -387,7 +414,8 @@ def run(document, args):
             else:
                 ids = [DB.ElementId(Int64(int(source_id)))]
                 for cut in sorted(row["cuts"], key=lambda item: item["elevation_ft"]):
-                    split_piece(document, ids, float(cut["elevation_ft"]), created)
+                    measurement = split_piece(document, ids, float(cut["elevation_ft"]), created, budget)
+                    column_cuts.append(dict(measurement, source_id=source_id, level_id=cut["id"]))
             for identifier in ids:
                 element = document.GetElement(identifier)
                 requests.append({"source_id": source_id, "result": reader.identity(element)})
@@ -464,7 +492,8 @@ def run(document, args):
 
     report = {"status": "trial_rolled_back", "transaction": transaction_name, "approval_sha256": args["approval_sha256"],
               "inner_effects": serializable(commit_events[0]), "rollback_events": list(map(serializable, rollback_events)),
-              "comparison": comparison, "readback_json": readback_text, "wall_measurements": wall_measurements}
+              "comparison": comparison, "readback_json": readback_text, "wall_measurements": wall_measurements,
+              "column_cuts": column_cuts}
     if floor_basis is not None:
         report.update(floor_measurements=floor_measurements, floor_cascade_sha256=args["floor_cascade_sha256"])
     encoded = json.dumps(report, ensure_ascii=True, allow_nan=False)

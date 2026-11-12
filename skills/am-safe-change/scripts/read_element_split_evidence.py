@@ -258,6 +258,21 @@ def read_cut(document, row, floor, budget):
     return dict(identity(element), kind="grid" if grid else "line", start_xy_ft=start[:2], end_xy_ft=end[:2])
 
 
+def column_point_axis(element, geometry):
+    location = xyz(element.Location.Point)
+    transform = element.GetTransform()
+    origin, direction = xyz(transform.Origin), xyz(transform.BasisZ)
+    if math.dist(location, origin) > TOLERANCE_FT or min(
+            math.dist(direction, [0, 0, 1]), math.dist(direction, [0, 0, -1])) > TOLERANCE_FT:
+        raise ValueError("The point-located column has no verified vertical insertion frame.")
+    start, end = (geometry["base_ft"], geometry["top_ft"]) if direction[2] > 0 else (
+        geometry["top_ft"], geometry["base_ft"])
+    if abs(origin[2] - start) > TOLERANCE_FT:
+        raise ValueError("The column insertion point does not anchor its candidate split direction.")
+    return {"first_ft": origin[:2] + [start], "last_ft": origin[:2] + [end],
+            "basis": [xyz(transform.BasisX), xyz(transform.BasisY), direction]}
+
+
 def wall_axis(element):
     return {"line_xy_ft": [p[:2] for p in line_points(element.Location.Curve)],
             "orientation": xyz(element.Orientation), "flipped": bool(element.Flipped)}
@@ -297,10 +312,12 @@ def read_source(document, row, budget, require_split_eligible=True):
         geometry, footprint = floor_geometry(document, element, budget), None
     else:
         geometry, footprint = vertical_geometry(document, element, wall, budget, require_split_eligible)
+    point_axis = (column_point_axis(element, geometry)
+                  if not floor and not wall and isinstance(element.Location, DB.LocationPoint) else None)
     return dict(source, type_id=type_info["id"], type_uid=type_info["uid"], category=category, geometry=geometry,
                 cuts=cuts), dict(source, parameters=read_parameters(element, budget), dependencies=dependencies,
                                  geometry_joins=joins, wall_end_joins=wall_ends, footprint_xy_ft=footprint,
-                                 wall_axis=wall_axis(element) if wall else None)
+                                 wall_axis=wall_axis(element) if wall else None, column_point_axis=point_axis)
 
 
 def readback(document, args, project, version):
