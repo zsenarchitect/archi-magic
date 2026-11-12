@@ -632,3 +632,92 @@ def test_wall_trial_preserves_level_orientation_type_and_parameters(model, monke
         assert [receipt["wall_measurements"][key]["solid_volume_cuft"] for key in ("10", "300", "301")] == [
             16, 14, 2 * final_height,
         ]
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "floor_cascade_rolled_back"),
+    ("wrong_digest", "stopped"),
+    ("external_dependency", "stopped"),
+    ("extra_delete", "transaction_unresolved"),
+    ("partial_ids", "transaction_unresolved"),
+    ("failed_restore", "transaction_unresolved"),
+])
+def test_floor_cascade_discovery_reconciles_exact_owned_ids_after_rollback(model, monkeypatch, fault, expected):
+    document, elements, _ = model
+    db = sys.modules["pyrevit.api"].DB
+    monkeypatch.delitem(sys.modules, "read_element_split_evidence", raising=False)
+    status = db.TransactionStatus = NS(Uninitialized="new", Started="started", RolledBack="rolled_back")
+    owned = native(ModelLine, 23, GeometryCurve=Line((0, 0, 0), (8, 0, 0)))
+    elements[23] = owned
+    floor, sketch = elements[13], elements[20]
+    floor.GetDependentElements = lambda _: [Id(20), Id(23)] + ([Id(100)] if fault == "external_dependency" else [])
+    sketch.GetAllElements = lambda: [Id(23)]
+    sketch.GetDependentElements = lambda _: [Id(23)]
+    baseline = dict(elements)
+    starts, rolled = [], []
+
+    class Transaction:
+        def __init__(self, _document, name):
+            self.name = name
+            self.state = status.Uninitialized
+
+        def Start(self):
+            starts.append(self.name)
+            self.state = status.Started
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def RollBack(self):
+            elements.update(baseline)
+            if fault == "failed_restore":
+                elements[23] = native(ModelLine, 999)
+            document.IsModified = document.IsModifiable = False
+            self.state = status.RolledBack
+            rolled.append(self.name)
+            return self.state
+
+    def delete(identifier):
+        assert identifier == Id(13)
+        ids = [Id(13), Id(20), Id(23)]
+        if fault == "extra_delete":
+            ids.append(Id(100))
+        for value in ids:
+            del elements[value]
+        document.IsModified = document.IsModifiable = True
+        yield ids[0]
+        if fault == "partial_ids":
+            raise RuntimeError("native ID iterator failed")
+        yield from ids[1:]
+
+    db.Transaction = Transaction
+    document.Delete = delete
+    before_request = request(document)
+    before_request["scope"] = [before_request["scope"][-1]]
+    before = invoke(document, before_request)
+    assert before["status"] == "ok", before
+    snapshot_sha = sha256(before["snapshot_json"].encode()).hexdigest()
+    inventory_sha = sha256(before["inventory_json"].encode()).hexdigest()
+    response = runpy.run_path(str(SCRIPTS / "probe_floor_split_cascade.py"), init_globals={
+        "doc": document, "inputs": {"mode": "floor_cascade_trial", "disposable_fixture": True,
+                                    "source_request": before_request,
+                                    "snapshot_sha256": "0" * 64 if fault == "wrong_digest" else snapshot_sha,
+                                    "inventory_sha256": inventory_sha},
+    })["result"]
+    assert response["status"] == expected, response
+    assert starts == rolled
+    if fault in ("wrong_digest", "external_dependency"):
+        assert starts == []
+    else:
+        assert len(rolled) == 1 and not document.IsModified
+    if fault == "none":
+        receipt = json.loads(response["cascade_json"])
+        assert receipt["deleted"] == [{"id": "13", "uid": "uid-13"}, {"id": "20", "uid": "uid-20"},
+                                      {"id": "23", "uid": "uid-23"}]
+        assert receipt["source"] == {"id": "13", "uid": "uid-13"}
+        assert receipt["sketch"] == {"id": "20", "uid": "uid-20"}
+        assert receipt["snapshot_sha256"] == snapshot_sha and receipt["inventory_sha256"] == inventory_sha
+        assert invoke(document, before_request) == before
+    else:
+        assert "cascade_json" not in response

@@ -239,6 +239,12 @@ Qualify the installed Revit 2026 bridge's transaction nesting on a disposable co
 
 The probe measures the resulting pieces and checks their types and typed parameters before rolling back the full transaction group. New wall pieces use their reviewed level, retain the source type and orientation, and restore writable instance values. The probe checks wall axes, footprints, end-join permissions, rectangular side faces, and conserved solid volume. For top-constrained walls, intermediate pieces end at the next cut level and the last piece retains the original top level and offset. Verify these checks in the disposable model as part of native qualification. Save `trial_json` privately. Its inner effects and rollback events are separate. Independently retrieve the complete bridge run and reread the original fixture and unrelated controls before accepting rollback. Stop on an unresolved outcome. Native trial and Keep/Discard verification remain required before release.
 
+### Measure the floor deletion set on a disposable copy
+
+For a separately approved disposable floor fixture, use `scripts/probe_floor_split_cascade.py` with `run_modify` in dry-run mode. Pass `mode: floor_cascade_trial`, `disposable_fixture: true`, the original single-floor query arguments as `source_request`, and the exact `snapshot_sha256` and `inventory_sha256` from the reviewed preview inputs. Start with an unblocked floor preview.
+
+The probe reads the floor and its owned sketch members, obtains the full native deletion list inside a transaction, and rolls the transaction back. Save `cascade_json` privately only after a verified rollback. It identifies the actual floor and sketch deletions by ID and UID and binds them to the reviewed source digests. Reread the disposable project and unrelated controls independently. Use the exact observed deletion list for a separate approval before qualifying any floor replacement. [Autodesk deletion semantics](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/a0461dd1-71d9-4581-1604-2ef8c211dd60.htm)
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.
