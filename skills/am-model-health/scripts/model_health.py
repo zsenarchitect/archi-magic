@@ -304,10 +304,8 @@ def link_path_kind(path, local=None):
         return None
     if normalized.startswith("\\\\"):
         return "network"
-    if local is True:
-        return "local"
     if re.match(r"^[a-zA-Z]:\\", normalized):
-        return "drive_letter"
+        return "local" if local is True else "drive_letter"
     return None
 
 
@@ -322,6 +320,11 @@ def link_type_details(link_type):
     saved = link_read(lambda: ref.GetPath())
     model_path = absolute if absolute is not None else saved
     path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(model_path))
+    if (not path and absolute is not None and saved is not None
+            and not link_read(lambda: bool(absolute.CloudPath))
+            and not link_read(lambda: bool(absolute.ServerPath))):
+        model_path = saved
+        path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
     if not path:
         path = link_read(lambda: link_type.GetExternalResourceReference(
             DB.ExternalResourceTypes.BuiltInExternalResourceTypes.RevitLink).InSessionPath)
