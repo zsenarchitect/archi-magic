@@ -1,0 +1,150 @@
+# -*- coding: utf-8 -*-
+"""Read exact instance and type values for the proposed view coloring."""
+
+import json
+import re
+
+from System import Int64
+from System.Collections.Generic import List
+from System.Diagnostics import Stopwatch
+from pyrevit.api import DB
+
+from duplicate_views import bounded, document_identity, identifier, key
+from read_view_filter_graphics import native_number
+from view_duplicate_preview import MAX_BYTES, TEXT
+
+SIGNED_ID = re.compile(r"^-?[1-9][0-9]{0,18}\Z")
+STORAGE_TYPES = ("String", "Integer", "Double", "ElementId")
+
+
+def signed_identifier(value):
+    if (not isinstance(value, TEXT) or not SIGNED_ID.match(value) or value == "-1"
+            or not -2**63 <= int(value) < 2**63):
+        raise ValueError("Use an exact signed Revit category or parameter ID.")
+    return DB.ElementId(Int64(int(value)))
+
+
+def selected_parameter(element, parameter_id, clock):
+    matches = [parameter for parameter in bounded(element.Parameters, 512, "element parameter", clock)
+               if key(parameter.Id) == parameter_id]
+    if len(matches) > 1:
+        raise ValueError("Revit reported ambiguous parameters with ID %s." % parameter_id)
+    return matches[0] if matches else None
+
+
+def parameter_state(document, parameter):
+    if parameter is None:
+        return None
+    storage = str(parameter.StorageType)
+    row = {"id": key(parameter.Id), "guid": str(parameter.GUID) if parameter.IsShared else None,
+           "storage": storage, "spec": str(parameter.Definition.GetDataType().TypeId),
+           "has_value": bool(parameter.HasValue), "value": None, "label": None}
+    if storage not in STORAGE_TYPES:
+        raise ValueError("The selected parameter has unsupported storage.")
+    if not row["has_value"]:
+        return row
+    if storage == "String":
+        value = parameter.AsString()
+        if value is None:
+            raise ValueError("Revit reported a populated text parameter without a string value.")
+        row["value"] = str(value)
+        row["label"] = row["value"]
+    elif storage == "Integer":
+        row["value"] = int(parameter.AsInteger())
+        row["label"] = parameter.AsValueString() or str(row["value"])
+    elif storage == "Double":
+        row["value"] = native_number(parameter.AsDouble())
+        row["label"] = parameter.AsValueString() or str(row["value"])
+    else:
+        value = parameter.AsElementId()
+        row["value"] = key(value)
+        row["label"] = row["value"]
+        if value.Value > 0:
+            reference = document.GetElement(value)
+            if reference is None:
+                raise ValueError("A populated element reference could not be resolved.")
+            row["reference_uid"] = str(reference.UniqueId)
+    if len(row["label"]) > 1024:
+        raise ValueError("A parameter label exceeds the inventory limit.")
+    return row
+
+
+def element_row(document, element, parameter_id, types, clock):
+    type_id = element.GetTypeId()
+    type_key = key(type_id)
+    if type_id.Value > 0 and type_key not in types:
+        element_type = document.GetElement(type_id)
+        if element_type is None:
+            raise ValueError("An observed element has an unresolved type.")
+        types[type_key] = {"uid": str(element_type.UniqueId), "parameter": parameter_state(
+            document, selected_parameter(element_type, parameter_id, clock))}
+    instance = parameter_state(document, selected_parameter(element, parameter_id, clock))
+    type_row = types.get(type_key)
+    type_value = type_row["parameter"] if type_row is not None else None
+    if instance and type_value and any(instance[field] != type_value[field] for field in ("guid", "storage", "spec")):
+        raise ValueError("Instance and type expose incompatible definitions for parameter %s." % parameter_id)
+    if instance is not None and instance["has_value"]:
+        source = "instance"
+    elif type_value is not None and type_value["has_value"]:
+        source = "type"
+    elif instance is not None or type_value is not None:
+        source = "unset"
+    else:
+        source = "missing"
+    return {"id": key(element.Id), "uid": str(element.UniqueId), "category_id": key(element.Category.Id),
+            "type_id": type_key, "instance": instance, "source": source}
+
+
+def main(document, args):
+    project = document_identity(document)
+    view_id = identifier(args["view_id"])
+    view = document.GetElement(view_id)
+    if (not isinstance(view, DB.View) or view.IsTemplate or not view.AreGraphicsOverridesAllowed()
+            or view.IsTemporaryViewPropertiesModeEnabled()
+            or not DB.FilteredElementCollector.IsViewValidForElementIteration(document, view_id)):
+        raise ValueError("Select a non-temporary project view with supported filter graphics and element iteration.")
+    parameter_id = key(signed_identifier(args["parameter_id"]))
+    selected = args["category_ids"]
+    if not isinstance(selected, list) or not 1 <= len(selected) <= 20 or len(set(selected)) != len(selected):
+        raise ValueError("Select one to 20 distinct native categories.")
+    category_ids = List[DB.ElementId]()
+    for item in selected:
+        category_ids.Add(signed_identifier(item))
+    filterable = {key(item) for item in DB.ParameterFilterUtilities.GetFilterableParametersInCommon(document, category_ids)}
+    if parameter_id not in filterable:
+        raise ValueError("The parameter is not filterable across all selected categories.")
+    clock = Stopwatch.StartNew()
+    types, rows = {}, []
+    category_filter = DB.ElementMulticategoryFilter(category_ids)
+    collector = DB.FilteredElementCollector(document, view_id)
+    try:
+        candidates = collector.WhereElementIsNotElementType().WherePasses(category_filter)
+        for element in bounded(candidates, 5000, "view candidate", clock):
+            rows.append(element_row(document, element, parameter_id, types, clock))
+    finally:
+        collector.Dispose()
+        category_filter.Dispose()
+    links = DB.FilteredElementCollector(document, view_id)
+    try:
+        link_ids = [key(link.Id) for link in bounded(links.OfClass(DB.RevitLinkInstance), 100, "view link", clock)]
+    finally:
+        links.Dispose()
+    missing = [row["id"] for row in rows if row["source"] == "missing"]
+    data = {"kind": "view-color-parameter-inventory", "document": project,
+            "view": {"id": key(view.Id), "uid": str(view.UniqueId)}, "parameter_id": parameter_id,
+            "category_ids": sorted(selected, key=int), "scope": "potentially_visible_host_elements",
+            "rows": sorted(rows, key=lambda row: int(row["id"])), "types": types, "missing_parameter_ids": sorted(missing, key=int),
+            "link_candidate_ids": sorted(link_ids, key=int)}
+    payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(payload) > MAX_BYTES or clock.ElapsedMilliseconds > 10000:
+        raise ValueError("The parameter inventory exceeds its size or time budget.")
+    return {"status": "ok", "inventory_json": payload}
+
+
+if "inputs" in globals():
+    try:
+        result = main(doc, inputs)  # noqa: F821
+    except (KeyError, TypeError, ValueError) as error:
+        result = {"status": "stopped", "message": str(error)}
+    except Exception:
+        result = {"status": "stopped", "message": "Revit could not verify the selected parameter inventory."}
