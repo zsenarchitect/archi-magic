@@ -123,7 +123,7 @@ def display_row(id_value, state):
     return [id_value, *state["point"], state["rotation_rad"], state["level_uid"], state["offset_ft"]]
 
 
-def compute(snapshot):
+def calculate(snapshot):
     project = snapshot.get("project")
     targets = snapshot.get("targets")
     operation = snapshot.get("operation")
@@ -153,7 +153,7 @@ def compute(snapshot):
             raise ValueError("Select a read-only reference element outside the target list.")
         reference_state = read_state(reference)
 
-    before, after, warnings, changed_ids = [], [], [], []
+    before, after, warnings, changes = [], [], [], {}
     for row in targets:
         id_value = row["id"]
         try:
@@ -171,10 +171,10 @@ def compute(snapshot):
             expected = state
         after.append(display_row(id_value, expected))
         if expected != state:
-            changed_ids.append(id_value)
+            changes[id_value] = expected
 
     basis = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-    return {
+    preview = {
         "kind": "change-preview",
         "title": "Match Revit rotation, offset, or reference level",
         "keyColumn": COLUMNS[0],
@@ -188,14 +188,42 @@ def compute(snapshot):
         "review_only": True,
         "basis_sha256": hashlib.sha256(basis.encode("ascii")).hexdigest(),
         "params": {"operation": operation, "units": "ft"},
-        "ownership_ids": [] if warnings else changed_ids,
+        "ownership_ids": [] if warnings else list(changes),
         "steps": [],
+    }
+
+
+    return preview, {} if warnings else changes
+
+
+def compute(snapshot):
+    return calculate(snapshot)[0]
+
+
+def probe_plan(snapshot):
+    preview, changes = calculate(snapshot)
+    if preview["blocked"] or not changes:
+        raise ValueError("The rollback probe requires a reviewed, unblocked change.")
+    request = {"operation": snapshot["operation"], "target_ids": [row["id"] for row in snapshot["targets"]]}
+    if "reference" in snapshot:
+        request["reference_id"] = snapshot["reference"]["id"]
+    if snapshot["operation"] != "rotation":
+        if not snapshot.get("frame_evidence"):
+            raise ValueError("Read the independently verified frame through the native query first.")
+        request["verified_frame"] = snapshot["frame_evidence"]
+    return {
+        "kind": "level-alignment-rollback-plan",
+        "version": 1,
+        "request": request,
+        "basis_sha256": preview["basis_sha256"],
+        "changes": changes,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot")
+    parser.add_argument("--probe-plan", action="store_true", help="Output a separate rollback qualification plan")
     args = parser.parse_args()
     try:
         with open(args.snapshot, "rb") as stream:
@@ -205,12 +233,12 @@ def main():
         snapshot = json.loads(raw)
         if not isinstance(snapshot, dict):
             raise ValueError("Expected a level alignment snapshot object.")
-        result = compute(snapshot)
+        result = probe_plan(snapshot) if args.probe_plan else compute(snapshot)
     except (OSError, ValueError, TypeError, RecursionError) as error:
         print(str(error), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, allow_nan=False))
-    return 1 if result["blocked"] else 0
+    return 1 if result.get("blocked") else 0
 
 
 if __name__ == "__main__":
