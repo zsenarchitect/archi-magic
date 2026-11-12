@@ -237,6 +237,13 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 3. Open only the working RFA named in the receipt. Call `get_context`. Run `read_batch_family_derivation.py` in CPython query mode with the receipt as `derivation`. Use the skill's scripts folder as the query workspace.
 4. Check the exact embedded seeds, type names, and writable size definitions. Save the family read for the derivation preview. Native type edits still require a separate reviewed dry run and Keep/Discard.
 
+### Review and test family type derivation
+
+1. Run `python scripts/batch_family_derivation_preview.py --derivation derivation.json --family-read family-read.json`. Review the exact seeds, target names, size changes, and calculated parameters.
+2. Call `get_context` and confirm the exact disposable family. Obtain approval for the rollback-only trial. Run `probe_batch_family_derivation.py` in guarded CPython dry-run mode.
+3. Pass `disposable_fixture: true`, the receipt as `derivation`, the saved query as `working_read`, and the reviewed `preview`. Pass its `preview_sha256` from `family_library_discovery.manifest_digest(preview)`.
+4. Check the measured values and rollback result. Save the full trial record. Keep and export still require independent verification and native qualification.
+
 ## Preview a CAD layout (issue #166)
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.

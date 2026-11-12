@@ -5,6 +5,7 @@ import json
 from family_library_discovery import manifest_digest
 from prepare_batch_family_derivation import verified_working_copy
 from read_batch_models import normalized_path
+from read_family_placement import inventory, inventory_record
 from read_family_library import MAX_TYPES, bounded_text, parameter_values
 
 MAX_PARAMETERS = 250
@@ -52,7 +53,7 @@ def family_state(document):
     }
 
 
-def read_working_family(document, plan):
+def read_working_family(document, plan, DB=None):
     with verified_working_copy(plan) as path:
         if (document is None or not document.IsFamilyDocument or document.IsReadOnly or document.IsModified
                 or document.IsWorkshared or document.IsModelInCloud or document.IsModifiable
@@ -63,6 +64,7 @@ def read_working_family(document, plan):
         family = document.OwnerFamily
         category = family.FamilyCategory
         identity = {"family": bounded_text(family.Name), "category_id": str(category.Id.Value)}
+        owner = {"id": str(family.Id.Value), "uid": str(family.UniqueId)}
         state = family_state(document)
         names = {name.casefold() for name in state["types"]}
         for row in plan["rows"]:
@@ -77,11 +79,12 @@ def read_working_family(document, plan):
                         or actual["reporting"] or actual["storage"] != "Double"
                         or any(actual[key] != value for key, value in expected.items())):
                     raise ValueError(f"The reviewed size parameter {size['parameter']} changed or is not writable.")
+        baseline_inventory = inventory_record(inventory(document, DB)) if DB is not None else None
         if document.IsModified:
             raise ValueError("The active family changed during the read.")
     receipt = {"kind": "batch-family-working-read", "version": 1,
                "derivation_sha256": plan["derivation_sha256"], "revit_build": plan["revit_build"],
-               **identity, "state": state}
+               **identity, "owner": owner, "state": state, "inventory": baseline_inventory}
     return dict(receipt, working_read_sha256=manifest_digest(receipt))
 
 
@@ -90,8 +93,9 @@ try:
 except NameError:
     pass
 else:
+    from pyrevit.api import DB
     try:
-        read = read_working_family(active_family, query_inputs["derivation"])
+        read = read_working_family(active_family, query_inputs["derivation"], DB)
         result = {"status": "ok", "snapshot_json": json.dumps(read, ensure_ascii=True, allow_nan=False)}
     except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:
         result = {"status": "blocked", "reason": str(error)}

@@ -240,7 +240,8 @@ def test_working_family_read_binds_exact_seed_and_writable_definition(derivation
     parameter = SimpleNamespace(Id=SimpleNamespace(Value=42), IsShared=False, StorageType="Double",
                                 Definition=SimpleNamespace(Name="Width", GetDataType=lambda: SimpleNamespace(TypeId="length")),
                                 IsReadOnly=False, IsDeterminedByFormula=False, IsReporting=False, IsInstance=False)
-    family = SimpleNamespace(Name="Fixture", FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-1000)))
+    family = SimpleNamespace(Name="Fixture", Id=SimpleNamespace(Value=20), UniqueId="family-20",
+                             FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-1000)))
     document = SimpleNamespace(PathName=str(Path(plan["workspace"]) / "Fixture.rfa"), IsFamilyDocument=True,
                                IsReadOnly=False, IsModified=False, IsWorkshared=False, IsModelInCloud=False,
                                IsModifiable=False, Application=SimpleNamespace(VersionNumber="2026", VersionBuild="fixture"),
@@ -262,3 +263,127 @@ def test_working_family_read_binds_exact_seed_and_writable_definition(derivation
     document.PathName = str(Path(derivation_input[0]["request"]["root"]) / plan["source"]["path"])
     with pytest.raises(ValueError, match="exact saved writable family copy"):
         read_working_family(document, plan)
+
+
+@pytest.mark.parametrize("failure", [None, "inheritance", "effect"])
+def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, failure):
+    from types import SimpleNamespace
+    from batch_family_derivation_preview import build_preview
+    from prepare_batch_family_derivation import create_working_copy
+    from probe_batch_family_derivation import run_trial
+    from read_batch_family_derivation import read_working_family
+
+    plan = create_working_copy(*derivation_input)
+
+    def parameter(number, name):
+        return SimpleNamespace(Id=SimpleNamespace(Value=number), IsShared=False, StorageType="Double",
+                               Definition=SimpleNamespace(Name=name,
+                                                          GetDataType=lambda: SimpleNamespace(TypeId="length")),
+                               IsReadOnly=False, IsDeterminedByFormula=False, IsReporting=False, IsInstance=False)
+
+    class FamilyType:
+        def __init__(self, name, values):
+            self.Name = name
+            self.values = dict(values)
+
+        def HasValue(self, field):
+            return field.Id.Value in self.values
+
+        def AsDouble(self, field):
+            return self.values[field.Id.Value]
+
+        AsString = AsInteger = AsElementId = AsDouble
+
+    seed = FamilyType("Seed", {42: 3.0, 43: 8.0})
+    manager = SimpleNamespace(Parameters=[parameter(42, "Width"), parameter(43, "Height")],
+                              Types=[seed], CurrentType=seed)
+
+    def new_type(name):
+        row = FamilyType(name, manager.CurrentType.values)
+        if failure == "inheritance":
+            row.values[43] = 9.0
+        manager.Types.append(row)
+        manager.CurrentType = row
+        return row
+
+    manager.NewType = new_type
+    manager.Set = lambda field, value: manager.CurrentType.values.update({field.Id.Value: value})
+
+    class EventHook(list):
+        def __iadd__(self, handler):
+            self.append(handler)
+            return self
+
+        def __isub__(self, handler):
+            self.remove(handler)
+            return self
+
+    class Scope:
+        def __init__(self, document, name):
+            self.name = name
+            self.status = "Uninitialized"
+
+        def Start(self):
+            self.status = "Started"
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def RollBack(self):
+            manager.Types = [seed]
+            manager.CurrentType = seed
+            self.status = "RolledBack"
+            return self.status
+
+        def Dispose(self):
+            pass
+
+    class Transaction(Scope):
+        def Commit(self):
+            self.status = "Committed"
+            event = SimpleNamespace(
+                GetDocument=lambda: document, Operation="TransactionCommitted", GetTransactionNames=lambda: [self.name],
+                GetAddedElementIds=lambda: [], GetDeletedElementIds=lambda: [],
+                GetModifiedElementIds=lambda: [SimpleNamespace(Value=99 if failure == "effect" else 20)],
+            )
+            for handler in document.Application.DocumentChanged:
+                handler(None, event)
+            return self.status
+
+    class Spec:
+        def __init__(self, name):
+            self.TypeId = name
+
+        def Equals(self, other):
+            return self.TypeId == other.TypeId
+
+    owner = SimpleNamespace(Name="Fixture", Id=SimpleNamespace(Value=20), UniqueId="family-20", VersionGuid="v1",
+                            FamilyCategory=SimpleNamespace(Id=SimpleNamespace(Value=-1000)))
+    document = SimpleNamespace(PathName=str(Path(plan["workspace"]) / "Fixture.rfa"), IsFamilyDocument=True,
+                               IsReadOnly=False, IsModified=False, IsWorkshared=False, IsModelInCloud=False,
+                               IsModifiable=False, Application=SimpleNamespace(VersionNumber="2026", VersionBuild="fixture",
+                                                                               DocumentChanged=EventHook()),
+                               OwnerFamily=owner, FamilyManager=manager, Regenerate=lambda: None,
+                               Equals=lambda other: other is document)
+    status = SimpleNamespace(**{name: name for name in ("Uninitialized", "Started", "Committed", "RolledBack")})
+    db = SimpleNamespace(Transaction=Transaction, TransactionGroup=Scope, TransactionStatus=status,
+                         FilteredElementCollector=lambda _: SimpleNamespace(WhereElementIsElementType=lambda: [],
+                                                                             WhereElementIsNotElementType=lambda: [owner]),
+                         ForgeTypeId=Spec, SpecTypeId=SimpleNamespace(Length=Spec("length")),
+                         UnitTypeId=SimpleNamespace(Feet="ft"),
+                         UnitUtils=SimpleNamespace(IsValidUnit=lambda spec, unit: unit == "ft",
+                                                   ConvertToInternalUnits=lambda value, unit: value))
+    baseline = read_working_family(document, plan, db)
+    preview = build_preview(plan, baseline)
+    report = run_trial(document, db, {"disposable_fixture": True, "derivation": plan, "working_read": baseline,
+                                      "preview": preview, "preview_sha256": manifest_digest(preview)})
+    assert report["rollback_verified"] is True
+    assert manager.Types == [seed] and manager.CurrentType is seed
+    assert not document.Application.DocumentChanged
+    if failure:
+        assert report["status"] == "stopped"
+    else:
+        assert report["status"] == "trial_rolled_back"
+        assert report["types"]["New"] == {"42": {"state": "value", "value": 4.0},
+                                         "43": {"state": "value", "value": 8.0}}
