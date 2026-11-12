@@ -372,6 +372,10 @@ class SequentialReport(HTMLParser):
         self.items = []
         self.pair = None
         self.parts = None
+        self.warnings = []
+        self.test_number = 0
+        self.test_start = 0
+        self.test_totals = []
 
     def handle_starttag(self, tag, attrs):
         css = dict(attrs).get("class", "")
@@ -380,6 +384,10 @@ class SequentialReport(HTMLParser):
         viewpoint = self.CONTAINER + (self.VIEWPOINT,)
         if len(parent) >= 24 or self.parts is not None:
             raise ValueError("Unsupported nested sequential clash field.")
+        if parent + (node,) == self.CONTAINER:
+            self.test_number += 1
+            self.test_start = len(self.clashes)
+            self.test_totals = []
         if node == self.VIEWPOINT:
             if parent != self.CONTAINER:
                 raise ValueError("Unsupported nested sequential report. Export Individual Clashes Only or HTML (Tabular).")
@@ -388,9 +396,9 @@ class SequentialReport(HTMLParser):
             self.fields, self.items = {}, []
         if parent == viewpoint and node == self.SIDE:
             self.parts = []
-        if parent == viewpoint and node == self.PAIR:
+        if parent in (self.CONTAINER, viewpoint) and node == self.PAIR:
             self.pair = []
-        if parent == viewpoint + (self.PAIR,):
+        if parent in (self.CONTAINER + (self.PAIR,), viewpoint + (self.PAIR,)):
             if len(self.pair) >= 2 or node != ("span", ("name", "value")[len(self.pair)]):
                 raise ValueError("Unexpected sequential property field.")
             self.parts = []
@@ -412,19 +420,22 @@ class SequentialReport(HTMLParser):
         node = self.stack.pop()
         parent = tuple(self.stack)
         viewpoint = self.CONTAINER + (self.VIEWPOINT,)
-        if parent == viewpoint + (self.PAIR,):
+        if parent in (self.CONTAINER + (self.PAIR,), viewpoint + (self.PAIR,)):
             self.pair.append(" ".join("".join(self.parts).split()))
             self.parts = None
-        elif parent == viewpoint and node == self.PAIR:
+        elif parent in (self.CONTAINER, viewpoint) and node == self.PAIR:
             if len(self.pair) != 2:
                 raise ValueError("Incomplete sequential clash property.")
             label, value = self.pair
             label = label.casefold()
-            if not self.items and label in ("name", "status", "clash group"):
+            if parent == self.CONTAINER:
+                if label == "total":
+                    self.test_totals.append(value)
+            elif not self.items and label in ("name", "status", "clash group"):
                 if label in self.fields:
                     raise ValueError("The viewpoint repeats a clash field.")
                 self.fields[label] = text(value)
-            if self.items and label in HTML_LABELS["element"]:
+            if parent == viewpoint and self.items and label in HTML_LABELS["element"]:
                 if "element_id" in self.items[-1]:
                     raise ValueError("The item repeats an Element ID.")
                 self.items[-1]["element_id"] = html_element_id(text(value))
@@ -445,6 +456,16 @@ class SequentialReport(HTMLParser):
                                  "source_point": None, "objects": self.items})
             if self.fields.get("clash group"):
                 self.clashes[-1]["source_group"] = self.fields["clash group"]
+        elif parent + (node,) == self.CONTAINER and self.test_totals:
+            if len(self.test_totals) != 1 or not re.fullmatch(r"[0-9]{1,9}", self.test_totals[0]):
+                self.warnings.append(f"Sequential test {self.test_number} has an unreadable clash total.")
+            else:
+                declared = int(self.test_totals[0])
+                present = len(self.clashes) - self.test_start
+                if declared != present:
+                    suffix = "" if present == 1 else "s"
+                    self.warnings.append(f"Sequential test {self.test_number} reports {declared} total clashes "
+                                         f"and contains {present} individual row{suffix}. Check the report filters.")
 
 
 def parse_html_report(data):
@@ -464,7 +485,7 @@ def parse_html_report(data):
     reader.close()
     if reader.stack or not reader.clashes:
         raise ValueError("The report is not a complete default sequential Navisworks export.")
-    return "html_sequential", reader.clashes, []
+    return "html_sequential", reader.clashes, reader.warnings
 
 
 def point(value):
