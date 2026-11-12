@@ -472,6 +472,49 @@ def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, st
                    for check in ("system", "connectivity", "size", "airflow"))
 
 
+def test_large_native_audit_uses_complete_runtime_pages(runtime, tmp_path):
+    system = NS(Id=ElementId(9), Name="SA-01", GetTypeId=lambda: ElementId(10))
+    connected = [connector(index, connected=True, system=system) for index in range(4)]
+    ducts = {identifier: Duct(connected, flow=120) for identifier in range(1000, 1500)}
+    host = model("host", {10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow"), **ducts})
+    request = {"source": execute(host, describe=True)["source"], "element_ids": [str(item) for item in ducts]}
+    result = execute(host, **request)
+    assert result["status"] == "ok", result
+    assert 200 * 1024 < len(result["snapshot_json"]) <= 512 * 1024
+    encoded = json.dumps(result).encode("utf-16-le")
+    units = len(encoded) // 2
+    response = {"run_id": "a00000000001", "mode": "query", "decision": "rolled_back", "status": "ok",
+                "exit_code": 0, "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0}}
+    pages = []
+    for start in range(0, units, 100 * 1024):
+        end = min(start + 100 * 1024, units)
+        pages.append({"response": dict(response, result_truncated=True, result=None, result_page={
+            "offset": start, "length": end - start, "total_length": units,
+            "text": encoded[2 * start:2 * end].decode("utf-16-le", "surrogatepass"),
+        })})
+
+    source, output = tmp_path / "runtime.json", tmp_path / "report.json"
+    cli = [sys.executable, str(SCRIPT.with_name("mep_qa.py")), str(source), "--runtime-record",
+           "--output", str(output)]
+    for record in (list(reversed(pages)), dict(response, result_truncated=False, result=result)):
+        source.write_text(json.dumps(record))
+        invocation = subprocess.run(cli, capture_output=True, text=True)
+        assert invocation.returncode == 0, invocation.stderr
+        report = json.loads(output.read_text())["report"]
+        assert report["status"] == "audited" and report["findings"] == []
+        assert report["inventory"] == {"elements": 500, "connectors_visited": 2000, "connectors_retained": 2000}
+        assert report["coverage"]["airflow"]["evaluated"] == 500
+        output.unlink()
+
+    foreign = dict(pages[1]["response"], run_id="b00000000002")
+    dirty = dict(pages[0]["response"], changes={"modified_count": 1})
+    for invalid in (pages[1:], [pages[0], foreign, *pages[2:]], [dirty, *pages[1:]], [*pages, pages[0]]):
+        source.write_text(json.dumps(invalid))
+        invocation = subprocess.run(cli, capture_output=True, text=True)
+        assert invocation.returncode == 2 and "incomplete or its pages disagree" in invocation.stderr
+        assert not output.exists()
+
+
 @pytest.mark.parametrize("scenario", [
     "host", "linked", "moved_link", "changed_element", "changed_evidence", "changed_note",
     "wrong_board_project", "unguarded_inner", "missing_source_guard", "unexpected_element_link",
