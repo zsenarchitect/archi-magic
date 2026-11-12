@@ -39,3 +39,9 @@ Chromium 157.0.8103.78 used three isolated browser contexts through Apache HTTP 
 The editor changed a finding's status and assignee, and the viewer saw both updates with editing controls hidden. A second editor's stale edit was rejected. A script-like comment rendered as text, and a viewer reload recovered the saved annotation and reconnected. A malformed publication showed the last valid results as stale and hid editing controls. Restoring the valid file recovered the controls. Publishing a new generation updated the viewer and retained the earlier annotation in history. Sign-out returned the viewer to sign-in. The workspace Python suite passed 42 tests and the viewer JavaScript suite passed 64.
 
 The browser test used synthetic audit content, temporary accounts, and loopback HTTPS. Native Revit audit and preview evidence and a run on the approved office host are still pending.
+
+### Offline Git snapshot and restore
+
+The workspace code at `2c28994ff871e037ef27fbfa480c10c14375e5cc` accepted an authenticated editor's status, assignment and comment on a synthetic audit finding. After stopping the service, the maintenance CLI exported the private review snapshot. A disposable local Git repository held only that fixture snapshot. A separate clone restored it through the maintenance CLI into an empty project root. The exported and cloned bytes matched with SHA-256 `ec0f87e502d2e5675e51fb51e5ced8a1c275e84ce41c8f5f9f2c8a3df6f3f801`.
+
+A fresh service returned the same review to the authorized viewer and denied a member of the other project. It returned the original response to an exact retry and refused an altered retry with HTTP 409. It withheld an older audit generation until the approved generation was republished, then returned the original finding with its status, assignee and single comment. This test used temporary accounts, synthetic data and loopback HTTP.
