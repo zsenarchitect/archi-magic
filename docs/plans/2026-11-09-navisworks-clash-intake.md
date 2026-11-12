@@ -20,3 +20,8 @@ Baseline e0df05c097aef9b39cc97f6720fb1883fad34e01. Filed gap confirmed: the issu
 - The public [Lumis XML fixture](https://github.com/iampratik13/Lumis/blob/f82e1092c7f02ed7fdb9934e818db593fcc71112/navis/clashes.xml), blob `b874958bd6f74ff858da250dcdcfa559fb942d7e`, produced five clashes with five canonical GUIDs and ten explicit element IDs. With no Revit snapshot, all five had null section boxes.
 - The public [sanitized support report](https://github.com/reallakshman19/XML_Compare_Utilities_v1.0a/blob/100475b541835f2552a837463d99b509c167ee5e/tests/fixtures/support-report/support-report-ps007-sl097.sanitized.xml), blob `265ec6dc993c3b6cf052c43885f26543e689c5e5`, produced twenty clashes with canonical GUIDs and no explicit element IDs. Its Item Name tags did not resolve any model elements.
 - These fixtures exercise the offline parser. Their originating Navisworks versions and export settings were not independently verified. No Windows Revit host participated in this check.
+
+## Tabular HTML evidence
+
+- A later compatibility check used a public [French tabular Navisworks export](https://github.com/yormantbt-tech/Navisworks-BIM-4D-Report/blob/cd6544e8a20089e19e07a1ea5c4c232ae3389b1f/Sols%20Vs%20Ossature0.html), Git blob `a8e514b4ad7dd2559eb8496ddfcc696119fb7b6a`. The CLI read all 16 individual rows and 32 explicitly labelled element IDs. The checked export contains no clash GUIDs or selection-tree paths, so it yields a review report with no section-box or issue-board proposal. Its export version was unavailable.
+- The adapter checks the two header levels, item groups and cell spans. It rejects unsupported group rows and custom layouts. Sequential HTML, grouped tabular HTML, and the end-to-end Revit workflow still need fixtures and verification.

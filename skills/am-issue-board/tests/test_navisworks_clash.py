@@ -142,3 +142,63 @@ def test_archive_dedup_is_distinct_from_active_board(inputs, tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
     assert data["skipped_guids"] == [FIRST] and len(data["plan"]["operations"]) == 1
+
+
+def tabular_report(left="ID d'élément: 42", right="9007199254740993", row_class="contentRow"):
+    return f"""<!doctype html><html><body>
+<table class="mainTable">
+<tr class="headerRow">
+<td class="generalHeader" colspan="3"></td><td class="item1HeaderGroup">Elément 1</td>
+<td class="item2HeaderGroup">Elément 2</td></tr>
+<tr class="headerRow">
+<td class="generalHeader" colspan="2">Nom de conflit</td><td class="generalHeader">Etat</td>
+<td class="item1Header">ID d'élément</td><td class="item2Header">ID d'élément</td></tr>
+<tr class="{row_class}">
+<td class="contentCell" colspan="2">Fixture clash</td><td class="contentCell">Nouveau</td>
+<td class="élément1Contenu">{left}</td><td class="élément2Contenu">{right}</td></tr>
+</table></body></html>"""
+
+
+def test_html_tabular_reads_both_explicit_ids_without_guessing_model_or_clash_identity(inputs, tmp_path):
+    _, snapshot, board = inputs
+    source = tmp_path / "tabular.html"
+    source.write_text(tabular_report(), encoding="utf-8")
+    original = board.read_bytes()
+    result = invoke(source, "--snapshot", snapshot, "--board", board)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    row, = data["clashes"]
+    assert data["source_format"] == "html_tabular"
+    assert row["name"] == "Fixture clash" and row["source_status"] == "nouveau"
+    assert row["objects"] == [
+        {"element_id": "42", "selection_path": []},
+        {"element_id": "9007199254740993", "selection_path": []},
+    ]
+    assert row["guid"] is None and row["section_box"] is None and data["plan"] is None
+    assert "Export XML" in data["warnings"][-1]
+    assert board.read_bytes() == original
+
+
+def test_html_ids_require_an_exact_numeric_value_in_the_element_column(tmp_path):
+    source = tmp_path / "invalid-ids.html"
+    source.write_text(tabular_report(left="Element ID: 42, 43", right="Item ID: 42"), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    assert [side["element_id"] for side in json.loads(result.stdout)["clashes"][0]["objects"]] == [None, None]
+
+
+@pytest.mark.parametrize("bad_layout", ["grouped", "wrong_side", "extra_header", "script"])
+def test_unsupported_html_layout_does_not_return_partial_results(tmp_path, bad_layout):
+    source = tmp_path / "unrecognized.html"
+    html = tabular_report()
+    if bad_layout == "grouped":
+        html = tabular_report(row_class="clashGroupRow")
+    elif bad_layout == "wrong_side":
+        html = html.replace('class="élément1Contenu"', 'class="élément2Contenu"')
+    elif bad_layout == "extra_header":
+        html = html.replace('class="item2Header"', 'class="item1Header"')
+    else:
+        html = html.replace("<body>", "<body><script>untrusted()</script>")
+    source.write_text(html, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout
