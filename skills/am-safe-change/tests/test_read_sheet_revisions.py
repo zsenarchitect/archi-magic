@@ -29,10 +29,15 @@ class Sheet:
     def GetAdditionalRevisionIds(self):
         return list(map(eid, self.additional))
 
+    def SetAdditionalRevisionIds(self, values):
+        self.additional = [item.Value for item in values]
+
     def GetAllRevisionCloudIds(self):
         return list(map(eid, self.clouds))
 
     def GetRevisionNumberOnSheet(self, identifier):
+        if identifier.Value == 8:
+            return ""  # A revision with no numbering scheme.
         return str(self.scheduled.index(identifier.Value) + 1)
 
 
@@ -57,6 +62,9 @@ class Revision:
 
 @pytest.fixture
 def inventory(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    monkeypatch.setitem(sys.modules, "read_sheets", None)
+    monkeypatch.delitem(sys.modules, "read_sheets")
     sheet_ids = [9007199254740993, 102, 103]
     a, b, c = sheet_ids
     sheets = [Sheet(a, [5, 6], [6], [51]), Sheet(b, [5], [], [52]), Sheet(c, [], [], []),
@@ -72,12 +80,55 @@ def inventory(monkeypatch):
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
     monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(Stopwatch=NS(StartNew=lambda: NS(ElapsedMilliseconds=0))))
-    document = NS(Title="Fixture", IsFamilyDocument=False, PathName="synthetic.rvt",
+    class RevisionList(list):
+        Add = list.append
+
+        @classmethod
+        def __class_getitem__(cls, item):
+            assert item is eid
+            return cls
+
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=RevisionList))
+    db.TransactionStatus = NS(Started="started", Committed="committed", RolledBack="rolled_back")
+
+    class Transaction:
+        def __init__(self, doc, title):
+            self.state = None
+            self.baseline = [(sheet.additional[:], sheet.scheduled[:]) for sheet in sheets]
+            doc.transactions.append(self)
+
+        def Start(self):
+            self.state = "started"
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def RollBack(self):
+            for sheet, (additional, scheduled) in zip(sheets, self.baseline):
+                sheet.additional, sheet.scheduled = additional, scheduled
+            self.state = "rolled_back"
+            return self.state
+
+        def Commit(self):
+            self.state = "committed"
+            return self.state
+
+    db.Transaction = Transaction
+
+    def regenerate():
+        for sheet in sheets:
+            scheduled_clouds = {cloud.RevisionId.Value for cloud in clouds if cloud.Id.Value in sheet.clouds}
+            sheet.scheduled = sorted(set(sheet.additional) | scheduled_clouds)
+
+    document = NS(Title="Fixture", IsFamilyDocument=False, IsReadOnly=False, PathName="synthetic.rvt",
+                  Regenerate=regenerate, transactions=[],
                   ProjectInformation=NS(UniqueId="fixture-project"), GetElement=lambda item: elements.get(item.Value))
 
     def execute(**inputs):
         return runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": inputs})["result"]
 
+    execute.document = document
     return execute, list(map(str, sheet_ids)), sheets, clouds
 
 
@@ -151,3 +202,76 @@ def test_preview_adds_explicit_revision_and_rejects_unreconciled_cloud_evidence(
     snapshot["sheets"][0]["scheduled_cloud_ids"] = []
     result = revision_preview(dict(read, snapshot_json=json.dumps(snapshot)), intent, tmp_path)
     assert result.returncode == 2 and not result.stdout
+
+
+def apply_revision(execute, plan):
+    path = SCRIPT.with_name("apply_sheet_revisions.py")
+    return runpy.run_path(str(path), init_globals={"doc": execute.document, "inputs": {"preview": plan}})["result"]
+
+
+@pytest.mark.parametrize("operation,target", [("add", "8"), ("remove", "5")])
+def test_apply_checks_native_membership_and_preserves_other_revisions(inventory, tmp_path, operation, target):
+    execute, ids, sheets, _ = inventory
+    sheets[0].additional = [5, 6]
+    sheets[2].additional, sheets[2].scheduled = [5], [5]
+    read = execute(revision_sheet_ids=ids, revision_ids=["8"])
+    plan = json.loads(revision_preview(read, {"operation": operation, "revision_id": target}, tmp_path).stdout)
+    plan["ownership"] = {"checked": len(plan["steps"])}
+    plan["notes"].append("Ownership checked.")
+    result = apply_revision(execute, plan)
+    assert result["status"] == "ok"
+    assert [txn.state for txn in execute.document.transactions] == ["committed"]
+    post = execute(revision_sheet_ids=ids, revision_ids=["8"])
+    assert result["snapshot_json"] == post["snapshot_json"]
+    if operation == "add":
+        assert [sheet.additional for sheet in sheets[:3]] == [[5, 6, 8], [8], [5, 8]]
+        assert [sheet.scheduled for sheet in sheets[:3]] == [[5, 6, 8], [5, 8], [5, 8]]
+    else:
+        assert [sheet.additional for sheet in sheets[:3]] == [[6], [], []]
+        assert [sheet.scheduled for sheet in sheets[:3]] == [[5, 6], [5], []]
+    source, record = tmp_path / "kept.json", tmp_path / "preview.json"
+    source.write_text(json.dumps(post))
+    record.write_text(json.dumps(plan))
+    verification = subprocess.run(
+        [sys.executable, str(SCRIPT.with_name("sheet_revision_preview.py")), str(source), str(record), "--verify"],
+        text=True, capture_output=True,
+    )
+    assert verification.returncode == 0, verification.stderr
+    changes = {"added_count": 0, "deleted_count": 0, "modified_count": len(plan["steps"]),
+               "by_category": {"Sheets": len(plan["steps"])},
+               "modified": [{"id": int(value)} for value in plan["ownership_ids"]]}
+    dry_run = {"status": "ok", "result": dict(result, changes=changes)}
+    source.write_text(json.dumps(dry_run))
+    command = [sys.executable, str(SCRIPT.with_name("sheet_revision_preview.py")), str(source), str(record),
+               "--check-dry-run"]
+    assert subprocess.run(command, text=True, capture_output=True).returncode == 0
+    changes["modified"][0] = {"id": 104}
+    source.write_text(json.dumps(dry_run))
+    bad = subprocess.run(command, text=True, capture_output=True)
+    assert bad.returncode == 2 and "did not identify every reviewed edit" in bad.stderr
+
+
+def test_apply_stops_before_transaction_for_drift_or_changed_steps(inventory, tmp_path):
+    execute, ids, sheets, clouds = inventory
+    read = execute(revision_sheet_ids=ids, revision_ids=["8"])
+    plan = json.loads(revision_preview(read, {"operation": "add", "revision_id": "8"}, tmp_path).stdout)
+    plan["steps"][0]["additional_revision_ids"] = ["5"]
+    with pytest.raises(ValueError, match="does not match"):
+        apply_revision(execute, plan)
+    plan["steps"][0]["additional_revision_ids"] = ["8"]
+    clouds[0].comment = "Changed since review"
+    with pytest.raises(ValueError, match="Model changed since the preview"):
+        apply_revision(execute, plan)
+    assert execute.document.transactions == []
+    assert [sheet.additional for sheet in sheets[:3]] == [[6], [], []]
+
+
+def test_wrong_revit_readback_rolls_back_every_sheet(inventory, tmp_path, monkeypatch):
+    execute, ids, sheets, _ = inventory
+    read = execute(revision_sheet_ids=ids, revision_ids=["8"])
+    plan = json.loads(revision_preview(read, {"operation": "add", "revision_id": "8"}, tmp_path).stdout)
+    monkeypatch.setattr(sheets[0], "SetAdditionalRevisionIds", lambda _values: None)
+    with pytest.raises(ValueError, match="readback differs"):
+        apply_revision(execute, plan)
+    assert [txn.state for txn in execute.document.transactions] == ["rolled_back"]
+    assert execute(revision_sheet_ids=ids, revision_ids=["8"]) == read

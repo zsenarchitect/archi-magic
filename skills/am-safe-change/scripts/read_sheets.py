@@ -79,6 +79,7 @@ def revision_inventory(document, request):
     if not ids:
         raise ValueError("Select at least one real sheet for revision review.")
     revisions = revision_scope(request.get("revision_ids", []), 50)
+    explicit_revision_ids = sorted(revisions, key=int)
     sheets, scheduled_clouds, revisions_by_sheet = {}, {}, {}
     clock = Stopwatch.StartNew()
     for key, identifier in sorted(ids.items(), key=lambda item: int(item[0])):
@@ -162,10 +163,11 @@ def revision_inventory(document, request):
     return {"kind": "sheet-revision-snapshot", "host_identity": {
                 "project_uid": str(project_uid),
                 "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()},
+            "revision_ids_requested": explicit_revision_ids,
             "sheets": [sheets[key] for key in sorted(sheets, key=int)], "revisions": catalog}
 
 
-if "inputs" in globals() and "revision_sheet_ids" in inputs:
+if "doc" in globals() and "inputs" in globals() and "revision_sheet_ids" in inputs:
     import json
 
     try:
@@ -179,5 +181,5 @@ if "inputs" in globals() and "revision_sheet_ids" in inputs:
     except Exception as error:
         result = {"status": "stopped", "message": "Revit could not read the reviewed revision scope.",
                   "error_type": type(error).__name__}
-else:
+elif "doc" in globals():
     result = sheet_inventory(doc)

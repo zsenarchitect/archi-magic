@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Preview one manually added revision across reviewed Revit sheets."""
 
+from __future__ import print_function
+
 import argparse
+import copy
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 
@@ -101,6 +105,53 @@ def compute(snapshot, intent):
             "notes": ["Revit computes the final revision numbers on each sheet after applying."]}
 
 
+def revision_references(sheets):
+    return {row["revision_id"] for sheet in sheets for field in ("scheduled", "clouds") for row in sheet[field]}
+
+
+def read_request(basis):
+    return {"revision_sheet_ids": [row["id"] for row in basis["sheets"]],
+            "revision_ids": basis["revision_ids_requested"]}
+
+
+def approved_steps(plan, current):
+    if plan.get("blocked") is not False or any(row.get("blocking") for row in plan.get("warnings", [])):
+        raise ValueError("Resolve the blocking warnings before applying the preview.")
+    if current != plan["basis"]:
+        raise ValueError("Model changed since the preview. Read and preview again.")
+    expected = compute(current, plan["intent"])
+    for field in ("kind", "recipe", "basis_sha256", "revision", "steps", "ownership_ids",
+                  "before", "after", "columns", "keyColumn", "changedColumns"):
+        if plan.get(field) != expected[field]:
+            raise ValueError("The revision preview does not match the reviewed model state.")
+    return expected["steps"]
+
+
+def verify_result(plan, snapshot):
+    expected = copy.deepcopy(plan["basis"])
+    actual = copy.deepcopy(snapshot)
+    steps = {row["sheet_id"]: row for row in plan["steps"]}
+    for sheet in expected["sheets"]:
+        step = steps.get(sheet["id"])
+        if step is None:
+            continue
+        scheduled = step["scheduled_revision_ids"]
+        sheet["additional_revision_ids"] = step["additional_revision_ids"]
+        sheet["scheduled"] = [{"revision_id": key} for key in scheduled]
+        for row in sheet["clouds"]:
+            row["revision_on_sheet"] = row["revision_id"] in scheduled
+    for sheet in actual["sheets"]:
+        if sheet["id"] in steps:
+            for item in sheet["scheduled"]:
+                number = item.pop("number")
+                if not isinstance(number, TEXT):
+                    raise ValueError("Revit did not report the resulting revision numbers.")
+    references = revision_references(expected["sheets"]) | set(read_request(plan["basis"])["revision_ids"])
+    expected["revisions"] = [row for row in expected["revisions"] if row["id"] in references]
+    if actual != expected:
+        raise ValueError("Revit revision readback differs from the preview.")
+
+
 def unique_object(pairs):
     result = dict(pairs)
     if len(result) != len(pairs):
@@ -130,18 +181,59 @@ def read_snapshot(record):
     return response
 
 
+def report_dry_run(plan, record):
+    envelope = record.get("response", record)
+    changes = envelope.get("result", envelope).get("changes") or envelope.get("changes") or {}
+    categories = changes.get("by_category")
+    count = changes.get("modified_count")
+    if (changes.get("added_count") != 0 or changes.get("deleted_count") != 0
+            or changes.get("other_documents") or not isinstance(categories, dict)
+            or type(count) is not int or count < len(plan["ownership_ids"])
+            or any(type(value) is not int or value < 0 for value in categories.values())
+            or sum(categories.values()) != count):
+        raise ValueError("Dry-run telemetry does not confirm the reviewed sheet edit. Check the full run.")
+    modified = changes.get("modified", [])
+    ids = {str(row["id"]) for row in modified}
+    if len(ids) != count or not set(plan["ownership_ids"]) <= ids:
+        raise ValueError("Dry-run telemetry did not identify every reviewed edit. Check the full run.")
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    import side_effects
+    summary = side_effects.summarize(plan, {"modified_count": count, "modified_by_category": categories}, ["Sheets"])
+    print(side_effects.text_table(summary))
+    return 1 if summary["warnings"] else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot")
     parser.add_argument("intent")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check-baseline", action="store_true")
+    modes.add_argument("--verify", action="store_true")
+    modes.add_argument("--check-dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
-        preview = compute(read_snapshot(load(args.snapshot)), load(args.intent))
+        source = load(args.snapshot)
+        snapshot = read_snapshot(source)
+        record = load(args.intent)
+        if args.check_baseline:
+            approved_steps(record, snapshot)
+            print("Model matches the approved baseline.")
+            return 0
+        if args.verify or args.check_dry_run:
+            approved_steps(record, record["basis"])
+            verify_result(record, snapshot)
+            print("Revit revision readback matches the preview.")
+            return report_dry_run(record, source) if args.check_dry_run else 0
+        preview = compute(snapshot, record)
         encoded = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, indent=2)
         if len(encoded) > LIMIT:
             raise ValueError("The revision preview exceeds the size limit.")
-    except (ValueError, TypeError, KeyError, AttributeError, IOError):
-        print("Sheet revision preview failed. Check the snapshot, scope, and intent.", file=sys.stderr)
+    except ValueError as error:
+        print("Sheet revision check failed: " + str(error), file=sys.stderr)
+        return 2
+    except (TypeError, KeyError, AttributeError, IOError):
+        print("Sheet revision check failed. Check the snapshot and second input.", file=sys.stderr)
         return 2
     print(encoded)
     return 0
