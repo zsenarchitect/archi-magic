@@ -67,6 +67,10 @@ jobs:
         run: |
           .\hooks\tests\test-update-check.ps1
           exit $LASTEXITCODE
+      - name: SessionStart feedback hook tests (temp folders)
+        run: |
+          .\hooks\tests\test-session-start-feedback.ps1
+          exit $LASTEXITCODE
       - name: SessionEnd feedback hook tests (temp folders)
         run: |
           .\hooks\tests\test-session-end-feedback.ps1
