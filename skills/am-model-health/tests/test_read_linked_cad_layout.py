@@ -1,5 +1,6 @@
 """Exercise linked CAD geometry extraction with a simulated Revit geometry tree."""
 
+from hashlib import sha256
 import json
 from pathlib import Path
 import runpy
@@ -43,6 +44,8 @@ def linked_dwg(monkeypatch):
     def element_id(value):
         return Record(Value=int(value))
 
+    element_id.InvalidElementId = element_id(-1)
+
     class Line:
         def __init__(self, layer, start, end):
             self.GraphicsStyleId = element_id(layer)
@@ -78,6 +81,12 @@ def linked_dwg(monkeypatch):
     class Level(Record):
         pass
 
+    class ViewPlan(Record):
+        pass
+
+    class Phase(Record):
+        pass
+
     class Style(Record):
         pass
 
@@ -104,13 +113,14 @@ def linked_dwg(monkeypatch):
                   geometry=[Instance(rotate, [Instance(mirror, primitives)])])
     reference = Record(GetLinkedFileStatus=lambda: "Loaded", GetAbsolutePath=lambda: "drawing.dwg")
     objects = {
-        1: link, 2: Level(UniqueId="aa-2", VersionGuid="level-v1", ProjectElevation=feet(3000)),
+        1: link, 2: Level(Id=element_id(2), UniqueId="aa-2", VersionGuid="level-v1", ProjectElevation=feet(3000)),
         3: Record(UniqueId="link-type", VersionGuid="link-type-v1", IsExternalFileReference=lambda: True,
                   GetExternalFileReference=lambda: reference),
         80: WallType(UniqueId="wall-type", VersionGuid="wall-v1", Kind="basic", Width=feet(200.25)),
         81: FamilySymbol(UniqueId="door-type", VersionGuid="door-v1", Category=Record(Id=element_id(-2000014)),
                          Family=Record(FamilyPlacementType="hosted"),
                          width=Record(StorageType="double", HasValue=True, AsDouble=lambda: feet(900))),
+        95: Phase(UniqueId="phase-id", VersionGuid="phase-v1"),
         **{id: Style(GraphicsStyleCategory=Record(Name=label)) for id, label in
            [(10, "WALL"), (11, "DOOR"), (12, "ROOM")]},
     }
@@ -118,14 +128,23 @@ def linked_dwg(monkeypatch):
                 GeometryInstance=Instance, Line=Line, PolyLine=Polyline, ImportInstance=Linked,
                 Level=Level, GraphicsStyle=Style, Options=Options,
                 WallType=WallType, WallKind=Record(Basic="basic"), FamilySymbol=FamilySymbol,
-                BuiltInCategory=Record(OST_Doors=-2000014), BuiltInParameter=Record(DOOR_WIDTH="door-width"),
-                FamilyPlacementType=Record(OneLevelBasedHosted="hosted"), StorageType=Record(Double="double"),
+                BuiltInCategory=Record(OST_Doors=-2000014),
+                BuiltInParameter=Record(DOOR_WIDTH="door-width", VIEW_PHASE="view-phase"),
+                FamilyPlacementType=Record(OneLevelBasedHosted="hosted"),
+                StorageType=Record(Double="double", ElementId="element-id"),
+                ViewPlan=ViewPlan, ViewType=Record(FloorPlan="floor"), Phase=Phase,
+                DesignOption=Record(GetActiveDesignOptionId=lambda doc: doc.active_option),
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
     api, system = ModuleType("pyrevit.api"), ModuleType("System")
     api.DB, system.Int64 = db, int
     monkeypatch.setitem(sys.modules, "pyrevit.api", api)
     monkeypatch.setitem(sys.modules, "System", system)
+    monkeypatch.delitem(sys.modules, "read_linked_cad_layout", raising=False)
+    view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
+                    GenLevel=objects[2], get_Parameter=lambda _: Record(
+                        StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
     document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt",
+                      ActiveView=view, active_option=element_id(-1), Application=Record(VersionNumber="2026"),
                       ProjectInformation=Record(UniqueId="aa-3"), GetElement=lambda id: objects.get(id.Value))
     request = {"link_id": "1", "level_id": "2", "segment_layers": ["WALL", "DOOR"],
                "room_layers": ["ROOM"], "room_points_mm": {}}
@@ -141,6 +160,82 @@ def layout_mapping():
     return {"tolerance_mm": 1, "minimum_overlap_mm": 100, "door_setback_mm": 100,
             "walls": {"WALL": {"type_id": "80", "width_mm": 200}},
             "doors": {"DOOR": {"type_id": "81", "width_mm": 900}}, "room_layers": ["ROOM"]}
+
+
+def native_preview(document, request):
+    return runpy.run_path(str(SCRIPTS / "preview_cad_layout_in_revit.py"),
+                          init_globals={"doc": document, "inputs": request})["result"]
+
+
+def placement_request(linked_dwg, room_edge_y=200):
+    document, source, primitives, *_ = linked_dwg
+    for point in (primitives[-1].points[0], primitives[-1].points[1], primitives[-1].points[-1]):
+        point.Y = room_edge_y / 304.8
+    candidate, = read(document, source)["room_candidates"]
+    source["room_points_mm"] = {candidate["id"]: [-750, 500, 3000]}
+    source["mapping"] = layout_mapping()
+    source["expected_evidence_sha256"] = read(document, source)["evidence_sha256"]
+    return {"source": source, "view_id": "93", "phase_id": "95",
+            "walls": {"wall-1": {"height_mm": 3000, "room_bounding": True}},
+            "doors": {"dwg-1.1.3": {"hand_flipped": True, "facing_flipped": False}}}
+
+
+def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_dwg):
+    document = linked_dwg[0]
+    request = placement_request(linked_dwg)
+    first = native_preview(document, request)
+    assert first["status"] == "proposed"
+    assert native_preview(document, json.loads(json.dumps(request))) == first
+    preview = json.loads(first["preview_json"])
+    assert preview["model_write_approved"] is False
+    assert preview["view"]["phase_uid"] == "phase-id"
+    assert preview["wall_choices"]["wall-1"]["height_mm"] == 3000
+    assert preview["door_choices"]["dwg-1.1.3"] == {"hand_flipped": True, "facing_flipped": False}
+    room, = preview["proposal"]["rooms"]
+    assert [item["kind"] for item in room["boundary_edges"]].count("wall_face") == 1
+    digest = preview.pop("geometry_sha256")
+    canonical = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    assert digest == sha256(canonical.encode("ascii")).hexdigest()
+    document.ActiveView.VersionGuid = "plan-v2"
+    assert json.loads(native_preview(document, request)["preview_json"])["geometry_sha256"] != digest
+
+
+def test_native_entry_point_shows_boundary_conflicts_without_a_geometry_digest(linked_dwg):
+    request = placement_request(linked_dwg, room_edge_y=0)
+    result = native_preview(linked_dwg[0], request)
+    assert result["status"] == "review_required"
+    preview = json.loads(result["preview_json"])
+    assert preview["model_write_approved"] is False
+    assert "geometry_sha256" not in preview
+    assert any(row["wall_ids"] == ["wall-1"] for row in preview["proposal"]["unresolved"])
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("evidence", "evidence changed"),
+    ("phase", "does not match"),
+    ("view", "Activate the reviewed floor plan"),
+    ("design_option", "Activate the main model"),
+    ("wall_choice", "height and room-bounding"),
+    ("door_choice", "explicit Boolean"),
+])
+def test_native_entry_point_refuses_unreviewed_placement(linked_dwg, change, reason):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+    if change == "evidence":
+        request["source"]["expected_evidence_sha256"] = "0" * 64
+    elif change == "phase":
+        request["phase_id"] = "96"
+    elif change == "view":
+        document.ActiveView.ViewType = "ceiling"
+    elif change == "design_option":
+        document.active_option = id_value(17)
+    elif change == "wall_choice":
+        request["walls"].clear()
+    else:
+        request["doors"]["dwg-1.1.3"]["hand_flipped"] = 1
+    result = native_preview(document, request)
+    assert result["status"] == "stopped" and reason in result["message"]
+    assert "preview_json" not in result
 
 
 def test_nested_mirror_rotation_and_translation_feed_real_layout_cli(linked_dwg, tmp_path):
