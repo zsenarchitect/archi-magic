@@ -41,19 +41,21 @@ def orientation(value):
             "forward": triple(value.ForwardDirection)}
 
 
-def staged_identity(document, request):
+def file_identity(document, request, saved=False):
     if (document is None or not document.IsFamilyDocument or document.IsLinked
             or not document.PathName or document.OwnerFamily is None):
         raise ValueError("Open the reviewed staged Revit family.")
     path = os.path.normpath(document.PathName)
-    if (not path.lower().endswith(".rfa")
-            or not os.path.basename(os.path.dirname(path)).startswith("family-previews-")):
+    staged = os.path.basename(os.path.dirname(path)).startswith("family-previews-")
+    if not path.lower().endswith(".rfa") or (not saved and not staged):
         raise ValueError("Open the staged family copy from the family preview workspace.")
-    for key in ("staged_path_sha256", "staged_file_sha256"):
+    prefix = "saved" if saved else "staged"
+    path_key, file_key = prefix + "_path_sha256", prefix + "_file_sha256"
+    for key in (path_key, file_key):
         if not isinstance(request.get(key), TEXT) or not re.match(r"^[0-9a-f]{64}\Z", request[key]):
             raise ValueError("Use the Revit inputs from the verified staging manifest.")
     path_sha = hashlib.sha256(os.path.normcase(path).encode("utf-8")).hexdigest()
-    if path_sha != request["staged_path_sha256"]:
+    if path_sha != request[path_key]:
         raise ValueError("The active family path differs from the verified staged path.")
     info = os.lstat(path)
     if (not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
@@ -77,9 +79,9 @@ def staged_identity(document, request):
     if (total != info.st_size
             or any((row.st_dev, row.st_ino, row.st_size, row.st_mtime) != signature
                    for row in (before, after, final))
-            or value.hexdigest() != request["staged_file_sha256"]):
+            or value.hexdigest() != request[file_key]):
         raise ValueError("The staged family bytes differ from the verified copy.")
-    return {"staged_path_sha256": path_sha, "staged_file_sha256": value.hexdigest(),
+    return {path_key: path_sha, file_key: value.hexdigest(),
             "family_uid": str(document.OwnerFamily.UniqueId)}
 
 
@@ -196,13 +198,7 @@ def geometry_extent(document, view, clock):
     return {"element_ids": sorted(found, key=int), "min_ft": low, "max_ft": high}
 
 
-def read_family(document, request):
-    identity = staged_identity(document, request)
-    clock = Stopwatch.StartNew()
-    view = document.ActiveView
-    owner = document.OwnerFamily
-    category = owner.FamilyCategory
-    current_type = document.FamilyManager.CurrentType
+def document_preview(document):
     settings = document.GetDocumentPreviewSettings()
     try:
         selected = settings.PreviewViewId
@@ -212,8 +208,27 @@ def read_family(document, request):
         forced = bool(settings.IsViewUpdateForced)
     finally:
         settings.Dispose()
+    return preview_view, forced
+
+
+def read_saved_family(document, request):
+    identity = file_identity(document, request, saved=True)
+    view, forced = document_preview(document)
+    return {"kind": "family-preview-saved-snapshot", "identity": identity,
+            "document_modified": bool(document.IsModified), "preview_view": view_state(view),
+            "force_preview_update": forced}
+
+
+def read_family(document, request):
+    identity = file_identity(document, request)
+    clock = Stopwatch.StartNew()
+    view = document.ActiveView
+    owner = document.OwnerFamily
+    category = owner.FamilyCategory
+    current_type = document.FamilyManager.CurrentType
+    preview_view, forced = document_preview(document)
     active_state = view_state(view)
-    same_view = preview_view is not None and view is not None and id_value(selected) == id_value(view.Id)
+    same_view = preview_view is not None and view is not None and id_value(preview_view.Id) == id_value(view.Id)
     preview_state = active_state if same_view else view_state(preview_view)
     result = {"kind": "family-preview-snapshot", "identity": identity, "document_modified": bool(document.IsModified),
               "read_only": bool(document.IsReadOnly), "category_type": str(category.CategoryType) if category else None,
@@ -240,7 +255,7 @@ def read_family(document, request):
 
 if "doc" in globals() and "inputs" in globals():
     try:
-        snapshot = read_family(doc, inputs)
+        snapshot = read_saved_family(doc, inputs) if inputs.get("mode") == "saved" else read_family(doc, inputs)
         result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
     except ValueError as error:
         result = {"status": "stopped", "message": str(error)}

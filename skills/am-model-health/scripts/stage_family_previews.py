@@ -8,9 +8,11 @@ from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import unicodedata
+import zlib
 
 from batch_model_audit import SHA, checked_path, digest, read_json, regular_file
 from cad_file_inventory import RESERVED
@@ -23,6 +25,9 @@ MAX_TOTAL = 512 * MIB
 HEADROOM = 256 * MIB
 BACKUP_CANDIDATE = re.compile(r"\.\d{4}\.rfa$", re.IGNORECASE)
 MANIFEST = "family-preview-manifest.json"
+THUMBNAIL_STREAM = "RevitPreview4.0"
+MAX_THUMBNAIL_STREAM = 2 * MIB
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def local_directory(raw):
@@ -167,7 +172,7 @@ def check_file(path, expected, sha):
         raise ValueError("File bytes or identity changed.")
 
 
-def verify(manifest_path, source_only, family=None):
+def load_manifest(manifest_path, family):
     path = checked_path(manifest_path)
     record = read_json(path)
     root = local_directory(record["source_folder"])
@@ -185,16 +190,26 @@ def verify(manifest_path, source_only, family=None):
         rows = [row for row in rows if row["name"] == family]
         if not rows:
             raise ValueError("That exact family name is absent from the manifest.")
-    output_entries = {} if source_only else entries(output)
-    results = []
     for row in rows:
-        name = row["name"]
         sha = row["sha256"]
         if (not isinstance(sha, str) or not SHA.fullmatch(sha)
                 or any(not isinstance(row[field], list) or len(row[field]) != 4
                        or any(type(value) is not int for value in row[field])
                        for field in ("source_identity", "staged_identity"))):
             raise ValueError("Invalid family fingerprints in the staging manifest.")
+    return root, work, output, rows
+
+
+def path_fingerprint(path):
+    return hashlib.sha256(os.path.normcase(str(path)).encode("utf-8")).hexdigest()
+
+
+def verify(manifest_path, source_only, family=None):
+    root, work, output, rows = load_manifest(manifest_path, family)
+    output_entries = {} if source_only else entries(output)
+    results = []
+    for row in rows:
+        name, sha = row["name"], row["sha256"]
         result = {"name": name, "source": "verified"}
         try:
             check_file(root / name, row["source_identity"], sha)
@@ -213,10 +228,77 @@ def verify(manifest_path, source_only, family=None):
     report = {"kind": "family-preview-stage-verification", "status": "verified" if ready else "incomplete",
               "source_only": source_only, "families": results}
     if ready and family is not None and not source_only:
-        path_key = os.path.normcase(str(work / family)).encode("utf-8")
-        report["revit_inputs"] = {"staged_path_sha256": hashlib.sha256(path_key).hexdigest(),
+        report["revit_inputs"] = {"staged_path_sha256": path_fingerprint(work / family),
                                   "staged_file_sha256": rows[0]["sha256"]}
     return report
+
+
+def thumbnail_png(data):
+    start = data.find(PNG_SIGNATURE)
+    if start < 0:
+        raise ValueError("The family preview stream does not contain a PNG.")
+    offset = start + len(PNG_SIGNATURE)
+    width = height = None
+    found_pixels = False
+    while offset + 12 <= len(data):
+        size, kind = struct.unpack_from(">I4s", data, offset)
+        end = offset + size + 12
+        if end > len(data):
+            break
+        crc, = struct.unpack_from(">I", data, end - 4)
+        if zlib.crc32(data[offset + 4:end - 4]) != crc:
+            raise ValueError("The embedded thumbnail PNG has an invalid checksum.")
+        if width is None:
+            if kind != b"IHDR" or size != 13:
+                raise ValueError("The embedded thumbnail has no valid PNG header.")
+            width, height = struct.unpack_from(">II", data, offset + 8)
+            if not (1 <= width <= 4096 and 1 <= height <= 4096):
+                raise ValueError("The embedded thumbnail dimensions exceed the supported range.")
+        if kind == b"IDAT" and size:
+            found_pixels = True
+        if kind == b"IEND" and size == 0 and found_pixels:
+            return {"sha256": hashlib.sha256(data[start:end]).hexdigest(), "width": width, "height": height}
+        offset = end
+    raise ValueError("The embedded thumbnail PNG is incomplete.")
+
+
+def embedded_thumbnail(path):
+    try:
+        import olefile
+    except ImportError:
+        raise ValueError("Install olefile to inspect the saved RFA thumbnail.") from None
+    with olefile.OleFileIO(str(path)) as storage:
+        if not storage.exists(THUMBNAIL_STREAM):
+            return None
+        if storage.get_size(THUMBNAIL_STREAM) > MAX_THUMBNAIL_STREAM:
+            raise ValueError("The embedded thumbnail stream exceeds 2 MiB.")
+        with storage.openstream(THUMBNAIL_STREAM) as stream:
+            return thumbnail_png(stream.read(MAX_THUMBNAIL_STREAM + 1))
+
+
+def inspect_output(manifest_path, family):
+    root, work, output, rows = load_manifest(manifest_path, family)
+    row = rows[0]
+    source = root / family
+    saved = entries(output).get(name_key(family))
+    if saved is None or saved.name != family:
+        raise ValueError("The reviewed output family was not found by its exact name.")
+    check_file(source, row["source_identity"], row["sha256"])
+    output_identity = identity(regular_file(saved))
+    output_sha = digest(saved, max_file=MAX_FILE)
+    original_image = embedded_thumbnail(source)
+    saved_image = embedded_thumbnail(saved)
+    check_file(source, row["source_identity"], row["sha256"])
+    check_file(saved, output_identity, output_sha)
+    image_status = "missing" if saved_image is None else "present"
+    if saved_image is not None and original_image is not None:
+        image_status = "unchanged" if original_image["sha256"] == saved_image["sha256"] else "changed"
+    return {"kind": "family-preview-saved-output", "status": "saved_unverified", "name": family,
+            "source_sha256": row["sha256"], "saved_sha256": output_sha,
+            "staged_path_sha256": path_fingerprint(work / family),
+            "source_thumbnail": original_image, "saved_thumbnail": saved_image, "thumbnail_status": image_status,
+            "revit_inputs": {"mode": "saved", "saved_path_sha256": path_fingerprint(saved),
+                             "saved_file_sha256": output_sha}}
 
 
 def main(argv=None):
@@ -233,6 +315,9 @@ def main(argv=None):
     check.add_argument("manifest")
     check.add_argument("--source-only", action="store_true")
     check.add_argument("--family")
+    saved = commands.add_parser("inspect-output")
+    saved.add_argument("manifest")
+    saved.add_argument("--family", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "inventory":
@@ -240,6 +325,8 @@ def main(argv=None):
         elif args.command == "stage":
             report = stage(local_directory(args.source), local_directory(args.staging_parent),
                            local_directory(args.output), args.family)
+        elif args.command == "inspect-output":
+            report = inspect_output(args.manifest, args.family)
         else:
             report = verify(args.manifest, args.source_only, args.family)
         print(json.dumps(report, ensure_ascii=True, indent=2))

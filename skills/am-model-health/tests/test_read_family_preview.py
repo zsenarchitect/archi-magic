@@ -320,6 +320,37 @@ def test_writer_validates_run_scope_and_reads_kept_thumbnail_independently(host,
     verify = [sys.executable, str(planner), str(fresh_path), str(plan_path), "--verify-kept", str(record_path)]
     kept = subprocess.run(verify, capture_output=True, text=True)
     assert kept.returncode == 0, kept.stderr
+    output = tmp_path / "output"
+    output.mkdir()
+    saved = output / "Fixture.rfa"
+    saved.write_bytes(b"synthetic saved family")
+    doc.PathName = str(saved)
+    doc.IsModified = False
+    saved_hash = hashlib.sha256(saved.read_bytes()).hexdigest()
+    saved_inputs = {"mode": "saved", "saved_path_sha256": hashlib.sha256(
+        os.path.normcase(str(saved)).encode()).hexdigest(), "saved_file_sha256": saved_hash}
+    actual = execute(saved_inputs)
+    assert actual["status"] == "ok" and json.loads(actual["snapshot_json"])["kind"] == "family-preview-saved-snapshot"
+    fresh_path.write_text(json.dumps({"mode": "query", "status": "ok", "run_id": "reopened", "result": actual}))
+    output_path = tmp_path / "saved-file.json"
+    basis = plan["basis"]["identity"]
+    file_record = {"kind": "family-preview-saved-output", "status": "saved_unverified",
+                   "source_sha256": basis["staged_file_sha256"], "staged_path_sha256": basis["staged_path_sha256"],
+                   "saved_sha256": saved_hash, "thumbnail_status": "changed",
+                   "saved_thumbnail": {"sha256": "a" * 64}, "revit_inputs": saved_inputs}
+    output_path.write_text(json.dumps(file_record))
+    verify = [sys.executable, str(planner), str(fresh_path), str(plan_path), "--verify-saved",
+              str(output_path), str(record_path)]
+    verified = subprocess.run(verify, capture_output=True, text=True)
+    assert verified.returncode == 0, verified.stderr
+    report = json.loads(verified.stdout)
+    assert report["status"] == "thumbnail_review_pending"
+    assert report["reuse_receipt"] == {"family_uid": basis["family_uid"], "view_uid": "new-view",
+                                       "saved_file_sha256": saved_hash}
+    file_record["saved_sha256"] = "0" * 64
+    output_path.write_text(json.dumps(file_record))
+    wrong_file = subprocess.run(verify, capture_output=True, text=True)
+    assert wrong_file.returncode == 2 and "does not match" in wrong_file.stderr
 
 
 def test_writer_refuses_stale_plan_and_rolls_back_wrong_preview_setting(host, tmp_path, monkeypatch):

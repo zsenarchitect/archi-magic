@@ -128,7 +128,7 @@ def checked_plan(plan, snapshot):
     return expected
 
 
-def check_view_result(plan, identity, view, forced):
+def check_view_result(plan, identity, view, forced, require_force=True):
     desired = plan["proposed"]
     step = plan["steps"][0]
     if (identity != plan["basis"]["identity"] or not view or not decimal_id(view["id"]) or not view["uid"]
@@ -138,7 +138,7 @@ def check_view_result(plan, identity, view, forced):
             or view["template"] or view["perspective"] or view["locked"]
             or view["crop_box"] or view["section_box"] or view["view_template_id"] != "-1"
             or view["display_style"] != desired["display_style"] or view["background"] != desired["background"]
-            or forced is not True or not view["saved_orientation"]
+            or (require_force and forced is not True) or not view["saved_orientation"]
             or not all(close_values(desired["orientation"][key], view["saved_orientation"][key])
                        for key in ("eye_ft", "forward", "up"))):
         raise ValueError("The saved thumbnail view settings differ from the preview.")
@@ -184,6 +184,35 @@ def verify_run(plan, record, kept=False):
     return receipt, len(added), len(modified)
 
 
+def verify_saved(plan, actual, output, kept):
+    receipt, _added, _modified = verify_run(plan, kept, kept=True)
+    basis = plan["basis"]["identity"]
+    saved_input = output["revit_inputs"]
+    saved_identity = actual["identity"]
+    if (actual["kind"] != "family-preview-saved-snapshot" or actual["document_modified"] is not False
+            or output["kind"] != "family-preview-saved-output" or output["status"] != "saved_unverified"
+            or output["source_sha256"] != basis["staged_file_sha256"]
+            or output["staged_path_sha256"] != basis["staged_path_sha256"]
+            or saved_input["saved_path_sha256"] == basis["staged_path_sha256"]
+            or saved_identity != {"family_uid": basis["family_uid"],
+                                  "saved_path_sha256": saved_input["saved_path_sha256"],
+                                  "saved_file_sha256": output["saved_sha256"]}
+            or saved_input["saved_file_sha256"] != output["saved_sha256"]):
+        raise ValueError("The reopened output does not match the staged family and saved-file evidence.")
+    check_view_result(plan, basis, actual["preview_view"], actual["force_preview_update"], require_force=False)
+    if actual["preview_view"]["uid"] != receipt["preview_view"]["uid"]:
+        raise ValueError("The saved thumbnail view is not the kept view.")
+    thumbnail = output["saved_thumbnail"]
+    if (output["thumbnail_status"] not in ("changed", "unchanged", "present") or not thumbnail
+            or not isinstance(thumbnail.get("sha256"), TEXT) or not SHA.match(thumbnail["sha256"])):
+        raise ValueError("The saved family has no verified embedded PNG thumbnail.")
+    return {"kind": "family-preview-saved-verification", "status": "thumbnail_review_pending",
+            "thumbnail_status": output["thumbnail_status"], "thumbnail_sha256": thumbnail["sha256"],
+            "reuse_receipt": {"family_uid": saved_identity["family_uid"],
+                              "view_uid": actual["preview_view"]["uid"],
+                              "saved_file_sha256": output["saved_sha256"]}}
+
+
 def snapshot_from_record(record):
     return json.loads(runtime_result(record)["snapshot_json"])
 
@@ -196,6 +225,7 @@ def main(argv=None):
     checks.add_argument("--baseline", action="store_true")
     checks.add_argument("--verify-run", action="store_true")
     checks.add_argument("--verify-kept", metavar="KEPT_RUN")
+    checks.add_argument("--verify-saved", nargs=2, metavar=("SAVED_FILE", "KEPT_RUN"))
     args = parser.parse_args(argv)
     try:
         evidence, supplied = load(args.read), load(args.intent)
@@ -221,6 +251,16 @@ def main(argv=None):
             if actual["preview_view"]["uid"] != receipt["preview_view"]["uid"]:
                 raise ValueError("The independently read view does not match the kept run.")
             print("The kept thumbnail view matches the reviewed settings.")
+            return 0
+        if args.verify_saved:
+            checked_plan(supplied, supplied["basis"])
+            fresh = evidence.get("response", evidence)
+            kept_run = load(args.verify_saved[1])
+            kept = kept_run.get("response", kept_run)
+            if fresh.get("mode") != "query" or not fresh.get("run_id") or fresh["run_id"] == kept["run_id"]:
+                raise ValueError("Read the reopened output in a separate Revit query.")
+            result = verify_saved(supplied, snapshot_from_record(evidence), load(args.verify_saved[0]), kept_run)
+            print(json.dumps(result, ensure_ascii=True, indent=2))
             return 0
         plan = review(snapshot_from_record(evidence), supplied)
         print(json.dumps(plan, ensure_ascii=True, allow_nan=False, indent=2))

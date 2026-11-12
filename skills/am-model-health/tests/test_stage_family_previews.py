@@ -2,8 +2,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
+import struct
 import subprocess
 import sys
+import zlib
 
 import pytest
 
@@ -86,3 +89,20 @@ def test_stage_rejects_source_alias_output_collision_and_traversal(folders):
     assert stage(folders, "../source/Model.rfa").returncode == 2
     assert not list(staging.iterdir())
     assert (output / "MODEL.RFA").read_bytes() == b"existing"
+
+def test_thumbnail_fingerprint_excludes_wrapper_and_checks_crc(monkeypatch):
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    inspect = runpy.run_path(str(SCRIPT))["thumbnail_png"]
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"\x00\x80")) + chunk(b"IEND", b""))
+    expected = {"sha256": hashlib.sha256(png).hexdigest(), "width": 1, "height": 1}
+    assert inspect(b"revit header" + png + b"trailer") == expected
+    corrupt = bytearray(png)
+    corrupt[30] ^= 1
+    with pytest.raises(ValueError, match="checksum"):
+        inspect(bytes(corrupt))
+    with pytest.raises(ValueError, match="incomplete"):
+        inspect(png[:-12])
