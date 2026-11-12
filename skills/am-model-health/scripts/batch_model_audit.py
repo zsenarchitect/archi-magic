@@ -12,7 +12,7 @@ import sys
 import uuid
 
 from cad_file_inventory import link_or_reparse, local_path
-from read_batch_models import AUDITS, HOST_STATUSES, MAX_FILE, MAX_JSON
+from read_batch_models import AUDITS, HOST_STATUSES, MAX_FILE, MAX_JSON, check_totals
 
 BACKUP = re.compile(r"\.\d{4}\.rvt$", re.I)
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -41,7 +41,7 @@ def regular_file(path):
     return info
 
 
-def digest(path, destination=None):
+def digest(path, destination=None, *, max_file=MAX_FILE):
     initial = regular_file(path)
     flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
              | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
@@ -49,13 +49,15 @@ def digest(path, destination=None):
     total = 0
     with os.fdopen(os.open(path, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not (stat.S_ISREG(before.st_mode) and 0 < before.st_size <= MAX_FILE
+        if not (stat.S_ISREG(before.st_mode) and 0 < before.st_size <= max_file
                 and os.path.samestat(initial, before)):
-            raise ValueError("Audit inputs must be regular, nonempty files up to 1 GiB.")
+            limit = "1 GiB" if max_file == MAX_FILE else f"{max_file // (1024 * 1024)} MiB"
+            raise ValueError(f"Audit inputs must be regular, nonempty files up to {limit}.")
         while chunk := stream.read(1024 * 1024):
             total += len(chunk)
-            if total > MAX_FILE:
-                raise ValueError("Input exceeds 1 GiB.")
+            if total > max_file:
+                limit = "1 GiB" if max_file == MAX_FILE else f"{max_file // (1024 * 1024)} MiB"
+                raise ValueError(f"Input exceeds {limit}.")
             value.update(chunk)
             if destination is not None:
                 destination.write(chunk)
@@ -167,11 +169,11 @@ def model_plan(plan):
 
 
 def valid_summary(summary):
-    return (isinstance(summary, dict) and set(summary) == COUNTS | FLAGS
+    return (isinstance(summary, dict) and set(summary) == COUNTS | FLAGS | {"health_checks", "parameter_checks"}
             and all(type(summary[key]) is int and summary[key] >= 0 for key in COUNTS)
             and all(type(summary[key]) is bool for key in FLAGS)
-            and summary["health_metrics"] > 0 and summary["parameter_categories"] > 0
-            and summary["health_bad"] + summary["health_warn"] <= summary["health_metrics"])
+            and all(summary[key] == value for key, value in
+                    check_totals(summary["health_checks"], summary["parameter_checks"]).items()))
 
 
 def read_receipt(work, plan, models):
@@ -181,14 +183,19 @@ def read_receipt(work, plan, models):
         raise ValueError("Receipt does not belong to this batch.")
     runtime = receipt["runtime"]
     if set(runtime) != {"revit_build", "pyrevit_build", "engine", "engine_version"} or not all(
-        isinstance(value, str) and RUNTIME.fullmatch(value) for value in runtime.values()
+        isinstance(value, str) and RUNTIME.fullmatch(value) and value.strip().lower() != "unknown"
+        for value in runtime.values()
     ):
         raise ValueError("Receipt did not record the actual host runtime.")
     rows = receipt["rows"]
     if not isinstance(rows, list) or len(rows) != len(models):
         raise ValueError("Receipt does not account for every model.")
+    stopped = False
     for row, model in zip(rows, models):
         status = row["status"]
+        if (status == "not_run") != stopped:
+            raise ValueError("Receipt rows disagree with the host stop after a close failure.")
+        stopped = stopped or status == "close_failed"
         expected_keys = {"id", "sha256", "status"}
         if status in ("audited", "incomplete"):
             expected_keys.add("summary")
@@ -258,6 +265,32 @@ def collect(plan_path):
             "runtime": runtime, "models": result}
 
 
+def verify_fixture(report, expected):
+    rows = report["models"]
+    seeds = expected["models"]
+    if (report["status"] != "audited" or len(rows) != 5 or not isinstance(seeds, list) or len(seeds) != 5
+            or sum(seed.get("clean") is True for seed in seeds) != 1):
+        raise ValueError("Qualification requires five complete audit rows and one reviewed clean control.")
+    for row, seed in zip(rows, seeds):
+        if (set(seed) != {"id", "clean", "health_checks", "parameter_checks"}
+                or type(seed["id"]) is not int or seed["id"] != row["id"] or type(seed["clean"]) is not bool
+                or not row["original_unchanged"] or not row["staged_unchanged"]):
+            raise ValueError("Qualification expectations do not match the five reviewed models.")
+        summary = row["summary"]
+        for key in ("health_checks", "parameter_checks"):
+            checks = seed[key]
+            if not isinstance(checks, dict):
+                raise ValueError("Use named health and parameter checks in the fixture expectations.")
+            if any(summary[key].get(name) != value for name, value in checks.items()):
+                raise ValueError(f"Model {row['id']} did not match its seeded {key}.")
+        clean = not any(summary[key] for key in ("health_bad", "health_warn", "parameter_offenders"))
+        seeded_finding = any(check["status"] in ("warn", "bad") for check in seed["health_checks"].values()) or any(
+            check["failed"] > 0 for check in seed["parameter_checks"].values())
+        if seed["clean"] != clean or (not seed["clean"] and not seeded_finding):
+            raise ValueError(f"Model {row['id']} did not match its reviewed clean or seeded status.")
+    return dict(report, fixture_checks_matched=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -268,12 +301,15 @@ def main(argv=None):
     merge = commands.add_parser("collect")
     merge.add_argument("--plan", required=True)
     merge.add_argument("--host-exited", required=True, action="store_true")
+    merge.add_argument("--fixture-expectations", help="Check the five reviewed fixture rows and clean control.")
     args = parser.parse_args(argv)
     try:
         report = (
             prepare(args.directory, args.workspace, args.revit)
             if args.command == "prepare" else collect(args.plan)
         )
+        if args.command == "collect" and args.fixture_expectations:
+            report = verify_fixture(report, read_json(checked_path(args.fixture_expectations)))
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return int(report.get("status") == "incomplete")
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as error:
