@@ -231,6 +231,12 @@ class ReviewState:
             return {"etag": self._etag(state), "annotations": state["annotations"],
                     "targets": sorted(self.targets)}, self._artifacts
 
+    def read_audits(self, actor, slots):
+        with self._thread_lock:
+            self._authorize(actor)
+            revision = self._load()["revision"]
+            return revision, [(slot, self._artifacts.get(slot, {"freshness": "unavailable"})) for slot in slots]
+
     def read_artifact(self, actor, slot):
         with self._thread_lock:
             self._authorize(actor)

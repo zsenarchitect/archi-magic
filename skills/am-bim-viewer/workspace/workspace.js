@@ -129,6 +129,29 @@ function render(data) {
         }
         return wrapper;
     });
+    if (data.audit_report_slots.length) {
+        const reports = document.createElement("section");
+        reports.append(element("h2", "Audit reports"));
+        const path = projectPath + "/audit-report";
+        const printable = element("a", "Open printable report");
+        printable.href = path;
+        const download = element("a", "Download HTML");
+        download.href = path;
+        download.download = slug + "-audit.html";
+        reports.append(printable, element("span", " · "), download);
+        if (data.audit_report_slots.length > 1) {
+            const list = document.createElement("ul");
+            for (const slot of data.audit_report_slots) {
+                const item = document.createElement("li");
+                const link = element("a", slot);
+                link.href = path + "?slot=" + encodeURIComponent(slot);
+                item.append(link);
+                list.append(item);
+            }
+            reports.append(list);
+        }
+        sections.push(reports);
+    }
     const manual = data.targets.map(target => ({target, title: target, details: []}));
     if (manual.length) sections.push(section("Review items", manual, "ready"));
     data.targets.forEach(target => visible.add(target));

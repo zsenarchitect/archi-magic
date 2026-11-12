@@ -195,6 +195,10 @@ Run `python scripts/workspace_artifacts.py <private-config.json> <project> <slot
 
 Read published data through `GET /projects/<project>/artifacts/<slot>`. Use its target keys to annotate current findings, preview rows, or issues. A stale response retains the last good data for reading. An unavailable response after restart requires a valid publication before editing resumes.
 
+### Audit reports
+
+Open **Audit reports** in the office workspace to print the current report or download self-contained HTML. Use the browser’s Print dialog and select Save as PDF for a PDF copy. The report includes accepted audit generations, freshness, model-health totals and rule IDs. Its descriptions come from installed checks. Set `audit_reports` to `false` in a project’s configuration to disable its report route and links.
+
 ### Review state backup and restore
 
 Stop the workspace service before backing up or restoring a project. Use the same project slug and the absolute physical root from the configuration. Keep the snapshot outside the project root in an operator-controlled directory.

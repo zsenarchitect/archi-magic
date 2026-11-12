@@ -417,3 +417,102 @@ def test_model_viewer_is_built_offline_and_served_only_to_project_members(tmp_pa
             assert (await restarted.get(url, headers=HEADERS, cookies=viewer)).status == 404
 
     asyncio.run(exercise())
+
+
+def test_audit_report_keeps_project_provenance_and_excludes_source_text(tmp_path, monkeypatch):
+    health_scripts = Path(__file__).resolve().parents[2] / "am-model-health" / "scripts"
+    monkeypatch.syspath_prepend(str(health_scripts))
+    from dwg_cad_audit import check_xrefs
+
+    accounts, projects = settings(tmp_path)
+    config = projects["sample"]
+    slots = {name: {"kind": "audit", "path": name + ".json"} for name in ("cad", "health", "missing")}
+    config["artifacts"] = slots
+    secret = r"Z:\private\missing.dwg"
+    sentinel = "<script>private-source-text</script>"
+    findings = check_xrefs([{"name": sentinel, "path": secret, "status": "missing"}])
+    assert secret in findings[0]["message"] and sentinel in findings[0]["message"]
+    publish(config["root"], slots["cad"], 3, {"findings": findings})
+    publish(config["root"], slots["health"], 4, {"model": sentinel, "timestamp": "2026-01-01T10:00:00", "metrics": [
+        {"id": "MH-02", "label": "Warnings", "unit": "", "hint": sentinel, "value": 2, "status": "warn"},
+    ]})
+    project = "/projects/sample"
+    report = project + "/audit-report"
+    started, finish = Event(), Event()
+    build = server.build_audit_report
+
+    def held_report(*args):
+        started.set()
+        if not finish.wait(5):
+            raise RuntimeError("Audit report test did not release the worker")
+        return build(*args)
+
+    async def exercise():
+        disconnected = asyncio.Event()
+        read_report = server.Workspace.read_audit_report
+
+        async def observe_disconnect(workspace, request):
+            try:
+                return await read_report(workspace, request)
+            except asyncio.CancelledError:
+                disconnected.set()
+                raise
+
+        monkeypatch.setattr(server.Workspace, "read_audit_report", observe_disconnect)
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+            assert (await client.get(report, headers=HEADERS)).status == 401
+            assert (await client.head(report, headers=HEADERS, cookies=outsider)).status == 404
+            await (await client.get(project + "/workspace", headers=HEADERS, cookies=viewer)).read()
+            monkeypatch.setattr(server, "build_audit_report", held_report)
+            request = asyncio.create_task(client.get(report, headers=HEADERS, cookies=viewer))
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                busy = await client.get(report, headers=HEADERS, cookies=viewer)
+                assert busy.status == 503 and busy.headers["Retry-After"]
+                other = await client.get("/projects/other/review", headers=HEADERS, cookies=outsider)
+                edit = await client.patch("/projects/other/review", cookies=outsider,
+                                          headers=dict(HEADERS, **{"If-Match": other.headers["ETag"]}),
+                                          json={"target": TARGET, "operation_id": "operation-0000001",
+                                                "patch": {"comment": "Review remains available."}})
+                assert edit.status == 200
+            finally:
+                finish.set()
+            response = await request
+            assert response.status == 200 and response.headers["Cache-Control"] == "private, no-store"
+            assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+            html = await response.text()
+            assert "<td>cad</td><td>3</td><td>ready</td>" in html
+            assert "<td>health</td><td>4</td><td>ready</td><td>2026-01-01T10:00:00</td>" in html
+            assert "<td>missing</td><td>Unavailable</td><td>unavailable</td>" in html
+            assert "CAD-XREF-01" in html and "Model health audits" in html and "MH-02" in html
+            assert secret not in html and "private-source-text" not in html
+            selected = await client.get(report + "?slot=health", headers=HEADERS, cookies=viewer)
+            assert "CAD-XREF-01" not in await selected.text()
+
+            started.clear()
+            finish.clear()
+            abandoned = asyncio.create_task(client.get(report, headers=HEADERS, cookies=viewer))
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                abandoned.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await abandoned
+                await asyncio.wait_for(disconnected.wait(), 2)
+                busy = await client.get(report, headers=HEADERS, cookies=viewer)
+                assert busy.status == 503
+            finally:
+                finish.set()
+
+        config["audit_reports"] = False
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as disabled:
+            response = await disabled.post("/session", headers=HEADERS, json={"token": TOKENS["viewer"]})
+            viewer = {COOKIE: response.cookies[COOKIE].value}
+            for method in (disabled.get, disabled.head):
+                assert (await method(report, headers=HEADERS, cookies=viewer)).status == 404
+
+    asyncio.run(exercise())

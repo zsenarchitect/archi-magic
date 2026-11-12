@@ -22,6 +22,7 @@ from workspace_artifacts import (
     ARTIFACT_KINDS, board_binding, open_json_file, read_json_stream, read_published, review_targets,
     slot_directory, slot_limit, slot_path, validate_publication,
 )
+from workspace_audit_report import AuditReportTooLarge, build_audit_report
 from workspace_model import ModelViewer, VIEWER_POLICY, build_model
 from workspace_page import describe_artifact, page
 from workspace_review_state import OperationConflict, ReviewState, RevisionConflict
@@ -84,6 +85,7 @@ class Workspace:
         self.account_by_digest = {digest: actor for actor, digest in accounts.items()}
         self.projects = {}
         self.artifact_slots = {}
+        self.audit_slots = {}
         roots = []
         for slug, config in projects.items():
             path = Path(config["root"])
@@ -112,11 +114,18 @@ class Workspace:
             if any(not isinstance(target, str) or target.startswith(namespaces) for target in self.projects[slug].targets):
                 raise ValueError("Explicit targets cannot overlap a published artifact's target namespace.")
             self.artifact_slots[slug] = slots
+            audit_reports = config.get("audit_reports", True)
+            if type(audit_reports) is not bool:
+                raise ValueError("Set audit_reports to true or false.")
+            self.audit_slots[slug] = tuple(name for name, slot in slots.items()
+                                           if audit_reports and slot["kind"] == "audit")
         self.model_build_lock = Lock()
         self.model_publications = {}
         self.sessions = {}
         self.login_attempts = deque()
         self.workers = set()
+        self.audit_request = False
+        self.audit_worker = None
         self.sockets = {}
         self.last_notified = {}
         self.watchers = {}
@@ -129,6 +138,8 @@ class Workspace:
                 yield
             finally:
                 await asyncio.gather(*self.workers, return_exceptions=True)
+                if self.audit_worker is not None:
+                    await asyncio.gather(self.audit_worker, return_exceptions=True)
                 self.model_publications.clear()
 
     async def storage(self, function, *args, on_success=None):
@@ -218,6 +229,7 @@ class Workspace:
         review, artifacts = project.read_workspace(actor)
         slots = self.artifact_slots[project.project]
         return {**review, "role": project.members[actor], "members": sorted(project.members),
+                "audit_report_slots": self.audit_slots[project.project],
                 "artifacts": {name: describe_artifact(artifacts.get(name, {"freshness": "unavailable"}))
                               for name in slots}}
 
@@ -342,6 +354,57 @@ class Workspace:
         if data.get("kind") == "model":
             data = describe_artifact(data)
         return web.json_response(data, status=503 if data["freshness"] == "unavailable" else 200)
+
+    async def read_audit_report(self, request):
+        actor, project = self.project_member(request)
+        allowed = self.audit_slots[project.project]
+        selected = request.query.getall("slot", allowed)
+        if not allowed or not selected or any(slot not in allowed for slot in selected):
+            raise web.HTTPNotFound(text="Audit report unavailable.")
+        if set(request.query) - {"slot"} or len(selected) != len(set(selected)):
+            raise web.HTTPBadRequest(text="Select each audit slot at most once.")
+        if self.audit_request:
+            raise web.HTTPServiceUnavailable(text="An audit report is being generated. Retry shortly.",
+                                             headers={"Retry-After": "2"})
+        self.audit_request = True
+        worker = None
+
+        def release(task=None):
+            if task is not None and not task.cancelled():
+                task.exception()
+            self.audit_worker = None
+            self.audit_request = False
+
+        def render():
+            revision, entries = project.read_audits(actor, selected)
+            return build_audit_report(project.project, revision, entries)
+
+        try:
+            worker = self.audit_worker = asyncio.create_task(asyncio.to_thread(render))
+            try:
+                body = await asyncio.shield(worker)
+            except AuditReportTooLarge as error:
+                raise web.HTTPRequestEntityTooLarge(max_size=0, actual_size=1, text=str(error)) from error
+            except (OSError, ValueError) as error:
+                LOG.warning("Workspace audit report could not be rendered (%s)", type(error).__name__)
+                raise web.HTTPServiceUnavailable(text="Project audit report is unavailable.") from error
+            headers = dict(SECURITY_HEADERS, **{
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Length": str(len(body)),
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            })
+            response = web.StreamResponse(headers=headers)
+            await response.prepare(request)
+            if request.method != "HEAD":
+                for offset in range(0, len(body), 128 * 1024):
+                    await response.write(body[offset:offset + 128 * 1024])
+            await response.write_eof()
+            return response
+        finally:
+            if worker is not None and not worker.done():
+                worker.add_done_callback(release)
+            else:
+                release()
 
     async def read_model(self, request):
         actor, project = self.project_member(request)
@@ -477,6 +540,7 @@ def create_app(origin, accounts, projects):
         web.patch("/projects/{project}/review", workspace.update_review),
         web.get("/projects/{project}/events", workspace.subscribe, allow_head=False),
         web.get("/projects/{project}/artifacts/{slot}", workspace.read_artifact),
+        web.get("/projects/{project}/audit-report", workspace.read_audit_report),
         web.get(r"/projects/{project}/models/{slot}/{digest:[0-9a-f]{64}}.html", workspace.read_model),
     ])
     return app
