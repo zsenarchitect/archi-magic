@@ -144,15 +144,7 @@ def element_id(value, label):
     return DB.ElementId(Int64(int(value)))
 
 
-def read_vertices(document, args):
-    project = project_identity(document)
-    if not isinstance(args, dict) or set(args) not in ({"toposolid_id"}, {"toposolid_id", "alignment"}):
-        raise ValueError("Supply inputs.toposolid_id and optionally an alignment request.")
-    clock = Stopwatch.StartNew()
-    terrain = document.GetElement(element_id(args["toposolid_id"], "Toposolid"))
-    if not isinstance(terrain, DB.Toposolid) or not terrain.UniqueId:
-        raise ValueError("The ID must resolve to a Toposolid in the active project.")
-
+def shape_vertices(terrain, clock):
     editor = terrain.GetSlabShapeEditor()
     if editor is None or not editor.IsEnabled:
         raise ValueError("The Toposolid has no enabled slab shape editor.")
@@ -166,9 +158,24 @@ def read_vertices(document, args):
         coordinates = xyz(point)
         if not all(finite_number(value) for value in coordinates):
             raise ValueError("A Toposolid shape vertex has non-finite or out-of-range coordinates.")
-        vertices.append(coordinates)
+        vertices.append((vertex, coordinates))
     if not vertices:
         raise ValueError("The enabled Toposolid shape editor returned no vertices.")
+
+    return editor, vertices
+
+
+def read_vertices(document, args):
+    project = project_identity(document)
+    if not isinstance(args, dict) or set(args) not in ({"toposolid_id"}, {"toposolid_id", "alignment"}):
+        raise ValueError("Supply inputs.toposolid_id and optionally an alignment request.")
+    clock = Stopwatch.StartNew()
+    terrain = document.GetElement(element_id(args["toposolid_id"], "Toposolid"))
+    if not isinstance(terrain, DB.Toposolid) or not terrain.UniqueId:
+        raise ValueError("The ID must resolve to a Toposolid in the active project.")
+
+    _, native_vertices = shape_vertices(terrain, clock)
+    vertices = [coordinates for _, coordinates in native_vertices]
 
     snapshot = {
         "document": project,
