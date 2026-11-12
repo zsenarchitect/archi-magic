@@ -94,6 +94,28 @@ def free_bytes(parent):
     return info.f_bavail * info.f_frsize
 
 
+def verify_pair(parent, rfa, catalog, budget):
+    start = directory_stamp(directory_info(parent))
+    name = rfa["basename"]
+    catalog_name = catalog["basename"] if catalog else None
+    entries = classify_entries(parent, budget)
+    expected = {name, catalog_name} if catalog else {name}
+    actual = {leaf for group in entries.values() for leaf, _ in group}
+    if actual - expected:
+        raise ValueError("The staging directory contains unexpected files.")
+    if expected - actual:
+        raise ValueError("The staging directory is missing part of the reviewed pair.")
+    catalogs = entries.get(catalog_name.casefold(), []) if catalog else []
+    info = child_info(parent, name)
+    inode = entries[name.casefold()][0][1]
+    if inode is not None and inode != info.st_ino:
+        raise ValueError("A staged family was replaced during verification.")
+    if (record_pair(parent, name, info, catalogs, budget) != (rfa, catalog)
+            or directory_stamp(directory_info(parent)) != start):
+        raise ValueError("The staged file bytes differ from the reviewed sources.")
+    return start
+
+
 def stage_folder(source, workspace, directory, rows, budget, verify_budget):
     with ExitStack() as stack:
         parent = source
@@ -125,20 +147,7 @@ def stage_folder(source, workspace, directory, rows, budget, verify_budget):
                                            copy_to=lambda leaf: new_file(destination, leaf))
                 if (rfa, catalog) != (row["rfa"], row["catalog"]):
                     raise ValueError("A family or companion catalog changed after discovery.")
-                copy_stamp = directory_stamp(directory_info(destination))
-                entries_after_copy = classify_entries(destination, verify_budget)
-                expected_names = {name} if expected_catalog is None else {name, expected_catalog}
-                actual_names = {leaf for group in entries_after_copy.values() for leaf, _ in group}
-                if actual_names != expected_names:
-                    raise ValueError("The staging directory contains unexpected files.")
-                copies = entries_after_copy.get(expected_catalog.casefold(), []) if expected_catalog else []
-                copy_info = child_info(destination, name)
-                copy_inode = entries_after_copy[name.casefold()][0][1]
-                if copy_inode is not None and copy_inode != copy_info.st_ino:
-                    raise ValueError("A staged family was replaced during verification.")
-                copied = record_pair(destination, name, copy_info, copies, verify_budget)
-                if copied != (rfa, catalog) or directory_stamp(directory_info(destination)) != copy_stamp:
-                    raise ValueError("The staged file bytes differ from the reviewed sources.")
+                verify_pair(destination, rfa, catalog, verify_budget)
                 pair_identity = identity(directory_info(destination))
             staged.append({"source_path": row["path"], "directory": pair_dir, "directory_identity": pair_identity,
                            "rfa": rfa, "catalog": catalog})
@@ -187,11 +196,12 @@ def stage(manifest, selected, raw_destination):
         if created:
             raise ValueError(f"{error} The unpublished workspace remains at {output}.") from error
         raise
-    return {
+    receipt = {
         "kind": "family-library-staging", "version": 1, "workspace": str(output),
         "workspace_identity": workspace_identity,
         "discovery_sha256": manifest["manifest_sha256"], "pairs": pairs,
     }
+    return dict(receipt, staging_sha256=manifest_digest(receipt))
 
 
 def main():
