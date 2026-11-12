@@ -136,21 +136,27 @@ def test_accepts_named_deletion_rows_in_saved_evidence(tmp_path, preview):
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="The HTML renderer requires PowerShell.")
 def test_renderer_preserves_exact_int64_ids_and_inert_labels(tmp_path, preview):
-    class DeletionData(HTMLParser):
+    class PreviewData(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.reading = False
-            self.payload = []
+            self.active = None
+            self.payloads = {"data": [], "deletions": []}
 
         def handle_starttag(self, tag, attrs):
-            self.reading = tag == "script" and dict(attrs).get("id") == "deletions"
+            if tag == "script":
+                identifier = dict(attrs).get("id")
+                self.active = identifier if identifier in self.payloads else None
 
         def handle_endtag(self, tag):
-            self.reading = False
+            if tag == "script":
+                self.active = None
 
         def handle_data(self, data):
-            if self.reading:
-                self.payload.append(data)
+            if self.active is not None:
+                self.payloads[self.active].append(data)
+
+        def read_json(self, identifier):
+            return json.loads("".join(self.payloads[identifier]))
 
     preview["deletions"][1].update(id=9007199254740993, name="</script><img src=x> __DATA_JSON__")
     source = tmp_path / "preview.json"
@@ -159,8 +165,11 @@ def test_renderer_preserves_exact_int64_ids_and_inert_labels(tmp_path, preview):
     run = subprocess.run(["pwsh", "-NoProfile", "-File", str(RENDERER),
                           "-Json", str(source), "-Out", str(target)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    parser = DeletionData()
+    parser = PreviewData()
     parser.feed(target.read_text(encoding="utf-8"))
-    assert json.loads("".join(parser.payload)) == [
+    data = parser.read_json("data")
+    assert data["before"] == preview["before"]
+    assert data["after"] == preview["after"]
+    assert parser.read_json("deletions") == [
         dict(row, id=str(row["id"])) for row in preview["deletions"]
     ]
