@@ -169,7 +169,20 @@ Set `kind` to `mep-penetration-host-spacing` and `frame` to `host_face_internal_
 
 Supply `proposed` and `existing` arrays. Give each outline a unique `key` and two `center` coordinates. Use `shape: "round"` with `diameter`. Use `shape: "rectangular"` with `width`, `height`, and `angle_rad`.
 
-Exit 1 lists conflicts. Exit 2 means the spacing check stopped. This command uses prepared measurements. Native geometry collection, tracking, and placement are pending.
+Exit 1 lists conflicts. Exit 2 means the spacing check stopped. This command uses prepared measurements.
+
+### Preview crossings and check tracked openings
+
+Run `python scripts/mep_penetration_preview.py evidence.json`. Keep the evidence and report private. The command does not write to Revit or the issue board.
+
+- Use `kind: "mep-penetration-evidence"` and `frame: "revit_host_internal_feet"`. Provide `host_identity` and `link_identity` with `project_uid` and `path_sha256`. Provide `link_instance_uid`, `clearance_ft`, and `tolerance_ft`.
+- Provide `hosts` with each host's `id`, `uid`, `kind`, `depth_ft`, unit `normal`, and `gross_sha256`. Set the normal from the first principal face toward the opposite face. Include `cuts_complete`, `minimum_web_ft`, and `existing` outlines from the same face frame.
+- Provide `runs` with each linked run's `id`, `uid`, `system`, and measured exterior `profile`. Use `shape` and `diameter` for round runs. Use `shape`, `width`, and `height` for rectangular runs.
+- Provide one `pairs` row per host and run. Use `host_uid`, `run_uid`, and `status`. Use `solid_crossing` only for a verified full crossing through material. Use `gross_crossing` for an independently measured gross host crossing. Use `no_crossing` for a measured miss and `unresolved` when evidence is missing.
+- For a crossing, supply `entry_ft` and `exit_ft` on the two principal faces, `center_uv_ft` in the host face frame, and the shortest `edge_distance_ft` from the crossing centers to any trim boundary. Confirm both centers are inside the trimmed faces. For a rectangular run, supply `angle_rad` in the face frame. Set `gross_verified` for a separately measured gross-host result. Set `existing_cut_verified` only when an existing cut has independent evidence.
+- Use an empty `tracked` array for a first pass. For each kept opening, include the pair UIDs, `crossing_key`, saved `geometry`, and `geometry_sha256`. Include `opening_uid`, `observed_uid`, `observed_host_uid`, `cut_verified`, and the saved and current opening digests as `opening_sha256` and `observed_opening_sha256`.
+
+Set `complete` to true only after the entire selected scope was measured. A complete miss can mark a tracked opening out of date. An unavailable link or missing cut proof leaves it unresolved. Native geometry collection, tracking storage, and guarded placement are pending.
 
 ## Rules
 
