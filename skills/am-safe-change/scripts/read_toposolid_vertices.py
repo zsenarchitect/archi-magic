@@ -57,9 +57,50 @@ def pad_target(point, face, origin, normal):
     return [x, y, z], gap
 
 
+def alignment_request(document, terrain, request, ui_document):
+    if (not isinstance(request, dict) or "tolerance_ft" not in request
+            or set(request) - {"points_xy_ft", "support_reference", "tolerance_ft"}):
+        raise ValueError("Supply alignment tolerance_ft and optionally points_xy_ft and support_reference.")
+    request = dict(request)
+    needs_support = "support_reference" not in request
+    needs_points = "points_xy_ft" not in request
+    if not (needs_support or needs_points):
+        return request
+    if ui_document is None or not ui_document.Document.Equals(document):
+        raise ValueError("Open the active Revit project to read alignment selections.")
+    support_refs, picked_xy = [], []
+    for index, reference in enumerate(ui_document.Selection.GetReferences()):
+        if index >= MAX_POINTS + 1:
+            raise ValueError("The alignment selection exceeds {} references.".format(MAX_POINTS + 1))
+        if reference.LinkedElementId.Value != -1:
+            raise ValueError("Remove linked references from the alignment selection.")
+        if reference.ElementId.Value == terrain.Id.Value:
+            if needs_points:
+                location = reference.GlobalPoint
+                if location is None:
+                    raise ValueError("Revit returned no selected terrain point coordinates for a reference. "
+                                     "Supply points_xy_ft from the inventory.")
+                coordinates = xyz(location)
+                if not all(finite_number(value) for value in coordinates[:2]):
+                    raise ValueError("Revit returned invalid XY for a selected terrain point.")
+                picked_xy.append(coordinates[:2])
+        elif needs_support:
+            stable = reference.ConvertToStableRepresentation(document)
+            if not stable:
+                raise ValueError("Revit returned no stable identity for a selected support.")
+            support_refs.append(stable)
+    if needs_support:
+        if len(support_refs) != 1:
+            raise ValueError("Select exactly one support edge or face in the active project.")
+        request["support_reference"] = support_refs[0]
+    if needs_points:
+        if not picked_xy:
+            raise ValueError("Revit returned no selected terrain point coordinates. Supply points_xy_ft from the inventory.")
+        request["points_xy_ft"] = sorted(picked_xy)
+    return request
+
+
 def alignment_preview(document, terrain, vertices, request, clock):
-    if not isinstance(request, dict) or set(request) != {"points_xy_ft", "support_reference", "tolerance_ft"}:
-        raise ValueError("Supply alignment points_xy_ft, support_reference and tolerance_ft.")
     points = request["points_xy_ft"]
     tolerance = request["tolerance_ft"]
     stable = request["support_reference"]
@@ -103,7 +144,8 @@ def alignment_preview(document, terrain, vertices, request, clock):
     else:
         raise ValueError("Select a bounded straight edge or an upward-facing planar face.")
 
-    support.update({"id": str(owner.Id.Value), "uid": str(owner.UniqueId), "reference": stable})
+    support.update({"id": str(owner.Id.Value), "uid": str(owner.UniqueId),
+                    "version": str(owner.VersionGuid), "reference": stable})
     rows, seen = [], set()
     for index, (x, y) in enumerate(points, 1):
         if clock.ElapsedMilliseconds >= MAX_READ_MS:
@@ -125,7 +167,8 @@ def alignment_preview(document, terrain, vertices, request, clock):
                 row["after_ft"], row["support_distance_ft"] = resolved
         rows.append(row)
     blocked = any("reason" in row for row in rows)
-    return {"support": support, "tolerance_ft": tolerance, "blocked": blocked, "rows": rows}
+    return {"support": support, "tolerance_ft": tolerance, "blocked": blocked, "rows": rows,
+            "request": request}
 
 
 def project_identity(document):
@@ -165,7 +208,7 @@ def shape_vertices(terrain, clock):
     return editor, vertices
 
 
-def read_vertices(document, args):
+def read_vertices(document, args, ui_document=None):
     project = project_identity(document)
     if not isinstance(args, dict) or set(args) not in ({"toposolid_id"}, {"toposolid_id", "alignment"}):
         raise ValueError("Supply inputs.toposolid_id and optionally an alignment request.")
@@ -183,7 +226,8 @@ def read_vertices(document, args):
         "vertices_ft": sorted(vertices),
     }
     if "alignment" in args:
-        snapshot["alignment"] = alignment_preview(document, terrain, vertices, args["alignment"], clock)
+        request = alignment_request(document, terrain, args["alignment"], ui_document)
+        snapshot["alignment"] = alignment_preview(document, terrain, vertices, request, clock)
     payload = json.dumps(snapshot, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise ValueError("Toposolid inventory is {} bytes, above the {} byte limit.".format(
@@ -195,7 +239,7 @@ def read_vertices(document, args):
 
 if "inputs" in globals():
     try:
-        result = read_vertices(doc, inputs)
+        result = read_vertices(doc, inputs, globals().get("uidoc"))
     except ValueError as error:
         result = {"status": "stopped", "message": str(error)}
     except Exception as error:
