@@ -4,8 +4,10 @@
 from collections import Counter
 import hashlib
 import json
+import math
 import os
 import platform
+import re
 import stat
 import sys
 
@@ -15,6 +17,15 @@ REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 AUDITS = ("model_health.py", "param_qa.py")
 HOST_STATUSES = ("audited", "incomplete", "rejected", "audit_failed", "close_failed",
                  "staged_changed", "not_run")
+METRIC_KEY = re.compile(r"\A[a-z][a-z0-9_]{0,47}\Z")
+CATEGORY_KEY = re.compile(r"\AOST_[A-Za-z0-9_]{1,48}\Z")
+PARAMETER_KEY = re.compile(r"\A[A-Za-z][A-Za-z0-9 _-]{0,47}\Z")
+STATUSES = ("ok", "warn", "bad", "info")
+
+try:
+    TEXT = basestring
+except NameError:
+    TEXT = str
 
 
 def linked(info):
@@ -68,6 +79,42 @@ def normalized_path(path):
     return os.path.normcase(os.path.abspath(path))
 
 
+def check_totals(health, parameters):
+    if (not isinstance(health, dict) or not 1 <= len(health) <= 64
+            or not isinstance(parameters, dict) or not 1 <= len(parameters) <= 32):
+        raise ValueError("invalid named batch check results")
+    statuses = Counter()
+    for key, row in health.items():
+        value = row["value"]
+        if (not isinstance(key, TEXT) or not METRIC_KEY.match(key)
+                or set(row) != {"status", "value"} or row["status"] not in STATUSES
+                or type(value) not in (int, float) or not 0 <= value <= 10 ** 12
+                or math.isnan(value) or math.isinf(value)):
+            raise ValueError("invalid named model health metric")
+        statuses[row["status"]] += 1
+    offenders = 0
+    for key, row in parameters.items():
+        counts = (row["total"], row["passed"], row["failed"])
+        if (not isinstance(key, TEXT) or not CATEGORY_KEY.match(key)
+                or set(row) != {"total", "passed", "failed", "by_parameter"}
+                or any(type(value) is not int or value < 0 for value in counts) or counts[0] != sum(counts[1:])):
+            raise ValueError("invalid named parameter QA category")
+        rules = row["by_parameter"]
+        if not isinstance(rules, dict) or not 1 <= len(rules) <= 16:
+            raise ValueError("invalid parameter QA rules")
+        for name, rule in rules.items():
+            if (not isinstance(name, TEXT) or not PARAMETER_KEY.match(name)
+                    or set(rule) != {"missing", "empty", "on_type"}
+                    or any(type(value) is not int or value < 0 for value in rule.values())
+                    or sum(rule.values()) > counts[0] or rule["missing"] + rule["empty"] > counts[2]):
+                raise ValueError("invalid parameter QA rule counts")
+        offenders += row["failed"]
+    return {
+        "health_metrics": len(health), "health_bad": statuses["bad"], "health_warn": statuses["warn"],
+        "parameter_offenders": offenders, "parameter_categories": len(parameters),
+    }
+
+
 def summarize(health, parameters):
     if "error" in health or "error" in parameters:
         raise ValueError("audit returned an error")
@@ -75,11 +122,6 @@ def summarize(health, parameters):
     cad_partial = health["cad_view_count"]["partial"]
     if not isinstance(metrics, list) or not metrics or type(cad_partial) is not bool:
         raise ValueError("invalid model health output")
-    ids = [row["id"] for row in metrics]
-    if len(set(ids)) != len(ids) or any(not row["id"] or row["status"] not in (
-        "ok", "warn", "bad", "info"
-    ) for row in metrics):
-        raise ValueError("invalid model health metrics")
     categories = parameters["summary"]
     unknown = parameters["unknown_categories"]
     truncated = parameters["rows_truncated"]
@@ -88,21 +130,18 @@ def summarize(health, parameters):
         raise ValueError("invalid parameter QA output")
     if type(total) is not int or total < 0 or type(truncated) is not bool:
         raise ValueError("invalid parameter QA counts")
-    failed = 0
-    for row in categories:
-        counts = (row["total"], row["passed"], row["failed"])
-        if any(type(value) is not int or value < 0 for value in counts) or counts[0] != sum(counts[1:]):
-            raise ValueError("invalid parameter QA category counts")
-        failed += row["failed"]
-    if failed != total:
+    named_health = {row["id"]: {"status": row["status"], "value": row["value"]} for row in metrics}
+    named_parameters = {row["key"]: {"total": row["total"], "passed": row["passed"], "failed": row["failed"],
+                                    "by_parameter": row["by_param"]} for row in categories}
+    if len(named_health) != len(metrics) or len(named_parameters) != len(categories):
+        raise ValueError("duplicate named batch checks")
+    summary = check_totals(named_health, named_parameters)
+    if summary["parameter_offenders"] != total:
         raise ValueError("parameter QA total does not match category counts")
-    statuses = Counter(row["status"] for row in metrics)
-    return {
-        "health_metrics": len(metrics), "health_bad": statuses["bad"], "health_warn": statuses["warn"],
-        "cad_coverage_partial": cad_partial, "parameter_offenders": total,
-        "parameter_categories": len(categories), "parameter_unknown_categories": len(unknown),
-        "parameter_details_truncated": truncated,
-    }
+    summary.update(cad_coverage_partial=cad_partial, parameter_unknown_categories=len(unknown),
+                   parameter_details_truncated=truncated, health_checks=named_health,
+                   parameter_checks=named_parameters)
+    return summary
 
 
 def preflight(DB, path, year):

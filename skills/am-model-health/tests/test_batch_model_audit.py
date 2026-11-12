@@ -35,7 +35,7 @@ def batch(tmp_path):
     return root, workspace, plan_path, json.loads(result.stdout)
 
 
-def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False):
+def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False, seeded=False):
     events = []
     documents = []
 
@@ -71,14 +71,22 @@ def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False
 
     def audits(script, doc, running_app, inputs):
         assert doc in documents and running_app is app and inputs["max_ids"] == 1
+        number = int(Path(doc.PathName).stem.split("-")[-1])
+        warnings = 60 * number if seeded and number < 3 else 60 * int(not seeded)
+        offenders = int(not seeded or number in (3, 4))
         if b"am-model-health:" in script:
             events.append(("audit", "health"))
-            return {"metrics": [{"id": "warnings", "status": "warn"}],
+            return {"metrics": [{"id": "warnings", "status": "warn" if warnings else "ok", "value": warnings,
+                                 "label": "Private model label", "details": [{"ids": [9]}]}],
                     "cad_view_count": {"partial": partial}}
         assert b"am-param-qa:" in script
         events.append(("audit", "parameter"))
-        return {"summary": [{"total": 2, "passed": 1, "failed": 1}],
-                "unknown_categories": [], "rows_truncated": True, "total_offenders": 1}
+        category = "OST_Rooms" if seeded and number == 4 else "OST_Doors"
+        name = "Department" if category == "OST_Rooms" else "Mark"
+        return {"summary": [{"key": category, "total": 2, "passed": 2 - offenders, "failed": offenders,
+                             "by_param": {name: {"missing": 0, "empty": offenders, "on_type": 0}},
+                             "category": "Private model category label", "offender_ids": [18]}],
+                "unknown_categories": [], "rows_truncated": bool(offenders), "total_offenders": offenders}
 
     # The fixture host models API objects. The native audit implementations are
     # present and pinned in staging, but only Revit can execute their API calls.
@@ -113,6 +121,60 @@ def test_five_inputs_stage_and_collect_with_unchanged_hashes(batch, monkeypatch)
     assert events.count(("close", False)) == 5 and not ui.Application.Documents
     assert before == {file.name: sha256(file.read_bytes()).hexdigest() for file in root.iterdir()}
     assert plan["run_id"] == report["run_id"]
+
+
+def test_combined_report_keeps_exact_seeded_checks_and_clean_control(batch, monkeypatch):
+    _, workspace, plan_path, _ = batch
+    ui, db, _ = fake_host(monkeypatch, seeded=True)
+    host.host_run(ui, db, "7.0.1.26312+1155", str(workspace))
+    result = collect(plan_path)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    summaries = [row["summary"] for row in report["models"]]
+    assert [row["health_checks"] for row in summaries] == [
+        {"warnings": {"status": status, "value": count}}
+        for status, count in [("warn", 60), ("warn", 120), ("ok", 0), ("ok", 0), ("ok", 0)]
+    ]
+    assert [row["parameter_checks"] for row in summaries] == [
+        {category: {"total": 2, "passed": 2 - failed, "failed": failed,
+                    "by_parameter": {name: {"missing": 0, "empty": failed, "on_type": 0}}}}
+        for category, name, failed in [
+            ("OST_Doors", "Mark", 0), ("OST_Doors", "Mark", 0), ("OST_Doors", "Mark", 1),
+            ("OST_Rooms", "Department", 1), ("OST_Doors", "Mark", 0),
+        ]
+    ]
+    assert "Private model" not in result.stdout
+    assert "offender_ids" not in result.stdout and "details" not in result.stdout.replace("parameter_details_truncated", "")
+
+
+def test_fixture_qualification_rejects_same_total_with_seed_on_wrong_model(batch, monkeypatch):
+    root, workspace, plan_path, _ = batch
+    ui, db, _ = fake_host(monkeypatch, seeded=True)
+    host.host_run(ui, db, "7.0.1.26312+1155", str(workspace))
+    expectations = root.parent / "expected.json"
+    seeds = [
+        {"id": number, "clean": number == 5, "health_checks": {}, "parameter_checks": {}}
+        for number in range(1, 6)
+    ]
+    seeds[0]["health_checks"] = {"warnings": {"status": "warn", "value": 60}}
+    seeds[1]["health_checks"] = {"warnings": {"status": "warn", "value": 120}}
+    for index, category, name in [(2, "OST_Doors", "Mark"), (3, "OST_Rooms", "Department")]:
+        seeds[index]["parameter_checks"] = {
+            category: {"total": 2, "passed": 1, "failed": 1,
+                       "by_parameter": {name: {"missing": 0, "empty": 1, "on_type": 0}}},
+        }
+
+    def compare():
+        expectations.write_text(json.dumps({"models": seeds}))
+        return run("collect", "--plan", plan_path, "--host-exited", "--fixture-expectations", expectations)
+
+    verified = compare()
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["fixture_checks_matched"] is True
+    seeds[0]["health_checks"], seeds[1]["health_checks"] = seeds[1]["health_checks"], seeds[0]["health_checks"]
+    mismatch = compare()
+    assert mismatch.returncode == 2
+    assert "Model 1 did not match its seeded health_checks" in mismatch.stderr
 
 
 @pytest.mark.parametrize("loaded_build", ["7.0.1.26312+1155", None])
@@ -153,7 +215,9 @@ def test_staged_worker_reads_version_from_loaded_runtime(batch, monkeypatch, loa
     assert events == []
 
 
-@pytest.mark.parametrize("mutant", ["missing", "stale", "duplicate", "wrong_digest", "unknown_build"])
+@pytest.mark.parametrize("mutant", [
+    "missing", "stale", "duplicate", "wrong_digest", "unknown_build", "wrong_health_total", "wrong_parameter_total",
+])
 def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch, mutant):
     _, work, plan, _ = batch
     ui, db, _ = fake_host(monkeypatch)
@@ -167,6 +231,10 @@ def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch,
             data["rows"][0] = data["rows"][1]
         elif mutant == "unknown_build":
             data["runtime"]["pyrevit_build"] = "Unknown"
+        elif mutant == "wrong_health_total":
+            data["rows"][0]["summary"]["health_checks"]["warnings"]["status"] = "bad"
+        elif mutant == "wrong_parameter_total":
+            data["rows"][0]["summary"]["parameter_checks"]["OST_Doors"]["by_parameter"]["Mark"]["empty"] = 2
         else:
             data["rows"][0]["sha256"] = "0" * 64
         receipt.write_text(json.dumps(data))
