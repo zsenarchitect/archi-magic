@@ -31,10 +31,27 @@ def read_payload(path):
     report = json.loads(data.decode("utf-8-sig"), parse_float=Decimal)
     if not isinstance(report, dict):
         raise ValueError("expected a query object")
-    if "result" in report:
-        if report.get("status", "ok") not in ("ok", "success", "succeeded", "completed") or report.get("error"):
-            raise Incomplete("the query runtime did not complete successfully")
-        report = report["result"]
+    if "response" in report:
+        report = report["response"]
+        if not isinstance(report, dict):
+            raise ValueError("expected a saved runtime response")
+    if {"result", "mode", "result_truncated", "changes"}.intersection(report):
+        exit_code = report.get("exit_code", 0)
+        if (report.get("status", "ok") not in ("ok", "success", "succeeded", "completed")
+                or type(exit_code) is not int or exit_code != 0
+                or report.get("error") or report.get("mode", "query") != "query"
+                or report.get("result_truncated", False) is not False or report.get("failures") or report.get("blocked")
+                or report.get("unclosed_documents")):
+            raise Incomplete("save the complete successful read-only query response")
+        if "changes" in report:
+            changes = report["changes"]
+            if (not isinstance(changes, dict)
+                    or any(type(changes.get(key)) is not int or changes[key] != 0
+                           for key in ("added_count", "modified_count", "deleted_count"))
+                    or any(changes.get(key) for key in ("added", "modified", "deleted", "added_ids", "modified_ids",
+                                                        "deleted_ids", "by_category", "other_documents"))):
+                raise Incomplete("the saved query does not verify zero model changes")
+        report = report.get("result")
     if not isinstance(report, dict) or report.get("error"):
         raise Incomplete("the query did not return a report")
     if "payload" in report:

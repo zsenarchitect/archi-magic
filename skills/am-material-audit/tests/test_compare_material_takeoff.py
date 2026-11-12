@@ -95,6 +95,34 @@ def test_rejects_mixed_projects_overlap_collisions_and_partial_reads(tmp_path):
     assert result.returncode == 2 and "out-of-range" in result.stderr
 
 
+@pytest.mark.parametrize("runtime", [
+    {"mode": "dry_run"},
+    {"result_truncated": True},
+    {"exit_code": 1},
+    {"changes": {"added_count": 0, "modified_count": 1, "deleted_count": 0}},
+    {"changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "deleted": ["7"]}},
+])
+def test_query_runtime_must_be_complete_and_read_only(tmp_path, runtime):
+    takeoff = query(tmp_path / "query.json", [quantity("A", 3, 1)])
+    record = json.loads(takeoff.read_text())
+    record.update(runtime)
+    takeoff.write_text(json.dumps(record))
+    result = compare(tmp_path, [["A", "Walls", "Level 1", 3, 1]], takeoff)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["status"] == "incomplete"
+
+
+def test_complete_get_run_response_can_be_used_for_comparison(tmp_path):
+    takeoff = query(tmp_path / "query.json", [quantity("A", 3, 1)])
+    record = json.loads(takeoff.read_text())
+    record.update(mode="query", status="ok", result_truncated=False,
+                  changes={"added_count": 0, "modified_count": 0, "deleted_count": 0})
+    takeoff.write_text(json.dumps({"response": record}))
+    result = compare(tmp_path, [["A", "Walls", "Level 1", 3, 1]], takeoff)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["status"] == "match"
+
+
 def test_schedule_metadata_and_existing_csv_export(tmp_path):
     powershell = shutil.which("pwsh")
     if not powershell:
