@@ -25,6 +25,8 @@ Run `scripts/read_sheets.py` with `run_query`. Pass up to 30 real sheet IDs as d
 
 Use `scheduled` to identify the clouds included in the native sheet revision schedule. Review cloud rows with `revision_on_sheet` set to `false`. Revit can identify a candidate cloud through its owner view or related views even if visibility or cropping keeps it off the sheet. The report is read-only.
 
+Save the complete query response as `read.json`. Save an intent such as `{"operation":"remove","revision_id":"123"}` as `intent.json`. Run `python scripts/sheet_revision_preview.py read.json intent.json > preview.json`. Render the preview with the schedule viewer. Check the manual setting and effective schedule separately. A revision that still has a scheduled cloud stays on the sheet after clearing the manual setting.
+
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
 ## The 8 steps (do all of them, in this order)

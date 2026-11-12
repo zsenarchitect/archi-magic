@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 from types import SimpleNamespace as NS
 
@@ -110,3 +111,43 @@ def test_revision_scope_keeps_placeholders_in_legacy_inventory_only(inventory):
     assert any(row["placeholder"] for row in execute()["sheets"])
     assert execute(revision_sheet_ids=["104"])["status"] == "stopped"
     assert execute(revision_sheet_ids=["102", "102"])["status"] == "stopped"
+
+
+def revision_preview(snapshot, intent, tmp_path):
+    source, request = tmp_path / "snapshot.json", tmp_path / "intent.json"
+    source.write_text(json.dumps({"response": {"status": "ok", "result": snapshot}}))
+    request.write_text(json.dumps(intent))
+    return subprocess.run([sys.executable, str(SCRIPT.with_name("sheet_revision_preview.py")), str(source), str(request)],
+                          text=True, capture_output=True)
+
+
+def test_preview_removes_manual_revision_without_erasing_cloud_schedule(inventory, tmp_path):
+    execute, ids, sheets, _ = inventory
+    sheets[0].additional = [5, 6]
+    sheets[2].scheduled = sheets[2].additional = [5]
+    result = revision_preview(execute(revision_sheet_ids=ids), {"operation": "remove", "revision_id": "5"}, tmp_path)
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    steps = {step["sheet_id"]: step for step in preview["steps"]}
+    assert preview["ownership_ids"] == [ids[2], ids[0]]
+    assert steps[ids[0]] == {"sheet_id": ids[0], "sheet_uid": "sheet-" + ids[0],
+                             "additional_revision_ids": ["6"], "scheduled_revision_ids": ["5", "6"]}
+    assert steps[ids[2]]["additional_revision_ids"] == [] and steps[ids[2]]["scheduled_revision_ids"] == []
+    after = {row[0]: row[-2:] for row in preview["after"]}
+    assert after == {ids[0]: [False, True], ids[1]: [False, True], ids[2]: [False, False]}
+    assert {warning["row"] for warning in preview["warnings"]} == {ids[0], ids[1]}
+
+
+def test_preview_adds_explicit_revision_and_rejects_unreconciled_cloud_evidence(inventory, tmp_path):
+    execute, ids, _, _ = inventory
+    read = execute(revision_sheet_ids=ids, revision_ids=["8"])
+    intent = {"operation": "add", "revision_id": "8"}
+    result = revision_preview(read, intent, tmp_path)
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    assert [row["additional_revision_ids"] for row in preview["steps"]] == [["8"], ["8"], ["6", "8"]]
+    assert [row["scheduled_revision_ids"] for row in preview["steps"]] == [["5", "8"], ["8"], ["5", "6", "8"]]
+    snapshot = json.loads(read["snapshot_json"])
+    snapshot["sheets"][0]["scheduled_cloud_ids"] = []
+    result = revision_preview(dict(read, snapshot_json=json.dumps(snapshot)), intent, tmp_path)
+    assert result.returncode == 2 and not result.stdout
