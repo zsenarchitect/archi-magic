@@ -182,7 +182,17 @@ Run `python scripts/mep_penetration_preview.py evidence.json`. Keep the evidence
 - For a crossing, supply `entry_ft` and `exit_ft` on the two principal faces, `center_uv_ft` in the host face frame, and the shortest `edge_distance_ft` from the crossing centers to any trim boundary. Confirm both centers are inside the trimmed faces. For a rectangular run, supply `angle_rad` in the face frame. Set `gross_verified` for a separately measured gross-host result. Set `existing_cut_verified` only when an existing cut has independent evidence.
 - Use an empty `tracked` array for a first pass. For each kept opening, include the pair UIDs, `crossing_key`, saved `geometry`, and `geometry_sha256`. Include `opening_uid`, `observed_uid`, `observed_host_uid`, `cut_verified`, and the saved and current opening digests as `opening_sha256` and `observed_opening_sha256`.
 
-Set `complete` to true only after the entire selected scope was measured. A complete miss can mark a tracked opening out of date. An unavailable link or missing cut proof leaves it unresolved. Native geometry collection, tracking storage, and guarded placement are pending.
+Set `complete` to true only after the entire selected scope was measured. A complete miss can mark a tracked opening out of date. An unavailable link or missing cut proof leaves it unresolved.
+
+### Read linked runs and host crossings in Revit
+
+Save the host project and call `get_context`. Run `scripts/read_mep_penetrations.py` with the CPython bridge in query mode. Use the skill's scripts folder as the workspace.
+
+Pass `link_instance_id`, `host_ids`, and `run_ids` as exact decimal strings. Use one loaded link and up to 100 selected IDs per model. Pass `clearance_ft`, `tolerance_ft`, and `minimum_web_ft` from the reviewed scope.
+
+Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The first native read covers uncut rectangular host solids and finite straight runs with measured exterior profiles. It reports unsupported or ambiguous geometry as unresolved.
+
+Verify this reader on a disposable Revit fixture before use. Native tracking storage and guarded placement are pending.
 
 ## Rules
 

@@ -160,11 +160,11 @@ def preview(snapshot):
         elif pair["status"] == "no_crossing":
             continue
         elif not complete or host["cuts_complete"] is not True:
-            status, reason = "unresolved", "The current scan or nearby-cut inventory is incomplete."
+            status, reason = "unresolved", pair.get("reason") or "The scan or nearby-cut inventory is incomplete."
         elif pair["status"] == "gross_crossing" and pair.get("existing_cut_verified") is True:
             status, reason = "untracked", "An existing cut has no verified tracking record."
         elif pair["status"] != "solid_crossing":
-            status, reason = "unresolved", "A complete crossing through host material was not verified."
+            status, reason = "unresolved", pair.get("reason") or "A complete crossing through host material was not verified."
         else:
             try:
                 geometry = measured_geometry(host, run, pair, clearance, tolerance)
