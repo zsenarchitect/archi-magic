@@ -64,6 +64,9 @@ def expected_pieces(row):
                     centerline = edge_key("Line", *footprint["centerline_ft"])
                     piece = dict(common, kind="wall", type_uid=row["wall_finish"]["type_uid"],
                                  centerline=centerline, source_wall_uid=edge["wall_finish"]["wall_uid"])
+                    for field in ("base_offset_ft", "height_ft"):
+                        if field in row["wall_finish"]:
+                            piece[field] = row["wall_finish"][field]
                     key = digest(piece)
                     if key in pieces:
                         raise ValueError("The preview repeats a finish piece.")
@@ -111,15 +114,20 @@ def record_fields(pairs):
     return record
 
 
+def payload_field(schema):
+    fields = list(schema.ListFields())
+    if (schema.SchemaName != SCHEMA_NAME or len(fields) != 1 or fields[0].FieldName != "Payload"
+            or fields[0].ValueType.FullName != "System.String" or fields[0].ContainerType != ContainerType.Simple):
+        raise ValueError("The room-finish schema differs from the expected field contract.")
+    return fields[0]
+
+
 def records_by_room(document, selected):
     guid = Guid(SCHEMA_GUID)
     schema = Schema.Lookup(guid)
     if schema is None:
         return {}
-    fields = list(schema.ListFields())
-    if (schema.SchemaName != SCHEMA_NAME or len(fields) != 1 or fields[0].FieldName != "Payload"
-            or fields[0].ValueType.FullName != "System.String" or fields[0].ContainerType != ContainerType.Simple):
-        raise ValueError("The room-finish schema differs from the expected field contract.")
+    field = payload_field(schema)
     records = {}
     collector = DB.FilteredElementCollector(document)
     try:
@@ -129,7 +137,7 @@ def records_by_room(document, selected):
             entity = element.GetEntity(schema)
             if not entity.IsValid():
                 raise ValueError("A room-finish provenance entity is invalid.")
-            encoded = entity.Get[String](fields[0])
+            encoded = entity.Get[String](field)
             if not isinstance(encoded, TEXT) or len(encoded) > 4096:
                 raise ValueError("A room-finish provenance record is unavailable.")
             record = json.loads(encoded, object_pairs_hook=record_fields)
@@ -172,11 +180,16 @@ def nearby_finish_scopes(document, row):
             yield (finish["kind"], finish["type_id"],
                    (min_x, min_y, elevation - width), (max_x, max_y, elevation + width))
     if row.get("wall_finish", {}).get("status") == "reported":
-        room = document.GetElement(DB.ElementId(Int64(row["room_id"])))
-        box = room.get_BoundingBox(None)
-        if box is None or not box.Enabled or not box.Transform.IsIdentity or not box.Min.Z < box.Max.Z:
-            raise ValueError("The room's vertical scope is unavailable.")
         wall = row["wall_finish"]
+        if "height_ft" in wall:
+            low_z = row["level"]["project_elevation_ft"] + wall["base_offset_ft"]
+            high_z = low_z + wall["height_ft"]
+        else:
+            room = document.GetElement(DB.ElementId(Int64(row["room_id"])))
+            box = room.get_BoundingBox(None)
+            if box is None or not box.Enabled or not box.Transform.IsIdentity or not box.Min.Z < box.Max.Z:
+                raise ValueError("The room's vertical scope is unavailable.")
+            low_z, high_z = box.Min.Z, box.Max.Z
         half_width = wall["width_ft"] / 2.0
         for edge in edges:
             for footprint in edge["wall_finish"]["finish_footprints"]:
@@ -185,8 +198,8 @@ def nearby_finish_scopes(document, row):
                 length = math.hypot(dx, dy)
                 pad_x, pad_y = abs(dy) * half_width / length, abs(dx) * half_width / length
                 yield ("wall", wall["type_id"],
-                       (min(a[0], b[0]) - pad_x, min(a[1], b[1]) - pad_y, box.Min.Z),
-                       (max(a[0], b[0]) + pad_x, max(a[1], b[1]) + pad_y, box.Max.Z))
+                       (min(a[0], b[0]) - pad_x, min(a[1], b[1]) - pad_y, low_z),
+                       (max(a[0], b[0]) + pad_x, max(a[1], b[1]) + pad_y, high_z))
 
 
 def nearby_finishes(document, row, recorded_ids):
@@ -215,6 +228,18 @@ def nearby_finishes(document, row, recorded_ids):
                 filter_.Dispose()
             outline.Dispose()
     return sorted(candidates.values(), key=lambda item: int(item["id"]))
+
+
+def matches_piece(intended, observed):
+    if any(observed[key] != intended[key] for key in ("kind", "type_uid", "level_uid", "phase_uid")):
+        return False
+    if intended["kind"] != "wall":
+        return (observed["profile"] == intended["profile"]
+                and abs(observed["offset_ft"] - intended["offset_ft"]) <= 1e-6)
+    return (observed["centerline"] == intended["centerline"] and observed["room_bounding"] == 0
+            and observed["top_constraint"] == "-1" and not any(observed["joined_ends"])
+            and all(abs(observed[key] - intended[key]) <= 1e-6
+                    for key in ("base_offset_ft", "height_ft") if key in intended))
 
 
 def audit_existing_finishes(document, rows):
@@ -247,17 +272,9 @@ def audit_existing_finishes(document, rows):
             for record, element in existing:
                 intended = expected[record["piece_key"]]
                 observed = observed_piece(document, element, record["kind"])
-                if record["kind"] == "wall":
-                    geometry_matches = (observed["centerline"] == intended["centerline"]
-                                        and observed["room_bounding"] == 0 and not any(observed["joined_ends"]))
-                else:
-                    geometry_matches = (observed["profile"] == intended["profile"]
-                                        and abs(observed["offset_ft"] - intended["offset_ft"]) <= 1e-6)
                 if (record["element_uid"] != str(element.UniqueId)
-                        or any(record[key] != intended[key] or observed[key] != intended[key]
-                               for key in ("kind", "type_uid", "level_uid"))
-                        or observed["phase_uid"] != intended["phase_uid"]
-                        or not geometry_matches
+                        or any(record[key] != intended[key] for key in ("kind", "type_uid", "level_uid"))
+                        or not matches_piece(intended, observed)
                         or record["observed_sha256"] != digest(observed)):
                     audit["reason"] = "tagged_piece_changed_or_copied"
                     break

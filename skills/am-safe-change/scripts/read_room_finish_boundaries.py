@@ -386,12 +386,20 @@ def inspect_room(room, room_id, options, remaining):
             profile.Dispose()
 
 
-def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False):
+def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, audit_existing=False,
+                    wall_dimensions=None):
     types = None
     identity = None
     wall_type = None
     if type(audit_existing) is not bool or (audit_existing and finish_request is None and wall_type_id is None):
         raise ValueError("Select finish types before requesting an existing-finish audit.")
+    if wall_dimensions is not None:
+        if (wall_type_id is None or not isinstance(wall_dimensions, dict)
+                or set(wall_dimensions) != {"height_ft", "base_offset_ft"}
+                or any(type(value) not in (int, float) or not finite(value) for value in wall_dimensions.values())
+                or not 0 < wall_dimensions["height_ft"] <= 30000
+                or not -30000 <= wall_dimensions["base_offset_ft"] <= 30000):
+            raise ValueError("Supply a wall type, positive wall height, and level-relative base offset in feet.")
     if finish_request is not None or wall_type_id is not None:
         project = document.ProjectInformation
         if not document.PathName or project is None or not project.UniqueId:
@@ -406,6 +414,8 @@ def read_boundaries(document, room_ids, finish_request=None, wall_type_id=None, 
                 or not finite(element.Width) or element.Width <= 0):
             raise ValueError("Select a basic finish wall type with a known positive width.")
         wall_type = {"type_id": str(value), "type_uid": str(element.UniqueId), "width_ft": element.Width}
+        if wall_dimensions is not None:
+            wall_type.update({key: float(value) + 0.0 for key, value in wall_dimensions.items()})
     rows = []
     remaining = MAX_SEGMENTS
     options = DB.SpatialElementBoundaryOptions()
@@ -448,5 +458,5 @@ if doc is None or doc.IsFamilyDocument:
 else:
     report = read_boundaries(doc, ids_from(inputs.get("room_ids")),
                              inputs.get("horizontal_finishes"), inputs.get("wall_type_id"),
-                             inputs.get("audit_existing_finishes", False))
+                             inputs.get("audit_existing_finishes", False), inputs.get("wall_dimensions"))
     result = {"payload": json.dumps(report, ensure_ascii=True, allow_nan=False)}

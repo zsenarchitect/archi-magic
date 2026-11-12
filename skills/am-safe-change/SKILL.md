@@ -215,6 +215,8 @@ Add `horizontal_finishes` to preview selected floor and ceiling types and their 
 
 Pass `wall_type_id` to review a basic wall finish type and its width. Review each straight host-wall boundary for projected door envelopes and the remaining spans. The span distances start at the boundary segment's first endpoint. Segments with unclassified inserts or door envelopes that reach a boundary end are excluded with reasons.
 
+Pass `wall_dimensions` with `height_ft` and `base_offset_ft` to include wall height and base offset in the preview. Set the base offset relative to the room level. Use the same dimensions when checking a previous tagged set.
+
 Review `finish_footprints` for the centerlines that fit inside the room outline at the selected width. The check accounts for holes in straight-edged outlines. Curved outlines need separate review. Within each room, longer pieces take priority when footprints overlap. Review `original_span_ft` and `span_ft` for any trim. Check oblique joints for gaps before placement.
 
 Set `audit_existing_finishes` to `true` with the selected finish types. Pass the skill's scripts directory as the query workspace. The audit reads tagged finishes and compares their element identities, type, level, phase, and geometry with the preview. A copied, edited, or partial tagged set reports a conflict.

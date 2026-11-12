@@ -477,7 +477,8 @@ def test_existing_finish_audit_reconciles_exact_set_and_native_sketch(run, monke
                                     else "tagged_piece_changed_or_copied")
 
 
-def test_existing_wall_scan_uses_each_trimmed_footprint_and_deduplicates_candidates(run, monkeypatch):
+@pytest.mark.parametrize("with_dimensions", [False, True])
+def test_existing_wall_scan_uses_each_trimmed_footprint_and_deduplicates_candidates(run, monkeypatch, with_dimensions):
     db = sys.modules["pyrevit.api"].DB
     db.Floor, db.Ceiling = type("Floor", (), {}), type("Ceiling", (), {})
     monkeypatch.setitem(sys.modules, "Autodesk.Revit.DB.ExtensibleStorage", NS(
@@ -501,14 +502,20 @@ def test_existing_wall_scan_uses_each_trimmed_footprint_and_deduplicates_candida
     room = Room(Seq([loop(rectangle(0, 0, 10, 8), source=[50, 51, 52, 53])]))
     room.get_BoundingBox = lambda _view: NS(Enabled=True, Transform=NS(IsIdentity=True),
                                            Min=Point(0, 0, 24.75), Max=Point(10, 8, 35))
+    dimensions = {"height_ft": 9, "base_offset_ft": 0.25} if with_dimensions else None
     report = run({1: room, 50: Wall(50), 51: Wall(51), 52: Wall(52), 53: Wall(53),
                   101: Level(), 102: Phase(), 103: WallType()}, ["1"],
-                 wall_type_id="103", audit_existing_finishes=True)
+                 wall_type_id="103", audit_existing_finishes=True, wall_dimensions=dimensions)
     assert report["status"] == "incomplete"
+    low, high = (25.25, 34.25) if with_dimensions else (24.75, 35)
     assert set(seen) == {
-        (0, 0, 24.75, 10, 0.125, 35), (0, 7.875, 24.75, 10, 8, 35),
-        (0, 0.125, 24.75, 0.125, 7.875, 35), (9.875, 0.125, 24.75, 10, 7.875, 35),
+        (0, 0, low, 10, 0.125, high), (0, 7.875, low, 10, 8, high),
+        (0, 0.125, low, 0.125, 7.875, high), (9.875, 0.125, low, 10, 7.875, high),
     }
+    if with_dimensions:
+        provenance = sys.modules["room_finish_provenance"]
+        assert {(piece["base_offset_ft"], piece["height_ft"])
+                for piece in provenance.expected_pieces(report["rooms"][0]).values()} == {(0.25, 9.0)}
     assert report["rooms"][0]["existing_finishes"]["nearby"]["candidates"] == [
         {"id": "201", "uid": "manual-wall", "kind": "wall", "type_id": "103", "same_selected_type": True},
     ]
