@@ -81,6 +81,10 @@ def workflow_identity(inventory):
                             "parameter_id": inventory["parameter_id"], "categories": inventory["category_ids"]})
 
 
+def legend_name(workflow):
+    return "Parameter colors - " + workflow[:12]
+
+
 def proposed_filter_name(workflow, group_id, label):
     readable = re.sub(r"[^A-Za-z0-9]+", " ", label).strip()[:28].strip() or "Value"
     fingerprint = snapshot_digest([workflow, group_id])
@@ -157,9 +161,17 @@ def build(inventory):
         after.append([group_id, label, group["count"], filter_name, action, color_text(rgb)])
         legend.append({"value_key": group_id, "label": label, "rgb": list(rgb), "filter_name": filter_name,
                        "filter_id": selected["id"] if selected else None, "slot": len(legend)})
+    native_legend = inventory.get("legend_preflight")
+    if native_legend is not None:
+        if native_legend["name"] != legend_name(workflow):
+            raise ValueError("The native legend preflight does not match the proposed view name.")
+        if native_legend["state"] != "available":
+            warnings.append({"row": groups[0]["key"], "blocking": True,
+                             "text": "Resolve the native legend preflight state before using this proposal: "
+                                     + native_legend["state"] + "."})
     proposal = {"kind": "view-color-proposal", "basis_sha256": basis, "workflow_sha256": workflow,
                 "document": inventory["document"], "view": inventory["view"],
-                "legend_name": "Parameter colors - " + workflow[:12], "legend_rows": legend,
+                "legend_name": legend_name(workflow), "legend_rows": legend, "legend_preflight": native_legend,
                 "blocked": bool(warnings)}
     display = {"kind": "change-preview", "recipe": "view-color", "title": "Color view by parameter",
                "keyColumn": "Row", "columns": COLUMNS, "changedColumns": COLUMNS[3:],

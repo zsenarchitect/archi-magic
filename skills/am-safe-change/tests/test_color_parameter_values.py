@@ -31,6 +31,7 @@ class NativeList:
 class View:
     Id = ElementId(31)
     UniqueId = "view-31"
+    Name = "Study"
     IsTemplate = False
 
     def __init__(self, applied=()):
@@ -76,7 +77,15 @@ class Collector:
         return self.document.candidates
 
     def OfClass(self, kind):
-        return [Link()] if kind is Link else self.document.existing_filters
+        if kind is Link:
+            return [Link()]
+        if kind is View:
+            return self.document.views
+        return self.document.existing_filters
+
+    def OwnedByView(self, identifier):
+        assert identifier.Value == 41
+        return NS(WhereElementIsNotElementType=lambda: self.document.legend_contents)
 
     def Dispose(self):
         self.document.collectors_closed += 1
@@ -101,9 +110,13 @@ def reader(monkeypatch):
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "duplicate_views", NS(
         bounded=bounded, document_identity=lambda _doc: {"project_uid": "project-1"},
-        identifier=ElementId, key=lambda value: str(value.Value)))
+        identifier=ElementId, key=lambda value: str(value.Value),
+        can_edit=lambda _state: True, owner_state=lambda _doc, _view: None,
+        viewports=lambda doc, ids, _clock: {item: doc.placements.get(item, []) for item in ids}))
     monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(native_number=float, rule_signature=lambda rule, *_: dict(rule.signature),
                                                       graphics=lambda settings, _solid: settings.values,
+                                                      color=lambda value: value,
+                                                      pattern_definition=lambda doc, pattern_id, *_: doc.patterns[pattern_id],
                                                       filter_definition=lambda item, *_: {"tree": item.tree}))
     return runpy.run_path(str(SCRIPTS / "read_color_parameter_values.py"))
 
@@ -404,3 +417,144 @@ def test_color_preview_rejects_duplicate_element_membership(reader):
     groups[1]["member_ids"] = list(groups[0]["member_ids"])
     with pytest.raises(ValueError, match="every observed element exactly once"):
         build(inventory)
+
+
+def native_legend_fixture(reader, monkeypatch, existing=None):
+    from view_color_preview import legend_name, workflow_identity
+
+    class NativeType:
+        def __init__(self, identifier, name):
+            self.Id = ElementId(identifier)
+            self.Name = name
+            self.UniqueId = "uid-%d" % identifier
+            self.VersionGuid = "version-%d" % identifier
+
+    class DraftingType(NativeType):
+        ViewFamily = "Drafting"
+        DefaultTemplateId = ElementId(-1)
+
+    class RegionType(NativeType):
+        ForegroundPatternId = ElementId(74)
+        BackgroundPatternId = ElementId(-1)
+        ForegroundPatternColor = [0, 0, 0]
+        BackgroundPatternColor = None
+        IsMasking = False
+        LineWeight = 2
+
+    class TextType(NativeType):
+        def get_Parameter(self, parameter_id):
+            assert parameter_id == "TEXT_SIZE"
+            return NS(HasValue=True, AsDouble=lambda: 0.01)
+
+    class PatternType(NativeType):
+        pass
+
+    class DraftingView(View):
+        Id = ElementId(41)
+        UniqueId = "legend-41"
+        VersionGuid = "legend-version"
+        ViewTemplateId = ElementId(-1)
+        Scale = 1
+
+        def GetTypeId(self):
+            return ElementId(71)
+
+        def GetPlacementOnSheetStatus(self):
+            return "CompletelyPlaced"
+
+    class Note:
+        Id = ElementId(151)
+        UniqueId = "note-151"
+        OwnerViewId = ElementId(41)
+        Text = "Existing North label"
+        Coord = NS(X=0.1, Y=0.2, Z=0)
+
+        def GetTypeId(self):
+            return ElementId(73)
+
+        def GetType(self):
+            return NS(Name="TextNote")
+
+        def GetLeaders(self):
+            return []
+
+    db = reader["DB"]
+    db.ViewDrafting, db.FilledRegion, db.TextNote = DraftingView, type("FilledRegion", (), {}), Note
+    db.ViewFamilyType, db.FilledRegionType, db.TextNoteType, db.FillPatternElement = (
+        DraftingType, RegionType, TextType, PatternType)
+    db.Element = NS(Name=NS(GetValue=lambda item: item.Name))
+    db.ViewFamily = NS(Drafting="Drafting")
+    db.BuiltInParameter = NS(TEXT_SIZE="TEXT_SIZE")
+    module = runpy.run_path(str(SCRIPTS / "read_color_legend.py"))
+    monkeypatch.setitem(sys.modules, "read_color_legend", NS(**module))
+
+    values = {31: View(), 71: DraftingType(71, "Drafting"), 72: RegionType(72, "Swatch region"),
+              73: TextType(73, "Legend text"), 74: PatternType(74, "Solid")}
+    source = {"document": {"project_uid": "project-1"}, "view": {"uid": "view-31"}, "parameter_id": "-55",
+              "category_ids": ["-200"]}
+    expected_name = legend_name(workflow_identity(source))
+    views = [values[31]]
+    if existing:
+        view = DraftingView()
+        view.Name = expected_name.lower() if existing == "collision" else expected_name
+        views.append(view)
+    candidate_row = candidate(101, parameter("String", "North"), "North")
+    values[101] = candidate_row
+    document = NS(GetElement=lambda identifier: values.get(identifier.Value), collectors_closed=0,
+                  views=views, patterns={"74": {"kind": "fill", "uid": "uid-74", "solid": True}},
+                  placements={"41": [["200", "sheet-200", "A-101", "201", "viewport-201"]]},
+                  legend_contents=[Note()], candidates=[candidate_row], existing_filters=[])
+    args = {"view_id": "31", "parameter_id": "-55", "category_ids": ["-200"],
+            "check_rules": True, "check_reuse": True,
+            "legend_types": {"drafting_type_id": "71", "region_type_id": "72",
+                             "text_type_id": "73", "solid_pattern_id": "74"}}
+    return document, args, expected_name, values
+
+
+def test_native_legend_resources_bind_exact_types_and_preview_name(reader, monkeypatch):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    document, args, expected_name, _ = native_legend_fixture(reader, monkeypatch)
+    inventory = json.loads(reader["main"](document, args)["inventory_json"])
+    preflight = inventory["legend_preflight"]
+    assert preflight["name"] == expected_name and preflight["state"] == "available"
+    assert {kind: row["uid"] for kind, row in preflight["resources"].items()} == {
+        "drafting": "uid-71", "region": "uid-72", "text": "uid-73", "solid": "uid-74",
+    }
+    assert preflight["resources"]["text"]["text_size_ft"] == 0.01
+    proposal, _ = build(inventory)
+    assert proposal["legend_name"] == expected_name and proposal["legend_preflight"] == preflight
+
+
+@pytest.mark.parametrize("existing,expected", [
+    ("collision", "name_conflict"), ("draft", "existing_requires_verification"),
+])
+def test_native_legend_preserves_collisions_and_records_existing_contents(reader, monkeypatch, existing, expected):
+    from view_color_preview import build
+
+    mock_rules(reader)
+    document, args, _, _ = native_legend_fixture(reader, monkeypatch, existing)
+    inventory = json.loads(reader["main"](document, args)["inventory_json"])
+    preflight = inventory["legend_preflight"]
+    assert preflight["state"] == expected and preflight["existing"]["uid"] == "legend-41"
+    if existing == "draft":
+        assert preflight["existing"]["placements"] == [["200", "sheet-200", "A-101", "201", "viewport-201"]]
+        assert preflight["existing"]["contents"] == [
+            {"id": "151", "uid": "note-151", "owner_id": "41", "type_id": "73", "native_kind": "TextNote",
+             "kind": "note", "text": "Existing North label", "position": [0.1, 0.2, 0.0], "leaders": 0},
+        ]
+    proposal, display = build(inventory)
+    assert proposal["blocked"] and any(expected in item["text"] for item in display["warnings"])
+
+
+def test_native_legend_refuses_non_solid_pattern_and_reports_template_default(reader, monkeypatch):
+    mock_rules(reader)
+    document, args, _, values = native_legend_fixture(reader, monkeypatch)
+    values[71].DefaultTemplateId = ElementId(81)
+    preflight = json.loads(reader["main"](document, args)["inventory_json"])["legend_preflight"]
+    assert preflight["state"] == "default_template_requires_verification"
+    assert preflight["resources"]["drafting"]["default_template_id"] == "81"
+    document.patterns["74"]["solid"] = False
+    with pytest.raises(ValueError, match="solid fill pattern"):
+        reader["main"](document, args)

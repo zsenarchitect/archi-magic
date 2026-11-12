@@ -354,6 +354,12 @@ def main(document, args):
                                              float(epsilon), clock)
     if check_reuse and data["native_rules"]["status"] == "verified_host_partition":
         data["existing_filters"] = existing_filter_matches(document, view, data, clock)
+    if "legend_types" in args:
+        from read_color_legend import legend_resources
+        from view_color_preview import legend_name, workflow_identity
+
+        data["legend_preflight"] = legend_resources(document, legend_name(workflow_identity(data)),
+                                                     args["legend_types"], clock)
     payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(payload) > MAX_BYTES or clock.ElapsedMilliseconds > 10000:
         raise ValueError("The parameter inventory exceeds its size or time budget.")
