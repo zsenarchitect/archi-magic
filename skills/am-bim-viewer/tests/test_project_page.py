@@ -1,4 +1,6 @@
+import base64
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import os
@@ -156,6 +158,39 @@ def test_project_page_renders_parsed_issue_board(tmp_path):
     assert "id9007199254740993" in page and "@reviewer" in page and "High" in page
     assert "Review the opening." in page and "Keep this on the board." in page and "#42" in page
     assert "default-src 'none'" in page
+
+
+def test_issue_board_filters_use_exact_unambiguous_model_ids():
+    identifier = 9007199254740993
+    model = {"elements": [
+        {"id": str(identifier), "category": "<Walls>", "level": "Level 1"},
+        {"id": identifier - 1, "category": "Adjacent ID", "level": "Level 2"},
+        {"id": 3, "category": "Conflicting ID", "level": "Unknown"},
+        {"id": "3", "category": "Other duplicate", "level": "Unknown"},
+    ]}
+    issue = {"number": 1, "status": "OPEN", "title": "Check", "severity": ["High"],
+             "element_ids": [identifier, 3], "findings": [], "todos": [], "assignees": [],
+             "comments": [], "related": []}
+    board = {"header": {"title": "Board"}, "warnings": [], "issues": [issue]}
+    page = pp.build_page("Project", [], {}, board=board, model_facets=pp.model_issue_facets(model))
+
+    class Parser(HTMLParser):
+        facets = None
+
+        def handle_starttag(self, tag, attributes):
+            if tag == "details":
+                self.facets = json.loads(dict(attributes)["data-facets"])
+
+    parser = Parser()
+    parser.feed(page)
+    assert parser.facets == {"severity": ["High"], "elements": [{"category": "<Walls>", "level": "Level 1"}]}
+    assert "<option value='&lt;Walls&gt;'>&lt;Walls&gt;</option>" in page
+    assert all(text not in page for text in ("<Walls>", "Adjacent ID", "Conflicting ID", "Other duplicate"))
+    assert "name='level'" in page and "name='severity'" in page
+    assert "name='category'" not in pp.build_page("Project", [], {}, board=board)
+    script = page.split("<script>", 1)[1].split("</script>", 1)[0]
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    assert f"script-src 'sha256-{digest}'" in page
 
 
 def test_invalid_board_export_does_not_replace_project_page(tmp_path):

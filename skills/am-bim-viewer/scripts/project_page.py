@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter
 from datetime import datetime
 import hashlib
@@ -257,7 +258,58 @@ def render_preview(preview: Dict[str, Any]) -> str:
     )
 
 
-def render_board(board):
+BOARD_FILTER_SCRIPT = """(() => {
+  const board = document.getElementById('issue-board');
+  const filters = board.querySelector('[data-board-filters]');
+  if (!filters) return;
+  const selects = [...filters.querySelectorAll('select')];
+  const rows = [...board.querySelectorAll('details[data-facets]')]
+    .map(row => [row, JSON.parse(row.dataset.facets)]);
+  const status = filters.querySelector('output');
+  function filter() {
+    const choices = Object.fromEntries(selects.map(select => [select.name, select.value]));
+    const location = ['category', 'level'].filter(name => choices[name]);
+    let shown = 0;
+    for (const [row, facets] of rows) {
+      const severityMatches = !choices.severity || facets.severity.includes(choices.severity);
+      const locationMatches = !location.length || facets.elements.some(element =>
+        location.every(name => element[name] === choices[name]));
+      row.hidden = !(severityMatches && locationMatches);
+      if (!row.hidden) shown += 1;
+    }
+    status.textContent = shown ? `${shown} of ${rows.length} issues` : 'No matching issues.';
+  }
+  filters.addEventListener('change', filter);
+  filter();
+  filters.hidden = false;
+})();"""
+BOARD_FILTER_HASH = base64.b64encode(hashlib.sha256(BOARD_FILTER_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+BOARD_FACETS = ("severity", "category", "level")
+
+
+def model_issue_facets(model):
+    """Index category and level by exact model export ID, omitting ambiguous IDs."""
+    if not isinstance(model, dict) or not isinstance(model.get("elements"), list):
+        raise ValueError("Use a BIM model export with an elements list.")
+    indexed = {}
+    for element in model["elements"]:
+        if not isinstance(element, dict):
+            continue
+        identifier = element.get("id")
+        if type(identifier) is int:
+            identifier = str(identifier)
+        if (not isinstance(identifier, str) or not identifier.isascii() or not identifier.isdecimal()
+                or len(identifier) > 19 or identifier.startswith("0") or int(identifier) > 2**63 - 1):
+            continue
+        if identifier in indexed:
+            indexed[identifier] = None
+            continue
+        indexed[identifier] = {name: value.strip() for name in ("category", "level")
+                               if isinstance(value := element.get(name), str) and value.strip()}
+    return indexed
+
+
+def render_board(board, model_facets=None):
     error = "Use the JSON output of board_cli.py parse for the issue board."
     if not isinstance(board, dict) or not isinstance(board.get("header"), dict):
         raise ValueError(error)
@@ -294,6 +346,7 @@ def render_board(board):
         )
 
     rendered = []
+    options = {name: set() for name in BOARD_FACETS}
     for issue in issues:
         if (not isinstance(issue, dict) or type(issue.get("number")) is not int
                 or issue["number"] < 1 or issue.get("status") not in ("OPEN", "IN PROGRESS", "DONE")
@@ -302,11 +355,30 @@ def render_board(board):
         summary = f"#{issue['number']} [{issue['status']}] {issue['title']}"
         details = "".join(f"<dt>{label}</dt>" + "".join(f"<dd>{_e(value)}</dd>" for value in values)
                           for label, values in fields(issue) if values)
-        rendered.append(f"<details><summary>{_e(summary)}</summary><dl>{details}</dl></details>")
+        severity = sorted({value.strip() for value in issue["severity"] if value.strip()})
+        options["severity"].update(severity)
+        matches = []
+        for identifier in dict.fromkeys(issue["element_ids"]):
+            attributes = model_facets.get(str(identifier)) if model_facets else None
+            if attributes:
+                matches.append(attributes)
+                for name, value in attributes.items():
+                    options[name].add(value)
+        data = json.dumps({"severity": severity, "elements": matches}, ensure_ascii=True)
+        rendered.append(f"<details data-facets='{_e(data)}'><summary>{_e(summary)}</summary><dl>{details}</dl></details>")
     notices = "".join(f"<li>{_e(warning)}</li>" for warning in warnings)
     warnings_html = f"<h3>Board warnings</h3><ul class='warn'>{notices}</ul>" if notices else ""
     rows = "".join(rendered) if rendered else "<p>No issues in the board.</p>"
-    return f"<h2>Issue board</h2><p>{_e(title)}</p>{warnings_html}{rows}"
+    controls = []
+    for name, values in options.items():
+        if not values:
+            continue
+        choices = "".join(f"<option value='{_e(value)}'>{_e(value)}</option>"
+                          for value in sorted(values, key=lambda value: (value.casefold(), value)))
+        controls.append(f"<label>{name}<select name='{name}'><option value=''>All</option>{choices}</select></label>")
+    filters = ("<div class='board-filters' data-board-filters hidden>" + "".join(controls)
+               + "<output aria-live='polite'></output></div>") if controls else ""
+    return f"<section id='issue-board'><h2>Issue board</h2><p>{_e(title)}</p>{warnings_html}{filters}{rows}</section>"
 
 
 STYLE = (
@@ -317,35 +389,42 @@ STYLE = (
     ".sev-error td:first-child{color:#b00020;font-weight:600}"
     ".sev-warning td:first-child{color:#8a5a00;font-weight:600}"
     "details{margin:.5rem 0}summary{cursor:pointer}dt{font-weight:600;margin-top:.5rem}"
+    ".board-filters:not([hidden]){display:flex;gap:.7rem 1.2rem;flex-wrap:wrap;align-items:center}"
+    ".board-filters label{display:inline-flex;gap:.4rem;align-items:center}"
+    ".board-filters select{font:inherit;color:inherit;background:transparent;border:1px solid currentColor;padding:.25rem}"
     ".chg{background:#fff3c4}.gate{font-weight:600}.warn{color:#b00020}"
     "@media(prefers-color-scheme:dark){body{background:#111;color:#eee}th,td{border-color:#555}}"
 )
 
 
 def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, Any], *,
-               board=None, viewer_name=None, model_health=()) -> str:
+               board=None, viewer_name=None, model_health=(), model_facets=None) -> str:
     s = summarize(findings)
     cards = "".join(
         f"<div class='card'><strong>{s[k]}</strong><br>{label}</div>"
         for k, label in (("error", "errors"), ("warning", "warnings"), ("info", "info"), ("total", "total"))
     )
     model_link = f"<p><a href='{_e(viewer_name)}'>Open 3D model</a></p>" if viewer_name else ""
+    board_html = render_board(board, model_facets) if board is not None else ""
+    script_policy = f"; script-src 'sha256-{BOARD_FILTER_HASH}'" if board_html else ""
+    script = f"<script>{BOARD_FILTER_SCRIPT}</script>" if board_html else ""
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
-        "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\">"
+        f"<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'{script_policy}\">"
         f"<title>{_e(title)}</title><style>{STYLE}</style></head><body>"
         f"<h1>{_e(title)}</h1><p>Read-only local report. No data leaves this computer.</p>"
         f"{model_link}<div class='cards'>{cards}</div>"
         f"{render_model_health(model_health)}"
         f"<h2>Audit findings</h2>{render_findings(findings)}"
         f"<h2>Change preview</h2>{render_preview(preview)}"
-        f"{render_board(board) if board is not None else ''}"
+        f"{board_html}{script}"
         "</body></html>"
     )
 
 
 def write_project_with_model(output, model, title, findings, preview, board, model_health):
     builder = Path(__file__).resolve().with_name("build-viewer.mjs")
+    facets = model_issue_facets(load_json(model)) if board is not None else None
     with TemporaryDirectory(prefix=".project-viewer-", dir=output.parent) as temporary:
         staging = Path(temporary)
         built = staging / "viewer.html"
@@ -369,7 +448,7 @@ def write_project_with_model(output, model, title, findings, preview, board, mod
 
         page = staging / "report.html"
         page.write_text(build_page(title, findings, preview, board=board, viewer_name=viewer.name,
-                                   model_health=model_health), encoding="utf-8")
+                                   model_health=model_health, model_facets=facets), encoding="utf-8")
         if not viewer.exists():
             os.replace(built, viewer)
         os.replace(page, output)
