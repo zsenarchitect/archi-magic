@@ -1,5 +1,6 @@
 from hashlib import sha256
 import json
+import os
 import runpy
 from pathlib import Path
 import subprocess
@@ -227,3 +228,44 @@ def test_empty_folder_does_not_create_workspace(tmp_path):
     root.mkdir()
     result = run("prepare", root, "--workspace", work, "--revit", 2026)
     assert result.returncode == 2 and not result.stdout and not work.exists()
+
+
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_host_refuses_staged_alias_before_opening(batch, monkeypatch, alias):
+    root, work, plan, _ = batch
+    source = root / "A.rvt"
+    staged = work / "model-001.rvt"
+    staged.unlink()
+    if alias == "symlink":
+        staged.symlink_to(source)
+    else:
+        os.link(source, staged)
+    ui, db, events = fake_host(monkeypatch)
+    host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    receipt = json.loads((work / "host-receipt.json").read_text())
+    assert [row["status"] for row in receipt["rows"]] == ["staged_changed"] + ["audited"] * 4
+    assert ("open", "model-001.rvt") not in events
+    result = collect(plan)
+    assert result.returncode == 1
+    assert len(json.loads(result.stdout)["models"]) == 5
+
+
+def test_host_refuses_identical_staged_replacement_after_metadata_preflight(batch, monkeypatch):
+    _, work, _, _ = batch
+    staged = work / "model-001.rvt"
+    replacement = work / "replacement"
+    replacement.write_bytes(staged.read_bytes())
+    ui, db, events = fake_host(monkeypatch)
+    original_preflight = host.preflight
+
+    def preflight(database, path, year):
+        result = original_preflight(database, path, year)
+        if Path(path) == staged:
+            replacement.replace(staged)
+        return result
+
+    monkeypatch.setattr(host, "preflight", preflight)
+    host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    receipt = json.loads((work / "host-receipt.json").read_text())
+    assert [row["status"] for row in receipt["rows"]] == ["staged_changed"] + ["audited"] * 4
+    assert ("open", "model-001.rvt") not in events
