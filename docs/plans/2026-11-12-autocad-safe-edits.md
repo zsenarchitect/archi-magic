@@ -37,3 +37,7 @@ Run `AMCADTRYLAYERRENAME` on a reopened disposable Windows AutoCAD 2026 Update 1
 ## Rollback-only layer map and attribute fill
 
 Use `AMCADTRYLAYERMAP` to select one layout entity and name an existing destination layer. Use `AMCADTRYATTRFILL` to select one layout block insert, specify an exact attribute tag and enter the proposed literal text. Review the native before/after rows before choosing Trial. The commands check the source and destination layer or exact attribute ownership and refuse locked, dependent, proxy, ambiguous and field-bearing targets as applicable. Both use the layer rename command's rollback and telemetry checks. Preserve the receipts and independently verify the original values, drawing bytes and recovery files before qualifying either operation.
+
+## Rollback-only purge
+
+Use `AMCADTRYPURGE` to select an exact layer, block definition, dimension style, or empty layout text entity. The named-symbol trial calls AutoCAD's purge eligibility API before preview and again before the transaction. The empty-block trial reviews the block's native begin and end handles and stops if the definition contains drawing entities or unreviewed owned objects. The text trial checks the actual stored text and layout owner. Review the exact handles before choosing Trial. The command requires the expected erase events before rollback and independently verifies the original candidate and fixture after disposal. Nonempty block ownership and the native erase event sequence still need fixture evidence.

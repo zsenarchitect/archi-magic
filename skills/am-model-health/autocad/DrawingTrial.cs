@@ -18,7 +18,12 @@ internal static class DrawingTrial
     private const int MaxEvents = 256;
 
     internal sealed record Target(ObjectId Id, string Handle, string Before, string After, string Context,
-        ObjectId RelatedId = default);
+        ObjectId RelatedId = default, bool ErasesTarget = false, ObjectId OwnedBegin = default,
+        ObjectId OwnedEnd = default)
+    {
+        internal bool Includes(ObjectId id) =>
+            !id.IsNull && (id == Id || id == OwnedBegin || id == OwnedEnd);
+    }
 
     private sealed record Baseline(string DrawingFingerprint, string DrawingVersion, string FileName,
         string FileDigest, Target Target);
@@ -136,7 +141,7 @@ internal static class DrawingTrial
         var trialName = "";
         var rollbackStarted = false;
         var rollbackCompleted = false;
-        var intendedModificationObserved = false;
+        var observedTargets = new HashSet<ObjectId>();
         var failure = "";
         void Record(string operation, ObjectId id)
         {
@@ -146,10 +151,14 @@ internal static class DrawingTrial
                 return;
             }
 
-            if (operation != "modified" || id != baseline.Target.Id)
+            var target = baseline.Target;
+            var permittedEvent = target.ErasesTarget
+                ? operation == "modified" || operation == (rollbackStarted ? "unerased" : "erased")
+                : operation == "modified";
+            if (!target.Includes(id) || !permittedEvent)
                 unexpected = true;
-            else if (!rollbackStarted)
-                intendedModificationObserved = true;
+            else if (!rollbackStarted && operation == (target.ErasesTarget ? "erased" : "modified"))
+                observedTargets.Add(id);
 
             events.Add((rollbackStarted ? "rollback:" : "trial:") + operation + ":"
                 + (id.IsNull ? "unavailable" : id.Handle.ToString()));
@@ -209,15 +218,21 @@ internal static class DrawingTrial
             failure = error.Message;
         }
 
-        var qualified = restored && trialName == baseline.Target.After && intendedModificationObserved
+        var reviewed = baseline.Target;
+        var expectedEvents = observedTargets.Contains(reviewed.Id)
+            && (reviewed.OwnedBegin.IsNull || observedTargets.Contains(reviewed.OwnedBegin))
+            && (reviewed.OwnedEnd.IsNull || observedTargets.Contains(reviewed.OwnedEnd));
+        var qualified = restored && trialName == reviewed.After && expectedEvents
             && !overflow && !unexpected && !saveObserved && failure.Length == 0;
         var status = !restored || !rollbackCompleted || unexpected || overflow || saveObserved ? "unresolved"
             : qualified ? "measured" : "unqualified";
         Write(document.Editor, new { status, baseline_restored = restored, expected = baseline.Target.After,
             drawing_fingerprint = baseline.DrawingFingerprint, drawing_version = baseline.DrawingVersion,
-            file_sha256_before = baseline.FileDigest, handle = baseline.Target.Handle,
+            file_sha256_before = baseline.FileDigest, handle = reviewed.Handle,
+            owned_begin = reviewed.OwnedBegin.IsNull ? null : reviewed.OwnedBegin.Handle.ToString(),
+            owned_end = reviewed.OwnedEnd.IsNull ? null : reviewed.OwnedEnd.Handle.ToString(),
             observed = trialName, rollback_completed = rollbackCompleted, save_observed = saveObserved,
-            unexpected, overflow, events, failure });
+            expected_events_observed = expectedEvents, unexpected, overflow, events, failure });
     }
 
     private static void Write(Editor editor, object message) =>
