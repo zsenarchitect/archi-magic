@@ -165,6 +165,23 @@ def test_picked_id_parameters_and_exact_repeated_link_selection(fixture):
     assert len(fixture.calls) == 1
 
 
+def test_selection_cannot_succeed_or_restore_in_a_different_host_view(fixture):
+    target = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))["selection_target"]
+    set_references = fixture.ui.Selection.SetReferences
+
+    def set_then_switch_view(items):
+        set_references(items)
+        fixture.ui.ActiveView = NS(Id=Id(78), UniqueId="view-two", IsTemplate=False)
+
+    fixture.ui.Selection.SetReferences = set_then_switch_view
+    outcome = fixture.run(mode="select", target=target)
+
+    assert outcome == {
+        "status": "selection_failed", "reason": "host_view_changed", "previous_selection": "unverified",
+    }
+    assert len(fixture.calls) == 1
+
+
 def test_moved_link_requires_reinspection_even_when_element_ids_are_unchanged(fixture):
     target = fixture.run(link_instance_id="6", linked_element_id=str(LARGE))["selection_target"]
     fixture.host.items[5].origin.X += 1

@@ -295,6 +295,13 @@ def typed_refs(items):
     return values
 
 
+def view_is_active(host, ui, target):
+    document = ui.Document
+    active = ui.ActiveView
+    return (document is not None and document.Equals(host) and active is not None
+            and key(active.Id) == target["view_id"] and str(active.UniqueId) == target["view_uid"])
+
+
 def select(host, ui, view, target):
     if not isinstance(target, dict):
         raise ValueError("Supply the target returned by a fresh inspection.")
@@ -312,20 +319,26 @@ def select(host, ui, view, target):
     prior_identity = stable_refs(host, before)
     desired, restore = typed_refs([created]), typed_refs(before)
     failure = {"status": "selection_failed", "reason": "reference_readback_mismatch"}
+    if not view_is_active(host, ui, target):
+        raise ValueError("The host view changed. Inspect it again.")
     try:
         ui.Selection.SetReferences(desired)
         selected = references(ui)
-        if [reference_pair(item) for item in selected] == [expected] and stable_refs(host, selected) == expected_identity:
+        if ([reference_pair(item) for item in selected] == [expected]
+                and stable_refs(host, selected) == expected_identity and view_is_active(host, ui, target)):
             return dict(expected, status="selected", view_id=key(view.Id))
     except Exception as error:
         failure.update(reason="selection_operation_failed", error_type=type(error).__name__)
     try:
+        if not view_is_active(host, ui, target):
+            return dict(failure, reason="host_view_changed", previous_selection="unverified")
         ui.Selection.SetReferences(restore)
     except Exception as error:
         # The setter can throw after changing the selection. Read it before reporting restoration.
         failure["restore_error_type"] = type(error).__name__
     try:
-        restored = stable_refs(host, references(ui)) == prior_identity
+        restored = (stable_refs(host, references(ui)) == prior_identity
+                    and view_is_active(host, ui, target))
     except Exception as error:
         restored = False
         failure["restore_read_error_type"] = type(error).__name__
