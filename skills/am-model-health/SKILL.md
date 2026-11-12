@@ -228,10 +228,40 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 
 Use the local geometry planner to review a CAD layout before any model work. It accepts a prepared geometry snapshot, and the CAD audit report is a different input. Keep the geometry and results private.
 
+To extract a linked DWG, use Revit 2026 and the CPython engine. Call `get_context` and `get_skill("revit-scripting")`. Run `scripts/read_linked_cad_layout.py` with `run_query` and the scripts directory as workspace. Pass the exact link and level IDs, selected layer names, and an empty room-point map for the first read.
+
+```json
+{"link_id":"101","level_id":"102","segment_layers":["A-WALL","A-DOOR"],"room_layers":["A-ROOM"],"room_points_mm":{}}
+```
+
+Review `unresolved` and `room_candidates`. Supply a reviewed interior point in millimetres for each room ID, then rerun the read. Save the decoded `snapshot_json` as the geometry input below. Preserve the full read record with the proposal. The reader uses native lines and closed polylines. Verify their layer, coordinates and curve fidelity against the source DWG in the disposable Revit fixture.
+
+Include the mapping from step 2 as the `mapping` object in the reviewed read. The reader checks the exact layer set and reads widths from Basic Wall types and level-and-host-based door types. It stops if a supplied width differs by more than the mapping tolerance. Use the returned `verified_mapping_json` as the planner mapping so the proposal uses measured widths. Keep `type_evidence` with the proposal to identify the Revit types that were read.
+
+Keep the `evidence_sha256` from a complete mapped read. To recheck the same inputs, add this value as `expected_evidence_sha256` to the request. A changed document, DWG source, geometry, level or mapped type stops the recheck. Review a fresh proposal before proceeding.
+
 1. Prepare a geometry JSON file for one linked drawing and one level. Set `coordinate_frame` to `revit_internal_axes_mm`. Record `link_id`, `level_id` and `level_mm`. Use exact IDs and model-space coordinates. Each item in `segments` has `id`, `layer`, `start` and `end`. A room in `room_loops` has `id`, `layer`, `closed`, `vertices` and `interior_point`. Use XYZ points in millimetres. For a room, set `closed` to true and list the vertices once.
 2. Prepare a mapping JSON file. Set `tolerance_mm`, `minimum_overlap_mm` and `door_setback_mm`. In `walls` and `doors`, map each exact layer name to a `type_id` and `width_mm`. Add room boundary layers to `room_layers`. Map each layer to one role.
 3. Run `python scripts/cad_layout_preview.py snapshot.json --mapping mapping.json`. Review the wall axes, maximum face errors, uncovered lengths, door spans, and room outlines. The door marker must lie along its proposed host wall. Check each unresolved item. Exit 1 means geometry needs review. Exit 2 means the input or calculation failed.
 4. Treat this JSON as a proposal. It contains no Revit write instructions. The linked DWG reader and guarded Revit creation still require live qualification.
+
+Add `--room-bounding all` to preview which room edges a proposed wall face supports. Use `--room-bounding none` when the proposed walls will not bound rooms. Review every separator edge and every unresolved wall contact. Verify the actual enclosure in Revit before creation.
+
+To tie the geometry preview to the open model, activate the floor plan for the selected level and phase. Run `scripts/preview_cad_layout_in_revit.py` with `run_query` and the scripts directory as workspace. Supply the reviewed DWG request under `source`, including `mapping` and `expected_evidence_sha256`. Supply the selected `view_id` and `phase_id` as decimal strings. In `walls`, key each choice by the proposed wall ID and supply `height_mm` and `room_bounding`. In `doors`, key each choice by its DWG source marker ID. Supply the Revit `hand_flipped` and `facing_flipped` states as Booleans. Set `cut_probe_height_mm` to a reviewed height inside the expected opening, measured from the selected level. Use an empty object for a category with no proposals. Recover a truncated response with `get_run`.
+
+Review the returned `preview_json` and keep its `geometry_sha256` when present. It identifies the geometry and choices for this model and view. The `existing_model_scan` checks model bounds around the proposed walls and door openings and at the room footprint elevation. It includes candidates from other phases. Review candidate bounds, phase IDs, and any unavailable records. A candidate needs a geometry check. An incomplete scan needs further evidence before placement. Existing model conflicts, room enclosure, and guarded placement still require separate checks.
+
+Read `wall_collision_scan` for measured overlaps between proposed wall bodies and existing host solids. The reported volume is the largest intersection with one solid from the candidate element. Check unresolved geometry, linked models, room boundaries, and the entries in `other_checks` separately. Verify these results in the disposable Revit model before using them for placement.
+
+Read `existing_room_boundaries` for the native area, phase, finish boundary digest, and source elements of nearby host rooms. A linked boundary identifies both the host link instance and its source element. Review any room with incomplete boundary evidence. This read does not inspect Revit's plan circuits.
+
+Review `provenance` for prior placement from the same link, level, and layer scope. A copied tag, incomplete prior placement, moved source, or overlapping layer scope requires review. Matching tags still require a fresh geometry readback of the placed elements.
+
+For native qualification, use a disposable, non-workshared Revit 2026 project with a known DWG and independently verified source read. Keep the runtime in ask policy. After review, use `run_modify` with `dry_run: true` and `scripts/probe_cad_layout_in_revit.py`. Pass `mode: "rollback_probe"`, the original preview inputs under `preview`, and the returned `preview_sha256`. The probe requires an unchanged full preview and a clean model scan. It rolls back its own transaction and checks that its temporary elements are absent and the preview still matches. Stop on `transaction_unresolved` and inspect the disposable model. This probe still requires native qualification before any Keep workflow.
+
+Check `measurements` for the wall finish plane offsets and the door cut span at three positions across each wall. The cut span must agree with the DWG marker at the reviewed height.
+
+After the rollback probe, run the original preview query again. Save the complete pyRevit records for the first preview, the probe, and the fresh query. Run `python scripts/verify_cad_layout_probe.py before.json dry-run.json fresh.json`. The command checks distinct run IDs, the unchanged preview, and the measured walls, door openings and room areas. It requires complete records with zero reported model changes.
 
 ## Area scheme cross-dependent standing check (issue #197)
 
