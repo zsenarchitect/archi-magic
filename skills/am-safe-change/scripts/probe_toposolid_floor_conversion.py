@@ -11,11 +11,8 @@ from pyrevit.api import DB
 from probe_toposolid_vertex_offset import TOLERANCE_FT, locate, rollback
 from read_toposolid_floor_region import read_floor, read_region
 from read_toposolid_vertices import element_id, finite_number, project_identity, shape_vertices
+from toposolid_floor_shape import MAX_SHAPE_POINTS, MAX_SPLIT_LINES
 from toposolid_grade_check import compare_conversion
-
-
-MAX_SHAPE_POINTS = 64
-MAX_SPLIT_LINES = 128
 
 
 def profile_at_level(loops, elevation):
