@@ -288,7 +288,8 @@ def layout_snapshot(document, request, target, types, clock):
         raise ValueError("The target legend graphics do not match the component and note inventory.")
     return {"source_legend_id": source_id, "source_legend_uid": source["uid"], "source_scale": source["scale"],
             "source_frame": {key: source[key] for key in ("origin_ft", "right", "up")},
-            "seed": seeds[0], "text_type": {"id": text_id, "uid": str(text_type.UniqueId), "name": text_type.Name},
+            "seed": seeds[0], "title_block_category_id": str(int(DB.BuiltInCategory.OST_TitleBlocks)),
+            "text_type": {"id": text_id, "uid": str(text_type.UniqueId), "name": text_type.Name},
             "target_graphics": graphics, "sheet_placements": sheet_placements(document, target["id"], clock, budget),
             "front_elevation_coverage": coverage_report(types, target["components"],
                                                         target["directions_verified_for_year"], front_only=True)}

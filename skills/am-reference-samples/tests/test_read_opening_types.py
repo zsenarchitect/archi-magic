@@ -117,7 +117,7 @@ def fixture_project(monkeypatch):
         def Dispose(self):
             disposed.append(self.category)
 
-    db = NS(BuiltInCategory=NS(OST_Doors=-1, OST_Windows=-2, OST_LegendComponents=-3, OST_TextNotes=-4),
+    db = NS(BuiltInCategory=NS(OST_Doors=-1, OST_Windows=-2, OST_LegendComponents=-3, OST_TextNotes=-4, OST_TitleBlocks=-5),
             FamilyInstance=Instance, ElementId=lambda value: NS(Value=value),
             View=View, ViewType=NS(Legend="Legend"),
             FamilySymbol=Symbol, FilteredElementCollector=Collector,

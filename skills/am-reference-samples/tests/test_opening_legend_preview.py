@@ -26,7 +26,7 @@ def snapshot():
             "legend": {"id": "25", "uid": "fixture-legend", "scale": 20, "directions_verified_for_year": True,
                        "origin_ft": [0, 0, 0], "right": [1, 0, 0], "up": [0, 1, 0],
                        "components": [], "text_notes": [], "layout": {
-                           "text_type": {"id": "50"}, "target_graphics": [], "sheet_placements": [{"id": "80"}],
+                           "text_type": {"id": "50"}, "target_graphics": [], "sheet_placements": [],
                        }}}
 
 
@@ -76,6 +76,7 @@ def managed_snapshot():
                        "category_id": "-8", "native_kind": "TextNote" if kind == "note" else "Element",
                        "bounds_ft": bounds}
             if kind == "note":
+                graphic["bounds_ft"] = {"min": [1 + offset, -9, 0], "max": [4 + offset, -8.5, 0]}
                 graphic["text_appearance"] = {"plain_single_line": True, "leaders": 0, "horizontal_alignment": "Left"}
             legend["layout"]["target_graphics"].append(graphic)
             pair[kind] = PLANNER["paired_state"](element, graphic, kind)
@@ -102,3 +103,121 @@ def test_refresh_retires_only_receipted_pairs_and_reuses_a_freed_cell():
     state["legend"]["text_notes"][1]["text"] = "Edited by hand"
     with pytest.raises(ValueError, match="changed after its kept receipt"):
         build(state, intent)
+
+
+def test_sheet_fit_refuses_a_batch_when_one_sheet_overflows():
+    def graphic(identifier, high):
+        return {"id": identifier, "native_kind": "Viewport", "category_id": "-8",
+                "bounds_ft": {"min": [0.1, 0.1, 0], "max": [high, 0.8, 0]},
+                "label_bounds_ft": {"min": [0.1, 0.03, 0], "max": [0.4, 0.08, 0]}}
+
+    def sheet(identifier, viewport_id, high):
+        return {"id": identifier, "uid": "fixture-sheet-" + identifier, "number": "A" + identifier,
+                "outline_ft": {"min": [0, 0], "max": [3, 2]},
+                "legend_viewport_ids": [viewport_id], "graphics": [graphic(viewport_id, high)]}
+
+    before = {"layout": {"title_block_category_id": "-9",
+                         "sheet_placements": [sheet("81", "91", 0.9), sheet("82", "92", 0.9)]}}
+    after = deepcopy(before)
+    after["layout"]["sheet_placements"][0]["graphics"] = [graphic("91", 1.2)]
+    after["layout"]["sheet_placements"][1]["graphics"] = [graphic("92", 1.2)]
+    intent = {"sheet_rectangles_ft": {"81": [0, 0, 1.5, 1], "82": [0, 0, 1, 1]}}
+    with pytest.raises(ValueError, match="does not fit on every reviewed sheet"):
+        PLANNER["verify_sheet_fit"](before, after, intent)
+    intent["sheet_rectangles_ft"]["82"][2] = 1.5
+    assert PLANNER["verify_sheet_fit"](before, after, intent) == ["91", "92"]
+
+
+def test_writer_rolls_back_if_retiring_pair_deletes_an_extra_element(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    state, receipt = managed_snapshot()
+    state["types"] = []
+    layout = state["legend"]["layout"]
+    layout.update(source_legend_id="26", seed={"id": "60"})
+    plan = PLANNER["build_preview"](state, {"grid": GRID, "receipt": receipt})
+    transactions = []
+
+    class ElementId:
+        def __init__(self, value):
+            self.Value = int(value)
+
+    class Element:
+        Pinned = False
+        OwnerViewId = ElementId(25)
+        GroupId = ElementId(-1)
+        Category = NS(Id=ElementId(-8))
+
+        def __init__(self, identifier):
+            self.Id = ElementId(identifier)
+
+        def GetDependentElements(self, _filter):
+            return []
+
+    class TextNote(Element):
+        pass
+
+    class IdList(list):
+        Add = list.append
+
+        @classmethod
+        def __class_getitem__(cls, _kind):
+            return cls
+
+    class Transaction:
+        def __init__(self, _document, _name):
+            self.state = None
+            transactions.append(self)
+
+        def Start(self):
+            self.state = "started"
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def RollBack(self):
+            self.state = "rolled_back"
+            return self.state
+
+    elements = {25: NS(Id=ElementId(25)), 26: NS(Id=ElementId(26)), 31: Element(31), 32: TextNote(32)}
+    doc = NS(IsReadOnly=False, IsWorkshared=False, GetElement=lambda identifier: elements.get(identifier.Value),
+             Delete=lambda ids: list(ids) + [ElementId(99)])
+    db = NS(ElementId=ElementId, TextNote=TextNote, BuiltInCategory=NS(OST_LegendComponents=-8),
+            Transaction=Transaction, TransactionStatus=NS(Started="started", RolledBack="rolled_back"))
+    monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
+    monkeypatch.setitem(sys.modules, "System.Collections.Generic", NS(List=IdList))
+    monkeypatch.setitem(sys.modules, "opening_legend_preview", NS(**PLANNER))
+    monkeypatch.setitem(sys.modules, "read_opening_types", NS(project_snapshot=lambda _doc, _request: state,
+                        positive_id=ElementId, element_id=lambda item: str(item.Value)))
+    script = SCRIPT.with_name("apply_opening_legend.py")
+    with pytest.raises(ValueError, match="outside the reviewed legend pair"):
+        runpy.run_path(str(script), init_globals={"doc": doc, "inputs": {"preview": plan}})
+    assert [transaction.state for transaction in transactions] == ["rolled_back"]
+
+
+def test_readback_accepts_verified_refresh_and_preserves_manual_notes():
+    state, receipt = managed_snapshot()
+    legend = state["legend"]
+    legend["revit_year"] = "2026"
+    legend["layout"].update(source_legend_id="26", source_legend_uid="fixture-source", source_scale=20,
+                            source_frame={"origin_ft": [0, 0, 0]}, seed={"id": "60"},
+                            front_elevation_coverage={"missing_type_ids": [], "duplicate_elevation_type_ids": [],
+                                                      "unplaced_elevation_type_ids": [], "unresolved_type_ids": []})
+    legend["text_notes"].append({"id": "35", "uid": "manual-note", "text": "Manual"})
+    legend["layout"]["target_graphics"].append({
+        "id": "35", "uid": "manual-note", "native_kind": "TextNote",
+        "bounds_ft": {"min": [40, -4, 0], "max": [42, -3, 0]},
+    })
+    state["types"][0]["type_mark"] = "A02"
+    plan = PLANNER["build_preview"](state, {"grid": GRID, "receipt": receipt})
+    assert [step["operation"] for step in plan["steps"]] == ["refresh"]
+    actual = deepcopy(state)
+    actual["legend"]["text_notes"][0]["text"] = "A02 | 3 ft × 7 ft"
+    pairs = {"door": {"component_id": "31", "note_id": "32"},
+             "window": {"component_id": "33", "note_id": "34"}}
+    result = PLANNER["verify_result"](plan, actual, pairs)
+    assert [pair["note"]["text"] for pair in result["pairs"]] == ["A02 | 3 ft × 7 ft", "A01 | 3 ft × 7 ft"]
+    actual["legend"]["text_notes"][2]["text"] = "Unexpected edit"
+    with pytest.raises(ValueError, match="Unmanaged graphics changed"):
+        PLANNER["verify_result"](plan, actual, pairs)
