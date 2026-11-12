@@ -14,6 +14,7 @@ MM_PER_FOOT = 304.8
 MAX_GEOMETRY = 20000
 MAX_DEPTH = 12
 MAX_ISSUES = 500
+EVIDENCE_LIMIT = 2 * INPUT_LIMIT
 
 
 def element_id(value):
@@ -30,6 +31,10 @@ def encoded(data, limit):
     return payload
 
 
+def sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def point_mm(transform, point):
     model = transform.OfPoint(point)
     return [number(float(axis) * MM_PER_FOOT, -1e7, 1e7) for axis in (model.X, model.Y, model.Z)]
@@ -37,7 +42,14 @@ def point_mm(transform, point):
 
 def scope(request):
     required = "link_id level_id segment_layers room_layers room_points_mm"
-    fields(request, required + " mapping" if isinstance(request, dict) and "mapping" in request else required)
+    if not isinstance(request, dict):
+        raise ValueError("Supply a linked DWG read request.")
+    optional = ("mapping", "expected_evidence_sha256")
+    fields(request, " ".join([required, *(key for key in optional if key in request)]))
+    if "expected_evidence_sha256" in request:
+        digest = request["expected_evidence_sha256"]
+        if "mapping" not in request or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("Recheck with the reviewed mapping and its evidence SHA-256.")
     layers = {}
     for key in ("segment_layers", "room_layers"):
         raw = request[key]
@@ -96,7 +108,8 @@ def read_mapping(document, mapping, layers):
                 raise ValueError(f"The mapped width for {layer} differs from Revit's {width_mm:.6g} mm.")
             verified[role][layer] = {**entry, "width_mm": width_mm}
             evidence.append({"role": role, "layer": layer, "type_id": entry["type_id"],
-                             "type_uid": str(target.UniqueId), "width_mm": width_mm})
+                             "type_uid": str(target.UniqueId), "version_guid": str(target.VersionGuid),
+                             "width_mm": width_mm})
     return {"verified_mapping_json": encoded(verified, INPUT_LIMIT), "type_evidence": evidence}
 
 
@@ -105,7 +118,7 @@ def linked_dwg(document, request):
     if not isinstance(link, DB.ImportInstance) or not link.IsLinked or not link.UniqueId:
         raise ValueError("Select an existing linked DWG instance.")
     link_type = document.GetElement(link.GetTypeId())
-    if link_type is None or not link_type.IsExternalFileReference():
+    if link_type is None or not link_type.UniqueId or not link_type.IsExternalFileReference():
         raise ValueError("The linked CAD type has no verifiable external file reference.")
     reference = link_type.GetExternalFileReference()
     if reference is None or str(reference.GetLinkedFileStatus()) != "Loaded":
@@ -114,7 +127,8 @@ def linked_dwg(document, request):
     name = DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(path) if path is not None else ""
     if not name or not name.lower().endswith(".dwg"):
         raise ValueError("The loaded linked file could not be identified as DWG.")
-    return link
+    return link, {"type_uid": str(link_type.UniqueId), "path_sha256": sha256(name),
+                  "type_version_guid": str(link_type.VersionGuid), "instance_version_guid": str(link.VersionGuid)}
 
 
 def read_geometry(document, root, layers, seeds):
@@ -181,7 +195,7 @@ def read_geometry(document, root, layers, seeds):
                     continue
                 ring = positions[:-1]
                 # A reviewed point belongs to this contour, not just its traversal index.
-                fingerprint = hashlib.sha256(encoded([layer, ring], INPUT_LIMIT).encode("ascii")).hexdigest()
+                fingerprint = sha256(encoded([layer, ring], INPUT_LIMIT))
                 identifier += "-" + fingerprint
                 vertices += len(ring)
                 if vertices > 512 or len(loops) + len(candidates) >= 32:
@@ -203,10 +217,11 @@ def read_geometry(document, root, layers, seeds):
 
 
 def read_snapshot(document, request):
-    if document is None or document.IsFamilyDocument or not document.PathName or document.ProjectInformation is None:
-        raise ValueError("Open the saved project containing the linked DWG.")
+    if (document is None or document.IsFamilyDocument or document.IsLinked or not document.PathName
+            or document.ProjectInformation is None or not document.ProjectInformation.UniqueId):
+        raise ValueError("Open the saved host project containing the linked DWG.")
     layers, seeds = scope(request)
-    link = linked_dwg(document, request)
+    link, source = linked_dwg(document, request)
     level = document.GetElement(element_id(request["level_id"]))
     if not isinstance(level, DB.Level) or not level.UniqueId:
         raise ValueError("Select the existing Revit level for the CAD layout.")
@@ -223,12 +238,19 @@ def read_snapshot(document, request):
                 "level_mm": number(float(level.ProjectElevation) * MM_PER_FOOT, -1e7, 1e7),
                 "segments": segments, "room_loops": loops}
     document_key = {"project_uid": str(document.ProjectInformation.UniqueId),
-                    "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+                    "path_sha256": sha256(document.PathName)}
     evidence = {"status": "review_required" if unresolved else "ok", "document": document_key,
                 "link_element_id": request["link_id"], "level_element_id": request["level_id"],
                 "snapshot_json": encoded(snapshot, INPUT_LIMIT), "room_candidates": candidates,
                 "unresolved": unresolved, **mapping_evidence}
-    encoded(evidence, 2 * INPUT_LIMIT)
+    if mapping_evidence and not unresolved:
+        evidence["source"] = source
+        evidence["level_version_guid"] = str(level.VersionGuid)
+        evidence["evidence_sha256"] = sha256(encoded(evidence, EVIDENCE_LIMIT))
+    if ("expected_evidence_sha256" in request
+            and request["expected_evidence_sha256"] != evidence.get("evidence_sha256")):
+        raise ValueError("The reviewed linked CAD layout evidence changed. Read and review it again.")
+    encoded(evidence, EVIDENCE_LIMIT)
     return evidence
 
 

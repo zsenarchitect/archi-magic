@@ -100,13 +100,15 @@ def linked_dwg(monkeypatch):
     door = Line(11, (1500, 100), (2400, 100))
     boundary = Polyline(12, [(0, 0), (4000, 0), (4000, 2500), (0, 2500), (0, 0)])
     primitives = [wall_a, wall_b, door, boundary]
-    link = Linked(IsLinked=True, UniqueId="aa-1", geometry=[Instance(rotate, [Instance(mirror, primitives)])])
+    link = Linked(IsLinked=True, UniqueId="aa-1", VersionGuid="link-v1",
+                  geometry=[Instance(rotate, [Instance(mirror, primitives)])])
     reference = Record(GetLinkedFileStatus=lambda: "Loaded", GetAbsolutePath=lambda: "drawing.dwg")
     objects = {
-        1: link, 2: Level(UniqueId="aa-2", ProjectElevation=feet(3000)),
-        3: Record(IsExternalFileReference=lambda: True, GetExternalFileReference=lambda: reference),
-        80: WallType(UniqueId="wall-type", Kind="basic", Width=feet(200.25)),
-        81: FamilySymbol(UniqueId="door-type", Category=Record(Id=element_id(-2000014)),
+        1: link, 2: Level(UniqueId="aa-2", VersionGuid="level-v1", ProjectElevation=feet(3000)),
+        3: Record(UniqueId="link-type", VersionGuid="link-type-v1", IsExternalFileReference=lambda: True,
+                  GetExternalFileReference=lambda: reference),
+        80: WallType(UniqueId="wall-type", VersionGuid="wall-v1", Kind="basic", Width=feet(200.25)),
+        81: FamilySymbol(UniqueId="door-type", VersionGuid="door-v1", Category=Record(Id=element_id(-2000014)),
                          Family=Record(FamilyPlacementType="hosted"),
                          width=Record(StorageType="double", HasValue=True, AsDouble=lambda: feet(900))),
         **{id: Style(GraphicsStyleCategory=Record(Name=label)) for id, label in
@@ -123,7 +125,7 @@ def linked_dwg(monkeypatch):
     api.DB, system.Int64 = db, int
     monkeypatch.setitem(sys.modules, "pyrevit.api", api)
     monkeypatch.setitem(sys.modules, "System", system)
-    document = Record(IsFamilyDocument=False, PathName="/tmp/test-model.rvt",
+    document = Record(IsFamilyDocument=False, IsLinked=False, PathName="/tmp/test-model.rvt",
                       ProjectInformation=Record(UniqueId="aa-3"), GetElement=lambda id: objects.get(id.Value))
     request = {"link_id": "1", "level_id": "2", "segment_layers": ["WALL", "DOOR"],
                "room_layers": ["ROOM"], "room_points_mm": {}}
@@ -169,6 +171,41 @@ def test_nested_mirror_rotation_and_translation_feed_real_layout_cli(linked_dwg,
                                                 geometry, "--mapping", mapping]))
     assert len(report["walls"]) == len(report["doors"]) == len(report["rooms"]) == 1
     assert not report["unresolved"]
+
+
+@pytest.mark.parametrize("change", ["geometry", "type_version", "level", "dwg_path", "document", "missing_layer"])
+def test_fresh_layout_read_rejects_drift(linked_dwg, change):
+    document, request, primitives, arc, id_value, reference = linked_dwg
+    candidate, = read(document, request)["room_candidates"]
+    request["room_points_mm"] = {candidate["id"]: [-750, 500, 3000]}
+    request["mapping"] = layout_mapping()
+    reviewed = read(document, request)
+    request["expected_evidence_sha256"] = reviewed["evidence_sha256"]
+    assert read(document, request) == reviewed
+
+    if change == "geometry":
+        primitives[0].points[1].X += 0.01
+    elif change == "type_version":
+        document.GetElement(id_value(81)).VersionGuid = "door-v2"
+    elif change == "level":
+        document.GetElement(id_value(2)).ProjectElevation += 0.01
+    elif change == "dwg_path":
+        reference.GetAbsolutePath = lambda: "replacement.dwg"
+    elif change == "document":
+        document.ProjectInformation.UniqueId = "different-project"
+    else:
+        primitives[2] = arc(GraphicsStyleId=id_value(10))
+    result = read(document, request)
+    assert result == {"status": "stopped",
+                      "message": "The reviewed linked CAD layout evidence changed. Read and review it again."}
+
+
+def test_linked_host_and_unreviewed_scope_cannot_be_used_for_recheck(linked_dwg):
+    document, request, *_ = linked_dwg
+    request["expected_evidence_sha256"] = "0" * 64
+    assert "reviewed mapping" in read(document, request)["message"]
+    document.IsLinked = True
+    assert "saved host project" in read(document, request)["message"]
 
 
 @pytest.mark.parametrize("change,reason", [
