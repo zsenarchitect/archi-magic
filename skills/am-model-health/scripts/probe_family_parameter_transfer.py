@@ -77,7 +77,9 @@ def audit_result(ui, document, DB, args):
             "trial_transaction": args.get("trial_transaction")}
 
 
-def run_trial(ui, document, DB, args, *, handoff=None, expected_audit_sha256=None):
+def run_trial(ui, document, DB, args, *, handoff=None, expected_audit_sha256=None, qualification=None):
+    if handoff is not None and qualification is not None:
+        raise ValueError("Formula binding qualification requires mandatory rollback.")
     if args["disposable_fixture"] is not True:
         raise ValueError("Use a private disposable family copy.")
     reviewed = preview(args["source_read"], args["target_read"], args["request"])
@@ -98,7 +100,7 @@ def run_trial(ui, document, DB, args, *, handoff=None, expected_audit_sha256=Non
         if handoff is not None and audit_sha256 != expected_audit_sha256:
             raise ValueError("The private family baseline changed before replay.")
         result = execute_trial(document, DB, reviewed, baseline, original, owner, handoff=handoff,
-                               audit_sha256=audit_sha256)
+                               audit_sha256=audit_sha256, qualification=qualification)
         if handoff is not None:
             if result["status"] != "awaiting_bridge_decision":
                 raise ValueError(result.get("reason", "The replay did not reach the native decision."))
@@ -114,7 +116,7 @@ def run_trial(ui, document, DB, args, *, handoff=None, expected_audit_sha256=Non
         return dict(result, rollback_verified=True)
 
 
-def execute_trial(document, DB, plan, baseline, original, owner, *, handoff=None, audit_sha256=None):
+def execute_trial(document, DB, plan, baseline, original, owner, *, handoff=None, audit_sha256=None, qualification=None):
     name = TRANSACTION_NAME + " " + uuid4().hex
     events = []
     invalid = False
@@ -144,13 +146,17 @@ def execute_trial(document, DB, plan, baseline, original, owner, *, handoff=None
     handed_off = False
     observed = None
     additions = None
+    qualification_result = None
     try:
         application.DocumentChanged += record
         subscribed = True
         if group.Start() != status.Started or transaction.Start() != status.Started:
             raise ValueError("Revit did not start the private family trial.")
         additions = add_definitions(document, DB, plan, baseline)
-        verify_family_effects(plan, baseline, transfer_state(document, DB, inspect_trial=True), additions)
+        provisional = transfer_state(document, DB, inspect_trial=True)
+        verify_family_effects(plan, baseline, provisional, additions)
+        if qualification is not None:
+            qualification_result = qualification(plan, provisional)
         if transaction.Commit() != status.Committed or transaction.GetStatus() != status.Committed:
             raise ValueError("Revit did not provisionally commit the family trial.")
         if invalid:
@@ -163,8 +169,8 @@ def execute_trial(document, DB, plan, baseline, original, owner, *, handoff=None
                 raise ValueError("Revit did not transfer the checked family changes to the bridge.")
             handed_off = True
     except Exception as error:
-        regeneration_failed = type(error).__name__ == "RegenerationFailedException"
-        failure = str(error) if isinstance(error, ValueError) else type(error).__name__
+        regeneration_failed = isinstance(error, WorkerUnresolved) or type(error).__name__ == "RegenerationFailedException"
+        failure = str(error) if isinstance(error, (ValueError, WorkerUnresolved)) else type(error).__name__
     finally:
         closing = True
         try:
@@ -187,9 +193,12 @@ def execute_trial(document, DB, plan, baseline, original, owner, *, handoff=None
         return {"status": "transaction_unresolved", "reason": failure or "Revit did not confirm rollback."}
     if failure:
         return {"status": "stopped", "reason": failure}
-    return {"status": "awaiting_bridge_decision" if handed_off else "trial_rolled_back",
+    result = {"status": "awaiting_bridge_decision" if handed_off else "trial_rolled_back",
             "preview_sha256": plan["preview_sha256"], "transaction": name,
-            "added_ids": additions, "values": observed, "effects": events, "audit_sha256": audit_sha256}
+              "added_ids": additions, "values": observed, "effects": events, "audit_sha256": audit_sha256}
+    if qualification_result is not None:
+        result["formula_qualification"] = qualification_result
+    return result
 
 
 try:

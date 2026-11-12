@@ -4,6 +4,20 @@ from family_parameter_transfer_preview import DEFINITION_FIELDS, reviewed_value
 from read_family_placement import eid
 
 
+def set_reviewed_value(manager, parameter, field, value):
+    import System
+
+    raw = reviewed_value(field, value)["value"]
+    storage = field["storage"]
+    if str(parameter.StorageType) != storage:
+        raise ValueError(f"Revit assigned unexpected storage to {field['name']!r}.")
+    if storage == "Double":
+        raw = System.Double(raw)
+    elif storage == "Integer":
+        raw = System.Int32(raw)
+    manager.Set(parameter, raw)
+
+
 def add_definitions(document, DB, plan, baseline):
     """Apply additions only. The caller owns the transaction and its rollback."""
     if not document.IsFamilyDocument or not document.IsModifiable:
@@ -13,8 +27,6 @@ def add_definitions(document, DB, plan, baseline):
     types = {str(family_type.Name): family_type for family_type in manager.Types}
     if types.keys() != baseline["types"].keys() or str(manager.CurrentType.Name) != baseline["current_type"]:
         raise ValueError("The native family types differ from the reviewed baseline.")
-
-    import System
 
     additions = {}
     for name, row in plan["operations"].items():
@@ -37,15 +49,7 @@ def add_definitions(document, DB, plan, baseline):
             field = row["definition"]
             if field["formula"] is not None:
                 continue
-            value = reviewed_value(field, row["expected_values"][type_name])["value"]
-            storage = field["storage"]
-            if str(parameter.StorageType) != storage:
-                raise ValueError(f"Revit assigned unexpected storage to {name!r}.")
-            if storage == "Double":
-                value = System.Double(value)
-            elif storage == "Integer":
-                value = System.Int32(value)
-            manager.Set(parameter, value)
+            set_reviewed_value(manager, parameter, field, row["expected_values"][type_name])
         document.Regenerate()
 
     for name in plan["formula_order"]:

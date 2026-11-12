@@ -614,3 +614,108 @@ def test_reload_checks_every_existing_override_and_new_type_value(change):
             verify_project_values(before, after, additions)
     else:
         verify_project_values(before, after, additions)
+
+
+def binding_fixture(trial_states):
+    plan, _, state, _ = trial_states
+    state["definitions"]["19"] = field("19", "Clearance")
+    state["definitions"]["22"]["formula"] = "Panel Width + Clearance"
+    cases = []
+
+    def value(raw):
+        return {"state": "value", "value": raw}
+
+    for index, (name, fields) in enumerate(state["types"].items(), 1):
+        fields["19"] = value(10.0 * index)
+        fields["22"] = value(fields["21"]["value"] + fields["19"]["value"])
+        cases.extend([
+            {"type": name, "parameter": "Base Width", "value": value(fields["10"]["value"] + 1),
+             "expected": {"Panel Width": value(fields["21"]["value"] + 2),
+                          "Total Width": value(fields["22"]["value"] + 2)}},
+            {"type": name, "parameter": "Clearance", "value": value(fields["19"]["value"] + 1),
+             "expected": {"Total Width": value(fields["22"]["value"] + 1)}},
+        ])
+    return plan, state, cases
+
+
+def test_formula_binding_fixture_requires_all_independent_changes(trial_states):
+    from probe_family_formula_binding import qualification_cases
+
+    plan, state, cases = binding_fixture(trial_states)
+    checks, _ = qualification_cases(plan, state, cases)
+    assert len(checks) == 4
+    assert checks[1]["expected"]["Panel Width"] == state["types"]["Target A"]["21"]
+    with pytest.raises(ValueError, match="do not cover every"):
+        qualification_cases(plan, state, cases[1:])
+    cases[0]["expected"]["Total Width"] = state["types"]["Target A"]["22"]
+    with pytest.raises(ValueError, match="expected affected formula must change"):
+        qualification_cases(plan, state, cases)
+
+
+@pytest.mark.parametrize("silent_rebinding", [False, True])
+def test_native_formula_binding_trial_restores_each_perturbation(trial_states, monkeypatch, silent_rebinding):
+    from types import SimpleNamespace
+    import probe_family_formula_binding as probe
+
+    plan, state, cases = binding_fixture(trial_states)
+    status = SimpleNamespace(Uninitialized="initial", Started="started", RolledBack="rolled_back")
+    events = []
+    changed = {}
+    types = [SimpleNamespace(Name=name) for name in state["types"]]
+    parameters = [SimpleNamespace(Id=SimpleNamespace(Value=int(key)), StorageType="Double")
+                  for key in state["definitions"]]
+    manager = SimpleNamespace(Types=types, CurrentType=types[0], Parameters=parameters)
+    document = SimpleNamespace(FamilyManager=manager, Regenerate=lambda: None)
+
+    def write(manager, parameter, field, value):
+        assert not changed
+        changed[field["id"]] = value["value"]
+
+    def read(family_type, parameter, storage):
+        key = str(parameter.Id.Value)
+        values = state["types"][family_type.Name]
+        if key == "21":
+            if silent_rebinding:
+                return values["21"]
+            raw = changed.get("10", values["10"]["value"]) * 2
+        elif key == "22":
+            raw = changed.get("10", values["10"]["value"]) * 2 + changed.get("19", values["19"]["value"])
+        else:
+            raw = changed.get(key, values[key]["value"])
+        return {"state": "value", "value": raw}
+
+    class Scope:
+        def __init__(self, doc):
+            self.status = status.Uninitialized
+            self.current = manager.CurrentType
+
+        def Start(self):
+            self.status = status.Started
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def RollBack(self):
+            events.append(dict(changed))
+            changed.clear()
+            manager.CurrentType = self.current
+            self.status = status.RolledBack
+            return self.status
+
+        def Dispose(self):
+            assert self.status == status.RolledBack
+
+    db = SimpleNamespace(SubTransaction=Scope, TransactionStatus=status)
+    monkeypatch.setattr(probe, "set_reviewed_value", write)
+    monkeypatch.setattr(probe, "parameter_values", read)
+    monkeypatch.setattr(probe, "transfer_state", lambda *args, **kwargs: state)
+    if silent_rebinding:
+        with pytest.raises(ValueError, match="Native formula responses differ"):
+            probe.run_cases(document, db, plan, state, cases)
+        assert len(events) == 1
+    else:
+        assert probe.run_cases(document, db, plan, state, cases)["case_count"] == 4
+        assert [list(event) for event in events] == [["10"], ["19"], ["10"], ["19"]]
+    assert not changed
+    assert manager.CurrentType is types[0]

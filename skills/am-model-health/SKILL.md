@@ -312,6 +312,16 @@ Save the full trial as `trial.json`. Run the audit again with the trial's `trans
 
 Verify both decisions in native Revit before use on project data.
 
+### Qualify native formula bindings
+
+Use a disposable fixture with at least two mapped types. Use distinct values for each numeric input across the types. Include a new formula that depends on a new input and a retained input.
+
+Run `scripts/probe_family_formula_binding.py` in guarded CPython dry-run mode. Pass the reviewed family trial inputs as `transfer`. Pass a `cases` list with one case for each mapped type and writable arithmetic input.
+
+Set `type` and `parameter` to the exact names. Set `value` to the new typed value record. Set `expected` to independently calculated typed value records keyed by each affected formula name. Use `{"state": "value", "value": 12.0}` for a numeric record.
+
+Save the full trial and the independent post-rollback family audit. Record the case count and observation digest in the qualification evidence. The trial rolls back each input change before it tests the next input.
+
 ### Seal the private family export
 
 1. After a verified Keep, run `family_parameter_transfer_export.py reserve`. Pass the six saved files with `--transfer`, `--before`, `--trial`, `--after`, `--modify`, and `--fresh`. Pass a separate private parent with `--destination`.
