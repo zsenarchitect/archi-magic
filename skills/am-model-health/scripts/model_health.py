@@ -9,9 +9,12 @@ The script changes nothing and writes no files. It sets `result` to a JSON-safe 
       {id, label, value, unit, threshold: {warn, bad}, status: ok|warn|bad|info,
        hint, details: [{label, count, ids: [int, ...]}]}]}
 
-Optional inputs (dict): {"max_ids": 300, "top_warnings": 15}
+Optional inputs (dict): {"max_ids": 300, "top_warnings": 15}.
+Use {"warning_triage": true} for the separate read-only warning inventory.
 """
 import datetime
+import hashlib
+import json
 import math
 import ntpath
 import re
@@ -143,6 +146,85 @@ def check_warnings():
         rows.append({"label": text, "count": count, "ids": ids[:MAX_IDS]})
     rows.sort(key=lambda r: -r["count"])
     return total, rows
+
+
+def read_warning_triage(document):
+    """Group persistent warnings by failure definition and failing-element creator."""
+    deadline = time.time() + 10.0
+    warnings = document.GetWarnings()
+    total = len(warnings)
+    if total > 5000:
+        raise ValueError("More than 5,000 warnings. The complete inventory cannot be returned.")
+    groups = {}
+    creators = {}
+    element_refs = 0
+    for warning in warnings:
+        if time.time() >= deadline:
+            raise ValueError("The warning inventory exceeded the ten-second read budget.")
+        failure_id = str(warning.GetFailureDefinitionId().Guid)
+        description = warning.GetDescriptionText()
+        if len(description) > 4096:
+            raise ValueError("A warning description exceeds 4,096 characters.")
+        failing = {eid(item): item for item in warning.GetFailingElements()}
+        additional = {eid(item) for item in warning.GetAdditionalElements()} - set(failing)
+        element_refs += len(failing) + len(additional)
+        if element_refs > 20000:
+            raise ValueError("More than 20,000 warning element references. The inventory is incomplete.")
+
+        group = groups.setdefault(failure_id, {"failure_id": failure_id, "descriptions": set(),
+                                               "count": 0, "creator_counts": {}, "instances": []})
+        group["descriptions"].add(description)
+        group["count"] += 1
+        names = set()
+        missing_creator = not failing
+        for element_id, native_id in failing.items():
+            if time.time() >= deadline:
+                raise ValueError("The warning inventory exceeded the ten-second read budget.")
+            if element_id not in creators:
+                creator = None
+                if document.IsWorkshared:
+                    try:
+                        info = DB.WorksharingUtils.GetWorksharingTooltipInfo(document, native_id)
+                        try:
+                            creator = info.Creator or None
+                        finally:
+                            info.Dispose()
+                    except Exception:
+                        creator = None
+                creators[element_id] = creator
+            if creators[element_id] is None:
+                missing_creator = True
+            else:
+                names.add(creators[element_id])
+
+        for name in names:
+            group["creator_counts"][name] = group["creator_counts"].get(name, 0) + 1
+        if missing_creator:
+            group["warnings_with_unknown_creator"] = group.get("warnings_with_unknown_creator", 0) + 1
+        group["instances"].append({"failing_ids": [str(item) for item in sorted(failing)],
+                                   "additional_ids": [str(item) for item in sorted(additional)],
+                                   "creators": sorted(names), "has_unknown_creator": missing_creator})
+
+    rows = sorted(groups.values(), key=lambda group: (-group["count"], group["failure_id"]))
+    for group in rows:
+        group["descriptions"] = sorted(group["descriptions"])
+        group["creator_counts"] = [{"name": name, "count": count} for name, count in
+                                   sorted(group["creator_counts"].items(), key=lambda item: (-item[1], item[0]))]
+        group["warnings_with_unknown_creator"] = group.get("warnings_with_unknown_creator", 0)
+        group["instances"].sort(key=lambda row: (row["failing_ids"], row["additional_ids"]))
+    payload = {"kind": "revit-warning-triage", "status": "ok", "warning_count": total,
+               "workshared": bool(document.IsWorkshared), "groups": rows,
+               "unavailable_creator_count": sum(name is None for name in creators.values())}
+    path = document.PathName
+    project = document.ProjectInformation
+    if path and project is not None and project.UniqueId:
+        payload["host_identity"] = {"project_uid": str(project.UniqueId),
+                                    "path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest()}
+    if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > 1024 * 1024:
+        raise ValueError("The complete warning inventory exceeds 1 MiB.")
+    if time.time() >= deadline:
+        raise ValueError("The warning inventory exceeded the ten-second read budget.")
+    return payload
 
 
 def check_links():
@@ -1308,6 +1390,11 @@ if doc is None or doc.IsFamilyDocument:  # noqa: F821
               "message": "Open a Revit project (.rvt), not a family, then run again."}
 elif INPUTS.get("revit_link_audit") is True:
     result = jsonable(read_revit_link_audit())
+elif INPUTS.get("warning_triage") is True:
+    try:
+        result = jsonable(read_warning_triage(doc))
+    except ValueError as error:
+        result = {"kind": "revit-warning-triage", "status": "stopped", "message": str(error)}
 else:
     metrics = []
     w_total, w_rows = check_warnings()

@@ -33,6 +33,8 @@ Recipes (the task-specific parts):
 
 - [Copy or combine instance parameter values](recipes/parameter-copy.md). Copy compatible typed values or join selected parameter values into text.
 
+- Warning repair qualification: [recipes/warning-repair.md](recipes/warning-repair.md). Use a disposable Revit project to verify reviewed repair pairs.
+
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
 ## The 8 steps (do all of them, in this order)
