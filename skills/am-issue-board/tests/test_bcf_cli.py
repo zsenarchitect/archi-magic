@@ -157,9 +157,11 @@ def test_bcf_plan_binds_revit_target_before_transaction(board, tmp_path, monkeyp
             "note": {"id": "40", "unique_id": "note-id", "sha1": ib.text_sha1(text), "text": text},
         }))
     archive = tmp_path / "archive.json"
+    archive_plan, _, _ = ib.plan_archive_note(ib.parse_board(text), [])
+    archive_text = archive_plan["final_text"]
     archive.write_text(json.dumps({
         "host_identity": ib.saved_document_identity(document),
-        "note": {"id": "41", "unique_id": "archive-id", "sha1": ib.text_sha1(text), "text": text},
+        "note": {"id": "41", "unique_id": "archive-id", "sha1": ib.text_sha1(archive_text), "text": archive_text},
     }))
     source = tmp_path / "source.bcfzip"
     seed(source)
@@ -168,17 +170,18 @@ def test_bcf_plan_binds_revit_target_before_transaction(board, tmp_path, monkeyp
     plan = json.loads(preview.stdout)["plan"]
 
     class TextNote:
-        def __init__(self, uid):
+        def __init__(self, uid, contents):
             self.UniqueId = uid
+            self.contents = contents
 
         def GetFormattedText(self):
-            return SimpleNamespace(GetPlainText=lambda: text)
+            return SimpleNamespace(GetPlainText=lambda: self.contents)
 
     if target == "other_project":
         document.PathName = "C:/Tests/Copy.rvt"
     notes = {
-        40: TextNote("other-note" if target == "other_note" else "note-id"),
-        41: TextNote("other-archive" if target == "other_archive" else "archive-id"),
+        40: TextNote("other-note" if target == "other_note" else "note-id", text),
+        41: TextNote("other-archive" if target == "other_archive" else "archive-id", archive_text),
     }
     document.GetElement = notes.get
 
@@ -232,8 +235,18 @@ def test_cli_import_export_preserves_cameras_and_components(board, tmp_path):
     assert duplicate["status"] == "no_changes"
     assert duplicate["plan"] is None
     archive = tmp_path / "archive.json"
-    snapshot(archive, imported["plan"]["final_text"])
+    populated_board = imported["plan"]["final_text"]
+    snapshot(archive, populated_board)
     snapshot(board, ib.plan_create("Issue board", [])["final_text"])
+    wrong_archive = invoke("import", board, "--input", dest, "--archive", archive)
+    assert wrong_archive.returncode == 2 and not wrong_archive.stdout
+    assert "archive note" in wrong_archive.stderr
+
+    archive_plan, _, _ = ib.plan_archive_note(ib.parse_board(populated_board), [planned["number"]])
+    snapshot(archive, archive_plan["final_text"])
+    wrong_board = invoke("import", archive, "--input", dest)
+    assert wrong_board.returncode == 2 and not wrong_board.stdout
+    assert "active issue board" in wrong_board.stderr
     archived = json.loads(invoke("import", board, "--input", dest, "--archive", archive).stdout)
     assert archived["plan"] is None
     assert archived["skipped_topic_guids"] == [TOPIC]

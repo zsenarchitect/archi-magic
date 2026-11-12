@@ -84,12 +84,16 @@ def note_target(source, body):
 
 def import_preview(args):
     body, formats, board, source = read_board(args.board)
+    if board["header"]["archive"] or board["header"]["next_number"] is None:
+        raise ValueError("Use an active issue board for BCF import.")
     active_target = note_target(source, body)
     archive_target = None
     existing = {marker(row) for row in board["issues"]}
     topics, warnings = bcf.read_topics(args.input)
     if args.archive:
         archive_body, _, archive, archive_source = read_board(args.archive)
+        if not archive["header"]["archive"] or archive["header"]["next_number"] is not None:
+            raise ValueError("Use an archive note for BCF duplicate checking.")
         archive_target = note_target(archive_source, archive_body)
         if active_target and archive_target and (
             source["host_identity"] != archive_source["host_identity"]
