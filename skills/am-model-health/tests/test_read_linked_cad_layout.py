@@ -706,7 +706,10 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
                 "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
                 "result": result}
 
-    measurements = {"wall_face_offsets_mm": {"wall-1": [[-100.125], [100.125]]},
+    wall, = preview["proposal"]["walls"]
+    expected_axis = [[*point, preview["proposal"]["level_mm"]] for point in reversed(wall["axis"])]
+    measurements = {"wall_axes_mm": {wall["id"]: expected_axis},
+                    "wall_face_offsets_mm": {"wall-1": [[-100.125], [100.125]]},
                     "door_cuts": {door["source_ids"][0]: {"elevation_mm": 4000, "samples": [
                         {"lateral_mm": offset, "span_mm": [start, end]} for offset in (-lateral, 0, lateral)
                     ]}},
@@ -754,6 +757,10 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
     ]
     with pytest.raises(ValueError, match="finish edges differ"):
         verify(before, moved_room, fresh)
+    wrong_axis = deepcopy(dry)
+    wrong_axis["result"]["measurements"]["wall_axes_mm"][wall["id"]][1][0] += 50
+    with pytest.raises(ValueError, match="wall axis differs"):
+        verify(before, wrong_axis, fresh)
     wrong_cut = deepcopy(dry)
     wrong_cut["result"]["measurements"]["door_cuts"][door["source_ids"][0]]["samples"][2]["span_mm"][1] += 10
     with pytest.raises(ValueError, match="differs from the reviewed cut span"):

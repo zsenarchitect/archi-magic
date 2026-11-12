@@ -114,7 +114,7 @@ def door_cut(wall, bodies, door, neighbors, elevation, tolerance, options, deadl
 def measure_walls_and_doors(preview, walls, deadline):
     proposal = preview["proposal"]
     z, tolerance = proposal["level_mm"], proposal["tolerance_mm"]
-    faces, cuts = {}, {}
+    axes, faces, cuts = {}, {}, {}
     geometry_budget, probe_budget = [MAX_GEOMETRY], [MAX_SOLID_PROBES]
     with ExitStack() as options_stack:
         options = DB.Options()
@@ -129,6 +129,8 @@ def measure_walls_and_doors(preview, walls, deadline):
                 raise ValueError("Wall geometry measurement exceeded its time budget.")
             identifier = row["id"]
             wall = walls[identifier]
+            curve = wall.Location.Curve
+            axes[identifier] = [xyz_mm(curve.GetEndPoint(index)) for index in (0, 1)]
             height = preview["wall_choices"][identifier]["height_mm"]
             faces[identifier] = wall_faces(wall, row["axis"], row["width_mm"], z, height, tolerance)
             doors = [door for door in proposal["doors"] if door["host"] == identifier]
@@ -149,4 +151,4 @@ def measure_walls_and_doors(preview, walls, deadline):
                     elevation = z + preview["door_choices"][marker]["cut_probe_height_mm"]
                     cuts[marker] = {"elevation_mm": elevation, "samples": door_cut(
                         row, bodies, door, doors, elevation, tolerance, intersection_options, deadline, probe_budget)}
-    return {"wall_face_offsets_mm": faces, "door_cuts": cuts}
+    return {"wall_axes_mm": axes, "wall_face_offsets_mm": faces, "door_cuts": cuts}

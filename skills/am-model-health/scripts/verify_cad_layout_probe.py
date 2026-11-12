@@ -36,16 +36,26 @@ def near(value, target, tolerance):
 
 
 def verify_measurements(preview, measurements):
-    fields(measurements, "wall_face_offsets_mm door_cuts rooms")
+    fields(measurements, "wall_axes_mm wall_face_offsets_mm door_cuts rooms")
     proposal = preview["proposal"]
     tolerance = proposal["tolerance_mm"]
     walls = {wall["id"]: wall for wall in proposal["walls"]}
     doors = {door["source_ids"][0]: door for door in proposal["doors"]}
     rooms = {room["source_ids"][0]: room for room in proposal["rooms"]}
-    for name, expected in (("wall_face_offsets_mm", walls), ("door_cuts", doors), ("rooms", rooms)):
+    for name, expected in (("wall_axes_mm", walls), ("wall_face_offsets_mm", walls),
+                           ("door_cuts", doors), ("rooms", rooms)):
         if not isinstance(measurements[name], dict) or measurements[name].keys() != expected.keys():
             raise ValueError(f"The {name} receipt differs from the reviewed scope.")
     for identifier, wall in walls.items():
+        axis = measurements["wall_axes_mm"][identifier]
+        expected_axis = [(*point, proposal["level_mm"]) for point in wall["axis"]]
+        if (not isinstance(axis, list) or len(axis) != 2
+                or any(not isinstance(point, list) or len(point) != 3
+                       or any(type(value) not in (int, float) or not math.isfinite(value) for value in point)
+                       for point in axis)
+                or not any(all(math.dist(actual, target) <= tolerance for actual, target in zip(points, expected_axis))
+                           for points in (axis, axis[::-1]))):
+            raise ValueError("A measured wall axis differs from the reviewed endpoints or elevation.")
         offsets = measurements["wall_face_offsets_mm"][identifier]
         half = wall["width_mm"] / 2
         if (not isinstance(offsets, list) or len(offsets) != 2
