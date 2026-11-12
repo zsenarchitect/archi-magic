@@ -53,14 +53,14 @@ def test_preview_lists_both_deletes_separately_from_twenty_one_edits(tmp_path, p
 @pytest.mark.parametrize("corruption", [None, "same_count_wrong_ids", "missing", "duplicated", "truncated", "another_model"])
 def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corruption):
     run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
-           "changes": {"deleted_count": 2, "deleted": [{"id": 300}, {"id": "301"}]}}
+           "changes": {"deleted_count": 2, "deleted": [300, "301"]}}
     changes = run["changes"]
     if corruption == "same_count_wrong_ids":
-        changes["deleted"][1]["id"] = "999"
+        changes["deleted"][1] = "999"
     elif corruption == "missing":
         changes["deleted"].pop()
     elif corruption == "duplicated":
-        changes["deleted"][1]["id"] = 300
+        changes["deleted"][1] = 300
     elif corruption == "truncated":
         run["result_truncated"] = True
     elif corruption == "another_model":
@@ -69,3 +69,9 @@ def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corrupt
     assert completed.returncode == (2 if corruption else 0)
     if corruption == "same_count_wrong_ids":
         assert "Extra IDs: 999. Missing IDs: 301." in completed.stderr
+
+
+def test_accepts_named_deletion_rows_in_saved_evidence(tmp_path, preview):
+    run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
+           "changes": {"deleted_count": 2, "deleted": [{"id": 300}, {"id": "301"}]}}
+    assert run_cli(tmp_path, preview, run).returncode == 0

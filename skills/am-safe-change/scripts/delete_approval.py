@@ -56,7 +56,8 @@ def verify_dry_run(by_id, saved):
     if (not isinstance(rows, list) or type(count) is not int or count != len(rows)
             or changes.get("deleted_ids") or changes.get("other_documents")):
         raise ValueError("The dry run did not return one complete list of deleted elements in the reviewed model.")
-    actual = {element_id(row["id"]) for row in rows}
+    # pyRevit emits bare IDs for deleted elements. Saved evidence can also have named rows.
+    actual = {element_id(row["id"] if isinstance(row, dict) else row) for row in rows}
     if len(actual) != count:
         raise ValueError("The dry run repeated a deletion ID.")
     if actual != by_id.keys():
