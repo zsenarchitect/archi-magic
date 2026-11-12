@@ -38,7 +38,7 @@ def link_or_reparse(info):
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
 
 
-def snapshot_file(source, snapshot):
+def snapshot_file(source, snapshot, *, limit=FILE_LIMIT):
     info = source.lstat()
     if link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
         raise ValueError("Select an original regular drawing file.")
@@ -47,12 +47,12 @@ def snapshot_file(source, snapshot):
     copied = 0
     with os.fdopen(os.open(source, flags), "rb") as origin, snapshot.open("xb") as target:
         before = os.fstat(origin.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > FILE_LIMIT:
-            raise ValueError("Drawing must be a regular file up to 32 MiB.")
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"The source must be a regular file up to {limit} bytes.")
         while chunk := origin.read(1024 * 1024):
             copied += len(chunk)
-            if copied > FILE_LIMIT:
-                raise ValueError("Drawing exceeds 32 MiB.")
+            if copied > limit:
+                raise ValueError(f"The source exceeds {limit} bytes.")
             digest.update(chunk)
             target.write(chunk)
         after = os.fstat(origin.fileno())
@@ -263,7 +263,8 @@ def dxf_worker(snapshot):
     for layer in doc.layers:
         name = text_value(layer.dxf.name)
         layers.append({"name": name, "entityCount": counts[name.casefold()],
-                       "color": layer.dxf.color, "linetype": layer.dxf.linetype})
+                       "color": layer.dxf.color, "linetype": layer.dxf.linetype,
+                       "true_color": layer.dxf.get("true_color", None)})
     for layout in doc.blocks:
         entity = layout.block
         name = text_value(layout.name)

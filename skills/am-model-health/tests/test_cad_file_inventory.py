@@ -156,3 +156,80 @@ def test_dxf_purge_review_excludes_indirect_and_protected_blocks(tmp_path):
     assert inventory["coverage"]["purge_eligibility"] == "not_assessed"
     assert inventory["purge_candidates"] == [{"kind": "block", "name": "Unused"}]
     assert source.read_bytes() == original
+
+
+def test_dxf_layer_policy_checks_linetype_aci_and_true_color_without_edits(tmp_path):
+    source, policy = tmp_path / "drawing.dxf", tmp_path / "standards.json"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    layer = doc.layers.new("A-WALL", dxfattribs={"color": 3})
+    layer.off()
+    doc.layers.new("A-DOOR", dxfattribs={"color": 3, "true_color": 0x225588})
+    doc.layers.new("A-FLOR", dxfattribs={"color": 5})
+    doc.saveas(source)
+    original = source.read_bytes()
+    policy.write_text(json.dumps({"layers": {
+        "a-wall": {"aci": 3, "linetype": "continuous"},
+        "A-DOOR": {"aci": 3},
+        "A-FLOR": {"aci": 4, "linetype": "Dashed"},
+        "A-ANNO": {"aci": 3},
+    }}))
+    result = run(source, "--layer-policy", policy)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    checks = [f for f in report["findings"] if f["ruleId"] == "CAD-LAY-02"]
+    assert [(f["target"], f["field"], f["observed_field"], f["actual"]) for f in checks] == [
+        ("A-DOOR", "aci", "rgb", "#225588"), ("A-FLOR", "aci", "aci", 5),
+        ("A-FLOR", "linetype", "linetype", "Continuous"),
+    ]
+    evidence = report["inventory"]["layer_policy"]
+    assert evidence == {"sha256": hashlib.sha256(policy.read_bytes()).hexdigest(), "checked_fields": 5,
+                        "unchecked_fields": [], "unmatched_layers": ["A-ANNO"]}
+    assert report["inventory"]["coverage"]["layer_style_policy"] == "checked"
+    assert source.read_bytes() == original
+
+    policy.write_text('{"layers":{"A-DOOR":{"rgb":"#225588"}}}')
+    matches = json.loads(run(source, "--layer-policy", policy).stdout)
+    assert not any(f["ruleId"] == "CAD-LAY-02" for f in matches["findings"])
+    policy.write_text('{"layers":{"A-ANNO":{"aci":3}}}')
+    absent = run(source, "--layer-policy", policy)
+    assert absent.returncode == 3
+    assert json.loads(absent.stdout)["inventory"]["coverage"]["layer_style_policy"] == "incomplete"
+
+
+def test_layer_policy_keeps_unreadable_dwg_color_separate_from_linetype(tmp_path, monkeypatch):
+    from dwg_cad_audit import check_layer_policy
+
+    records = [
+        {"object": "LAYER", "handle": [0, 1, 10], "name": "A-WALL",
+         "color": {"index": 3, "rgb": "c3000003"}, "ltype": [12, 1, 9, 15]},
+        {"object": "LTYPE", "handle": [0, 1, 15], "name": "Continuous"},
+    ]
+    native = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14", "OBJECTS": records,
+              "HEADER": {"INSUNITS": 4}, "Template": {"MEASUREMENT": 1}}
+    drawing = dwg_inventory(native, "AC1032")
+    findings, evidence = check_layer_policy(drawing, {"a-wall": ("A-WALL", {"aci": 3, "linetype": "Dashed"})})
+    assert [(f["field"], f["actual"]) for f in findings] == [("linetype", "Continuous")]
+    assert evidence == {"checked_fields": 1, "unchecked_fields": [{"layer": "A-WALL", "field": "aci"}],
+                        "unmatched_layers": []}
+
+    source, policy, output = (tmp_path / name for name in ("sample.dwg", "policy.json", "report.json"))
+    source.write_bytes(b"AC1032fixture")
+    monkeypatch.setattr("cad_file_inventory.run_decoder", lambda *_: (json.dumps(native).encode(), b""))
+    policy.write_text('{"layers":{"A-WALL":{"aci":3,"linetype":"Continuous"}}}')
+    assert audit_file(SimpleNamespace(input=str(source), dwgread=sys.executable, output=str(output),
+                                      summary=False, layer_policy=str(policy))) == 3
+    assert json.loads(output.read_text())["inventory"]["coverage"]["layer_style_policy"] == "incomplete"
+
+
+def test_layer_policy_rejects_duplicate_names_and_conflicting_color_modes(tmp_path):
+    from dwg_cad_audit import read_layer_policy
+
+    policy = tmp_path / "bad.json"
+    for raw in ('{"layers":{"A-WALL":{"aci":3},"a-wall":{"aci":4}}}',
+                '{"layers":{"A-WALL":{"aci":3,"rgb":"#225588"}}}',
+                '{"layers":{"A-WALL":{"aci":3,"aci":4}}}'):
+        policy.write_text(raw)
+        with pytest.raises(ValueError):
+            read_layer_policy(str(policy))

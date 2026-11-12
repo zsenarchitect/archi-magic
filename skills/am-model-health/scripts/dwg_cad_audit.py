@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -85,6 +86,82 @@ def check_layer_standards(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 })
 
     return findings
+
+
+def read_layer_policy(path):
+    from cad_file_inventory import local_path, snapshot_file, validate_json
+
+    source = local_path(path)
+    source = source.parent.resolve(strict=True) / source.name
+    with TemporaryDirectory(prefix="archi-cad-policy-") as temporary:
+        snapshot = Path(temporary) / "policy.json"
+        digest = snapshot_file(source, snapshot, limit=256 * 1024)
+        policy = validate_json(snapshot.read_bytes())
+
+    if (not isinstance(policy, dict) or set(policy) != {"layers"} or not isinstance(policy["layers"], dict)
+            or not 1 <= len(policy["layers"]) <= 512):
+        raise ValueError("Supply a layer policy with one to 512 named layers.")
+    rules = {}
+    for name, rule in policy["layers"].items():
+        if not name.strip() or name.strip() != name or len(name) > 255 or name.casefold() in rules:
+            raise ValueError("Use distinct, exact layer names.")
+        if not isinstance(rule, dict) or not rule or set(rule) - {"aci", "rgb", "linetype"}:
+            raise ValueError("Use ACI, RGB, or linetype checks for each layer.")
+        if ("aci" in rule and (type(rule["aci"]) is not int or not 1 <= rule["aci"] <= 255 or "rgb" in rule)
+                or "rgb" in rule and (not isinstance(rule["rgb"], str)
+                                      or re.fullmatch(r"#[0-9a-fA-F]{6}", rule["rgb"]) is None)
+                or "linetype" in rule and (not isinstance(rule["linetype"], str)
+                                           or not 1 <= len(rule["linetype"].strip()) <= 255)):
+            raise ValueError("Use one color mode and a valid linetype.")
+        rules[name.casefold()] = (name, rule)
+    return digest, rules
+
+
+def check_layer_policy(drawing, rules):
+    layers = {}
+    for layer in drawing["layers"]:
+        layers.setdefault(layer["name"].casefold(), []).append(layer)
+    findings, unchecked, unmatched = [], [], []
+    checked = 0
+    for key, (name, rule) in rules.items():
+        matching = layers.get(key, [])
+        if not matching:
+            unmatched.append(name)
+            continue
+        if len(matching) != 1:
+            unchecked.extend({"layer": name, "field": field} for field in rule)
+            continue
+
+        layer = matching[0]
+        aci = layer.get("color")
+        rgb = layer.get("true_color")
+        color = None
+        if type(rgb) is int and 0 <= rgb <= 0xFFFFFF:
+            color = ("rgb", f"#{rgb:06x}")
+        elif rgb is None and type(aci) is int and 1 <= abs(aci) <= 255:
+            color = ("aci", abs(aci))
+        for field, expected in rule.items():
+            observed = field
+            if field == "linetype":
+                actual = layer.get("linetype")
+                if not isinstance(actual, str) or not actual.strip():
+                    unchecked.append({"layer": layer["name"], "field": field})
+                    continue
+                equal = actual.casefold() == expected.strip().casefold()
+            elif color is None:
+                unchecked.append({"layer": layer["name"], "field": field})
+                continue
+            else:
+                observed, actual = color
+                equal = observed == field and actual == (expected.lower() if field == "rgb" else expected)
+
+            checked += 1
+            if not equal:
+                findings.append({"ruleId": "CAD-LAY-02", "severity": "warning", "category": "CAD Layer",
+                                 "target": layer["name"], "field": field, "expected": expected,
+                                 "observed_field": observed, "actual": actual,
+                                 "message": f"Layer '{layer['name']}' has {observed} {actual!r}, expected {field} {expected!r}."})
+    return findings, {"checked_fields": checked, "unchecked_fields": unchecked, "unmatched_layers": unmatched}
 
 
 def check_xrefs(xrefs: List[Dict[str, Any]], drawing_dir: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -212,7 +289,7 @@ def check_scale_and_units(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     return findings
 
 
-def run_cad_audit(drawing_data: Dict[str, Any]) -> Dict[str, Any]:
+def run_cad_audit(drawing_data: Dict[str, Any], layer_findings=()) -> Dict[str, Any]:
     """Execute all CAD audit rules on drawing data dictionary."""
     all_findings: List[Dict[str, Any]] = []
     finding_id = 1
@@ -222,7 +299,7 @@ def run_cad_audit(drawing_data: Dict[str, Any]) -> Dict[str, Any]:
     blocks = drawing_data.get("blocks", [])
     header = drawing_data.get("header", {})
 
-    for f in check_layer_standards(layers):
+    for f in [*check_layer_standards(layers), *layer_findings]:
         f["id"] = f"CAD-{finding_id:04d}"
         finding_id += 1
         all_findings.append(f)
@@ -265,8 +342,19 @@ def audit_file(args):
     from cad_file_inventory import FILE_LIMIT, inspect_drawing, local_path
 
     try:
+        policy_path = getattr(args, "layer_policy", None)
+        policy = read_layer_policy(policy_path) if policy_path else None
         drawing = inspect_drawing(args.input, args.dwgread)
-        result = run_cad_audit(drawing)
+        layer_findings = []
+        if policy is not None:
+            digest, rules = policy
+            layer_findings, evidence = check_layer_policy(drawing, rules)
+            drawing["layer_policy"] = {"sha256": digest, **evidence}
+            complete = evidence["checked_fields"] > 0 and not evidence["unchecked_fields"]
+            drawing["coverage"]["layer_style_policy"] = "checked" if complete else "incomplete"
+            if not complete:
+                drawing["notes"].append("One or more requested layer style checks lack drawing evidence.")
+        result = run_cad_audit(drawing, layer_findings)
         result.update(status="incomplete" if drawing["notes"] else "audited",
                       inventory=drawing)
         report = result if args.output or not args.summary else {
@@ -295,10 +383,13 @@ def main() -> int:
     parser.add_argument("--summary", action="store_true", help="Print summary only")
 
     parser.add_argument("--dwgread", help="Absolute path to trusted LibreDWG 0.14 dwgread")
+    parser.add_argument("--layer-policy", help="Local JSON layer color and linetype standard")
     args = parser.parse_args()
 
     if Path(args.input).suffix.lower() in {".dxf", ".dwg"}:
         return audit_file(args)
+    if args.layer_policy:
+        parser.error("--layer-policy requires a direct DWG or DXF drawing.")
 
     if not os.path.isfile(args.input):
         print(f"Error: input file '{args.input}' not found.", file=sys.stderr)
