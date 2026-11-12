@@ -13,6 +13,7 @@ DISTANCE_TOLERANCE = 0.001
 ANGLE_TOLERANCE = 0.00001
 MAX_INPUT = 2 * 1024 * 1024
 MAX_WITNESSES = 64
+TRANSACTION_NAME = "Trial Revit plan dimensions"
 MODES = ("grid", "overall", "opening")
 COLUMNS = ["String", "Mode", "Status", "References", "Segments ft"]
 
@@ -179,6 +180,13 @@ def compare(candidate, other):
     return "match"
 
 
+def geometry_context(snapshot):
+    origin, axes = check_frame(snapshot["view"]["frame"])
+    axes = [unit(axis)[0] for axis in axes]
+    minimum = max(DISTANCE_TOLERANCE, real(snapshot["short_curve_tolerance_ft"], 0, 1))
+    return origin, axes, minimum, element_id(snapshot["dimension_type"]["id"])
+
+
 def compute(snapshot):
     if (snapshot.get("kind") != "plan-dimension-snapshot" or type(snapshot.get("version")) is not int
             or snapshot["version"] != 1 or snapshot.get("existing_complete") is not True):
@@ -190,11 +198,7 @@ def compute(snapshot):
     view_id = element_id(view["id"])
     label(view["uid"])
     label(snapshot["dimension_type"]["uid"])
-    type_id = element_id(snapshot["dimension_type"]["id"])
-    origin, axes = check_frame(view["frame"])
-    axes = [unit(axis)[0] for axis in axes]
-    minimum = max(DISTANCE_TOLERANCE, real(snapshot["short_curve_tolerance_ft"], 0, 1))
-    context = (origin, axes, minimum, type_id)
+    context = geometry_context(snapshot)
 
     existing, requests = snapshot["existing"], snapshot["requests"]
     if (not isinstance(existing, list) or len(existing) > 500
@@ -254,21 +258,38 @@ def compute(snapshot):
     return preview, {} if warnings else proposals
 
 
+def probe_plan(snapshot):
+    preview, proposals = compute(snapshot)
+    request = snapshot.get("request")
+    if not proposals or not isinstance(request, dict) or "revit" not in snapshot:
+        raise ValueError("A native snapshot with unblocked, new dimension proposals is required.")
+    return {
+        "kind": "plan-dimension-rollback-plan",
+        "version": 1,
+        "basis_sha256": preview["basis_sha256"],
+        "ownership_ids": preview["ownership_ids"],
+        "request": request,
+        "proposals": proposals,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot")
+    parser.add_argument("--probe-plan", action="store_true", help="Output the separate rollback qualification plan")
     args = parser.parse_args()
     try:
         with open(args.snapshot, "rb") as stream:
             raw = stream.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise ValueError("The saved dimension snapshot exceeds 2 MiB.")
-        preview, _ = compute(json.loads(raw))
+        snapshot = json.loads(raw)
+        preview = probe_plan(snapshot) if args.probe_plan else compute(snapshot)[0]
     except (AttributeError, KeyError, OSError, TypeError, ValueError, RecursionError) as error:
         print(str(error), file=sys.stderr)
         return 2
     print(json.dumps(preview, indent=2, allow_nan=False))
-    return 1 if preview["blocked"] else 0
+    return 1 if preview.get("blocked") else 0
 
 
 if __name__ == "__main__":

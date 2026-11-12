@@ -8,7 +8,7 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from plan_dimension_preview import compute
+from plan_dimension_preview import compute, probe_plan
 
 
 class ElementId:
@@ -91,7 +91,8 @@ class Collector:
 @pytest.fixture
 def runtime(monkeypatch):
     document = NS(
-        IsFamilyDocument=False, IsLinked=False, PathName="synthetic.rvt", elements={},
+        IsFamilyDocument=False, IsLinked=False, IsReadOnly=False, IsWorkshared=False,
+        IsModifiable=False, PathName="synthetic.rvt", elements={},
         ProjectInformation=NS(UniqueId="project"),
         Application=NS(VersionNumber="2026", VersionBuild="fixture", ShortCurveTolerance=0.0026),
     )
@@ -110,12 +111,12 @@ def runtime(monkeypatch):
                RightDirection=point(1, 0), UpDirection=point(0, 1), ViewDirection=point(0, 0, 1))
     dimension_type = add(DimensionType, 51, StyleType="Linear")
     for grid_id, x in ((10, 0), (11, 3), (12, 7)):
-        grid = add(Grid, grid_id, IsCurved=False)
+        grid = add(Grid, grid_id, IsCurved=False, Station=x)
         grid.GetDatumExtentTypeInView = lambda end, view: "ViewSpecific"
         grid.GetCurvesInView = lambda mode, view, x=x: [Line(point(x, -5), point(x, 5))]
 
     for wall_id, x, normal in ((20, 1, 1), (21, 8, -1)):
-        wall = add(Wall, wall_id, Location=NS(Curve=Line(point(x, -5), point(x, 5))))
+        wall = add(Wall, wall_id, Station=x, Location=NS(Curve=Line(point(x, -5), point(x, 5))))
         face = PlanarFace(FaceNormal=point(normal, 0), Origin=point(x, 0),
                           EdgeLoops=[[NS(AsCurve=lambda x=x: Line(point(x, -5), point(x, 5)))]])
         wall.faces = [reference(wall)]
@@ -147,10 +148,12 @@ def runtime(monkeypatch):
     for name, module in (("System", system), ("System.Collections.Generic", generic), ("pyrevit.api", api)):
         monkeypatch.setitem(sys.modules, name, module)
 
-    def run(**request):
+    def run(check_absent_ids=None, **request):
+        args = {"request": {"view_id": "41", "dimension_type_id": "51", **request}}
+        if check_absent_ids is not None:
+            args["check_absent_ids"] = check_absent_ids
         scope = runpy.run_path(str(SCRIPTS / "read_plan_dimensions.py"), init_globals={
-            "doc": document, "uidoc": NS(Document=document, ActiveView=view),
-            "inputs": {"request": {"view_id": "41", "dimension_type_id": "51", **request}},
+            "doc": document, "uidoc": NS(Document=document, ActiveView=view), "inputs": args,
         })
         return scope["result"]
 
@@ -202,7 +205,8 @@ def test_opening_inventory_and_measured_references_are_bound_to_instance_state(r
 
 def test_unbounded_existing_dimension_is_a_no_op(runtime):
     run, document, _, dimension_type, add = runtime
-    add(Dimension, 66, DimensionType=dimension_type, AreReferencesAvailable=True, GetTypeId=lambda: dimension_type.Id,
+    add(Dimension, 66, OwnerViewId=ElementId(41), DimensionType=dimension_type,
+        AreReferencesAvailable=True, GetTypeId=lambda: dimension_type.Id,
         References=[reference(document.elements[value]) for value in (12, 11, 10)],
         NumberOfSegments=2, Segments=[NS(Value=4), NS(Value=3)], Curve=Line(point(30, 0, 25)))
     preview, proposals = compute(read(run, row("grid", ["10", "11", "12"])))
@@ -221,3 +225,177 @@ def test_mixed_grid_extents_hidden_elements_and_missing_work_plane_are_reported(
     assert "11: Source is unavailable" in warning
     view.SketchPlane = None
     assert run(requests=[grid])["status"] == "stopped"
+
+
+class Changes:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+    def send(self, document, operation, name, added=(), modified=(), deleted=()):
+        event = NS(
+            Operation=operation, GetDocument=lambda: document, GetTransactionNames=lambda: [name],
+            GetAddedElementIds=lambda: IdList(ElementId(value) for value in added),
+            GetModifiedElementIds=lambda: IdList(ElementId(value) for value in modified),
+            GetDeletedElementIds=lambda: IdList(ElementId(value) for value in deleted),
+        )
+        for handler in self.handlers:
+            handler(None, event)
+
+
+@pytest.fixture
+def probe(runtime, monkeypatch):
+    run, document, view, _, add = runtime
+    event = Changes()
+    document.Application.DocumentChanged = event
+    document.Regenerate = lambda: None
+    log = []
+    behavior = NS(wrong_value=False, extra_effect=False, late_failure=False, failed_rollback=False)
+    status = NS(Uninitialized="Uninitialized", Started="Started", Committed="Committed", RolledBack="RolledBack")
+
+    class Group:
+        def __init__(self, doc, name):
+            self.doc, self.name = doc, name
+            self.state = status.Uninitialized
+
+        def GetStatus(self):
+            return self.state
+
+        def Start(self):
+            self.baseline = dict(self.doc.elements)
+            self.state = status.Started
+            return self.state
+
+        def RollBack(self):
+            if behavior.failed_rollback:
+                raise ValueError("Fixture rollback failed.")
+            removed = self.doc.elements.keys() - self.baseline.keys()
+            self.doc.elements = self.baseline
+            self.state = status.RolledBack
+            event.send(self.doc, "TransactionGroupRolledBack", self.name, deleted=removed)
+            return self.state
+
+    class Transaction(Group):
+        def Commit(self):
+            added = self.doc.elements.keys() - self.baseline.keys()
+            self.state = status.Committed
+            log.append(("commit", sorted(added)))
+            event.send(self.doc, "TransactionCommitted", self.name, added=added,
+                       modified=[10] if behavior.extra_effect else [])
+            return self.state
+
+    def parse(doc, value):
+        if value in ("left", "right"):
+            return reference(doc.elements[22], value)
+        return reference(next(item for item in doc.elements.values() if item.UniqueId == value))
+
+    def new_dimension(owner, line, references, style):
+        created = [item for item in document.elements.values() if isinstance(item, Dimension)]
+        if behavior.late_failure and created:
+            raise ValueError("Fixture second dimension failed.")
+        stations = []
+        for ref in references:
+            source = document.GetElement(ref.ElementId)
+            if isinstance(source, FamilyInstance):
+                stations.append({"left": 6, "right": 2}[ref.ConvertToStableRepresentation(document)])
+            else:
+                stations.append(source.Station)
+        values = [abs(a - b) for a, b in zip(stations, stations[1:])]
+        if behavior.wrong_value:
+            values[0] += 0.1
+        return add(
+            Dimension, 100 + len(created), OwnerViewId=owner.Id,
+            DimensionType=style, GetTypeId=lambda: style.Id, AreReferencesAvailable=True,
+            References=references, NumberOfSegments=len(values) if len(values) > 1 else 0,
+            Segments=[NS(Value=value) for value in values], Value=values[0], Curve=Line(line.Origin),
+        )
+
+    class ReferenceArray(list):
+        Append = list.append
+
+    api = sys.modules["pyrevit.api"].DB
+    monkeypatch.setattr(api.Reference, "ParseFromStableRepresentation", parse, raising=False)
+    monkeypatch.setattr(api.Line, "CreateBound", Line, raising=False)
+    api.ReferenceArray, api.XYZ = ReferenceArray, point
+    api.TransactionGroup, api.Transaction, api.TransactionStatus = Group, Transaction, status
+    document.Create = NS(NewDimension=new_dimension)
+    exceptions = ModuleType("Autodesk.Revit.Exceptions")
+    exceptions.RegenerationFailedException = type("RegenerationFailedException", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "Autodesk.Revit.Exceptions", exceptions)
+
+    def trial(plan):
+        values = runpy.run_path(str(SCRIPTS / "probe_plan_dimensions.py"), init_globals={
+            "doc": document, "uidoc": NS(Document=document, ActiveView=view),
+            "inputs": {"plan": plan, "disposable_fixture": True},
+        })
+        assert not event.handlers
+        return values["result"]
+
+    return run, document, trial, behavior, log
+
+
+def test_probe_measures_grid_wall_and_opening_then_removes_every_temporary_id(probe):
+    run, document, trial, _, log = probe
+    grids = row("grid", ["10", "11", "12"])
+    walls = row("overall", ["20", "21"], faces=[{"side": "interior"}, {"side": "exterior"}])
+    candidate = run(opening_wall_ids=["20"])["openings"][0]["candidate"]
+    opening = row("opening", ["20", "22"], opening_evidence={
+        "opening": candidate, "traces": [[[6, -1, 25], [6, 1, 25]], [[2, -1, 25], [2, 1, 25]]],
+    })
+    baseline = read(run, grids, walls, opening)
+    outcome = trial(probe_plan(baseline))
+    assert outcome["status"] == "trial_rolled_back", outcome
+    assert outcome["temporary_dimension_ids"] == ["100", "101", "102"]
+    assert {name: item["segments_ft"] for name, item in outcome["measurements"].items()} == {
+        "grid": [3, 4], "overall": [7], "opening": [4],
+    }
+    assert log == [("commit", [100, 101, 102])]
+    assert read(run, grids, walls, opening) == baseline
+    assert all(document.GetElement(ElementId(value)) is None for value in (100, 101, 102))
+    fresh = run(requests=[grids, walls, opening], check_absent_ids=outcome["temporary_dimension_ids"])
+    assert fresh["confirmed_absent_ids"] == outcome["temporary_dimension_ids"]
+    assert json.loads(fresh["snapshot_json"]) == baseline
+    assert run(requests=[grids], check_absent_ids=["10"])["status"] == "stopped"
+
+
+@pytest.mark.parametrize(("behavior_name", "expected_commits", "message"), [
+    ("wrong_value", [], "measured dimension"),
+    ("extra_effect", [("commit", [100, 101])], "exact Revit change record"),
+    ("late_failure", [], "second dimension"),
+])
+def test_mismatches_rollback_without_leaving_partial_dimensions(probe, behavior_name, expected_commits, message):
+    run, _, trial, behavior, log = probe
+    requests = [
+        row("grid", ["10", "11", "12"]),
+        row("overall", ["20", "21"], faces=[{"side": "interior"}, {"side": "exterior"}]),
+    ]
+    baseline = read(run, *requests)
+    setattr(behavior, behavior_name, True)
+    outcome = trial(probe_plan(baseline))
+    assert outcome["status"] == "stopped", outcome
+    assert message in outcome["message"]
+    assert outcome["rollback_verified"] is True
+    assert log == expected_commits
+    assert read(run, *requests) == baseline
+
+
+def test_stale_source_stops_before_transaction_and_failed_rollback_is_unresolved(probe):
+    run, document, trial, behavior, log = probe
+    grids = row("grid", ["10", "11", "12"])
+    plan = probe_plan(read(run, grids))
+    document.elements[10].hidden = True
+    assert trial(plan)["status"] == "stopped"
+    assert log == []
+
+    document.elements[10].hidden = False
+    behavior.failed_rollback = True
+    outcome = trial(plan)
+    assert outcome["status"] == "transaction_unresolved"
+    assert "rollback_verified" not in outcome

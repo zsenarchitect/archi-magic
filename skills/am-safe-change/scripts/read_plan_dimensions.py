@@ -198,31 +198,38 @@ def opening_witnesses(document, opening, candidate, refs, evidence, frame):
     return result
 
 
+def read_dimension(document, dimension, frame):
+    if not dimension.AreReferencesAvailable:
+        raise ValueError("The linear dimension reference inventory is incomplete.")
+    references = []
+    for reference in dimension.References:
+        if len(references) == MAX_WITNESSES:
+            raise ValueError("An existing dimension exceeds the reference limit.")
+        owner = document.GetElement(reference.ElementId)
+        if owner is None:
+            raise ValueError("An existing dimension reference has no resolved owner.")
+        references.append(stable(document, owner, reference))
+    values = [float(segment.Value) for segment in dimension.Segments] if dimension.NumberOfSegments else [float(dimension.Value)]
+    curve = dimension.Curve
+    if not isinstance(curve, DB.Line):
+        raise ValueError("An existing linear dimension does not expose a straight support line.")
+    row = dict(identity(dimension), type_id=key(dimension.GetTypeId()), references=references, segments_ft=values)
+    if curve.IsBound:
+        row["line"] = line_points(curve, frame)
+    else:
+        row["support"] = {"point": on_plane(xyz(curve.Origin), frame), "direction": xyz(curve.Direction)}
+    return row
+
+
 def existing_dimensions(document, view, frame):
     result = []
     for dimension in DB.FilteredElementCollector(document, view.Id).OfClass(DB.Dimension):
-        if dimension.DimensionType.StyleType != DB.DimensionStyleType.Linear:
+        if (key(dimension.OwnerViewId) != key(view.Id)
+                or dimension.DimensionType.StyleType != DB.DimensionStyleType.Linear):
             continue
-        if len(result) == MAX_EXISTING or not dimension.AreReferencesAvailable:
-            raise ValueError("The existing linear dimension inventory is incomplete.")
-        references = []
-        for reference in dimension.References:
-            if len(references) == MAX_WITNESSES:
-                raise ValueError("An existing dimension exceeds the reference limit.")
-            owner = document.GetElement(reference.ElementId)
-            if owner is None:
-                raise ValueError("An existing dimension reference has no resolved owner.")
-            references.append(stable(document, owner, reference))
-        values = [float(segment.Value) for segment in dimension.Segments] if dimension.NumberOfSegments else [float(dimension.Value)]
-        curve = dimension.Curve
-        if not isinstance(curve, DB.Line):
-            raise ValueError("An existing linear dimension does not expose a straight support line.")
-        row = dict(identity(dimension), type_id=key(dimension.GetTypeId()), references=references, segments_ft=values)
-        if curve.IsBound:
-            row["line"] = line_points(curve, frame)
-        else:
-            row["support"] = {"point": on_plane(xyz(curve.Origin), frame), "direction": xyz(curve.Direction)}
-        result.append(row)
+        if len(result) == MAX_EXISTING:
+            raise ValueError("The existing linear dimension inventory exceeds the reviewed limit.")
+        result.append(read_dimension(document, dimension, frame))
     return sorted(result, key=lambda row: int(row["id"]))
 
 
@@ -292,7 +299,7 @@ def read_snapshot(document, view, request):
         raise ValueError("Select an exact linear dimension type.")
     frame, view_basis = view_geometry(view)
     return {
-        "kind": "plan-dimension-snapshot", "version": 1,
+        "kind": "plan-dimension-snapshot", "version": 1, "request": request,
         "project": {"project_uid": str(document.ProjectInformation.UniqueId),
                     "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()},
         "revit": {"version": str(document.Application.VersionNumber), "build": str(document.Application.VersionBuild)},
@@ -346,7 +353,16 @@ def main(document, ui_document, args):
         encoded = json.dumps(result, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
         if len(encoded) > MAX_INPUT:
             raise ValueError("The complete dimension snapshot exceeds 2 MiB.")
-        return {"status": "ok", "snapshot_json": encoded}
+        response = {"status": "ok", "snapshot_json": encoded}
+        if "check_absent_ids" in args:
+            ids = args["check_absent_ids"]
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 20:
+                raise ValueError("Use the probe's exact temporary dimension IDs.")
+            canonical = sorted({element_id(value) for value in ids}, key=int)
+            if ids != canonical or any(get(document, value) is not None for value in ids):
+                raise ValueError("The temporary dimension IDs are invalid or still resolve in Revit.")
+            response["confirmed_absent_ids"] = canonical
+        return response
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         return {"status": "stopped", "message": str(error)}
     except Exception as error:

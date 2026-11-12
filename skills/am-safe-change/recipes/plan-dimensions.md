@@ -9,3 +9,12 @@ Use Revit 2026 with a saved host project and an independent floor plan. Assign a
 5. Save the decoded `snapshot_json` and run `python scripts/plan_dimension_preview.py snapshot.json > preview.json` from the skill directory. Render the preview with am-schedule-view. Check measured spans and unresolved references before requesting a native qualification trial.
 
 The reference forms and visibility checks still need qualification in a disposable Revit project. This workflow ends with a review-only preview. [Autodesk view sketch plane](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/2531634f-f0d4-3cb3-7f8a-fe809d33a61f.htm) · [Autodesk hosted insert discovery](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/58990230-38cb-3af7-fd25-96ed3215a43d.htm)
+
+## Qualify dimension creation with rollback
+
+1. Use a saved, writable, non-workshared disposable model. Keep the bridge in ask policy. Check the destination view's ownership and obtain approval for the exact preview.
+2. Run `python scripts/plan_dimension_preview.py snapshot.json --probe-plan > probe-plan.json`. Keep both outputs from the same snapshot. The qualification payload contains only resolved proposals.
+3. Recheck context and policy. Run `scripts/probe_plan_dimensions.py` with `run_modify`, `dry_run: true`, and the skill scripts directory as workspace. Supply `disposable_fixture: true` and the decoded payload under `plan`.
+4. Save the full trial record. If it reports `trial_rolled_back`, repeat the original query and supply its exact `temporary_dimension_ids` as `check_absent_ids` alongside `request`. Check the fresh baseline against the original snapshot and the confirmed absent IDs against the trial. Stop on an unresolved transaction, unexpected effect, or changed baseline.
+
+The probe verifies the geometry and exact added dimensions while a transaction group can still roll back. Persistent Keep/Discard remains pending live Revit qualification. [Autodesk NewDimension](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/475aab91-19d3-5884-d3eb-18dfc0d4004f.htm) · [Autodesk transaction group rollback](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/2efcf628-bb40-bf36-a2e4-eaeca4cca461.htm)
