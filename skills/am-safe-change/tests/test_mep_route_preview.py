@@ -96,3 +96,33 @@ def test_malformed_or_incompatible_route_input_emits_no_preview(tmp_path, change
         data["obstacles"] = [{"min_ft": [3, 0, 0], "max_ft": [2, 1, 1]}]
     result = run(tmp_path, data)
     assert result.returncode == 2 and not result.stdout
+
+
+def test_alternating_obstacles_require_multiple_detours_inside_routing_area(tmp_path):
+    data = fixture()
+    data["routing_bounds_ft"] = {"min_ft": [-1, -3, -1], "max_ft": [11, 3, 1]}
+    data["obstacles"] = [
+        {"min_ft": [2, -3, -1], "max_ft": [3, 0, 1]},
+        {"min_ft": [6, 0, -1], "max_ft": [7, 3, 1]},
+    ]
+    result = run(tmp_path, data)
+    assert result.returncode == 0, result.stderr
+    route = json.loads(result.stdout)["route"]
+    points = route["points_ft"]
+    assert max(point[1] for point in points) > 0.75
+    assert min(point[1] for point in points) < -0.75
+    assert all(-2.25 <= y <= 2.25 and -0.25 <= z <= 0.25 for _, y, z in points)
+    assert points[0] == [0, 0, 0] and points[-1] == [10, 0, 0]
+    assert set(route["bends_degrees"]) <= {45, 90}
+    for station, sign in ((2.5, 1), (6.5, -1)):
+        crossings = []
+        for a, b in zip(points, points[1:]):
+            if min(a[0], b[0]) < station < max(a[0], b[0]):
+                fraction = (station - a[0]) / (b[0] - a[0])
+                crossings.append(a[1] + fraction * (b[1] - a[1]))
+        assert crossings and all(sign * y > 0.75 for y in crossings)
+
+    data["obstacles"][0]["max_ft"][1] = 3
+    blocked = run(tmp_path, data)
+    assert blocked.returncode == 1, blocked.stderr
+    assert json.loads(blocked.stdout)["route"] is None

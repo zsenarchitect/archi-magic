@@ -2,6 +2,7 @@
 
 import argparse
 from hashlib import sha256
+from heapq import heappop, heappush
 from itertools import permutations
 import json
 import math
@@ -13,6 +14,7 @@ from mep_sizing_preview import unique_object
 
 EPSILON = 1e-7
 DIAGONAL_COSINE = math.sqrt(0.5)
+MAX_EDGE_CHECKS = 100_000
 COLUMNS = ["Route", "Length (ft)", "Bends", "Waypoints (host ft)"]
 
 
@@ -95,6 +97,72 @@ def candidates(start, end, first_axis, last_axis, setback, boxes):
                     yield [start, first, tuple(leading), *axis_path(leading, trailing, order), last, end]
 
 
+def inside(point, bounds):
+    return bounds is None or all(low <= value <= high for value, low, high in zip(point, *bounds))
+
+
+def compatible_turn(incoming, outgoing):
+    cosine = dot(incoming, outgoing)
+    return cosine >= 1 - EPSILON or abs(cosine) <= EPSILON or abs(cosine - DIAGONAL_COSINE) <= EPSILON
+
+
+def multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds):
+    first = along(start, first_axis, 2 * minimum)
+    last = along(end, last_axis, 2 * minimum)
+    if (not all(inside(point, bounds) for point in (start, first, last, end))
+            or any(intersects(a, b, box) for a, b in ((start, first), (last, end)) for box in boxes)):
+        return None, False
+    planes = [{first[axis], last[axis]} for axis in range(3)]
+    for axis, values in enumerate(planes):
+        for low, high in boxes:
+            values.update((low[axis] - 10 * EPSILON, high[axis] + 10 * EPSILON))
+        if bounds is not None:
+            values.update((bounds[0][axis], bounds[1][axis]))
+            planes[axis] = {value for value in values if bounds[0][axis] <= value <= bounds[1][axis]}
+    ordered_planes = [sorted(values) for values in planes]
+
+    initial = (first, first_axis)
+    reverse_last = tuple(-axis for axis in last_axis)
+    queue = [(math.dist(first, last), 0.0, initial)]
+    distances = {initial: 0.0}
+    parents = {}
+    checked = 0
+    while queue:
+        _, distance, state = heappop(queue)
+        if distance != distances[state]:
+            continue
+        current, incoming = state
+        if current == last and compatible_turn(incoming, reverse_last):
+            route = [current]
+            while state in parents:
+                state = parents[state]
+                route.append(state[0])
+            return [start, *reversed(route), end], False
+        for axis, values in enumerate(ordered_planes):
+            for sign in (-1, 1):
+                heading = tuple(sign if index == axis else 0 for index in range(3))
+                if not compatible_turn(incoming, heading):
+                    continue
+                scan = values if sign == 1 else reversed(values)
+                for coordinate in scan:
+                    length = (coordinate - current[axis]) * sign
+                    if length < minimum:
+                        continue
+                    point = tuple(coordinate if index == axis else value for index, value in enumerate(current))
+                    checked += 1
+                    if checked > MAX_EDGE_CHECKS:
+                        return None, True
+                    if any(intersects(current, point, box) for box in boxes):
+                        break
+                    next_state, next_distance = (point, heading), distance + length
+                    if next_distance >= distances.get(next_state, math.inf):
+                        continue
+                    distances[next_state] = next_distance
+                    parents[next_state] = state
+                    heappush(queue, (next_distance + math.dist(point, last), next_distance, next_state))
+    return None, False
+
+
 def beveled(points, setback):
     result = [points[0]]
     for a, b, c in zip(points, points[1:], points[2:]):
@@ -107,8 +175,8 @@ def beveled(points, setback):
     return result + points[-1:]
 
 
-def assess(points, first_axis, last_axis, minimum, boxes):
-    if len(points) < 2:
+def assess(points, first_axis, last_axis, minimum, boxes, bounds):
+    if len(points) < 2 or not all(inside(point, bounds) for point in points):
         return None
     segments = list(zip(points, points[1:]))
     directions = [unit(delta(a, b)) for a, b in segments]
@@ -132,7 +200,8 @@ def assess(points, first_axis, last_axis, minimum, boxes):
 
 
 def preview(data):
-    if set(data) != {"endpoints", "minimum_segment_ft", "clearance_ft", "obstacles"}:
+    required = {"endpoints", "minimum_segment_ft", "clearance_ft", "obstacles"}
+    if not required <= set(data) <= required | {"routing_bounds_ft"}:
         raise ValueError("Supply the reviewed endpoints, minimum segment, clearance and obstacle boxes.")
     evidence = data["endpoints"]
     if (evidence["kind"] != "mep-route-endpoints" or type(evidence["version"]) is not int
@@ -171,16 +240,36 @@ def preview(data):
             raise ValueError("Each obstacle needs increasing minimum and maximum coordinates.")
         boxes.append((tuple(value - padding for value in low), tuple(value + padding for value in high)))
 
+    bounds = None
+    if "routing_bounds_ft" in data:
+        limits = data["routing_bounds_ft"]
+        if set(limits) != {"min_ft", "max_ft"}:
+            raise ValueError("The routing area needs minimum and maximum host-space coordinates.")
+        bounds = (tuple(value + padding for value in point(limits["min_ft"])),
+                  tuple(value - padding for value in point(limits["max_ft"])))
+        if any(a >= b for a, b in zip(*bounds)):
+            raise ValueError("The routing area has no room for the section and clearance.")
+
     best = None
-    for raw in candidates(start, end, first_axis, last_axis, 2 * minimum, boxes):
+
+    def consider(raw):
+        nonlocal best
         path = compact(raw)
         for option in (path, compact(beveled(path, minimum)) if len(path) >= 3 else path):
-            result = assess(option, first_axis, last_axis, minimum, boxes)
+            result = assess(option, first_axis, last_axis, minimum, boxes, bounds)
             if result is not None:
                 length, bends = result
                 candidate = (length, len(bends), option, bends)
                 if best is None or candidate < best:
                     best = candidate
+
+    for raw in candidates(start, end, first_axis, last_axis, 2 * minimum, boxes):
+        consider(raw)
+    exhausted = False
+    if best is None:
+        detour, exhausted = multi_detour(start, end, first_axis, last_axis, minimum, boxes, bounds)
+        if detour is not None:
+            consider(detour)
 
     before = [["candidate", None, None, None]]
     warnings = []
@@ -188,7 +277,8 @@ def preview(data):
     if best is None:
         after = before
         warnings.append({"row": "candidate", "blocking": True,
-                         "text": "The search found no route with compatible turns and supplied clearances."})
+                         "text": ("The route search reached its edge-check budget." if exhausted
+                                  else "The search found no route with compatible turns and supplied clearances.")})
     else:
         length, _, path, bends = best
         route = {"source": evidence["source"], "endpoints": evidence["endpoints"],
