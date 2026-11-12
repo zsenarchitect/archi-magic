@@ -336,6 +336,13 @@ def audit_records(monkeypatch):
               approved=preview["proposal_sha256"])
 
 
+def test_independent_verifier_rejects_a_crop_corner_out_of_plane(audit_records):
+    row = audit_records.receipt["views"][0]
+    row["crop_world"][0] = [point + axis for point, axis in zip(row["crop_world"][0], row["direction"])]
+    with pytest.raises(ValueError, match="one view plane"):
+        audit_records.verify()
+
+
 def test_independent_verifier_proves_exact_rollback(audit_records):
     result = audit_records.verify()
     assert result["status"] == "verified_room_view_trial_rollback"

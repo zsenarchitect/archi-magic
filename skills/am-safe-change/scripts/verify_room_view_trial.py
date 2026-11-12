@@ -94,13 +94,17 @@ def measured_additions(receipt, preview, snapshot):
             raise ValueError("A measured crop differs from the reviewed rectangle.")
         targets = [(x, y) for x in (spec["crop_min"][0], spec["crop_max"][0])
                    for y in (spec["crop_min"][1], spec["crop_max"][1])]
+        depths = []
         for corner in planner.bounded_list(row["crop_world"], 4, "World crop corners", 4):
             delta = [a - b for a, b in zip(planner.geometry.point(corner, 3), spec["origin"])]
             projected = [sum(axis * component for axis, component in zip(spec["right"], delta)), delta[2]]
+            depths.append(sum(axis * component for axis, component in zip(spec["look"], delta)))
             matches = [target for target in targets if close(projected, target)]
             if len(matches) != 1:
                 raise ValueError("A measured crop is displaced from its reviewed room surface.")
             targets.remove(matches[0])
+        if max(depths) - min(depths) > TOLERANCE:
+            raise ValueError("The measured crop corners do not lie in one view plane.")
         identities.append(row["view"])
         if spec["kind"] == "elevation":
             marker = planner.geometry.point(row["marker_point"], 3)
