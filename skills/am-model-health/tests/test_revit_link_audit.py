@@ -198,6 +198,26 @@ def test_link_audit_uses_runtime_entry_point_and_separates_source_and_cache(quer
         assert secret not in output
 
 
+def test_long_windows_paths_and_conflicting_ifc_source_risk(query, capsys):
+    execute, _ = query
+    profile = LinkType(1, r"\\?\C:\Users\private-long-owner\OneDrive\private-long-model.rvt")
+    network = LinkType(2, r"\\?\UNC\private-long-server\share\private-long-model.rvt")
+    device = LinkType(3, r"\\.\private-device\private-long-model.rvt")
+    relative_components = LinkType(4, r"C:\Projects\..\Users\private-long-owner\Desktop\model.rvt")
+    ifc = LinkType(5, r"C:\Cache\private-long-model.ifc.rvt")
+    ifc.resources["ifc"] = NS(InSessionPath=r"\\private-long-server\share\private-long-model.ifc")
+    ifc.source = r"\\?\C:\Users\private-long-owner\Documents\private-long-model.ifc"
+    result = execute(Document([profile, network, device, relative_components, ifc], {}))
+    rows = result["revit_links"]["types"]
+    assert [(row["source_path_kind"], row["path_risk"]) for row in rows] == [
+        ("personal", "personal"), ("network", None), (None, None), ("personal", "personal"), (None, "personal"),
+    ]
+    assert rows[-1]["source_path_kind_candidates"] == ["network", "personal"]
+    output = json.dumps(result) + capsys.readouterr().out
+    assert all(value not in output for value in (
+        "private-long-owner", "private-long-model", "private-long-server", "private-device"))
+
+
 def test_unavailable_collector_cannot_claim_absence_and_templates_are_invalid(query):
     execute, _ = query
     view = View(VIEW_ID)
