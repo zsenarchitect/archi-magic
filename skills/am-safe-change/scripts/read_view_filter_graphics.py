@@ -6,7 +6,7 @@ import math
 
 from pyrevit.api import DB
 
-from duplicate_views import bounded, document_identity, identifier, key
+from duplicate_views import bounded, can_edit, document_identity, identifier, key, owner_state, viewports
 from System import Int64
 from System.Diagnostics import Stopwatch
 
@@ -220,22 +220,147 @@ def read_view(document, view, definitions, patterns, remaining, clock):
             "is_template": bool(view.IsTemplate), "template_id": key(view.ViewTemplateId), "filters": rows}
 
 
+def transfer_scope(document, request, clock):
+    if (not isinstance(request, dict) or not {"source_id", "target_ids"}.issubset(request)
+            or set(request) - {"source_id", "target_ids", "allow_placed"}
+            or type(request.get("allow_placed", False)) is not bool):
+        raise ValueError("Supply a source, explicit targets and optional placement approval.")
+    target_ids = request["target_ids"]
+    if not isinstance(target_ids, list) or not 1 <= len(target_ids) <= 20:
+        raise ValueError("Supply one to 20 explicit target views or templates.")
+    source_id = key(identifier(request["source_id"]))
+    target_ids = [key(identifier(item)) for item in target_ids]
+    if len(set([source_id] + target_ids)) != len(target_ids) + 1:
+        raise ValueError("Source and target view IDs must be distinct.")
+    views = {key(view.Id): view for view in bounded(DB.FilteredElementCollector(document).OfClass(DB.View),
+                                                    10000, "project view", clock)}
+    if source_id not in views or any(item not in views for item in target_ids):
+        raise ValueError("Every requested view or template must exist in the saved project.")
+
+    filter_group = str(int(DB.BuiltInParameter.VIS_GRAPHICS_FILTERS))
+    controlled, consumers = {}, {}
+    for view_id, view in views.items():
+        if view.IsTemplate:
+            continue
+        template_id = key(view.ViewTemplateId)
+        if template_id != "-1":
+            consumers.setdefault(template_id, []).append(view_id)
+
+    def controls_filters(template_id):
+        if template_id not in controlled:
+            template = views.get(template_id)
+            if template is None or not template.IsTemplate:
+                raise ValueError("A selected view has an unresolved template assignment.")
+            groups = {key(item) for item in template.GetTemplateParameterIds()}
+            exclusions = {key(item) for item in template.GetNonControlledTemplateParameterIds()}
+            if not exclusions.issubset(groups):
+                raise ValueError("A selected template has inconsistent controlled parameters.")
+            controlled[template_id] = filter_group in groups - exclusions
+        return controlled[template_id]
+
+    def family(view_id):
+        view = views[view_id]
+        primary_id = key(view.GetPrimaryViewId())
+        if primary_id == "-1":
+            primary_id = view_id
+        primary = views.get(primary_id)
+        if primary is None or primary.IsTemplate or key(primary.GetPrimaryViewId()) != "-1":
+            raise ValueError("A selected dependent view has no verified primary.")
+        members = [primary_id] + [key(item) for item in bounded(primary.GetDependentViewIds(), 99,
+                                                                  "dependent family", clock)]
+        if view_id not in members or len(set(members)) != len(members):
+            raise ValueError("A dependent view is missing from its primary's family.")
+        for member_id in members[1:]:
+            member = views.get(member_id)
+            if (member is None or member.IsTemplate or key(member.GetPrimaryViewId()) != primary_id
+                    or key(member.ViewTemplateId) not in ("-1", key(primary.ViewTemplateId))):
+                raise ValueError("A dependent family's authority could not be verified.")
+        return primary_id, members
+
+    def authority(view_id):
+        view = views[view_id]
+        if view.IsTemplate:
+            return view_id
+        primary_id, _ = family(view_id)
+        template_id = key(views[primary_id].ViewTemplateId)
+        return template_id if template_id != "-1" and controls_filters(template_id) else primary_id
+
+    source_authority = authority(source_id)
+    affected = set()
+    targets = []
+    for target_id in target_ids:
+        recipient = authority(target_id)
+        if views[recipient].IsTemplate and target_id != recipient:
+            raise ValueError("Target %s is filter-controlled by template %s. Select that template explicitly."
+                             % (target_id, recipient))
+        if views[recipient].IsTemplate:
+            members = {recipient}
+            if controls_filters(recipient):
+                for consumer in bounded(consumers.get(recipient, []), 99, "template consumer", clock):
+                    members.update(family(consumer)[1])
+                    if len(members) > 100:
+                        raise ValueError("The transfer affects more than 100 views.")
+        else:
+            members = set(family(recipient)[1])
+        if source_id in members or source_authority in members or affected.intersection(members):
+            raise ValueError("The source or multiple target scopes overlap.")
+        affected.update(members)
+        if len(affected) > 100:
+            raise ValueError("The transfer affects more than 100 views.")
+        targets.append({"requested_id": target_id, "recipient_id": recipient,
+                        "affected_ids": sorted(members, key=int)})
+
+    inspected = affected | {source_id, source_authority}
+    if len(inspected) > 100:
+        raise ValueError("The complete view inventory exceeds 100 views.")
+    placements = viewports(document, [item for item in inspected if not views[item].IsTemplate], clock)
+    metadata = {}
+    for view_id in sorted(inspected, key=int):
+        view = views[view_id]
+        placed = placements.get(view_id, [])
+        if not view.IsTemplate and bool(placed) != (str(view.GetPlacementOnSheetStatus()) != "NotPlaced"):
+            raise ValueError("A selected view has an unverified sheet placement.")
+        ownership = owner_state(document, view) if view_id in affected else None
+        metadata[view_id] = {"authority_id": authority(view_id), "placements": placed,
+                             "ownership": ownership, "writable": view_id in affected and can_edit(ownership)}
+    return views, metadata, {"source_id": source_id, "source_authority_id": source_authority,
+                             "allow_placed": request.get("allow_placed", False), "targets": targets}
+
+
+def transfer_inventory(document, request, definitions, patterns, remaining, clock):
+    native, metadata, scope = transfer_scope(document, request, clock)
+    views = {}
+    for view_id, detail in metadata.items():
+        row = read_view(document, native[view_id], definitions, patterns, remaining, clock)
+        row.update(detail)
+        views[view_id] = row
+    for row in views.values():
+        controller = views.get(row["authority_id"])
+        if controller is None or controller["filters"] != row["filters"]:
+            raise ValueError("A view's filter graphics do not match its identified authority.")
+    return {"kind": "view-filter-transfer-inventory", "scope": scope, "views": views}
+
+
 def main(document, args):
     project = document_identity(document)
-    requested = args["view_ids"]
-    if not isinstance(requested, list) or not 1 <= len(requested) <= 21:
-        raise ValueError("Supply one to 21 explicit view or template IDs.")
-    ids = [identifier(item) for item in requested]
-    if len({key(item) for item in ids}) != len(ids):
-        raise ValueError("View IDs must be distinct.")
     clock = Stopwatch.StartNew()
     definitions, patterns, remaining = {}, {}, [4096]
-    views = [read_view(document, document.GetElement(item), definitions, patterns, remaining, clock) for item in ids]
-    payload = json.dumps({"kind": "view-filter-graphics-inventory", "document": project, "views": views,
-                          "filter_definitions": definitions, "pattern_definitions": patterns},
-                         ensure_ascii=True, separators=(",", ":"), allow_nan=False)
-    if len(payload) > MAX_BYTES:
-        raise ValueError("The graphic override inventory exceeds 2 MiB.")
+    if "request" in args:
+        data = transfer_inventory(document, args["request"], definitions, patterns, remaining, clock)
+    else:
+        requested = args["view_ids"]
+        if not isinstance(requested, list) or not 1 <= len(requested) <= 21:
+            raise ValueError("Supply one to 21 explicit view or template IDs.")
+        native_ids = [identifier(item) for item in requested]
+        if len({key(item) for item in native_ids}) != len(native_ids):
+            raise ValueError("View IDs must be distinct.")
+        data = {"kind": "view-filter-graphics-inventory",
+                "views": [read_view(document, document.GetElement(item), definitions, patterns, remaining, clock)
+                          for item in native_ids]}
+    data.update(document=project, filter_definitions=definitions, pattern_definitions=patterns)
+    payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    if len(payload) > MAX_BYTES or clock.ElapsedMilliseconds > 10000:
+        raise ValueError("The filter inventory exceeds its size or time budget.")
     return {"status": "ok", "inventory_json": payload}
 
 

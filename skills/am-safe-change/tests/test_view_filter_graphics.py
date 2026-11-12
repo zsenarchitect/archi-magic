@@ -81,6 +81,26 @@ class View:
     def __init__(self, settings, temporary):
         self.settings = settings
         self.temporary = temporary
+        self.primary = MockId(-1)
+        self.children = []
+        self.controls = []
+        self.exclusions = []
+        self.placement = "NotPlaced"
+
+    def GetPrimaryViewId(self):
+        return self.primary
+
+    def GetDependentViewIds(self):
+        return self.children
+
+    def GetTemplateParameterIds(self):
+        return self.controls
+
+    def GetNonControlledTemplateParameterIds(self):
+        return self.exclusions
+
+    def GetPlacementOnSheetStatus(self):
+        return self.placement
 
     def AreGraphicsOverridesAllowed(self):
         return True
@@ -101,11 +121,33 @@ class View:
         return item.Value == 20
 
 
+class Sheet:
+    Id = MockId(200)
+    UniqueId = "sheet-200"
+    SheetNumber = "A-101"
+
+
+class Viewport:
+    Id = MockId(201)
+    UniqueId = "viewport-201"
+    ViewId = MockId(43)
+    SheetId = MockId(200)
+
+
+class Collector:
+    def __init__(self, document):
+        self.document = document
+
+    def OfClass(self, category):
+        return [element for element in self.document.elements.values() if isinstance(element, category)]
+
+
 @pytest.fixture
 def reader(monkeypatch):
     db = NS(View=View, ElementId=MockId, FilterElement=Filter, LinePatternElement=LinePattern,
             SelectionFilterElement=SelectionFilter, ParameterFilterElement=ParameterFilter,
-            FillPatternElement=FillPattern)
+            FillPatternElement=FillPattern, FilteredElementCollector=Collector, Viewport=Viewport,
+            ViewSheet=Sheet, BuiltInParameter=NS(VIS_GRAPHICS_FILTERS=-500))
     monkeypatch.syspath_prepend(str(SCRIPTS))
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
@@ -133,7 +175,8 @@ def view_fixture(reader, temporary=False):
     settings[20].IsSurfaceForegroundPatternVisible = True
     view = View(settings, temporary)
     elements = {10: SelectionFilter(10), 20: ParameterFilter(20), 31: view, 68: FillPattern()}
-    document = NS(IsFamilyDocument=False, IsReadOnly=False, PathName="fixture.rvt",
+    document = NS(IsFamilyDocument=False, IsReadOnly=False, IsWorkshared=False,
+                  PathName="fixture.rvt", elements=elements,
                   ProjectInformation=NS(UniqueId="project-1"),
                   GetElement=lambda identifier: elements.get(identifier.Value))
     return document, disposed
@@ -211,3 +254,120 @@ def test_unknown_rules_and_oversize_selection_stop_inventory(reader):
     document.GetElement(MockId(10)).GetElementIds = lambda: map(MockId, range(1001))
     with pytest.raises(ValueError, match="filter member inventory exceeds"):
         reader["main"](document, {"view_ids": ["31"]})
+
+
+def transfer_fixture(reader):
+    document, _ = view_fixture(reader)
+    source = document.GetElement(MockId(31))
+    source.ViewTemplateId = MockId(-1)
+    for value in (41, 42, 43):
+        view = View(source.settings, False)
+        view.Id, view.Name, view.UniqueId = MockId(value), "View %d" % value, "view-%d" % value
+        view.ViewTemplateId = MockId(-1)
+        document.elements[value] = view
+    template, primary, dependent = (document.elements[value] for value in (41, 42, 43))
+    template.IsTemplate = True
+    template.controls = [MockId(-500)]
+    primary.ViewTemplateId = template.Id
+    primary.children = [dependent.Id]
+    dependent.primary = primary.Id
+    dependent.placement = "CompletelyPlaced"
+    document.elements[200], document.elements[201] = Sheet(), Viewport()
+    return document
+
+
+def transfer(reader, document, source, *targets):
+    request = {"source_id": source, "target_ids": list(targets)}
+    result = reader["main"](document, {"request": request})
+    return json.loads(result["inventory_json"])
+
+
+def test_transfer_resolves_template_consumers_and_dependent_sheet_placement(reader):
+    document = transfer_fixture(reader)
+    snapshot = transfer(reader, document, "31", "41")
+    assert snapshot["scope"] == {
+        "source_id": "31", "source_authority_id": "31", "allow_placed": False,
+        "targets": [{"requested_id": "41", "recipient_id": "41", "affected_ids": ["41", "42", "43"]}],
+    }
+    assert snapshot["views"]["43"]["authority_id"] == "41"
+    assert snapshot["views"]["43"]["placements"] == [["200", "sheet-200", "A-101", "201", "viewport-201"]]
+    assert snapshot["views"]["42"]["filters"] == snapshot["views"]["41"]["filters"]
+    assert snapshot["views"]["41"]["writable"] and not snapshot["views"]["31"]["writable"]
+
+
+def test_transfer_resolves_dependent_primary_and_refuses_overlapping_recipients(reader):
+    document = transfer_fixture(reader)
+    document.elements[41].exclusions = [MockId(-500)]
+    snapshot = transfer(reader, document, "31", "43")
+    assert snapshot["scope"]["targets"] == [
+        {"requested_id": "43", "recipient_id": "42", "affected_ids": ["42", "43"]},
+    ]
+    with pytest.raises(ValueError, match="scopes overlap"):
+        transfer(reader, document, "31", "42", "43")
+
+
+def test_transfer_refuses_implicit_template_edits_and_mismatched_effective_graphics(reader):
+    document = transfer_fixture(reader)
+    with pytest.raises(ValueError, match="filter-controlled by template 41"):
+        transfer(reader, document, "31", "43")
+    with pytest.raises(ValueError, match="scopes overlap"):
+        transfer(reader, document, "43", "41")
+    document.elements[43].GetFilterVisibility = lambda _id: True
+    with pytest.raises(ValueError, match="do not match its identified authority"):
+        transfer(reader, document, "31", "41")
+
+
+def test_preview_preserves_target_only_graphics_and_requires_sheet_approval(reader, tmp_path):
+    import subprocess
+    from view_filter_transfer_preview import compute
+
+    document = transfer_fixture(reader)
+    document.elements[11] = SelectionFilter(11)
+    for view_id in (41, 42, 43):
+        view = document.elements[view_id]
+        view.settings = dict(view.settings)
+        view.settings[11] = view.settings[10]
+        view.GetOrderedFilters = lambda: [MockId(10), MockId(11), MockId(20)]
+        view.GetFilterVisibility = lambda item: item.Value == 20
+        view.GetIsFilterEnabled = lambda item: item.Value == 10
+    request = {"source_id": "31", "target_ids": ["41"]}
+    result = reader["main"](document, {"request": request})
+    snapshot = json.loads(result["inventory_json"])
+    blocked, display = compute(snapshot)
+    assert blocked["blocked"] and blocked["steps"] == []
+    assert display["warnings"] == [
+        {"row": "43:20", "text": "View 43 [43] Approve the listed sheet placement before transferring filters.",
+         "blocking": True},
+    ]
+    assert [row[5] for row in display["before"] if row[1] == "View 43"] == [3, 1, 2]
+    assert [row[5] for row in display["after"] if row[1] == "View 43"] == [1, 2, 3]
+    assert {row[2] for row in display["after"] if row[1] == "View 43"} == {"A-101"}
+
+    request["allow_placed"] = True
+    result = reader["main"](document, {"request": request})
+    snapshot = json.loads(result["inventory_json"])
+    plan, display = compute(snapshot)
+    assert not plan["blocked"] and display["review_only"]
+    assert plan["basis_sha256"] != blocked["basis_sha256"]
+    assert plan["ownership_ids"] == ["41", "42", "43"]
+    step = plan["steps"][0]
+    assert step["recipient_id"] == "41" and step["affected_ids"] == ["41", "42", "43"]
+    assert [row["id"] for row in step["after"]] == ["20", "10", "11"]
+    assert step["after"][:2] == snapshot["views"]["31"]["filters"]
+    assert step["after"][-1] == step["before"][1]
+
+    record = tmp_path / "runtime.json"
+    record.write_text(json.dumps({"result": result}))
+    completed = subprocess.run([sys.executable, str(SCRIPTS / "view_filter_transfer_preview.py"), str(record)],
+                               capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"plan": plan, "preview": display}
+
+
+def test_exact_filter_repeat_has_no_ownership_or_steps(reader):
+    from view_filter_transfer_preview import compute
+
+    document = transfer_fixture(reader)
+    plan, display = compute(transfer(reader, document, "31", "41"))
+    assert not plan["blocked"] and plan["ownership_ids"] == [] and plan["steps"] == []
+    assert all(row[4] == "Already matches" for row in display["after"])
