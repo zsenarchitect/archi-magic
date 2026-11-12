@@ -398,9 +398,10 @@ def check_independent_trial(tmp_path, document, audit, baseline, result, approva
         path = tmp_path / "cascade.json"
         path.write_text(cascade)
         command.extend(["--floor-cascade", str(path)])
-    for fault in ("none", "same_run", "changed_control", "omitted_id", "extra_bridge_effect"):
-        if cascade is not None and fault != "none":
-            continue
+    faults = (("none", "missing_native_measurement") if cascade is not None else
+              ("none", "same_run", "changed_control", "omitted_id", "extra_bridge_effect",
+               "missing_native_measurement", "wrong_cut_elevation"))
+    for fault in faults:
         after = json.loads(json.dumps(saved_after))
         trial = json.loads(json.dumps(saved_trial))
         if fault == "same_run":
@@ -411,6 +412,15 @@ def check_independent_trial(tmp_path, document, audit, baseline, result, approva
             after["result"]["confirmed_absent_ids"] = fresh["confirmed_absent_ids"][:-1]
         elif fault == "extra_bridge_effect":
             trial["changes"]["modified"][0]["id"] = 100
+        elif fault in ("missing_native_measurement", "wrong_cut_elevation"):
+            measured = json.loads(trial["result"]["trial_json"])
+            if cascade is not None:
+                measured["floor_measurements"].pop(next(iter(measured["floor_measurements"])))
+            elif fault == "missing_native_measurement":
+                measured["column_cuts"].pop()
+            else:
+                measured["column_cuts"][0]["elevation_ft"] += 0.01
+            trial["result"]["trial_json"] = json.dumps(measured)
         for path, record in zip(paths, (saved_before, trial, after)):
             path.write_text(json.dumps(record))
         checked = subprocess.run(command, capture_output=True, text=True)

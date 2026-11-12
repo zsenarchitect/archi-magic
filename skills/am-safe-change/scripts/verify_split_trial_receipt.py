@@ -10,7 +10,7 @@ import sys
 
 import element_split_preview as planner
 from split_replay_comparison import TRANSACTION, match_replay, stable_effects
-from verify_element_split import read_json, verify as verify_pieces
+from verify_element_split import GEOMETRY_TOLERANCE, read_json, verify as verify_pieces
 
 
 EFFECTS = ("added", "modified", "deleted")
@@ -91,6 +91,49 @@ def audit(record):
     return result
 
 
+def verify_native_measurements(snapshot, measured, receipt):
+    categories = {row["id"]: row["category"] for row in snapshot["elements"]}
+    for category in ("wall", "floor"):
+        expected = {row["id"] for row in measured["pieces"] if categories[row["source_id"]] == category}
+        observations = receipt.get(category + "_measurements", {})
+        if not isinstance(observations, dict) or observations.keys() != expected:
+            raise ValueError("The native {} measurements omit or add result pieces.".format(category))
+        for row in observations.values():
+            dimension = "side_offsets_ft" if category == "wall" else "thickness_ft"
+            planner.fields(row, {dimension, "solid_volume_cuft"})
+            volume = row["solid_volume_cuft"]
+            if type(volume) not in (int, Decimal) or not Decimal(volume).is_finite() or volume <= 0:
+                raise ValueError("A native split solid lacks a positive measured volume.")
+            if category == "wall":
+                first, second = map(planner.number, planner.bounded_list(row[dimension], 2, 2, "wall face offsets"))
+                if first <= second:
+                    raise ValueError("The measured wall faces do not enclose a solid.")
+            elif planner.number(row[dimension]) <= 0:
+                raise ValueError("The measured floor lacks positive thickness.")
+
+    cuts = {}
+    for row in snapshot["elements"]:
+        if categories[row["id"]] in ("wall", "floor"):
+            continue
+        low, high = (planner.number(row["geometry"][key]) for key in ("base_ft", "top_ft"))
+        for cut in sorted(row["cuts"], key=lambda item: item["elevation_ft"]):
+            elevation = planner.number(cut["elevation_ft"])
+            cuts[row["id"], cut["id"]] = (low, elevation, high)
+            low = elevation
+    for observation in planner.bounded_list(receipt["column_cuts"], len(cuts), len(cuts), "native column cuts"):
+        planner.fields(observation, {"source_id", "level_id", "elevation_ft", "location", "normalized", "spans_ft"})
+        key = observation["source_id"], observation["level_id"]
+        if key not in cuts or observation["location"] not in ("point", "curve") or not 0 < planner.number(observation["normalized"]) < 1:
+            raise ValueError("The native column cut does not identify one reviewed level and source.")
+        low, elevation, high = cuts.pop(key)
+        spans = planner.bounded_list(observation["spans_ft"], 2, 2, "column spans")
+        actual = [planner.number(observation["elevation_ft"])] + [
+            planner.number(value) for span in spans for value in planner.bounded_list(span, 2, 2, "column span endpoints")
+        ]
+        if any(abs(a - b) > GEOMETRY_TOLERANCE for a, b in zip(actual, (elevation, low, elevation, elevation, high))):
+            raise ValueError("The measured column cut does not land at the reviewed elevation and span.")
+
+
 def verify(before_raw, trial_raw, after_raw, approval, approval_sha, cascade=None, cascade_sha=None):
     before, trial, after = [run_record(record, mode) for record, mode in (
         (before_raw, "query"), (trial_raw, "dry_run"), (after_raw, "query"))]
@@ -120,6 +163,7 @@ def verify(before_raw, trial_raw, after_raw, approval, approval_sha, cascade=Non
         raise ValueError("The saved result pieces do not match the independently recomputed preview.")
 
     stable_effects(receipt)
+    verify_native_measurements(snapshot, measured, receipt)
     inner = receipt["inner_effects"]
     planner.fields(inner, set(EFFECTS))
     inner = {key: exact_ids(inner[key]) for key in EFFECTS}
