@@ -508,16 +508,18 @@ def test_transfer_probe_rejects_preview_tampering_before_transaction(reader, mon
     assert changes == []
 
 
-def runtime_record(run_id, mode, result, modified=()):
+def runtime_record(run_id, mode, result, modified=(), *, added=(), transaction_name=None):
     from view_filter_transfer_preview import TRANSACTION_NAME
 
+    touched = len(added) + len(modified)
     return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "rolled_back",
             "exit_code": 0, "result_truncated": False, "error": None, "result": result,
             "failures": [], "dialogs": [], "blocked": [], "warnings": [],
-            "changes": {"added_count": 0, "deleted_count": 0, "modified_count": len(modified),
-                        "added": [], "deleted": [], "modified": [{"id": int(view_id)} for view_id in modified],
-                        "transactions": [TRANSACTION_NAME] if modified else [],
-                        "by_category": {"Views": len(modified)} if modified else {}}}
+            "changes": {"added_count": len(added), "deleted_count": 0, "modified_count": len(modified),
+                        "added": [{"id": int(item)} for item in added], "deleted": [],
+                        "modified": [{"id": int(item)} for item in modified],
+                        "transactions": [transaction_name or TRANSACTION_NAME] if touched else [],
+                        "by_category": {"Fixture elements": touched} if touched else {}}}
 
 
 @pytest.fixture

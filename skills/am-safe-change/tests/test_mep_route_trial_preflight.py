@@ -134,7 +134,7 @@ def test_route_preflight_rejects_unreviewed_or_stale_inputs(reviewed_fixture, fa
 def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(reviewed_fixture, tmp_path):
     import subprocess
     from mep_route_trial_preflight import TRANSACTION_NAME
-    from test_color_parameter_values import fixture_record
+    from test_view_filter_graphics import runtime_record
 
     baseline = {"kind": "mep-route-trial-preflight", "version": 1, "owner_ids": ["41", "42"]}
     query = {"status": "ok", "preflight_json": json.dumps(baseline)}
@@ -142,10 +142,10 @@ def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(revi
     measured = {"status": "mep_route_trial_rolled_back", "receipt": {
         "preflight": baseline, "changes": changes, "measurements": [{"id": "63"}], "rollback_events": [],
     }}
-    original = fixture_record("a00000000001", "query", query)
-    trial = fixture_record("a00000000002", "dry_run", measured, changes)
-    trial["changes"]["transactions"] = [TRANSACTION_NAME]
-    fresh = fixture_record("a00000000003", "query", dict(query, confirmed_absent_ids=["63"]))
+    original = runtime_record("a00000000001", "query", query)
+    trial = runtime_record("a00000000002", "dry_run", measured, changes["modified"],
+                           added=changes["added"], transaction_name=TRANSACTION_NAME)
+    fresh = runtime_record("a00000000003", "query", dict(query, confirmed_absent_ids=["63"]))
     paths = [tmp_path / name for name in ("original.json", "trial.json", "fresh.json")]
     cli = [sys.executable, str(SCRIPTS / "mep_route_trial_preflight.py"), *map(str, paths)]
 
@@ -170,8 +170,8 @@ def test_independent_trial_verifier_requires_exact_complete_bridge_evidence(revi
         "added": [], "modified": ["41", "42"], "deleted": ["63"],
     }]
     net = dict(changes, added=[])
-    netted_trial = fixture_record("a00000000002", "dry_run", netted, net)
-    netted_trial["changes"]["transactions"] = [TRANSACTION_NAME]
+    netted_trial = runtime_record("a00000000002", "dry_run", netted, net["modified"],
+                                  added=net["added"], transaction_name=TRANSACTION_NAME)
     accepted = verify([original, netted_trial, fresh])
     assert accepted.returncode == 0, accepted.stderr
     assert json.loads(accepted.stdout)["bridge_changes"] == net
