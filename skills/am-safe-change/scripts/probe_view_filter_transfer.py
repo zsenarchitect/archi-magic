@@ -7,9 +7,7 @@ from pyrevit.api import DB
 
 from duplicate_views import can_edit, capture_changes, identifier, key, owner_state, rollback
 from read_view_filter_graphics import main as read_inventory
-from view_filter_transfer_preview import compute
-
-TRANSACTION_NAME = "Test reviewed view filter transfer"
+from view_filter_transfer_preview import TRANSACTION_NAME, compute
 
 
 def request_for(plan):

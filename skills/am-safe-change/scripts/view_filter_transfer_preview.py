@@ -4,10 +4,13 @@ from __future__ import print_function
 
 import argparse
 import json
+import re
 import sys
 
-from view_duplicate_preview import MAX_BYTES, element_id, read_payload, read_record, snapshot_digest
+from view_duplicate_preview import element_id, read_payload, read_record, snapshot_digest
 
+TRANSACTION_NAME = "Test reviewed view filter transfer"
+RUN_ID = re.compile(r"^[0-9a-f]{12}\Z")
 COLUMNS = ["Row", "View", "Sheet", "Filter", "Action", "Priority", "Visible", "Enabled", "Graphics"]
 
 
@@ -103,12 +106,109 @@ def compute(snapshot):
     return plan, display
 
 
+def checked_record(record, mode):
+    record = record.get("response", record)
+    run_id = record["run_id"]
+    if (not RUN_ID.match(run_id) or record["mode"] != mode or record["status"] != "ok"
+            or record["decision"] != "rolled_back" or record.get("approval") is not None
+            or type(record["exit_code"]) is not int or record["exit_code"] != 0
+            or record["result_truncated"] is not False or record["error"] is not None
+            or any(record[field] != [] for field in ("failures", "dialogs", "blocked", "warnings"))
+            or record.get("unclosed_documents")):
+        raise ValueError("The full pyRevit record does not establish a clean %s rollback." % mode)
+    return record
+
+
+def checked_changes(record, expected):
+    changes = record["changes"]
+    if (any(type(changes[field]) is not int or changes[field] != count for field, count in (
+            ("added_count", 0), ("deleted_count", 0), ("modified_count", len(expected))))
+            or changes["added"] != [] or changes["deleted"] != [] or changes.get("other_documents")):
+        raise ValueError("The bridge reported unreviewed additions, deletions or document changes.")
+    modified = sorted((element_id(str(row["id"])) for row in changes["modified"]), key=int)
+    category_counts = changes["by_category"].values()
+    transactions = [TRANSACTION_NAME] if expected else []
+    if (modified != expected or changes["transactions"] != transactions
+            or any(type(count) is not int or count <= 0 for count in category_counts)
+            or sum(category_counts) != len(expected)):
+        raise ValueError("The bridge change record disagrees with the complete recipe telemetry.")
+
+
+def checked_ownership_delta(delta, allowed, baseline):
+    if not isinstance(delta, list):
+        raise ValueError("The rollback receipt has invalid ownership data.")
+    changed = set()
+    for row in delta:
+        view_id = element_id(row["view_id"])
+        if (view_id not in allowed or view_id in changed or row["before"] != baseline[view_id]["ownership"]
+                or row["before"] == row["after"]
+                or set(row) != {"view_id", "before", "after"}):
+            raise ValueError("The rollback receipt has an unreviewed ownership change.")
+        changed.add(view_id)
+
+
+def verify_rollback(plan, original_record, probe_record, fresh_record):
+    original = checked_record(original_record, "query")
+    probe = checked_record(probe_record, "dry_run")
+    fresh = checked_record(fresh_record, "query")
+    if len({record["run_id"] for record in (original, probe, fresh)}) != 3:
+        raise ValueError("Supply three distinct pyRevit run records.")
+    checked_changes(original, [])
+    checked_changes(fresh, [])
+    baseline = read_payload(original, "inventory_json")
+    expected_plan, _ = compute(baseline)
+    if expected_plan != plan or plan["blocked"] or not plan["steps"]:
+        raise ValueError("The original record does not reproduce the reviewed transfer plan.")
+    receipt = probe["result"]
+    if (receipt["status"] != "trial_rolled_back" or receipt["basis_sha256"] != plan["basis_sha256"]
+            or receipt["document"] != plan["document"]):
+        raise ValueError("The rollback probe receipt does not match the reviewed transfer.")
+    allowed = set(plan["ownership_ids"])
+    required = {step["recipient_id"] for step in plan["steps"]}
+    changes = receipt["changes"]
+    modified = changes["modified"]
+    if (changes["added"] != [] or changes["deleted"] != [] or not isinstance(modified, list)
+            or modified != sorted(set(modified), key=int) or not required.issubset(modified)
+            or not set(modified).issubset(allowed)):
+        raise ValueError("The rollback probe did not report the reviewed recipient change set.")
+    checked_changes(probe, modified)
+    checked_ownership_delta(receipt["trial_ownership_changes"], allowed, baseline["views"])
+    checked_ownership_delta(receipt["remaining_ownership_changes"], allowed, baseline["views"])
+
+    observed = read_payload(fresh, "inventory_json")
+    if set(observed["views"]) != set(baseline["views"]):
+        raise ValueError("The independent query returned a different view scope.")
+    remaining = []
+    for view_id in sorted(baseline["views"], key=int):
+        before, after = baseline["views"][view_id], observed["views"][view_id]
+        if before["ownership"] != after["ownership"]:
+            remaining.append({"view_id": view_id, "before": before["ownership"], "after": after["ownership"]})
+            after.update(ownership=before["ownership"], writable=before["writable"])
+    if observed != baseline:
+        raise ValueError("The independent Revit query differs from the original filter and view state.")
+    if remaining != receipt["remaining_ownership_changes"]:
+        raise ValueError("The independent query disagrees with the reported remaining ownership changes.")
+    return {"status": "ownership_reconciliation_required" if remaining else "verified_fixture_rollback",
+            "basis_sha256": plan["basis_sha256"], "document": plan["document"],
+            "original_run_id": original["run_id"], "probe_run_id": probe["run_id"],
+            "fresh_run_id": fresh["run_id"], "modified_view_ids": modified, "remaining_ownership_changes": remaining}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runtime_record", help="Full Revit runtime read record")
+    parser.add_argument("--verify-rollback", nargs=3, metavar=("PLAN", "PROBE", "FRESH"),
+                        help="Verify the plan, full dry-run record, and independent post-rollback query")
     args = parser.parse_args()
     try:
-        snapshot = read_payload(read_record(args.runtime_record), "inventory_json")
+        record = read_record(args.runtime_record)
+        if args.verify_rollback:
+            plan_file, probe_file, fresh_file = args.verify_rollback
+            plan = read_record(plan_file)
+            report = verify_rollback(plan.get("plan", plan), record, read_record(probe_file), read_record(fresh_file))
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            return 1 if report["remaining_ownership_changes"] else 0
+        snapshot = read_payload(record.get("response", record), "inventory_json")
         plan, display = compute(snapshot)
         print(json.dumps({"plan": plan, "preview": display}, ensure_ascii=True, indent=2))
         return 1 if plan["blocked"] else 0

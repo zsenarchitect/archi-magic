@@ -506,3 +506,95 @@ def test_transfer_probe_rejects_preview_tampering_before_transaction(reader, mon
     with pytest.raises(ValueError, match="no longer matches"):
         native["probe"](document, args)
     assert changes == []
+
+
+def runtime_record(run_id, mode, result, modified=()):
+    from view_filter_transfer_preview import TRANSACTION_NAME
+
+    return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "rolled_back",
+            "exit_code": 0, "result_truncated": False, "error": None, "result": result,
+            "failures": [], "dialogs": [], "blocked": [], "warnings": [],
+            "changes": {"added_count": 0, "deleted_count": 0, "modified_count": len(modified),
+                        "added": [], "deleted": [], "modified": [{"id": int(view_id)} for view_id in modified],
+                        "transactions": [TRANSACTION_NAME] if modified else [],
+                        "by_category": {"Views": len(modified)} if modified else {}}}
+
+
+@pytest.fixture
+def verified_fixture(reader, monkeypatch):
+    native, document, request, _, args, _ = probe_fixture(reader, monkeypatch)
+    original = reader["main"](document, {"request": request})
+    result = native["probe"](document, args)
+    assert result["status"] == "trial_rolled_back"
+    fresh = reader["main"](document, {"request": request})
+    return (args["plan"], runtime_record("a00000000001", "query", original),
+            runtime_record("b00000000002", "dry_run", result, result["changes"]["modified"]),
+            runtime_record("c00000000003", "query", fresh))
+
+
+def test_verify_fixture_rollback_through_cli(verified_fixture, tmp_path):
+    import subprocess
+
+    plan, original, probe, fresh = verified_fixture
+    paths = [tmp_path / (name + ".json") for name in ("original", "plan", "probe", "fresh")]
+    for path, record in zip(paths, (original, {"plan": plan}, probe, {"response": fresh})):
+        path.write_text(json.dumps(record))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "view_filter_transfer_preview.py"), str(paths[0]),
+         "--verify-rollback", *map(str, paths[1:])],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "status": "verified_fixture_rollback", "basis_sha256": plan["basis_sha256"], "document": plan["document"],
+        "original_run_id": original["run_id"], "probe_run_id": probe["run_id"], "fresh_run_id": fresh["run_id"],
+        "modified_view_ids": ["41"], "remaining_ownership_changes": [],
+    }
+
+
+@pytest.mark.parametrize("fault,error", [
+    ("replayed", "distinct"), ("auto", "clean dry_run rollback"), ("truncated", "clean query rollback"),
+    ("wrong_id", "disagrees"), ("short_samples", "disagrees"), ("foreign", "unreviewed additions"),
+    ("model_drift", "differs from the original"), ("foreign_borrowing", "unreviewed ownership"),
+])
+def test_verify_fixture_rollback_fails_closed(verified_fixture, fault, error):
+    from view_filter_transfer_preview import verify_rollback
+
+    plan, original, probe, fresh = verified_fixture
+    if fault == "replayed":
+        fresh["run_id"] = original["run_id"]
+    elif fault == "auto":
+        probe["approval"] = "auto"
+    elif fault == "truncated":
+        fresh["result_truncated"] = True
+    elif fault == "wrong_id":
+        probe["changes"]["modified"] = [{"id": 42}]
+    elif fault == "short_samples":
+        probe["changes"]["modified"] = []
+    elif fault == "foreign":
+        probe["changes"]["other_documents"] = [{"title": "Other project"}]
+    elif fault == "model_drift":
+        inventory = json.loads(fresh["result"]["inventory_json"])
+        inventory["views"]["43"]["filters"][0]["visible"] = not inventory["views"]["43"]["filters"][0]["visible"]
+        fresh["result"]["inventory_json"] = json.dumps(inventory)
+    else:
+        probe["result"]["remaining_ownership_changes"] = [
+            {"view_id": "31", "before": None, "after": ["OwnedByCurrentUser", "CurrentWithCentral"]},
+        ]
+    with pytest.raises(ValueError, match=error):
+        verify_rollback(plan, original, probe, fresh)
+
+
+def test_verify_fixture_reports_remaining_borrowing(verified_fixture):
+    from view_filter_transfer_preview import verify_rollback
+
+    plan, original, probe, fresh = verified_fixture
+    borrowed = ["OwnedByCurrentUser", "CurrentWithCentral"]
+    snapshot = json.loads(fresh["result"]["inventory_json"])
+    snapshot["views"]["41"]["ownership"] = borrowed
+    fresh["result"]["inventory_json"] = json.dumps(snapshot)
+    delta = [{"view_id": "41", "before": None, "after": borrowed}]
+    probe["result"]["remaining_ownership_changes"] = delta
+    report = verify_rollback(plan, original, probe, fresh)
+    assert report["status"] == "ownership_reconciliation_required"
+    assert report["remaining_ownership_changes"] == delta
