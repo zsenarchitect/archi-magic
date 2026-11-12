@@ -161,7 +161,7 @@ Build one read-only HTML page that shows audit results, a change preview, and an
 
 `python skills/am-bim-viewer/scripts/project_page.py --title "Project A" --audit <audit.json> [--audit <more.json>] [--preview <preview.json>] [--board <board.json>] --out project.html`
 
-- Audit inputs: output of `mep_qa.py`, `dwg_cad_audit.py`, or other audits with a `findings` list.
+- Pass the saved `model_health.py` result, the output of `mep_qa.py` or `dwg_cad_audit.py`, or another audit with a `findings` list. The page shows model-health warnings and errors with the model name and audit timestamp.
 - To include the issue board, save the output of `board_cli.py parse <read.json>` as `board.json`. The page displays its entries and warnings.
 - The page escapes all model text. It sets a strict content policy.
 

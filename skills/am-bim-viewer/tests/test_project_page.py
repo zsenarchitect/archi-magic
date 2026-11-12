@@ -140,3 +140,49 @@ def test_invalid_board_export_does_not_replace_project_page(tmp_path):
     ], capture_output=True, text=True)
     assert result.returncode == 1 and "board_cli.py parse" in result.stderr
     assert out.read_text() == "Existing project page"
+
+
+def test_model_health_snapshot_flags_its_bad_and_warn_metrics(tmp_path):
+    from pathlib import Path
+    import runpy
+
+    root = Path(HERE).parents[2]
+    metric = runpy.run_path(str(root / "skills/am-model-health/scripts/model_health.py"))["metric"]
+    snapshot = {
+        "model": "Coordination <img src=x>",
+        "revit_year": "2026",
+        "timestamp": "2026-11-11T12:00:00",
+        "path": "/private/model-file.rvt",
+        "metrics": [
+            metric("file_size", "File size", 712, 500, 700, "Review imported CAD.", unit="MB"),
+            metric("links_unpinned", "Unpinned links", 1, 0, 3, "Check the link."),
+            metric("rooms_unplaced", "Rooms not placed", 0, 0, 20, "Review rooms."),
+            metric("links_total", "Link instances", 2, None, None, "Inventory."),
+        ],
+    }
+    audit = tmp_path / "health.json"
+    audit.write_text(json.dumps(snapshot), encoding="utf-8")
+    out = tmp_path / "project.html"
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", audit, "--out", out,
+    ], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    page = out.read_text()
+    assert "<td>error</td><td>file_size</td>" in page and "File size (712 MB)" in page
+    assert "<td>warning</td><td>links_unpinned</td>" in page and "Unpinned links (1)" in page
+    assert "2026-11-11T12:00:00" in page and "Coordination &lt;img src=x&gt;" in page
+    assert "<img" not in page and snapshot["path"] not in page
+    assert "rooms_unplaced" not in page and "links_total" not in page
+
+
+def test_failed_health_audit_cannot_be_rendered_as_clean(tmp_path):
+    audit = tmp_path / "health.json"
+    audit.write_text(json.dumps({"error": "no_project_document"}))
+    out = tmp_path / "project.html"
+    out.write_text("Existing project page")
+    result = subprocess.run([
+        sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", audit, "--out", out,
+    ], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "audit" in result.stderr.lower()
+    assert out.read_text() == "Existing project page"

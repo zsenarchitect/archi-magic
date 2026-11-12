@@ -1,7 +1,7 @@
 """Local project page generator (issue #187 Phase 1).
 
 Builds one self-contained, read-only HTML page from local JSON files:
-- audit findings (mep_qa.py, dwg_cad_audit.py, check_packs.py output),
+- audit findings (model_health.py, mep_qa.py, dwg_cad_audit.py, check_packs.py output),
 - optional change-preview JSON (am-safe-change),
 - optional read-only issue board JSON (board_cli.py parse).
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import html
+import math
 from itertools import zip_longest
 import json
 import os
@@ -32,12 +33,47 @@ def load_json(path: str) -> Any:
         return json.load(f)
 
 
+def model_health_findings(audit):
+    metrics = audit.get("metrics")
+    if (not isinstance(metrics, list) or not metrics
+            or any(not isinstance(audit.get(field), str) or not audit[field].strip()
+                   for field in ("model", "timestamp"))):
+        raise ValueError("Expected a completed model-health audit with metrics, model, and timestamp.")
+    source = f"Model health · {audit['model']} · {audit['timestamp']}"
+    levels = {"bad": "error", "warn": "warning"}
+    for metric in metrics:
+        if (not isinstance(metric, dict)
+                or metric.get("status") not in ("bad", "warn", "ok", "info")
+                or any(not isinstance(metric.get(field), str) for field in ("id", "label", "unit", "hint"))
+                or type(metric.get("value")) not in (int, float)
+                or (isinstance(metric["value"], float) and not math.isfinite(metric["value"]))):
+            raise ValueError("The model-health audit contains an invalid metric.")
+        severity = levels.get(metric["status"])
+        if severity:
+            amount = f"{metric['value']} {metric['unit']}".rstrip()
+            yield {
+                "severity": severity,
+                "ruleId": metric["id"],
+                "message": f"{metric['label']} ({amount}) {metric['hint']}".rstrip(),
+                "source": source,
+            }
+
+
 def collect_findings(audits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Merge findings from several audit result files."""
     merged: List[Dict[str, Any]] = []
     for audit in audits:
+        if not isinstance(audit, dict) or audit.get("error"):
+            raise ValueError("An audit input did not contain a completed audit result.")
+        if "metrics" in audit:
+            merged.extend(model_health_findings(audit))
+            continue
+        if not isinstance(audit.get("findings"), list):
+            raise ValueError("An audit input needs a findings list or a model-health result.")
         source = audit.get("drawing_name") or audit.get("source") or "audit"
-        for f in audit.get("findings", []):
+        for f in audit["findings"]:
+            if not isinstance(f, dict):
+                raise ValueError("An audit finding needs to be a JSON object.")
             item = dict(f)
             item.setdefault("source", source)
             if item.get("severity") not in SEVERITIES:
@@ -245,9 +281,9 @@ def main() -> int:
             print("Error: output must be separate from the input files.", file=sys.stderr)
             return 1
 
-    findings = collect_findings([load_json(a) for a in args.audit])
-    preview = load_json(args.preview) if args.preview else {}
     try:
+        findings = collect_findings([load_json(a) for a in args.audit])
+        preview = load_json(args.preview) if args.preview else {}
         board = load_json(args.board) if args.board else None
         if args.board and board is None:
             raise ValueError("Use the JSON output of board_cli.py parse for the issue board.")
