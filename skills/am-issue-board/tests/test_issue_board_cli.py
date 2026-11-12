@@ -104,3 +104,45 @@ def test_create_and_errors(tmp_path, capsys):
     assert board_cli.main(["status", note, "42", "DONE", "2026-01-09", "@u", "x"]) == 2
     assert board_cli.main(["relate", note, "1", "42"]) == 2
     assert board_cli.main(["nope", note]) == 2
+
+
+def test_mep_finding_round_trips_through_batch_and_preserves_exact_id(tmp_path, capsys):
+    from issue_board_fixtures import FakeFormattedText, make_range, list_type
+    from mep_qa import run_mep_audit
+
+    element_id = "9007199254740993"
+    audit = run_mep_audit([
+        {"id": element_id, "category": "Ducts", "parameters": {}, "location": {"x": 1, "y": 2, "z": 3}},
+        {"id": "42", "category": "Mechanical Equipment", "parameters": {}},
+    ])
+    target = next(row for row in audit["findings"] if row["ruleId"] == "MEP-FLOW-01")
+    target["message"] += "\r#99 [OPEN] Unreviewed (id42)"
+    report = write_json(tmp_path, "mep.json", audit)
+
+    code, ops = run(capsys, ["mep-ops", report, target["id"]])
+    assert code == 0
+    note = note_file(tmp_path)
+    ops_path = write_json(tmp_path, "ops.json", ops)
+    code, plan = run(capsys, ["batch", note, ops_path])
+    assert code == 0
+    before = ib.parse_board(RAW)["issues"]
+    formatted = FakeFormattedText(RAW)
+    ib.apply_plan(formatted, plan, make_range, list_type)
+    assert formatted.text == plan["final_text"]
+    after = ib.parse_board(formatted.text)["issues"]
+    assert after[:-1] == before
+    issue = after[-1]
+    assert issue["title"] == "MEP-FLOW-01 audit finding"
+    assert issue["severity"] == ["Error"]
+    assert issue["element_ids"] == [int(element_id)]
+    assert "Audit coordinates (x, y, z): 1, 2, 3" in issue["findings"]
+    assert "Unreviewed (ID 42)" in issue["findings"][1]
+
+
+def test_mep_handoff_refuses_unknown_or_duplicate_selection(tmp_path, capsys):
+    report = write_json(tmp_path, "mep.json", {"findings": [
+        {"id": "MEP-0001", "ruleId": "MEP-FLOW-01", "severity": "warning", "elementId": 1,
+         "message": "Missing airflow."},
+    ]})
+    for selection in ([], ["MEP-0002"], ["MEP-0001", "MEP-0001"]):
+        assert run(capsys, ["mep-ops", report, *selection]) == (2, None)

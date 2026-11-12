@@ -155,11 +155,35 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 
 - **Audit checks**:
   - `MEP-SYS-01`: System classification and naming convention.
-  - `MEP-CON-01`: Open connectors and broken distribution ends.
-  - `MEP-FLOW-01`: Missing duct/pipe dimensions and zero calculated flow.
+  - `MEP-CON-01`: Confirmed open connectors.
+  - `MEP-CON-02`: Missing connector inventory on distribution elements or unknown connection states.
+  - `MEP-FLOW-01`: Missing or invalid duct, pipe, conduit, or cable tray dimensions, missing or unreadable airflow on active duct runs, and zero or negative calculated airflow.
   - `MEP-CLR-01`: Mechanical equipment maintenance clearance zones.
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
+  An empty or invalid extract returns exit 2 without a findings file. A completed audit with errors returns exit 1 and writes its findings.
+
+- Review the saved report and select finding IDs from that report.
+- Run `python skills/am-issue-board/scripts/board_cli.py mep-ops findings.json MEP-0001 > ops.json`.
+- Pass `ops.json` to the board batch planner with a fresh note read. Review the plan, run the dry run, and use Keep/Discard in Revit.
+
+### Native Revit snapshot verification
+
+The native reader still needs qualification in Revit. In a disposable project, run `read_mep.py` through `run_query` with `describe: true`. For a link, include its reviewed decimal `link_instance_id` and `link_instance_uid` in both calls. Review the returned source identity, then send it back under `source`. Supply `element_ids` to restrict the query to reviewed decimal IDs. A clearance check requires a reviewed Yes/No shared parameter GUID and an `absent_value` of 0 or 1.
+
+Save the complete pyRevit query response, or save its result pages as a JSON array, and run `python scripts/mep_qa.py query.json --runtime-record --output findings.json`. The reader checks that the pages come from one complete query. If you already saved the complete `snapshot_json` contents, pass that file without `--runtime-record`. The native report retains the source and separates evidence diagnostics from violations. Exit 3 indicates unavailable applicable evidence alongside any confirmed findings. Exit 2 means the input or inventory was incomplete. A complete empty scope is labeled `empty_scope`.
+
+For native findings, read the board with `include_identity: true` from the audited host and save the complete response object. Run `python scripts/board_cli.py mep-native-preview report.json board.json MEP-0001`. Review the new issue text in `edit.final_text`. Pass the complete native plan as `plan` and the reviewed board ID as `note_id` to `apply_board.py` through the existing dry-run and Keep/Discard flow. The writer re-reads the selected source evidence before each call. After Keep, read the board again and verify the new issues. A linked element ID appears as text with its link instance ID. The host board creates element links only for reviewed host elements.
+
+For read-only parameter repair evidence, send the reviewed host `source` and `repair_parameters: {"guid": "<shared parameter GUID>", "elements": [{"id": "123", "uid": "<element UID>"}]}` to `read_mep.py`. Use a saved standalone project. Review the decoded `repair_parameters_json` for unset, empty, already-filled and ineligible parameters. Keep the returned values private. Save the complete response as `query.json`. Put the proposed text in a separate JSON file, for example `{"text": "Ventilation"}`. Run `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py query.json fill.json > preview.json` and open it in the change-preview renderer. The preview contains no model-write steps.
+
+For read-only system name evidence, send the reviewed host `source` and `repair_system_name: {"id": "123", "uid": "<system UID>", "name": "<proposed system name>"}` to `read_mep.py`. Use the ID of the duct or piping system. Save the complete response as `system-query.json`. Run `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py system-query.json --system-name > system-preview.json`. Review the name, members, connector assignments and collisions.
+
+To test a system-name API in a disposable fixture, use the same rollback probe below in CPython and dry-run mode. Pass the parsed `query` and `preview`, `disposable_fixture: true`, and `rename_method: "element_name"` or `"built_in_parameter"` in separate runs. Use one reviewed system per trial. Repeat the original query after each run to verify its name and membership. Native rename remains unqualified.
+
+For the disposable text-fill trial, run `am-safe-change/scripts/probe_mep_parameter_fill.py` with CPython and `run_modify` in dry-run mode. Pass `disposable_fixture: true` and the exact parsed `query`, `fill` and `preview` objects. The script checks the inner transaction and rolls back its group. Repeat the original query independently. Verify all three saved responses with `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py query.json fill.json --trial trial.json --fresh fresh.json`. Require `verified_mep_text_fill_trial_rollback`. Native Revit qualification is pending.
+
+For routing review, use the separate [connector endpoint query](../../docs/rfcs/003-mep-support.md#read-reviewed-route-endpoints).
 
 ## Check spacing for linked MEP openings (issue #152)
 

@@ -21,6 +21,12 @@ Recipes (the task-specific parts):
 
 - Toposolid alignment and floor conversion: [review terrain changes](../../docs/plans/2026-11-12-toposolid-workflows.md#review-artifacts-for-the-fixture-probes). Preview the selected vertices or region and qualify the changes with rollback probes in a disposable Revit project.
 
+- [Preview MEP sizes from a reviewed rule table](../../docs/rfcs/003-mep-support.md#review-only-sizing-table). [Preview a route between reviewed connector ends](../../docs/rfcs/003-mep-support.md#review-only-route-preview).
+
+- Batch duplicate views: [reviewed names and templates](../../docs/plans/2026-11-11-batch-view-duplication.md). Preview plain, detailing, or dependent copies and check exact names, template effects, and the native qualification steps.
+
+- Transfer view filters: [review filter graphics and target scope](../../docs/plans/2026-11-12-view-filter-transfer.md#rollback-only-fixture-entry-point). Preview filter order, overrides, and visibility. Use the rollback probe to qualify the transfer in a disposable Revit project.
+
 For a change with no recipe yet, follow the same 8 steps. Write the read query, the pure compute function and the apply script in the recipe style: one transaction, a stale-state guard, and a result that lists the values after the change.
 
 ## The 8 steps (do all of them, in this order)

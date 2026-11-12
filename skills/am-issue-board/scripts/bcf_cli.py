@@ -64,29 +64,11 @@ def read_board(path):
     return body, formats, board, source
 
 
-def note_target(source, body):
-    if "host_identity" not in source:
-        return None
-    host = source["host_identity"]
-    note = source["note"]
-    if (
-        set(host) != {"project_uid", "path_sha256"}
-        or not host["project_uid"].strip()
-        or not re.fullmatch(r"[0-9a-f]{64}", host["path_sha256"])
-        or not re.fullmatch(r"[1-9][0-9]{0,18}", note["id"])
-        or int(note["id"]) > 2**63 - 1
-        or not note["unique_id"].strip()
-        or note["sha1"] != ib.text_sha1(body)
-    ):
-        raise ValueError("Read the board again with include_identity enabled.")
-    return {key: note[key] for key in ("id", "unique_id", "sha1")}
-
-
 def import_preview(args):
     body, formats, board, source = read_board(args.board)
     if board["header"]["archive"] or board["header"]["next_number"] is None:
         raise ValueError("Use an active issue board for BCF import.")
-    active_target = note_target(source, body)
+    active_target = board_cli.note_target(source, body)
     archive_target = None
     existing = {marker(row) for row in board["issues"]}
     topics, warnings = bcf.read_topics(args.input)
@@ -94,7 +76,7 @@ def import_preview(args):
         archive_body, _, archive, archive_source = read_board(args.archive)
         if not archive["header"]["archive"] or archive["header"]["next_number"] is not None:
             raise ValueError("Use an archive note for BCF duplicate checking.")
-        archive_target = note_target(archive_source, archive_body)
+        archive_target = board_cli.note_target(archive_source, archive_body)
         if active_target and archive_target and (
             source["host_identity"] != archive_source["host_identity"]
             or active_target["id"] == archive_target["id"]
@@ -192,7 +174,7 @@ def checked_readback(path, target, expected_sha1):
     source = record["result"]
     text, _ = board_cli.decode_note(source)
     if (source["host_identity"] != target["host_identity"]
-            or note_target(source, text) != dict(target["active"], sha1=expected_sha1)):
+            or board_cli.note_target(source, text) != dict(target["active"], sha1=expected_sha1)):
         raise ValueError("The fresh board readback does not match the reviewed project, note, and text.")
     return record
 

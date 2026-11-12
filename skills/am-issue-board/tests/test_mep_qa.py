@@ -169,3 +169,99 @@ def test_cli_execution_with_output_file(tmp_path, seeded_error_mep_elements):
         saved_data = json.load(f)
     assert saved_data["total_findings"] > 0
     assert "findings" in saved_data
+
+
+@pytest.mark.parametrize("flow", [None, "", "unavailable", "NaN CFM", float("inf"), True])
+def test_active_duct_reports_missing_or_unreadable_flow(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    findings = run_mep_audit([duct])["findings"]
+    assert [(finding["ruleId"], finding["severity"], finding["elementId"]) for finding in findings] == [
+        ("MEP-FLOW-01", "warning", 101)
+    ]
+    assert "no readable calculated flow" in findings[0]["message"]
+
+
+@pytest.mark.parametrize("flow", ["125 l/s", "1.4 m³/s", "40 Cfm", 0.5])
+def test_positive_flow_is_clean(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    assert run_mep_audit([duct])["findings"] == []
+
+
+@pytest.mark.parametrize("flow", ["0 L/s", "-2 m³/h"])
+def test_nonpositive_flow_keeps_its_diagnostic(clean_mep_elements, flow):
+    duct = clean_mep_elements[0]
+    duct["parameters"]["Flow"] = flow
+    findings = run_mep_audit([duct])["findings"]
+    assert [(finding["ruleId"], finding["elementId"]) for finding in findings] == [("MEP-FLOW-01", 101)]
+    assert "zero or negative calculated flow" in findings[0]["message"]
+
+
+@pytest.mark.parametrize("connectors", [None, [], {}, [{"domain": "Hvac"}], [{"isConnected": 0}],
+                                        [{"isConnected": "false"}], [None]])
+def test_missing_connector_evidence_is_not_a_verified_connection(clean_mep_elements, connectors):
+    duct = clean_mep_elements[0]
+    duct["connectors"] = connectors
+    findings = run_mep_audit([duct])["findings"]
+    assert [(row["ruleId"], row["severity"], row["elementId"]) for row in findings] == [
+        ("MEP-CON-02", "warning", 101),
+    ]
+
+
+def test_partial_connector_evidence_preserves_verified_open_end(clean_mep_elements):
+    duct = clean_mep_elements[0]
+    duct["connectors"] = [{"isConnected": False, "origin": {"x": 1, "y": 2, "z": 3}}, {}]
+    findings = run_mep_audit([duct])["findings"]
+    assert [(row["ruleId"], row["severity"], row["elementId"]) for row in findings] == [
+        ("MEP-CON-01", "error", 101),
+        ("MEP-CON-02", "warning", 101),
+    ]
+    assert findings[0]["location"] == {"x": 1, "y": 2, "z": 3}
+
+
+@pytest.mark.parametrize(("category", "parameters"), [
+    ("Ducts", {"Diameter": "200 mm"}),
+    ("Flex Ducts", {"Width": "12 in", "Height": "6 in"}),
+    ("Pipes", {"Size": '2 1/2"'}),
+    ("Flex Pipes", {"Size": "DN 25"}),
+    ("Conduits", {"Diameter": "3/4″"}),
+    ("Cable Trays", {"Width": "0.3 m", "Height": "50 mm"}),
+])
+def test_recognized_sizes_do_not_create_findings(category, parameters):
+    assert check_sizing_and_flow({"id": 101, "category": category, "parameters": parameters}) == []
+
+
+@pytest.mark.parametrize(("category", "parameters"), [
+    ("Ducts", {"Width": "0 mm", "Height": "100 mm", "Diameter": True}),
+    ("Pipes", {"Size": '2 1/0"', "Diameter": -5}),
+    ("Conduits", {"Diameter": "unavailable", "Size": "DN 0"}),
+    ("Cable Trays", {"Width": 10, "Height": float("inf")}),
+])
+def test_invalid_sizes_cannot_pass(category, parameters):
+    findings = check_sizing_and_flow({"id": 101, "category": category, "parameters": parameters})
+    assert [(item["ruleId"], item["severity"], item["elementId"]) for item in findings] == [
+        ("MEP-FLOW-01", "error", 101),
+    ]
+
+
+def test_cli_refuses_empty_and_ambiguous_inventories(tmp_path):
+    import subprocess
+
+    source = tmp_path / "extract.json"
+    output = tmp_path / "findings.json"
+    script = os.path.join(HERE, "..", "scripts", "mep_qa.py")
+    command = [sys.executable, script, str(source), "--output", str(output)]
+    first = {"id": 1, "category": "Ducts", "parameters": {}}
+    for raw in ({}, [], {"elements": []}, [None], [dict(first, parameters=[])],
+                [first, dict(first, id="1")], [dict(first, id=True)]):
+        source.write_text(json.dumps(raw))
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 2 and result.stdout == ""
+        assert "could not read the input" in result.stderr
+        assert not output.exists()
+
+    source.write_text(json.dumps({"elements": [first]}))
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert json.loads(output.read_text())["total_elements_audited"] == 1
