@@ -27,6 +27,9 @@ Pass `{"legend_id":"123"}` to compare the inventory with an existing legend. The
 
 In Revit 2026, add `source_legend_id`, `seed_component_id`, and `text_type_id` to read the layout for a proposed update. Use a separate source legend with a measured door or window front elevation. The query records target graphics, front-elevation coverage, and every sheet placement. Check the viewport box and label bounds separately.
 
+Save the full layout query as `read.json`. Set `grid` in `intent.json` with `origin_uv_ft`, `columns`, `cell_width_ft`, and `cell_height_ft`. Run `python scripts/opening_legend_preview.py read.json intent.json > preview.json`. Pass explicit single-line `labels` keyed by type UID for unresolved mark or size data. A refresh also needs the previous kept-run `receipt`. Render the change preview and check adds, refreshes, and retirements. Revit must verify the actual graphics and sheet fit before any update.
+
+
 
 
 

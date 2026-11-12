@@ -104,7 +104,10 @@ def legend_component(document, element, view, opening_types, known_directions):
         length = float(length_param.AsDouble())
         if math.isnan(length) or math.isinf(length):
             raise ValueError("A legend component length is not finite.")
+    location = getattr(element, "Location", None)
+    anchor = getattr(location, "Point", None)
     return {"id": element_id(element.Id), "uid": str(element.UniqueId), "type_id": type_id,
+            "position_ft": vector(anchor) if anchor is not None else None,
             "type_uid": str(symbol.UniqueId), "opening_category": category, "direction_raw": value,
             "direction": directions.get(value) if known_directions else None, "host_length_ft": length,
             "pinned": bool(element.Pinned), "type_read_only": bool(reference.IsReadOnly),
@@ -185,6 +188,25 @@ def sheet_bounds(sheet):
         outline.Dispose()
 
 
+def text_appearance(note):
+    if not hasattr(note, "GetFormattedText") or not hasattr(note, "LeaderCount"):
+        return None
+    formatted = note.GetFormattedText()
+    try:
+        text = formatted.GetPlainText()
+        if not text or any(character in text for character in ("\r", "\n", "\v", "\t")):
+            return None
+        span = formatted.AsTextRange()
+        flags = ("GetBoldStatus", "GetItalicStatus", "GetUnderlineStatus", "GetAllCapsStatus",
+                 "GetSuperscriptStatus", "GetSubscriptStatus")
+        plain = (all(str(getattr(formatted, method)()) == "None" for method in flags)
+                 and str(formatted.GetListType(span)) == "None" and formatted.GetIndentLevel(span) == 0)
+        return {"plain_single_line": plain, "leaders": int(note.LeaderCount),
+                "horizontal_alignment": str(note.HorizontalAlignment)}
+    finally:
+        formatted.Dispose()
+
+
 def graphic_state(element, view):
     category = element.Category
     row = {"id": element_id(element.Id), "uid": str(element.UniqueId),
@@ -197,6 +219,8 @@ def graphic_state(element, view):
                     "label_bounds_ft": outline_bounds(element.GetLabelOutline())})
     elif row["native_kind"] != "ExtentElem":
         row["bounds_ft"] = element_bounds(element, view)
+        if row["native_kind"] == "TextNote":
+            row["text_appearance"] = text_appearance(element)
     return row
 
 
