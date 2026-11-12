@@ -311,17 +311,8 @@ def approved_snapshot(document, plan, display, approved_borrowing):
     ids = set(map(preview.element_id, approved_borrowing))
     if len(ids) != len(approved_borrowing) or not ids.issubset(plan["ownership_ids"]):
         raise ValueError("Review borrowing for approved removal IDs only.")
-    live_ownership = {}
-    actual_borrowing = []
-    for item in plan["ownership_ids"]:
-        element = snapshot["elements"][item]
-        current = element.get("ownership")
-        prior = plan["removal_ownership"][item]
-        live_ownership[item] = current
-        if item in ids and prior is not None and current is not None:
-            if prior[0] == "NotOwned" and current[0] == "OwnedByCurrentUser" and prior[1] == current[1]:
-                element["ownership"] = prior
-                actual_borrowing.append(item)
+    live_ownership = {item: snapshot["elements"][item].get("ownership") for item in plan["ownership_ids"]}
+    snapshot, actual_borrowing = preview.compare_baseline(plan, snapshot)
     if set(actual_borrowing) != ids:
         raise ValueError("The observed post-dry-run borrowing does not match the approved IDs.")
     recomputed_plan, recomputed_display = preview.compute(snapshot)
@@ -515,12 +506,29 @@ def apply(document, plan, display, approved_borrowing):
                 "posted_failures": guard.failures if guard else []}
 
 
+def verify_kept(document, plan):
+    if plan.get("kind") != "warning-repair-plan" or plan.get("blocked") is not False or not plan["steps"]:
+        raise ValueError("Use an unblocked reviewed warning repair plan.")
+    expect_rooms = any(step["recipe"] == "coincident-room-separators" for step in plan["steps"])
+    clock = Stopwatch.StartNew()
+    kept, rooms, warnings = inspect_result(document, plan, clock, expect_rooms)
+    observed = {"document": project_identity(document), "basis_sha256": plan["basis_sha256"],
+                "deleted": sorted((step["remove_id"] for step in plan["steps"]), key=int),
+                "kept_sha256": preview.snapshot_digest(kept), "rooms_sha256": preview.snapshot_digest(rooms),
+                "warnings": warnings}
+    data = json.dumps(observed, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    clock_check(clock)
+    return {"status": "ok", "readback_json": data}
+
+
 def main(document, args):
     mode = args.get("mode", "read")
     if mode == "apply":
         return apply(document, args["plan"], args["preview"], args.get("approved_borrowing", []))
+    if mode == "verify":
+        return verify_kept(document, args["plan"])
     if mode != "read":
-        raise ValueError("Choose read or apply for a native warning repair.")
+        raise ValueError("Choose read, apply, or verify for a native warning repair.")
     snapshot = read_snapshot(document, args["request"])
     return {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, sort_keys=True,
                                                         separators=(",", ":"), allow_nan=False)}

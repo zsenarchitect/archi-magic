@@ -417,13 +417,91 @@ def test_only_reviewed_worksharing_borrowing_can_survive_recheck(writer):
     plan, display = preview.compute(read(writer, DUPLICATE, 1, 2))
     owners[2] = "OwnedByCurrentUser"
     args = {"mode": "apply", "plan": plan, "preview": display}
-    with pytest.raises(ValueError, match="no longer matches"):
+    with pytest.raises(ValueError, match="borrowing does not match"):
         script["main"](doc, args)
     updates[2] = "UpdatedInCentral"
     args["approved_borrowing"] = ["2"]
-    with pytest.raises(ValueError, match="borrowing does not match"):
+    with pytest.raises(ValueError, match="no longer matches"):
         script["main"](doc, args)
     updates[2] = "CurrentWithCentral"
     result = script["main"](doc, args)
     assert result["status"] == "ok"
     assert json.loads(result["receipt_json"])["borrowed_after_dry_run"] == ["2"]
+
+
+def wrap_query(result):
+    return {"status": "ok", "decision": "rolled_back", "result": result,
+            "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0}}
+
+
+def wrap_repair(result, decision):
+    return {"status": "rejected" if decision == "discarded" else "ok", "decision": decision,
+            "approval": "user" if decision in ("discarded", "committed") else None, "result": result,
+            "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 1, "deleted": [2],
+                        "added": [], "modified": [], "by_category": {}},
+            "failures": [], "dialogs": [], "blocked": []}
+
+
+def test_fresh_query_verifies_the_kept_repair(writer, tmp_path):
+    import subprocess
+
+    script, doc = writer
+    plan, display = preview.compute(read(writer, DUPLICATE, 1, 2))
+    applied = script["main"](doc, {"mode": "apply", "plan": plan, "preview": display})
+    observed = script["main"](doc, {"mode": "verify", "plan": plan})
+    plan_path, repair_path, fresh_path = [tmp_path / name for name in ("plan.json", "keep.json", "readback.json")]
+    plan_path.write_text(json.dumps(plan))
+    repair_path.write_text(json.dumps({"response": wrap_repair(applied, "committed")}))
+    fresh_path.write_text(json.dumps(wrap_query(observed)))
+    cli = [sys.executable, str(SCRIPTS / "warning_repair_preview.py"), "verify-keep",
+           str(plan_path), str(repair_path), "--fresh", str(fresh_path)]
+    result = subprocess.run(cli, text=True, capture_output=True, check=True)
+    assert json.loads(result.stdout) == {"status": "verified_keep", "deleted": ["2"],
+                                         "keepers": [{"id": "1", "uid": "instance-1"}]}
+    doc.elements[1].Parameters = [NS(Id=Id(50), StorageType="String", IsShared=False, HasValue=True,
+                                     AsString=lambda: "Changed after Keep")]
+    observed = script["main"](doc, {"mode": "verify", "plan": plan})
+    fresh_path.write_text(json.dumps(wrap_query(observed)))
+    failed = subprocess.run(cli, text=True, capture_output=True)
+    assert failed.returncode == 2 and "differs from the kept transaction" in failed.stderr
+
+
+@pytest.mark.parametrize("decision", ["rolled_back", "discarded"])
+def test_outcome_requires_fresh_restored_baseline_and_full_deletion_ids(writer, decision):
+    script, doc = writer
+    request = {"pairs": [{"failure_id": DUPLICATE, "keep_id": "1", "remove_id": "2"}]}
+    original = script["main"](doc, {"request": request})
+    plan, display = preview.compute(preview.read_snapshot({"result": original}))
+    outer = TransactionGroup(doc, "Outer fixture transaction")
+    outer.Start()
+    applied = script["main"](doc, {"mode": "apply", "plan": plan, "preview": display})
+    outer.RollBack()
+    restored = script["main"](doc, {"request": request})
+    command = "verify-dry-run" if decision == "rolled_back" else "verify-discard"
+    record = wrap_repair(applied, decision)
+    observed = wrap_query(restored)
+    result = preview.verify_outcome(command, plan, record, observed)
+    assert result["status"] == ("verified_dry_run" if decision == "rolled_back" else "verified_discard")
+    record["changes"]["deleted"] = []
+    with pytest.raises(ValueError, match="exactly the approved deletions"):
+        preview.verify_outcome(command, plan, record, observed)
+    record["changes"]["deleted"] = [2]
+    doc.elements[2].Parameters = []
+    drift = script["main"](doc, {"request": request})
+    with pytest.raises(ValueError, match="no longer matches"):
+        preview.verify_outcome(command, plan, record, wrap_query(drift))
+
+
+def test_new_outer_failure_or_other_document_prevents_dry_run_verification(writer):
+    script, doc = writer
+    snapshot = read(writer, DUPLICATE, 1, 2)
+    plan, display = preview.compute(snapshot)
+    result = script["main"](doc, {"mode": "apply", "plan": plan, "preview": display})
+    record = wrap_repair(result, "rolled_back")
+    record["failures"] = [{"severity": "Warning"}]
+    with pytest.raises(ValueError, match="unresolved effect"):
+        preview.check_runtime_receipt(plan, record, "rolled_back")
+    record["failures"] = []
+    record["changes"]["other_documents"] = [{"deleted_count": 1}]
+    with pytest.raises(ValueError, match="exactly the approved deletions"):
+        preview.check_runtime_receipt(plan, record, "rolled_back")

@@ -60,14 +60,34 @@ def snapshot_digest(snapshot):
     return hashlib.sha256(raw.encode("ascii")).hexdigest()
 
 
-def read_snapshot(record):
+def read_payload(record, field):
     result = record["result"]
     if result.get("status") != "ok":
-        raise ValueError("The native warning repair read did not complete.")
-    payload = result["snapshot_json"]
+        raise ValueError("The native warning repair script did not complete.")
+    payload = result[field]
     if not isinstance(payload, TEXT) or len(payload) > MAX_BYTES or any(ord(char) > 127 for char in payload):
-        raise ValueError("Expected an ASCII warning repair snapshot up to 2 MiB.")
+        raise ValueError("Expected an ASCII warning repair payload up to 2 MiB.")
     return json.loads(payload)
+
+
+def read_snapshot(record):
+    return read_payload(record, "snapshot_json")
+
+
+def compare_baseline(plan, current):
+    normalized = dict(current, elements=dict(current["elements"]))
+    borrowed = []
+    for item in plan["ownership_ids"]:
+        element = current["elements"][item]
+        prior = plan["removal_ownership"][item]
+        observed = element.get("ownership")
+        if (prior is not None and observed is not None and prior[0] == "NotOwned"
+                and observed[0] == "OwnedByCurrentUser" and prior[1] == observed[1]):
+            normalized["elements"][item] = dict(element, ownership=prior)
+            borrowed.append(item)
+    if snapshot_digest(normalized) != plan["basis_sha256"]:
+        raise ValueError("The approved repair plan no longer matches the model.")
+    return normalized, borrowed
 
 
 def compute(snapshot):
@@ -152,18 +172,85 @@ def compute(snapshot):
     return plan, display
 
 
+def load_record(path):
+    with io.open(path, "r", encoding="utf-8-sig") as stream:
+        raw = stream.read(2 * MAX_BYTES + 65537)
+    if len(raw) > 2 * MAX_BYTES + 65536:
+        raise ValueError("The full Revit record exceeds the supported size.")
+    data = json.loads(raw)
+    return data.get("response", data)
+
+
+def check_runtime_receipt(plan, record, outcome):
+    expected_status = "rejected" if outcome == "discarded" else "ok"
+    if (record.get("decision") != outcome or record.get("status") != expected_status
+            or (outcome == "discarded" and record.get("approval") != "user")
+            or (outcome == "committed" and record.get("approval") not in ("user", "auto"))):
+        raise ValueError("The full pyRevit record does not establish the requested repair outcome.")
+    if any(record.get(field) for field in ("error", "failures", "dialogs", "blocked", "warnings",
+                                           "unclosed_documents")):
+        raise ValueError("The pyRevit record reports a failure, dialog or other unresolved effect.")
+    if plan.get("kind") != "warning-repair-plan" or plan.get("blocked") is not False or not plan["steps"]:
+        raise ValueError("Use an unblocked reviewed warning repair plan.")
+    receipt = read_payload(record, "receipt_json")
+    expected = sorted((step["remove_id"] for step in plan["steps"]), key=int)
+    changes = record["changes"]
+    deleted = changes["deleted"]
+    if (not isinstance(deleted, list) or any(type(item) not in (int, type(u""), str) for item in deleted)
+            or type(changes["deleted_count"]) is not int
+            or changes["deleted_count"] != len(expected)
+            or sorted((element_id(str(item)) for item in deleted), key=int) != expected
+            or changes["added_count"] != 0 or changes["modified_count"] != 0
+            or changes.get("other_documents") or changes.get("added") or changes.get("modified")
+            or changes.get("by_category")):
+        raise ValueError("The runtime change record does not contain exactly the approved deletions.")
+    if (receipt["basis_sha256"] != plan["basis_sha256"] or receipt["document"] != plan["document"]
+            or receipt["deleted"] != expected or receipt["warnings"] != plan["expected_warnings"]):
+        raise ValueError("The inner transaction receipt differs from the approved repair plan.")
+    if any(not re.match(r"^[0-9a-f]{64}\Z", receipt[field]) for field in ("kept_sha256", "rooms_sha256")):
+        raise ValueError("The inner transaction did not provide survivor and room evidence.")
+    return receipt
+
+
+def verify_outcome(command, plan, record, fresh):
+    outcomes = {"verify-dry-run": "rolled_back", "verify-discard": "discarded", "verify-keep": "committed"}
+    receipt = check_runtime_receipt(plan, record, outcomes[command])
+    changes = fresh["changes"]
+    if (fresh.get("status") != "ok" or fresh.get("decision") != "rolled_back"
+            or any(fresh.get(field) for field in ("error", "failures", "dialogs", "blocked", "warnings",
+                                                  "unclosed_documents"))
+            or any(type(changes[field]) is not int or changes[field] != 0
+                   for field in ("added_count", "modified_count", "deleted_count"))
+            or changes.get("other_documents")):
+        raise ValueError("The independent Revit query did not finish without changes.")
+    if command == "verify-keep":
+        observed = read_payload(fresh, "readback_json")
+        expected = {field: receipt[field] for field in
+                    ("document", "basis_sha256", "deleted", "kept_sha256", "rooms_sha256", "warnings")}
+        if observed != expected:
+            raise ValueError("The independent Revit readback differs from the kept transaction receipt.")
+        return {"status": "verified_keep", "deleted": receipt["deleted"],
+                "keepers": [{"id": step["keep_id"], "uid": step["keep_uid"]} for step in plan["steps"]]}
+    _, borrowing = compare_baseline(plan, read_snapshot(fresh))
+    return {"status": "verified_dry_run" if command == "verify-dry-run" else "verified_discard",
+            "borrowed_removal_ids": borrowing}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("record")
-    parser.add_argument("plan")
-    parser.add_argument("preview")
+    parser.add_argument("record", help="Read record, verify-dry-run, verify-discard, or verify-keep")
+    parser.add_argument("plan", help="Plan output or reviewed plan")
+    parser.add_argument("preview", help="Preview output or full repair run record")
+    parser.add_argument("--fresh", help="Independent Revit query record for verification")
     args = parser.parse_args()
     try:
-        with io.open(args.record, "r", encoding="utf-8-sig") as stream:
-            raw = stream.read(2 * MAX_BYTES + 65537)
-        if len(raw) > 2 * MAX_BYTES + 65536:
-            raise ValueError("The full Revit record exceeds the supported size.")
-        plan, display = compute(read_snapshot(json.loads(raw)))
+        if args.record in ("verify-dry-run", "verify-discard", "verify-keep"):
+            if not args.fresh:
+                raise ValueError("Supply the full independent Revit query record with --fresh.")
+            report = verify_outcome(args.record, load_record(args.plan), load_record(args.preview), load_record(args.fresh))
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            return 0
+        plan, display = compute(read_snapshot(load_record(args.record)))
         for path, data in [(args.plan, plan), (args.preview, display)]:
             with io.open(path, "w", encoding="utf-8") as stream:
                 stream.write(u"%s\n" % json.dumps(data, ensure_ascii=True, indent=2))
