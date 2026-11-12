@@ -528,16 +528,23 @@ def write_project_with_model(output, model, title, findings, preview, board, mod
         staging = Path(temporary)
         built = staging / "viewer.html"
         source = model.resolve()
-        facets = None
-        if board is not None or preview:
-            data = load_json(source)
-            facets = model_issue_facets(data)
-            # Keep exact native IDs when the viewer reads JSON with JavaScript numbers.
-            for element in data["elements"]:
-                if isinstance(element, dict) and type(element.get("id")) is int and element["id"] > 2**53 - 1:
-                    element["id"] = str(element["id"])
+        data = load_json(source)
+        if not isinstance(data, dict) or not isinstance(data.get("elements"), list):
+            raise ValueError("Use a BIM model export with an elements list.")
+        facets = model_issue_facets(data) if board is not None or preview else None
+        normalized_ids = False
+        # JavaScript rounds large JSON integers even when the viewer has no issue links.
+        for element in data["elements"]:
+            if not isinstance(element, dict):
+                continue
+            identifier = element.get("id")
+            if type(identifier) is int and abs(identifier) > 2**53 - 1:
+                element["id"] = str(identifier)
+                normalized_ids = True
+        if normalized_ids or facets is not None:
             source = staging / "model.json"
             source.write_text(json.dumps(data, ensure_ascii=True, allow_nan=False), encoding="utf-8")
+        del data
         try:
             subprocess.run(
                 ["node", str(builder), "--offline", str(source), str(built)],

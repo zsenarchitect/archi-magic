@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(HERE, "..", "scripts")
 sys.path.insert(0, SCRIPTS)
@@ -355,10 +357,11 @@ def test_project_page_builds_and_links_local_model(tmp_path, monkeypatch):
     assert model.read_text() == '{"elements": []}'
 
 
-def test_project_model_preserves_numeric_revit_ids_beyond_javascript_precision(tmp_path, monkeypatch):
+@pytest.mark.parametrize("include_board", [False, True])
+def test_project_model_preserves_numeric_revit_ids_beyond_javascript_precision(tmp_path, monkeypatch, include_board):
     model = tmp_path / "model.json"
     identifier = 9007199254740993
-    original = {"elements": [{"id": identifier, "category": "Walls"}, {"id": 1}]}
+    original = {"elements": [{"id": identifier, "category": "Walls"}, {"id": identifier - 1}, {"id": 1}]}
     model.write_text(json.dumps(original))
     issue = {"number": 1, "status": "OPEN", "title": "Check", "severity": [], "element_ids": [identifier],
              "findings": [], "todos": [], "assignees": [], "comments": [], "related": []}
@@ -369,14 +372,14 @@ def test_project_model_preserves_numeric_revit_ids_beyond_javascript_precision(t
         source = Path(command[3])
         assert source != model
         assert json.loads(source.read_text())["elements"] == [
-            {"id": str(identifier), "category": "Walls"}, {"id": 1},
+            {"id": str(identifier), "category": "Walls"}, {"id": str(identifier - 1)}, {"id": 1},
         ]
         Path(command[4]).write_text("<!doctype html><title>Viewer</title>")
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(subprocess, "run", build_model)
-    pp.write_project_with_model(out, model, "Project", [], {}, board, [])
-    assert f"#elements={identifier}" in out.read_text()
+    pp.write_project_with_model(out, model, "Project", [], {}, board if include_board else None, [])
+    assert (f"#elements={identifier}" in out.read_text()) is include_board
     assert json.loads(model.read_text()) == original
 
 
