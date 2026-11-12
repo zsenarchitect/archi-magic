@@ -710,7 +710,12 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
                     "door_cuts": {door["source_ids"][0]: {"elevation_mm": 4000, "samples": [
                         {"lateral_mm": offset, "span_mm": [start, end]} for offset in (-lateral, 0, lateral)
                     ]}},
-                    "rooms": {room["source_ids"][0]: {"finish_area_mm2": 9200000, "segment_count": 4}}}
+                    "rooms": {room["source_ids"][0]: {
+                        "finish_area_mm2": 9200000, "segment_count": 4,
+                        "finish_edges_mm": [[end_point, start_point] for start_point, end_point in
+                                            reversed(list(zip(room["boundary"],
+                                                              room["boundary"][1:] + room["boundary"][:1])))],
+                    }}}
     before = run("preview-run", "query", response)
     dry = run("dry-run", "dry_run", {"status": "probe_rolled_back", "rollback_verified": True,
                                      "preview_sha256": response["preview_sha256"], "transient_element_count": 7,
@@ -737,6 +742,18 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
     drifted["result"]["preview_sha256"] = sha256(drifted["result"]["preview_json"].encode()).hexdigest()
     with pytest.raises(ValueError, match="differs after rollback"):
         verify(before, dry, drifted)
+    area_only = deepcopy(dry)
+    del area_only["result"]["measurements"]["rooms"][room["source_ids"][0]]["finish_edges_mm"]
+    with pytest.raises(ValueError, match="finish_edges_mm"):
+        verify(before, area_only, fresh)
+    moved_room = deepcopy(dry)
+    boundary = room["boundary"]
+    moved_room["result"]["measurements"]["rooms"][room["source_ids"][0]]["finish_edges_mm"] = [
+        [[x + 30, y] for x, y in (start_point, end_point)]
+        for start_point, end_point in zip(boundary, boundary[1:] + boundary[:1])
+    ]
+    with pytest.raises(ValueError, match="finish edges differ"):
+        verify(before, moved_room, fresh)
     wrong_cut = deepcopy(dry)
     wrong_cut["result"]["measurements"]["door_cuts"][door["source_ids"][0]]["samples"][2]["span_mm"][1] += 10
     with pytest.raises(ValueError, match="differs from the reviewed cut span"):

@@ -66,12 +66,28 @@ def verify_measurements(preview, measurements):
                     or any(not near(value, target, tolerance) for value, target in zip(span, door["span_mm"]))):
                 raise ValueError("A measured door opening differs from the reviewed cut span.")
     for identifier, room in rooms.items():
-        measurement = fields(measurements["rooms"][identifier], "finish_area_mm2 segment_count")
+        measurement = fields(measurements["rooms"][identifier], "finish_area_mm2 segment_count finish_edges_mm")
         sides = edges(room["boundary"])
         if (type(measurement["segment_count"]) is not int or measurement["segment_count"] != len(sides)
                 or not near(measurement["finish_area_mm2"], contour_area(sides), contour_area_tolerance(sides, tolerance))
                 or measurement["finish_area_mm2"] <= 0):
             raise ValueError("A measured room differs from the reviewed finish area or segment count.")
+        actual = measurement["finish_edges_mm"]
+        if (not isinstance(actual, list) or len(actual) != len(sides)
+                or any(not isinstance(edge, list) or len(edge) != 2
+                       or any(not isinstance(point, list) or len(point) != 2
+                              or any(type(value) not in (int, float) or not math.isfinite(value) for value in point)
+                              for point in edge)
+                       for edge in actual)):
+            raise ValueError("The room receipt lacks complete finish edges.")
+        unmatched = list(actual)
+        for start, end in sides:
+            matches = [edge for edge in unmatched
+                       if any(math.dist(start, first) <= tolerance and math.dist(end, last) <= tolerance
+                              for first, last in (edge, edge[::-1]))]
+            if len(matches) != 1:
+                raise ValueError("The measured room finish edges differ from the reviewed outline.")
+            unmatched.remove(matches[0])
 
 
 def verify(preview_run, dry_run, fresh_run):

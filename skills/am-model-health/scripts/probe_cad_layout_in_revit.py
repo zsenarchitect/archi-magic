@@ -235,7 +235,8 @@ def room_probe(document, proposal, walls, level, phase, created, deadline):
             area = contour_area(outline)
             if abs(area - contour_area(contour)) > contour_area_tolerance(contour, tolerance):
                 raise ValueError("The new room finish area differs from the reviewed outline.")
-            measurements[row["source_ids"][0]] = {"finish_area_mm2": area, "segment_count": len(outline)}
+            measurements[row["source_ids"][0]] = {"finish_area_mm2": area, "segment_count": len(outline),
+                                                  "finish_edges_mm": outline}
     finally:
         options.Dispose()
     return measurements
