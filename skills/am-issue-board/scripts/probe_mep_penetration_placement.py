@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 import sys
 from uuid import uuid4
@@ -10,7 +11,7 @@ from uuid import uuid4
 from mep_penetration_preview import fingerprint, preview
 from mep_penetration_spacing import scalar, spacing_conflicts
 from mep_penetration_tracking import opening_measurement, read_tracking, write_tracking
-from read_mep_penetrations import ReadBudget, area, matches_outline, principal_host, principal_references, read, selected
+from read_mep_penetrations import ReadBudget, area, matches_outline, principal_host, principal_references, project_inventory, read, selected
 from structural_compare_cli import checked_id, digest, identity, read_input, uid
 
 
@@ -100,7 +101,7 @@ def verify_new_cut(before, after, geometry, tolerance):
     old = [dict(row, key=f"old-cut-{index}") for index, row in enumerate(before["existing"])]
     if spacing_conflicts([new], old, before["minimum_web_ft"]):
         raise ValueError("The new cut leaves too little material beside another opening.")
-    return area(new) * after["depth_ft"]
+    return unmatched[0], area(new) * after["depth_ft"]
 
 
 def place_one(document, DB, snapshot, row, budget):
@@ -142,7 +143,7 @@ def place_one(document, DB, snapshot, row, budget):
     document.Regenerate()
 
     current, native = principal_host(DB, host, minimum_web, tolerance, budget)
-    expected_volume = verify_new_cut(before, current, geometry, tolerance)
+    cut_outline, expected_volume = verify_new_cut(before, current, geometry, tolerance)
     removed_volume = before_volume - float(native[4].Volume)
     if removed_volume <= 0 or abs(removed_volume - expected_volume) > tolerance * expected_volume / geometry["depth_ft"]:
         raise ValueError("The measured material removal differs from the reviewed through-cut.")
@@ -158,7 +159,8 @@ def place_one(document, DB, snapshot, row, budget):
     budget.visit()
     return {"crossing_key": row["crossing_key"], "opening_id": str(opening.Id.Value),
             "opening_uid": str(opening.UniqueId), "opening_sha256": observed, "tracking_sha256": tag_digest,
-            "removed_volume_ft3": removed_volume, "activated_symbol": mapping["id"] if activated else None}
+            "removed_volume_ft3": removed_volume, "cut_outline": cut_outline,
+            "activated_symbol": mapping["id"] if activated else None}
 
 
 def verify_after_commit(document, DB, snapshot, plan, rows, budget):
@@ -185,19 +187,6 @@ def verify_after_commit(document, DB, snapshot, plan, rows, budget):
             raise ValueError("A provisional opening or tracking record changed at commit.")
 
 
-def project_inventory(document, DB, budget):
-    inventory = {}
-    for collector in (DB.FilteredElementCollector(document).WhereElementIsElementType(),
-                      DB.FilteredElementCollector(document).WhereElementIsNotElementType()):
-        for element in collector:
-            budget.visit()
-            key = str(element.Id.Value)
-            if key in inventory or len(inventory) >= 10000:
-                raise ValueError("The disposable project exceeds the complete inventory limit.")
-            inventory[key] = (str(element.UniqueId), str(element.VersionGuid))
-    return inventory
-
-
 def verified_effects(plan, rows, original, current, events):
     added = {row["opening_id"] for row in rows}
     hosts = {row["host_id"] for row in plan["rows"]}
@@ -215,13 +204,19 @@ def verified_effects(plan, rows, original, current, events):
     return event
 
 
-def execute_trial(document, DB, snapshot, plan, reread):
-    name = "Trial linked MEP openings " + uuid4().hex
+TRANSACTION_NAME = "Trial linked MEP openings"
+
+
+def execute_trial(document, DB, snapshot, plan, reread, *, baseline_token=None, baseline_inventory=None):
+    name = TRANSACTION_NAME + " " + uuid4().hex
     status = DB.TransactionStatus
     group = DB.TransactionGroup(document, name)
     transaction = DB.Transaction(document, name)
     budget = ReadBudget(seconds=30)
     original = project_inventory(document, DB, budget)
+    inventory_digest = fingerprint(original)
+    if baseline_inventory is not None and baseline_inventory != inventory_digest:
+        raise ValueError("The project inventory changed after the reviewed baseline.")
     rows, events = [], []
     failure = None
     restored = subscribed = closing = unexpected = unresolved = False
@@ -298,13 +293,18 @@ def execute_trial(document, DB, snapshot, plan, reread):
     if failure:
         return {"status": "stopped", "reason": failure, "rollback_verified": True}
     return {"status": "trial_rolled_back", "transaction": name, "rows": rows,
-            "preview_sha256": fingerprint(plan), "effects": effects, "rollback_verified": True}
+            "preview_sha256": fingerprint(plan), "effects": effects, "rollback_verified": True,
+            "baseline_audit_token": baseline_token, "baseline_inventory_sha256": inventory_digest}
 
 
 def trial(document, DB, args):
     if (args["disposable_fixture"] is not True or document.IsWorkshared
             or str(document.Application.VersionNumber) != "2026"):
         raise ValueError("Use a saved standalone disposable Revit 2026 project.")
+    baseline_token = args["baseline_audit_token"]
+    if not isinstance(baseline_token, str) or not re.fullmatch(r"[0-9a-f]{32}", baseline_token):
+        raise ValueError("Use the audit token from the complete original project query.")
+    baseline_inventory = digest(args["baseline_inventory_sha256"])
     request = args["read"]
 
     def reread():
@@ -314,7 +314,8 @@ def trial(document, DB, args):
     plan = placement_plan(snapshot, args["choices"])
     if fingerprint(plan) != args["preview_sha256"]:
         raise ValueError("The live crossing evidence or mapping changed after preview.")
-    return execute_trial(document, DB, snapshot, plan, reread)
+    return execute_trial(document, DB, snapshot, plan, reread,
+                         baseline_token=baseline_token, baseline_inventory=baseline_inventory)
 
 
 def main():

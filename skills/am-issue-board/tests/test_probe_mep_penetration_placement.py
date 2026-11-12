@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import probe_mep_penetration_placement as probe
 from mep_penetration_preview import preview
 from test_mep_penetration_preview import evidence
@@ -33,7 +34,7 @@ def test_cut_verification_requires_unchanged_existing_cuts(evidence):
     before["existing"] = [old]
     new = dict(geometry["outline"], key="cut-2")
     current = dict(before, existing=[old, new])
-    assert probe.verify_new_cut(before, current, geometry, 0.001) == pytest.approx(3.75)
+    assert probe.verify_new_cut(before, current, geometry, 0.001) == (new, pytest.approx(3.75))
     current["existing"] = [dict(old, diameter=2), new]
     with pytest.raises(ValueError, match="prior opening changed"):
         probe.verify_new_cut(before, current, geometry, 0.001)
@@ -134,3 +135,91 @@ def test_trial_rolls_back_openings_cuts_and_tags_as_one_batch(monkeypatch, failu
     else:
         assert result["status"] == "trial_rolled_back"
         assert result["effects"]["added"] == ["30", "31"]
+
+
+@pytest.fixture
+def saved_trial(evidence):
+    import json
+    from mep_penetration_preview import fingerprint
+
+    key = preview(evidence)["findings"][0]["crossing_key"]
+    evidence["symbols"] = [{"id": "30", "uid": "opening-type", "version_guid": "version",
+                            "is_active": False, "placement_type": "WorkPlaneBased"}]
+    choices = {"crossing_keys": [key], "symbols": {"wall:rectangular": {
+        "id": "30", "uid": "opening-type", "parameters": {"width": "101", "height": "102", "depth": "103"}}}}
+    plan = probe.placement_plan(evidence, choices)
+    name = probe.TRANSACTION_NAME + " " + "e" * 32
+    inventory = "a" * 64
+
+    def envelope(mode, identifier, decision, result, effects=None):
+        effects = effects or {"added": [], "deleted": [], "modified": []}
+        return {"mode": mode, "run_id": identifier, "status": "ok", "decision": decision,
+                "exit_code": 0, "result_truncated": False, "engine": {"requested": "cpython"}, "result": result,
+                "changes": {**{key + "_count": len(values) for key, values in effects.items()},
+                            **{key: [{"id": value} for value in values] for key, values in effects.items()},
+                            "transactions": [name] if any(effects.values()) else []}}
+
+    before = envelope("query", "before", "no_changes", {
+        "status": "ok", "audit_token": "1" * 32, "snapshot_json": json.dumps(evidence),
+        "inventory_sha256": inventory, "trial_transaction": None, "absent_opening_uids": []})
+    effects = {"added": ["40"], "deleted": [], "modified": ["10", "30"]}
+    result = {"status": "trial_rolled_back", "rollback_verified": True, "preview_sha256": fingerprint(plan),
+              "baseline_audit_token": "1" * 32, "baseline_inventory_sha256": inventory, "transaction": name,
+              "effects": effects, "rows": [
+                  {"crossing_key": key, "opening_id": "40", "opening_uid": "opening-40", "activated_symbol": "30",
+                   "opening_sha256": "b" * 64, "tracking_sha256": "c" * 64, "removed_volume_ft3": 3.75,
+                   "cut_outline": dict(plan["rows"][0]["geometry"]["outline"])}]}
+    trial = envelope("dry_run", "trial", "rolled_back", result, effects=effects)
+    after = envelope("query", "after", "no_changes", {
+        "status": "ok", "audit_token": "2" * 32, "snapshot_json": json.dumps(evidence),
+        "inventory_sha256": inventory, "trial_transaction": name, "absent_opening_uids": ["opening-40"]})
+    return choices, before, trial, after
+
+
+def test_trial_verifier_reads_complete_saved_records_through_cli(saved_trial, tmp_path):
+    import json
+    import subprocess
+
+    paths = [tmp_path / f"record-{index}.json" for index in range(4)]
+    for path, record in zip(paths, saved_trial):
+        path.write_text(json.dumps(record))
+    run = subprocess.run([sys.executable, str(SCRIPTS / "verify_mep_penetration_trial.py"),
+                          *map(str, paths)], capture_output=True, text=True, check=True)
+    result = json.loads(run.stdout)
+    assert result["status"] == "mep_opening_trial_verified"
+    assert result["run_ids"] == ["before", "trial", "after"]
+    assert result["effects"] == {"added": ["40"], "deleted": [], "modified": ["10", "30"]}
+
+
+@pytest.mark.parametrize("problem", [
+    "reused_run", "stale_inventory", "missing_absence", "wrong_cut", "wrong_volume", "wrong_scope", "truncated",
+])
+def test_trial_verifier_blocks_changed_or_partial_evidence(saved_trial, problem):
+    from verify_mep_penetration_trial import verify
+
+    choices, before, trial, after = saved_trial
+    if problem == "reused_run":
+        after["run_id"] = before["run_id"]
+    elif problem == "stale_inventory":
+        after["result"]["inventory_sha256"] = "f" * 64
+    elif problem == "missing_absence":
+        after["result"]["absent_opening_uids"] = []
+    elif problem == "wrong_cut":
+        trial["result"]["rows"][0]["cut_outline"]["height"] = 2.0
+    elif problem == "wrong_volume":
+        trial["result"]["rows"][0]["removed_volume_ft3"] = 3
+    elif problem == "wrong_scope":
+        trial["changes"]["modified"][0]["id"] = "99"
+    elif problem == "truncated":
+        trial["result_truncated"] = True
+    with pytest.raises(ValueError):
+        verify(choices, before, trial, after)
+
+
+def test_trial_verifier_accepts_bridge_no_changes_after_internal_rollback(saved_trial):
+    from verify_mep_penetration_trial import verify
+
+    choices, before, trial, after = saved_trial
+    trial["decision"] = "no_changes"
+    trial["changes"] = before["changes"]
+    assert verify(choices, before, trial, after)["status"] == "mep_opening_trial_verified"

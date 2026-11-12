@@ -202,9 +202,15 @@ Add `symbol_ids` to the Revit query for the reviewed opening types. Prepare a ch
 
 Run `python scripts/probe_mep_penetration_placement.py evidence.json choices.json`. Save the preview and its digest. Show the before and after rows. Use am-safe-change to check ownership and review the exact host and symbol IDs.
 
-In the disposable project, call `get_context` and confirm ask policy. Obtain approval for the rollback trial. Use guarded CPython dry-run mode with the same script. Pass `read`, `choices`, `preview_sha256`, and `disposable_fixture: true`.
+In the disposable project, call `get_context` and confirm ask policy. Repeat the reviewed query with `audit: {}`. Save the full result as `before.json`. Confirm that its snapshot matches the reviewed preview.
 
-The trial measures the host before and after each cut. It attaches tracking only after the cut matches the preview. It rolls back every opening, host cut, and record together. Stop on an unresolved result. Native verification and the project Keep or Discard workflow are pending.
+Obtain approval for the rollback trial. Run the placement script in guarded CPython dry-run mode. Pass `read`, `choices`, `preview_sha256`, and `disposable_fixture: true`. Copy the baseline query's `audit_token` and `inventory_sha256` into `baseline_audit_token` and `baseline_inventory_sha256`.
+
+The trial measures the host before and after each cut. It attaches tracking only after the cut matches the preview. It rolls back every opening, host cut, and record together. Save the full run as `trial.json`. Stop on an unresolved result.
+
+Repeat the project query with `audit`. Set `trial_transaction` to the trial's transaction name. Set `absent_opening_uids` to every trial opening UID. Save the full result as `after.json`.
+
+Run `python scripts/verify_mep_penetration_trial.py choices.json before.json trial.json after.json`. Check the measured cuts, exact element effects, and restored project inventory. Native verification and the project Keep or Discard workflow are pending.
 
 ## Rules
 

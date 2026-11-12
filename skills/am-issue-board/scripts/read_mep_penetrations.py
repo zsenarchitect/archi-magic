@@ -5,6 +5,7 @@ import json
 import math
 from time import monotonic
 from types import SimpleNamespace
+from uuid import uuid4
 
 from issue_board import saved_document_identity
 from mep_penetration_preview import fingerprint
@@ -519,6 +520,19 @@ def inventory(elements, measure, budget):
     return records
 
 
+def project_inventory(document, DB, budget):
+    inventory = {}
+    for collector in (DB.FilteredElementCollector(document).WhereElementIsElementType(),
+                      DB.FilteredElementCollector(document).WhereElementIsNotElementType()):
+        for element in collector:
+            budget.visit()
+            key = str(element.Id.Value)
+            if key in inventory or len(inventory) >= 10000:
+                raise ValueError("The disposable project exceeds the complete inventory limit.")
+            inventory[key] = (str(element.UniqueId), str(element.VersionGuid))
+    return inventory
+
+
 def read(DB, document, args):
     if document is None or document.IsFamilyDocument or document.IsModifiable or document.IsModified:
         raise ValueError("Open the saved Revit project in read-only query mode.")
@@ -580,7 +594,18 @@ def read(DB, document, args):
     budget.visit()
     if len(encoded) > LIMIT:
         raise ReadLimit("The crossing snapshot exceeds 2 MiB.")
-    return {"status": "ok", "snapshot_json": encoded}
+    result = {"status": "ok", "snapshot_json": encoded}
+    audit = args.get("audit")
+    if audit is not None:
+        transaction = audit.get("trial_transaction")
+        absent = [uid(value) for value in bounded_list(audit.get("absent_opening_uids", []), 10)]
+        if len(set(absent)) != len(absent) or (absent and not transaction):
+            raise ValueError("Use distinct opening UIDs from the verified trial transaction.")
+        if any(document.GetElement(identifier) is not None for identifier in absent):
+            raise ValueError("A trial opening is still present after rollback.")
+        result.update(audit_token=uuid4().hex, inventory_sha256=fingerprint(project_inventory(document, DB, budget)),
+                      trial_transaction=transaction, absent_opening_uids=absent)
+    return result
 
 
 try:
