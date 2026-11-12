@@ -63,6 +63,17 @@ try {
         -not $note.occurred_at -and -not $note.incident_line
     ) $result.Out
 
+    $legacyBytes = [IO.File]::ReadAllBytes($file)
+    $legacyClaim = Invoke-Hook $file @('-Claim', $note.note_sha256)
+    Assert-True 'legacy note: first claim permits one offer' (
+        ($legacyClaim.Out | ConvertFrom-Json).status -eq 'claimed'
+    ) $legacyClaim.Out
+    [IO.File]::WriteAllBytes($file, $legacyBytes)
+    $legacyRepeat = Invoke-Hook $file @('-Read')
+    Assert-True 'legacy note: restoring the same bytes does not reopen the offer' (
+        $legacyRepeat.Code -eq 0 -and $legacyRepeat.Out -eq ''
+    ) $legacyRepeat.Out
+
     $incidentFile = Write-Note 'incident.json' 'revit_busy' '2026-11-07T02:00:00Z'
     $incident = [IO.File]::ReadAllText($incidentFile) | ConvertFrom-Json
     $incident | Add-Member -NotePropertyName occurred_at -NotePropertyValue '2026-11-06T15:38:47-05:00'

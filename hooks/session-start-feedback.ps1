@@ -8,7 +8,7 @@
   -Read prints the sanitized note and its digest. -Claim consumes only the
   matching note, after the GitHub duplicate check and before the one offer.
   Claim uses a same-directory rename so two sessions cannot offer the same note.
-  A local receipt keeps a later note about the same timed incident quiet.
+  A local receipt keeps the same timed incident or identical legacy note quiet.
   The SessionStart path never contacts GitHub and always exits 0.
 #>
 param(
@@ -32,14 +32,15 @@ function Get-FeedbackDigest([byte[]]$Bytes) {
     finally { $hash.Dispose() }
 }
 
-function Get-ReceiptPath([string]$Path, [string]$IncidentLine) {
-    if (-not $IncidentLine) { return }
-    $key = Get-FeedbackDigest ([Text.Encoding]::UTF8.GetBytes($IncidentLine))
+function Get-ReceiptPath([string]$Path, $Note) {
+    $key = $Note.note_sha256
+    if ($Note.incident_line) {
+        $key = Get-FeedbackDigest ([Text.Encoding]::UTF8.GetBytes($Note.incident_line))
+    }
     return "$Path.seen-$key"
 }
 
 function Register-Incident([string]$ReceiptPath) {
-    if (-not $ReceiptPath) { return $true }
     try {
         $stream = [IO.File]::Open($ReceiptPath, [IO.FileMode]::CreateNew)
     } catch [IO.IOException] {
@@ -115,7 +116,7 @@ try {
         try {
             $note = Read-SavedNote $claimed
             if ($note.note_sha256 -ceq $Claim) {
-                $receipt = Get-ReceiptPath $FeedbackFile $note.incident_line
+                $receipt = Get-ReceiptPath $FeedbackFile $note
                 $offer = Register-Incident $receipt
                 $consumed = $true
             }
@@ -135,8 +136,8 @@ try {
     }
 
     $note = Read-SavedNote $FeedbackFile
-    $receipt = Get-ReceiptPath $FeedbackFile $note.incident_line
-    if ($receipt -and [IO.File]::Exists($receipt)) { exit 0 }
+    $receipt = Get-ReceiptPath $FeedbackFile $note
+    if ([IO.File]::Exists($receipt)) { exit 0 }
     if ($Read) {
         Write-Json $note
         exit 0
