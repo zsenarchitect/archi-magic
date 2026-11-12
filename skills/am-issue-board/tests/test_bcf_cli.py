@@ -53,6 +53,97 @@ def seed(path, data=None):
     path.write_bytes(bcf.write_topics([data or topic()], "author@example.com"))
 
 
+@pytest.fixture
+def verified_import_fixture(board, tmp_path):
+    body = ib.plan_create("Fixture", [])["final_text"]
+    host = {"project_uid": "fixture-project", "path_sha256": "a" * 64}
+
+    def note(text):
+        return {"host_identity": host, "note": {"id": "40", "unique_id": "fixture-note",
+                                                "sha1": ib.text_sha1(text), "text": text}}
+
+    board.write_text(json.dumps(note(body)))
+    archive = tmp_path / "source.bcfzip"
+    seed(archive)
+    preview = invoke("import", board, "--input", archive)
+    assert preview.returncode == 0, preview.stderr
+    result = json.loads(preview.stdout)
+    reviewed = tmp_path / "reviewed.json"
+    reviewed.write_text(preview.stdout)
+    plan = result["plan"]
+    final_text = plan["final_text"]
+
+    def record(run_id, mode, status, decision, result, approval=None):
+        edited = mode != "query"
+        return {"run_id": run_id, "mode": mode, "status": status, "decision": decision, "approval": approval,
+                "exit_code": 0, "result_truncated": False, "result": result,
+                "changes": {"added": [], "deleted": [], "added_count": 0, "deleted_count": 0,
+                            "modified": [{"id": 40, "class": "TextNote"}] if edited else [],
+                            "modified_count": int(edited), "by_category": {"Text Notes": 1} if edited else {},
+                            "transactions": ["Issue board: " + plan.get("action", plan["mode"])] if edited else []}}
+
+    write = {"status": "ok", "note_id": 40, "sha1_after": ib.text_sha1(final_text)}
+    dry = record("dry", "dry_run", "ok", "rolled_back", dict(write))
+    dry_read = record("dry-query", "query", "ok", "rolled_back", note(body))
+    final = record("modify", "modify", "ok", "committed", dict(write), "user")
+    fresh = record("fresh", "query", "ok", "rolled_back", note(final_text))
+
+    def run(final_decision=True):
+        args = ["--input", archive, "--preview", reviewed]
+        pairs = [("dry-run", dry), ("dry-readback", dry_read)]
+        if final_decision:
+            pairs.extend((("decision", final), ("readback", fresh)))
+        for flag, row in pairs:
+            path = tmp_path / (flag + ".json")
+            path.write_text(json.dumps({"response": row}))
+            args.extend(("--" + flag, path))
+        return invoke("verify-import", board, *args)
+
+    return SimpleNamespace(run=run, dry=dry, dry_read=dry_read, final=final, fresh=fresh,
+                           before=body, note=note, metadata=result["metadata_after_keep"], source=archive)
+
+
+def test_bcf_metadata_is_released_only_after_verified_keep(verified_import_fixture):
+    fixture = verified_import_fixture
+    dry = fixture.run(final_decision=False)
+    assert dry.returncode == 0, dry.stderr
+    assert json.loads(dry.stdout) == {"status": "verified_dry_run", "note_id": "40", "run_ids": ["dry", "dry-query"]}
+    kept = fixture.run()
+    assert kept.returncode == 0, kept.stderr
+    assert json.loads(kept.stdout)["metadata_after_keep"] == fixture.metadata
+    fixture.final.update(status="rejected", decision="discarded")
+    fixture.fresh["result"] = fixture.note(fixture.before)
+    discarded = fixture.run()
+    assert discarded.returncode == 0, discarded.stderr
+    assert json.loads(discarded.stdout)["status"] == "verified_discard"
+    assert "metadata_after_keep" not in json.loads(discarded.stdout)
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (lambda fixture: fixture.final.update(approval="auto"), "required decision"),
+    (lambda fixture: fixture.final["changes"]["modified"][0].update(id=41), "reviewed board note changes"),
+    (lambda fixture: fixture.final.update(result_truncated=True), "complete pyRevit"),
+    (lambda fixture: fixture.fresh.update(run_id="dry-query"), "separate pyRevit run"),
+    (lambda fixture: fixture.fresh["result"]["note"].update(unique_id="other"), "fresh board readback"),
+    (lambda fixture: fixture.fresh.update(result=fixture.note(fixture.before)), "fresh board readback"),
+])
+def test_bcf_metadata_is_withheld_when_bridge_or_readback_evidence_differs(verified_import_fixture, change, reason):
+    change(verified_import_fixture)
+    result = verified_import_fixture.run()
+    assert result.returncode == 2
+    assert not result.stdout and reason in result.stderr
+
+
+def test_verifier_rejects_new_viewpoint_data_with_the_same_board_text(verified_import_fixture):
+    fixture = verified_import_fixture
+    changed = topic()
+    changed["viewpoints"][0]["camera"]["scale_m"] = 12
+    seed(fixture.source, changed)
+    result = fixture.run()
+    assert result.returncode == 2
+    assert not result.stdout and "differs from the saved reviewed preview" in result.stderr
+
+
 @pytest.mark.parametrize("target", ["reviewed", "other_project", "other_note", "other_archive", "offline"])
 def test_bcf_plan_binds_revit_target_before_transaction(board, tmp_path, monkeypatch, target):
     from board_cli import read_note
