@@ -279,7 +279,12 @@ def dwg_inventory(doc, version, *, graph=False):
             selected[key] = record
 
     inferred_owners, conflicts = r2000_attribute_owners(records, selected) if version == "AC1015" else ({}, set())
-    layer_counts = Counter(absolute_ref(record.get("layer")) for record in records if "layer" in record)
+    # DWG stores structural delimiters as entities with layers. DXF iteration
+    # omits them, and they do not represent drawn or placed content.
+    layer_counts = Counter(
+        absolute_ref(record["layer"]) for record in records
+        if "layer" in record and record.get("entity") not in {"BLOCK", "ENDBLK", "SEQEND"}
+    )
     layers, xrefs, blocks, notes = [], [], {}, []
     values, definitions = [], []
     for key, record in selected.items():
