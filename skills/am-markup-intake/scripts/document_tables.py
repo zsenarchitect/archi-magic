@@ -1,6 +1,7 @@
 """Extract explicitly selected tables from local project documents."""
 
 from datetime import date, datetime, time
+import hashlib
 import io
 import json
 import math
@@ -141,7 +142,7 @@ def cell_text(value):
     return value.strip()
 
 
-def xlsx_rows(data, sheet_name):
+def xlsx_rows(data, sheet_name, *, header=1, literal_text_column=None):
     import openpyxl
 
     with io.BytesIO(data) as stream:
@@ -154,10 +155,23 @@ def xlsx_rows(data, sheet_name):
                 raise ValueError("select an unmerged worksheet table")
             if sheet.max_row > MAX_ROWS or sheet.max_column > MAX_COLS:
                 raise ValueError("worksheet exceeds table bounds")
+            literal_index = None
             for index, row in enumerate(sheet.iter_rows(), 1):
                 if any(cell.data_type in {"e", "f"} for cell in row):
                     raise ValueError(f"spreadsheet row {index} has a formula or spreadsheet error")
-                yield index, [cell_text(cell.value) for cell in row]
+                values = [cell_text(cell.value) for cell in row]
+                if literal_text_column is not None:
+                    if index == header:
+                        if not literal_text_column or values.count(literal_text_column) != 1:
+                            raise ValueError("select one existing, unique literal text column")
+                        literal_index = values.index(literal_text_column)
+                    elif literal_index is not None and any(values):
+                        cell = row[literal_index]
+                        if (cell.data_type not in {"s", "inlineStr"} or not isinstance(cell.value, str)
+                                or not cell.value or cell.value.strip() != cell.value):
+                            raise ValueError(f"spreadsheet row {index} requires a nonempty literal text cell "
+                                             "without surrounding whitespace in the selected column")
+                yield index, values
         finally:
             book.close()
 
@@ -235,15 +249,19 @@ def normalize(rows, require_cells=False):
     return normalized
 
 
-def extract(raw_path, sheet=None, page=None, table=None, header=1):
+def extract(raw_path, sheet=None, page=None, table=None, header=1, *, literal_text_column=None):
     path, data = local_bytes(raw_path)
     source = {"file": path.name, "header_row": header}
     suffix = path.suffix.lower()
+    if literal_text_column is not None and suffix != ".xlsx":
+        raise ValueError("literal text column validation requires an XLSX worksheet")
     if suffix in {".xlsx", ".docx"}:
         validate_ooxml(data)
     if suffix == ".xlsx" and sheet and page is None and table is None:
         source.update(format="xlsx", sheet=sheet)
-        raw = normalize(xlsx_rows(data, sheet))
+        raw = normalize(xlsx_rows(data, sheet, header=header, literal_text_column=literal_text_column))
+        if literal_text_column is not None:
+            source.update(literal_text_column=literal_text_column, sha256=hashlib.sha256(data).hexdigest())
     elif suffix == ".docx" and table and sheet is None and page is None:
         source.update(format="docx", table=table)
         raw = normalize(docx_rows(data, table))
