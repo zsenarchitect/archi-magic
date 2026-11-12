@@ -373,20 +373,32 @@ def test_dependent_copy_verifies_primary_and_existing_sibling(write_runtime, mon
     assert receipt["changes"]["modified"] == ["9", "10"]
 
 
+def rollback_record(mode, run_id, result, changes):
+    return {"mode": mode, "run_id": run_id, "result": result, "changes": changes,
+            "status": "ok", "decision": "rolled_back", "result_truncated": False, "exit_code": 0}
+
+
 def test_dry_run_verifies_independent_runtime_telemetry(write_runtime):
     plan, display = preview.compute(read(write_runtime, mode="plain"))
     result = apply_request(write_runtime, plan, display)
-    record = {"result": result, "changes": {
-        "added_count": 1, "added_ids": [100], "modified_count": 0, "deleted_count": 0,
+    record = rollback_record("dry_run", "view-dry-run", result, {
+        "added_count": 1, "added": [{"id": 100}], "modified_count": 0, "deleted_count": 0,
         "by_category": {"Views": 1}, "other_documents": [],
-    }}
+    })
+    for fields in ({"mode": "modify"}, {"decision": "committed"}, {"result_truncated": True}):
+        with pytest.raises(ValueError, match="complete Revit dry_run"):
+            preview.verify_dry_run(plan, {**record, **fields})
     receipt = preview.verify_dry_run(plan, record)
     assert receipt["views"][0]["id"] == "100"
+    record["changes"]["added_ids"] = [101]
+    with pytest.raises(ValueError, match="conflicting addition lists"):
+        preview.verify_dry_run(plan, record)
+    del record["changes"]["added_ids"]
     record["changes"]["other_documents"] = [{"title": "Other"}]
     with pytest.raises(ValueError, match="runtime change record"):
         preview.verify_dry_run(plan, record)
     record["changes"]["other_documents"] = []
-    record["changes"]["added_ids"] = [101]
+    record["changes"]["added"] = [{"id": 101}]
     with pytest.raises(ValueError, match="runtime change record"):
         preview.verify_dry_run(plan, record)
 
@@ -400,17 +412,23 @@ def test_independent_verification_detects_a_rename_after_keep(write_runtime, tmp
     plan_path = tmp_path / "plan.json"
     record = tmp_path / "verified.json"
     plan_path.write_text(json.dumps(plan))
-    record.write_text(json.dumps({"result": readback}))
+    query = rollback_record("query", "view-reread", readback,
+                            {"added_count": 0, "modified_count": 0, "deleted_count": 0})
+    record.write_text(json.dumps({"response": query}))
     dry_receipt = json.loads(kept["receipt_json"])
     dry_receipt["views"][0].update(id="110", uid="provisional")
     dry_receipt["changes"]["added"] = ["110"]
     dry = tmp_path / "dry.json"
-    dry.write_text(json.dumps({
-        "result": {"status": "ok", "receipt_json": json.dumps(dry_receipt)},
-        "changes": {"added_count": 1, "added_ids": [110], "modified_count": 0,
-                    "deleted_count": 0, "by_category": {"Views": 1}, "other_documents": []},
-    }))
+    dry.write_text(json.dumps(rollback_record(
+        "dry_run", "view-dry-run", {"status": "ok", "receipt_json": json.dumps(dry_receipt)},
+        {"added_count": 1, "added": [{"id": 110}], "modified_count": 0,
+         "deleted_count": 0, "by_category": {"Views": 1}, "other_documents": []},
+    )))
     preview.run_verification("compare", str(plan_path), str(record), str(dry))
+    record.write_text(json.dumps({**query, "run_id": "view-dry-run"}))
+    with pytest.raises(ValueError, match="distinct read-only"):
+        preview.run_verification("compare", str(plan_path), str(record), str(dry))
+    record.write_text(json.dumps(query))
     dry_receipt["views"][0]["view_type"] = "Section"
     dry_record = json.loads(dry.read_text())
     dry_record["result"]["receipt_json"] = json.dumps(dry_receipt)
