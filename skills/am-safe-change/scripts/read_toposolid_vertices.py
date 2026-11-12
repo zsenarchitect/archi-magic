@@ -128,19 +128,28 @@ def alignment_preview(document, terrain, vertices, request, clock):
     return {"support": support, "tolerance_ft": tolerance, "blocked": blocked, "rows": rows}
 
 
-def read_vertices(document, args):
+def project_identity(document):
     if document is None or document.IsFamilyDocument or not document.PathName:
         raise ValueError("Open the saved Revit project containing the Toposolid.")
     if str(document.Application.VersionNumber) != "2026":
         raise ValueError("Use Revit 2026 for this Toposolid inventory.")
-    if not isinstance(args, dict) or set(args) not in ({"toposolid_id"}, {"toposolid_id", "alignment"}):
-        raise ValueError("Supply inputs.toposolid_id and optionally an alignment request.")
-    value = args["toposolid_id"]
+    return {"uid": str(document.ProjectInformation.UniqueId),
+            "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()}
+
+
+def element_id(value, label):
     if (not isinstance(value, TEXT) or not re.match(r"[1-9][0-9]{0,18}\Z", value)
             or int(value) >= 2 ** 63):
-        raise ValueError("Supply a positive decimal Toposolid ID as text.")
+        raise ValueError("Supply a positive decimal {} ID as text.".format(label))
+    return DB.ElementId(Int64(int(value)))
+
+
+def read_vertices(document, args):
+    project = project_identity(document)
+    if not isinstance(args, dict) or set(args) not in ({"toposolid_id"}, {"toposolid_id", "alignment"}):
+        raise ValueError("Supply inputs.toposolid_id and optionally an alignment request.")
     clock = Stopwatch.StartNew()
-    terrain = document.GetElement(DB.ElementId(Int64(int(value))))
+    terrain = document.GetElement(element_id(args["toposolid_id"], "Toposolid"))
     if not isinstance(terrain, DB.Toposolid) or not terrain.UniqueId:
         raise ValueError("The ID must resolve to a Toposolid in the active project.")
 
@@ -162,8 +171,7 @@ def read_vertices(document, args):
         raise ValueError("The enabled Toposolid shape editor returned no vertices.")
 
     snapshot = {
-        "document": {"uid": str(document.ProjectInformation.UniqueId),
-                     "path_sha256": hashlib.sha256(document.PathName.encode("utf-8")).hexdigest()},
+        "document": project,
         "toposolid": {"id": str(terrain.Id.Value), "uid": str(terrain.UniqueId)},
         "vertices_ft": sorted(vertices),
     }
