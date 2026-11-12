@@ -245,6 +245,14 @@ def host_run(ui, DB, runtime, directory):
             raise ValueError("bundled audit source changed")
         scripts.append(data)
 
+    receipt = os.path.join(directory, "host-receipt.json")
+    temp = receipt + ".tmp"
+    if "host-receipt.json" in (name.lower() for name in os.listdir(directory)):
+        raise ValueError("host receipt already exists")
+    os.close(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    if "host-receipt.json" in (name.lower() for name in os.listdir(directory)):
+        raise ValueError("host receipt already exists")
+
     rows = []
     stop = False
     for model in models:
@@ -264,10 +272,8 @@ def host_run(ui, DB, runtime, directory):
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("ascii")
     if len(encoded) > MAX_JSON:
         raise ValueError("host receipt too large")
-    receipt = os.path.join(directory, "host-receipt.json")
-    if os.path.exists(receipt):
+    if "host-receipt.json" in (name.lower() for name in os.listdir(directory)):
         raise ValueError("host receipt already exists")
-    temp = receipt + ".tmp"
     with open(temp, "wb") as stream:
         stream.write(encoded)
     os.rename(temp, receipt)

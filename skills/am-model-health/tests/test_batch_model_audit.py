@@ -47,7 +47,7 @@ def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False
 
         def Close(self, save):
             events.append(("close", save))
-            if close_fails:
+            if close_fails is True or Path(self.PathName).name == close_fails:
                 return False
             documents.remove(self)
             return True
@@ -217,6 +217,7 @@ def test_staged_worker_reads_version_from_loaded_runtime(batch, monkeypatch, loa
 
 @pytest.mark.parametrize("mutant", [
     "missing", "stale", "duplicate", "wrong_digest", "unknown_build", "wrong_health_total", "wrong_parameter_total",
+    "unexplained_not_run", "audit_after_close_failure",
 ])
 def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch, mutant):
     _, work, plan, _ = batch
@@ -229,6 +230,12 @@ def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch,
             data["run_id"] = "stale"
         elif mutant == "duplicate":
             data["rows"][0] = data["rows"][1]
+        elif mutant == "unexplained_not_run":
+            data["rows"][1]["status"] = "not_run"
+            del data["rows"][1]["summary"]
+        elif mutant == "audit_after_close_failure":
+            data["rows"][1]["status"] = "close_failed"
+            del data["rows"][1]["summary"]
         elif mutant == "unknown_build":
             data["runtime"]["pyrevit_build"] = "Unknown"
         elif mutant == "wrong_health_total":
@@ -270,6 +277,41 @@ def test_close_failure_stops_other_models(batch, monkeypatch):
         "close_failed", "not_run", "not_run", "not_run", "not_run",
     ]
     assert events.count(("close", False)) == 1
+
+
+def test_late_close_failure_keeps_earlier_model_reports(batch, monkeypatch):
+    _, work, plan, _ = batch
+    ui, db, events = fake_host(monkeypatch, close_fails="model-003.rvt")
+    host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    result = collect(plan)
+    assert result.returncode == 1
+    rows = json.loads(result.stdout)["models"]
+    assert [row["status"] for row in rows] == ["audited", "audited", "close_failed", "not_run", "not_run"]
+    assert [row["summary"]["health_checks"]["warnings"]["value"] for row in rows[:2]] == [60, 60]
+    assert events.count(("close", False)) == 3
+
+
+def test_worker_does_not_reopen_models_in_a_finished_workspace(batch, monkeypatch):
+    _, work, plan, _ = batch
+    ui, db, events = fake_host(monkeypatch)
+    host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    prior = collect(plan).stdout
+    events.clear()
+    with pytest.raises(ValueError, match="receipt already exists"):
+        host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    assert events == []
+    assert collect(plan).stdout == prior
+
+
+def test_interrupted_workspace_is_not_reused_by_the_worker(batch, monkeypatch):
+    _, work, _, _ = batch
+    ui, db, events = fake_host(monkeypatch)
+    pending = work / "host-receipt.json.tmp"
+    pending.write_text("interrupted")
+    with pytest.raises(FileExistsError):
+        host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+    assert events == []
+    assert pending.read_text() == "interrupted"
 
 
 def test_workshared_preflight_never_opens_a_model(batch, monkeypatch):
