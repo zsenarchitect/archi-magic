@@ -15,7 +15,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import html
+from itertools import zip_longest
 import json
 import os
 import sys
@@ -76,32 +78,67 @@ def render_findings(findings: List[Dict[str, Any]]) -> str:
     )
 
 
+def pair_preview_rows(preview):
+    before = preview.get("before", [])
+    after = preview.get("after", [])
+    columns = preview.get("columns", [])
+    key_column = preview.get("keyColumn")
+    if key_column is None:
+        return zip_longest(before, after)
+    if key_column not in columns:
+        raise ValueError("Preview key column is absent from the table.")
+    key_index = columns.index(key_column)
+
+    def index_rows(rows):
+        indexed = {}
+        occurrences = Counter()
+        for row in rows:
+            key = str(row[key_index]) if key_index < len(row) else object()
+            indexed[key, occurrences[key]] = row
+            occurrences[key] += 1
+        return indexed
+
+    left = index_rows(before)
+    right = index_rows(after)
+    return ((left.get(key), right.get(key)) for key in dict.fromkeys((*left, *right)))
+
+
 def render_preview(preview: Dict[str, Any]) -> str:
     if not preview:
         return "<p>No change preview supplied.</p>"
     cols = preview.get("columns", [])
     changed = set(preview.get("changedColumns", []))
-    before = preview.get("before", [])
-    after = preview.get("after", [])
-    head = "".join(f"<th>{_e(c)}</th>" for c in cols)
+    head = "<th>Status</th>" + "".join(f"<th>{_e(c)}</th>" for c in cols)
     body = []
-    for b_row, a_row in zip(before, after):
+    for before, after in pair_preview_rows(preview):
+        if before is None:
+            status = "Added"
+        elif after is None:
+            status = "Removed"
+        else:
+            status = "Unchanged"
+
         cells = []
-        for i, _ in enumerate(cols):
-            b = b_row[i] if i < len(b_row) else ""
-            a = a_row[i] if i < len(a_row) else ""
-            if cols[i] in changed and b != a:
-                cells.append(f"<td class='chg'><del>{_e(b)}</del> &rarr; <ins>{_e(a)}</ins></td>")
+        for i, column in enumerate(cols):
+            old = before[i] if before is not None and i < len(before) else ""
+            new = after[i] if after is not None and i < len(after) else ""
+            if before is not None and after is not None and column in changed and old != new:
+                status = "Changed"
+                cells.append(f"<td class='chg'><del>{_e(old)}</del> &rarr; <ins>{_e(new)}</ins></td>")
             else:
-                cells.append(f"<td>{_e(a)}</td>")
-        body.append("<tr>" + "".join(cells) + "</tr>")
+                cells.append(f"<td>{_e(old if after is None else new)}</td>")
+        body.append(f"<tr><td>{status}</td>" + "".join(cells) + "</tr>")
+    warnings = preview.get("warnings", [])
     notes = "".join(f"<li>{_e(n)}</li>" for n in preview.get("notes", []))
-    warns = "".join(f"<li class='warn'>{_e(w.get('text'))}</li>" for w in preview.get("warnings", []))
+    warns = "".join(f"<li class='warn'>{_e(w.get('text'))}</li>" for w in warnings)
+    blocked = preview.get("blocked") or any(w.get("blocking") for w in warnings)
+    gate = ("Preview blocked. Resolve the blocking items before continuing." if blocked
+            else "Preview only. Approve or discard the change in Revit (Keep/Discard).")
     return (
         f"<h3>{_e(preview.get('title', 'Change preview'))}</h3>"
         f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
         f"<ul>{notes}</ul><ul>{warns}</ul>"
-        "<p class='gate'>Preview only. Approve or discard the change in Revit (Keep/Discard).</p>"
+        f"<p class='gate'>{gate}</p>"
     )
 
 
@@ -150,8 +187,13 @@ def main() -> int:
 
     findings = collect_findings([load_json(a) for a in args.audit])
     preview = load_json(args.preview) if args.preview else {}
+    try:
+        page = build_page(args.title, findings, preview)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(build_page(args.title, findings, preview))
+        f.write(page)
     print(f"Wrote {args.out} ({len(findings)} findings)")
     return 0
 
