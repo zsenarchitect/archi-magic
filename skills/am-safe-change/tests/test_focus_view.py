@@ -212,6 +212,23 @@ def test_focus_modes_with_independent_readback(host, action, low, high):
     assert [i.Value for i in doc.selection] == [31, 30]
 
 
+@pytest.mark.parametrize("change", ["geometry", "identity"])
+def test_readback_refuses_changed_elements_with_same_selection_ids(host, change):
+    doc, run = host
+    plan = plan_for(run, "create_3d")
+    output = run({"mode": "apply", "plan": plan})
+    assert output["status"] == "ok", output
+    if change == "geometry":
+        doc.elements[30].bounds.Max = xyz(50, 60, 80)
+    else:
+        doc.elements[30].UniqueId = "replacement-element"
+    verified = run({"mode": "verify", "action": "create_3d", "view_id": output["view_id"],
+                    "view_uid": output["view_uid"]})
+    assert verified["status"] == "ok", verified
+    with pytest.raises(ValueError, match="selected element identity or bounds changed"):
+        compute.check_result(plan, verified)
+
+
 @pytest.mark.parametrize("change", ["geometry", "selection", "name", "model", "plan", "split"])
 def test_changed_intent_and_state_stop_before_transaction(host, change):
     doc, run = host
