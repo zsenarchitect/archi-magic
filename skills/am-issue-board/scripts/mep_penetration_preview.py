@@ -113,6 +113,8 @@ def tracked_status(rows, key, host, run, pair, complete, clearance, tolerance):
         prior = row["geometry"]
         if fingerprint(prior) != digest(row["geometry_sha256"]):
             return "unresolved", "The saved opening geometry does not match its record."
+        for field in ("entry_ft", "exit_ft"):
+            vector(prior[field], 3)
         if digest(row["opening_sha256"]) != digest(row["observed_opening_sha256"]):
             return "out_of_date", "The opening itself moved or changed size."
         if pair["status"] == "no_crossing" and pair.get("gross_verified") is True:
@@ -160,10 +162,16 @@ def preview(snapshot):
         key = crossing_key(project, link, link_instance, host_id, run_id)
         report = {"crossing_key": key, "ruleId": "MEP-PEN-01", "host_uid": host_id, "run_uid": run_id,
                   "host_id": host["id"] if host else None, "linked_run_id": run["id"] if run else None,
-                  "system": run.get("system") if run else None}
+                  "system": run.get("system") if run else None,
+                  "fire_rating": host.get("fire_rating") if host else None}
         existing = tracked.get((host_id, run_id))
         if existing:
             status, reason = tracked_status(existing, key, host, run, pair, complete, clearance, tolerance)
+            if status == "out_of_date":
+                prior = existing[0]["geometry"]
+                report["location"] = [a / 2 + b / 2 for a, b in zip(vector(prior["entry_ft"], 3),
+                                                                    vector(prior["exit_ft"], 3))]
+                report["location_basis"] = "last reviewed crossing"
         elif pair["status"] == "no_crossing":
             continue
         elif not complete or host["cuts_complete"] is not True:
@@ -176,7 +184,8 @@ def preview(snapshot):
             try:
                 geometry = measured_geometry(host, run, pair, clearance, tolerance)
                 location = [a / 2 + b / 2 for a, b in zip(geometry["entry_ft"], geometry["exit_ft"])]
-                report.update(geometry=geometry, geometry_sha256=fingerprint(geometry), location=location)
+                report.update(geometry=geometry, geometry_sha256=fingerprint(geometry),
+                              location=location, location_basis="measured crossing")
                 status, reason = "proposed", "A measured full crossing needs a reviewed opening."
                 proposed.setdefault(host_id, []).append(dict(geometry["outline"], key=key))
             except (KeyError, OverflowError, TypeError, ValueError) as error:

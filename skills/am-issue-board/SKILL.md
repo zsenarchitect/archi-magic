@@ -224,6 +224,12 @@ Save the full placement decision as `modify.json`. Run an independent query with
 
 Run `python scripts/verify_mep_penetration_decision.py choices.json before.json trial.json after.json modify.json fresh.json`. Stop and identify the named Undo entry if Keep fails verification. Verify the workflow on the installed Revit bridge before using project data.
 
+### Preview MEP findings on the issue board
+
+Read the active board and any existing archive from the same saved host project. Run `python scripts/mep_penetration_board.py --evidence evidence.json --board board.json --crossing <key>`. Repeat `--crossing` for each reviewed finding and pass `--archive archive.json` if the board has an archive.
+
+The preview lists matching issue numbers on the active board or archive. A new entry includes the host ID, linked run ID, system, crossing location in host internal feet, and any fire rating read from Revit. Existing entries require an explicit board edit. Review the preview through the board's own safe-change flow before applying a new entry.
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.

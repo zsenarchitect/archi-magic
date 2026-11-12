@@ -294,6 +294,20 @@ def principal_references(DB, element):
     return kind, [list(rows)[0] for rows in refs]
 
 
+def host_fire_rating(DB, element):
+    parameter_id = DB.BuiltInParameter.FIRE_RATING
+    element_type = element.Document.GetElement(element.GetTypeId())
+    for source in (element, element_type):
+        if source is None:
+            continue
+        parameter = source.get_Parameter(parameter_id)
+        if parameter is not None and parameter.StorageType == DB.StorageType.String:
+            value = parameter.AsString()
+            if value and str(value).strip():
+                return str(value).strip()
+    return None
+
+
 def principal_host(DB, element, minimum_web, tolerance, budget):
     scope = element_scope(element)
     kind, refs = principal_references(DB, element)
@@ -336,6 +350,7 @@ def principal_host(DB, element, minimum_web, tolerance, budget):
     holes.sort(key=lambda row: (row["center"], row["shape"]))
     existing = [dict(hole, key=f"measured-cut-{index + 1}") for index, hole in enumerate(holes)]
     row = dict(element_record(element), kind=kind, normal=xyz(normal), depth_ft=scalar(depth),
+               fire_rating=host_fire_rating(DB, element),
                gross_sha256=fingerprint(corners), cuts_complete=True, minimum_web_ft=minimum_web, existing=existing,
                **scope)
     return row, (faces, frame, outer, holes, solids[0], bounds(DB, element, DB.Transform.Identity))
