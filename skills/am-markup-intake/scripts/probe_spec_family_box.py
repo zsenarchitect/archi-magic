@@ -87,12 +87,31 @@ def measure_box(extrusion):
     return [min(values) for values in axes], [max(values) for values in axes]
 
 
-def verify_box(extrusion, dimensions):
+def verify_bounds(extrusion, expected_minimum, expected_maximum):
     minimum, maximum = measure_box(extrusion)
-    if max(abs(value) for value in minimum) > TOLERANCE_FT or any(
-            abs(actual - expected) > TOLERANCE_FT for actual, expected in zip(maximum, dimensions)):
-        raise ValueError("The Revit extrusion bounds differ from the reviewed box.")
+    if any(abs(actual - expected) > TOLERANCE_FT for actual, expected in
+           zip(minimum + maximum, expected_minimum + expected_maximum)):
+        raise ValueError("The Revit extrusion bounds differ from the reviewed box or clearance.")
     return {"min_ft": minimum, "max_ft": maximum}
+
+
+def create_box(document, minimum, maximum, created):
+    left, front, bottom = minimum
+    right, back, top = maximum
+    origin = DB.XYZ(0, 0, bottom)
+    sketch_plane = DB.SketchPlane.Create(document, DB.Plane.CreateByNormalAndOrigin(DB.XYZ.BasisZ, origin))
+    created.append(sketch_plane.Id)
+    points = [DB.XYZ(left, front, bottom), DB.XYZ(right, front, bottom),
+              DB.XYZ(right, back, bottom), DB.XYZ(left, back, bottom)]
+    loop = DB.CurveArray()
+    for start, end in zip(points, points[1:] + points[:1]):
+        loop.Append(DB.Line.CreateBound(start, end))
+    profile = DB.CurveArrArray()
+    profile.Append(loop)
+    extrusion = document.FamilyCreate.NewExtrusion(True, profile, sketch_plane, float(top - bottom))
+    created.append(extrusion.Id)
+    document.Regenerate()
+    return extrusion
 
 
 def probe(document, args):
@@ -105,45 +124,51 @@ def probe(document, args):
     dimensions, spec = specification(args["specification_json"], args["specification_sha256"])
     if min(dimensions) <= document.Application.ShortCurveTolerance:
         raise ValueError("A reviewed box dimension is below Revit's short-curve limit.")
-    view = original_parameters = None
+    view = original_parameters = offsets = None
     if "constraint_view" in args:
         from spec_family_box_constraints import add_plan_constraints, family_parameters, plan_view
+        from spec_family_clearance import clearance_bounds, clearance_offsets, constrain_clearance, existing_clearance_category
         from spec_family_source_parameters import read_source_values, set_source_values, source_values
         view = plan_view(document, args["constraint_view"])
         original_parameters = family_parameters(document)
         metadata = source_values(spec)
-    width, depth, height = dimensions
+        offsets = clearance_offsets(spec)
+        if offsets is not None and existing_clearance_category(document):
+            raise ValueError("The blank fixture already contains the Equipment Clearance subcategory.")
+    zero = [0, 0, 0]
     transaction = DB.Transaction(document, "Try reviewed equipment extrusion and roll back")
     created, failure, bounds, flexed, verified_metadata = [], None, None, {}, {}
+    envelope = clearance = None
+    flexed_clearance = {}
     try:
         if transaction.Start() != DB.TransactionStatus.Started:
             raise ValueError("Revit did not confirm the family fixture transaction started.")
-        sketch_plane = DB.SketchPlane.Create(document, DB.Plane.CreateByNormalAndOrigin(DB.XYZ.BasisZ, DB.XYZ.Zero))
-        created.append(sketch_plane.Id)
-        points = [DB.XYZ.Zero, DB.XYZ(width, 0, 0), DB.XYZ(width, depth, 0), DB.XYZ(0, depth, 0)]
-        loop = DB.CurveArray()
-        for start, end in zip(points, points[1:] + points[:1]):
-            loop.Append(DB.Line.CreateBound(start, end))
-        profile = DB.CurveArrArray()
-        profile.Append(loop)
-        extrusion = document.FamilyCreate.NewExtrusion(True, profile, sketch_plane, height)
-        created.append(extrusion.Id)
-        document.Regenerate()
-        bounds = verify_box(extrusion, dimensions)
+        extrusion = create_box(document, zero, dimensions, created)
+        bounds = verify_bounds(extrusion, zero, dimensions)
         if view is not None:
             parameters = add_plan_constraints(document, view, extrusion, dimensions, created)
-            verify_box(extrusion, dimensions)
+            verify_bounds(extrusion, zero, dimensions)
             manager = document.FamilyManager
             source_parameters = set_source_values(manager, metadata)
+            if offsets is not None:
+                envelope_minimum, envelope_maximum = clearance_bounds(dimensions, offsets)
+                envelope = create_box(document, envelope_minimum, envelope_maximum, created)
+                constrain_clearance(document, view, envelope, envelope_minimum, envelope_maximum, offsets, created)
+                clearance = verify_bounds(envelope, envelope_minimum, envelope_maximum)
+                verify_bounds(extrusion, zero, dimensions)
             for index, (axis, parameter) in enumerate(zip(AXES, parameters)):
                 trial = list(dimensions)
                 trial[index] *= 1.1
                 manager.Set(parameter, trial[index])
                 document.Regenerate()
-                flexed[axis] = verify_box(extrusion, trial)
+                flexed[axis] = verify_bounds(extrusion, zero, trial)
+                if envelope is not None:
+                    flexed_clearance[axis] = verify_bounds(envelope, *clearance_bounds(trial, offsets))
                 manager.Set(parameter, dimensions[index])
                 document.Regenerate()
-                verify_box(extrusion, dimensions)
+                verify_bounds(extrusion, zero, dimensions)
+                if envelope is not None:
+                    verify_bounds(envelope, envelope_minimum, envelope_maximum)
             verified_metadata = read_source_values(manager, source_parameters, metadata)
     except ValueError as error:
         failure = {"message": str(error)}
@@ -158,7 +183,8 @@ def probe(document, args):
                             or status == DB.TransactionStatus.RolledBack == transaction.GetStatus())
                            and all(document.GetElement(element_id) is None for element_id in created)
                            and snapshot(document) == before
-                           and (original_parameters is None or family_parameters(document) == original_parameters))
+                           and (original_parameters is None or family_parameters(document) == original_parameters)
+                           and (offsets is None or not existing_clearance_category(document)))
         except Exception:
             rolled_back = False
     if not rolled_back:
@@ -167,7 +193,7 @@ def probe(document, args):
         return dict(failure, status="stopped", rollback_verified=True)
     return {"status": "measured", "rollback_verified": True, "geometry": bounds,
             "reviewed_dimensions_ft": dict(zip(AXES, dimensions)), "flexed_geometry": flexed, "fixture": before,
-            "source_parameters": verified_metadata,
+            "source_parameters": verified_metadata, "clearance_geometry": clearance, "flexed_clearance": flexed_clearance,
             "specification_sha256": args["specification_sha256"],
             "revit_build": str(document.Application.VersionBuild), "python_engine": platform.python_implementation()}
 

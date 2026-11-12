@@ -33,11 +33,10 @@ def family_parameters(document):
     }
 
 
-def planar_sides(extrusion, dimensions):
+def planar_sides(extrusion, minimum, maximum):
     options = DB.Options()
     options.ComputeReferences = True
-    width, depth = dimensions[:2]
-    sides = (("X", 0), ("X", width), ("Y", 0), ("Y", depth))
+    sides = (("X", minimum[0]), ("X", maximum[0]), ("Y", minimum[1]), ("Y", maximum[1]))
     matches = {key: [] for key in sides}
     for item in extrusion.get_Geometry(options):
         if not isinstance(item, DB.Solid):
@@ -57,18 +56,13 @@ def planar_sides(extrusion, dimensions):
     return [matches[key][0] for key in sides]
 
 
-def add_plan_constraints(document, view, extrusion, dimensions, created):
+def constrain_box(document, view, extrusion, minimum, maximum, parameters, created):
     manager, factory = document.FamilyManager, document.FamilyCreate
-    existing = family_parameters(document)
-    if TYPE_NAME in existing["types"] or any(name in PARAMETER_NAMES for _, name in existing["parameters"]):
-        raise ValueError("The blank fixture already contains the probe type or parameters.")
-    manager.NewType(TYPE_NAME)
-    parameters = [manager.AddParameter(name, DB.GroupTypeId.Geometry, DB.SpecTypeId.Length, False)
-                  for name in PARAMETER_NAMES]
-    width, depth = dimensions[:2]
+    left, front = minimum[:2]
+    right, back = maximum[:2]
     endpoints = [
-        ((0, -2, 0), (0, depth + 2, 0)), ((width, -2, 0), (width, depth + 2, 0)),
-        ((-2, 0, 0), (width + 2, 0, 0)), ((-2, depth, 0), (width + 2, depth, 0)),
+        ((left, front - 2, 0), (left, back + 2, 0)), ((right, front - 2, 0), (right, back + 2, 0)),
+        ((left - 2, front, 0), (right + 2, front, 0)), ((left - 2, back, 0), (right + 2, back, 0)),
     ]
     planes = []
     for index, (start, end) in enumerate(endpoints):
@@ -79,10 +73,12 @@ def add_plan_constraints(document, view, extrusion, dimensions, created):
         planes.append(plane)
     document.Regenerate()
     plane_refs = [plane.GetReference() for plane in planes]
-    for plane_ref, face_ref in zip(plane_refs, planar_sides(extrusion, dimensions)):
+    for plane_ref, face_ref in zip(plane_refs, planar_sides(extrusion, minimum, maximum)):
         constraint = factory.NewAlignment(view, plane_ref, face_ref)
         created.append(constraint.Id)
-    for index, endpoints in enumerate((((0, -1, 0), (width, -1, 0)), ((-1, 0, 0), (-1, depth, 0)))):
+    dimension_lines = (((left, front - 1, 0), (right, front - 1, 0)),
+                       ((left - 1, front, 0), (left - 1, back, 0)))
+    for index, endpoints in enumerate(dimension_lines):
         references = DB.ReferenceArray()
         for reference in plane_refs[index * 2:index * 2 + 2]:
             references.Append(reference)
@@ -94,6 +90,17 @@ def add_plan_constraints(document, view, extrusion, dimensions, created):
     if height is None or not manager.CanElementParameterBeAssociated(height):
         raise ValueError("Revit did not expose an associable extrusion end parameter.")
     manager.AssociateElementParameterToFamilyParameter(height, parameters[2])
+
+
+def add_plan_constraints(document, view, extrusion, dimensions, created):
+    manager = document.FamilyManager
+    existing = family_parameters(document)
+    if TYPE_NAME in existing["types"] or any(name in PARAMETER_NAMES for _, name in existing["parameters"]):
+        raise ValueError("The blank fixture already contains the probe type or parameters.")
+    manager.NewType(TYPE_NAME)
+    parameters = [manager.AddParameter(name, DB.GroupTypeId.Geometry, DB.SpecTypeId.Length, False)
+                  for name in PARAMETER_NAMES]
+    constrain_box(document, view, extrusion, [0, 0, 0], dimensions, parameters, created)
     for parameter, value in zip(parameters, dimensions):
         manager.Set(parameter, float(value))
     document.Regenerate()
