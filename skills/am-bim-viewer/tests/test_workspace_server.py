@@ -298,7 +298,9 @@ def test_browser_workspace_serves_installed_shell_and_authorized_review_rows(tmp
     identifier = 9007199254740993
     message = "</script><img src=x onerror=alert(1)>"
     publish(root, slot, 1, {"columns": ["Element ID", "Text"], "before": [[identifier, "Old"]],
-                           "after": [[identifier, message]], "review_only": True})
+                           "after": [[identifier, message]], "review_only": True,
+                           "deletions": [{"id": identifier, "category": "Detail Lines", "name": message,
+                                          "script": "private execution field"}]})
     project = "/projects/sample"
     snapshot = project + "/workspace"
 
@@ -328,9 +330,15 @@ def test_browser_workspace_serves_installed_shell_and_authorized_review_rows(tmp
                 assert result["role"] == actor
                 artifact = result["artifacts"]["latest"]
                 assert artifact["freshness"] == "ready"
-                assert artifact["notices"] == ["This preview is review only."]
-                target = (await (await client.get(project + "/artifacts/latest", headers=HEADERS,
-                                                   cookies=cookie)).json())["targets"][0]
+                assert artifact["notices"] == [
+                    "This preview is review only.", "Delete: 1 element", f"ID {identifier} | Detail Lines | {message}",
+                ]
+                published = await (await client.get(project + "/artifacts/latest", headers=HEADERS,
+                                                    cookies=cookie)).json()
+                assert published["data"]["deletions"] == [
+                    {"id": str(identifier), "category": "Detail Lines", "name": message},
+                ]
+                target, = published["targets"]
                 assert artifact["rows"] == [{
                     "target": target, "title": "Change 1",
                     "details": [f"Before · Element ID = {identifier} · Text = Old",

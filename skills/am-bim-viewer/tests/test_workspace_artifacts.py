@@ -99,6 +99,16 @@ def test_published_preview_excludes_model_execution_fields(tmp_path):
     assert data == {key: value for key, value in preview.items() if key != "steps"}
 
 
+@pytest.mark.parametrize("ids", [[1, "1"], [2**63], [False], ["01"]])
+def test_publisher_rejects_ambiguous_or_invalid_deletion_ids(tmp_path, ids):
+    slot = {"kind": "preview", "path": "preview.json"}
+    preview = {"kind": "change-preview", "columns": ["Element ID"], "before": [], "after": [],
+               "deletions": [{"id": value, "category": "Detail Lines", "name": "Fixture line"} for value in ids]}
+    with pytest.raises(ValueError, match="distinct exact deletion IDs"):
+        artifacts.publish(tmp_path.resolve(), slot, 1, preview)
+    assert not (tmp_path / "preview.json").exists()
+
+
 def test_document_page_accepts_largest_table_and_comparison_records():
     from workspace_documents import encode_page
 

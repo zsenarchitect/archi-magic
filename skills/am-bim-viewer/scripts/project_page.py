@@ -278,7 +278,34 @@ def read_change_preview(value):
             or not isinstance(value.get("notes", []), list)
             or any(type(value.get(flag, False)) is not bool for flag in ("review_only", "blocked"))):
         raise ValueError(error)
+    if "deletions" in value:
+        entries = value["deletions"]
+        if not isinstance(entries, list) or len(entries) > 5000:
+            raise ValueError("Use a bounded list of planned deletions.")
+        deletions = []
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("Name the ID, category, and element for each deletion.")
+            identifier = issue_element_id(entry.get("id"))
+            category, name = entry.get("category"), entry.get("name")
+            if (identifier is None or identifier in seen
+                    or any(not isinstance(text, str) or not text.strip() or len(text) > 4096
+                           for text in (category, name))):
+                raise ValueError("Use distinct exact deletion IDs and provide their categories and names.")
+            seen.add(identifier)
+            deletions.append({"id": identifier, "category": category, "name": name})
+        value = dict(value, deletions=deletions)
     return value
+
+
+def preview_deletion_lines(preview):
+    deletions = preview.get("deletions", [])
+    if not deletions:
+        return []
+    count = len(deletions)
+    heading = f"Delete: {count} {'element' if count == 1 else 'elements'}"
+    return [heading, *(f"ID {row['id']} | {row['category']} | {row['name']}" for row in deletions)]
 
 
 def render_preview(preview: Dict[str, Any], viewer_name=None, model_facets=None) -> str:
@@ -333,8 +360,14 @@ def render_preview(preview: Dict[str, Any], viewer_name=None, model_facets=None)
         gate = "Review only. Use the recipe’s model change workflow to continue."
     else:
         gate = "Preview only. Approve or discard the change in Revit (Keep/Discard)."
+    deletion_lines = preview_deletion_lines(preview)
+    deletion_list = ""
+    if deletion_lines:
+        title, *entries = deletion_lines
+        deletion_list = f"<h4>{_e(title)}</h4><ul>" + "".join(f"<li>{_e(line)}</li>" for line in entries) + "</ul>"
     return (
         f"<h3>{_e(preview.get('title', 'Change preview'))}</h3>"
+        f"{deletion_list}"
         f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
         f"<ul>{notes}</ul><ul>{warns}</ul>"
         f"<p class='gate'>{gate}</p>"

@@ -119,7 +119,9 @@ def validate_data(kind, data):
     if kind == "audit":
         collect_findings([data])
     elif kind == "preview":
-        read_change_preview(data)
+        validated = read_change_preview(data)
+        if validated.get("deletions") != data.get("deletions"):
+            raise ValueError("Published deletion rows must use only exact decimal-string IDs and review labels.")
     elif kind == "board":
         render_board(data)
         if len({row["number"] for row in data["issues"]}) != len(data["issues"]):
@@ -147,7 +149,7 @@ def make_artifact(slot, generation, raw):
     elif kind == "preview":
         preview = read_change_preview(raw)
         keys = ("kind", "title", "keyColumn", "columns", "changedColumns", "before", "after", "notes", "warnings",
-                "review_only", "blocked")
+                "review_only", "blocked", "deletions")
         data = {key: preview[key] for key in keys if key in preview}
     elif kind == "board":
         data = normalize_board(raw, slot)

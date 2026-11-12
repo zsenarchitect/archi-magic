@@ -58,6 +58,18 @@ def test_preview_shows_change_and_gate():
     assert "Keep/Discard" in out
 
 
+def test_local_preview_shows_the_exact_deletion_list_before_edits():
+    label = "</script><img src=x>"
+    preview = pp.read_change_preview(dict(PREVIEW, deletions=[
+        {"id": 9007199254740993, "category": "Detail Lines", "name": label, "script": "private"},
+    ]))
+    out = pp.render_preview(preview)
+    assert preview["deletions"] == [{"id": "9007199254740993", "category": "Detail Lines", "name": label}]
+    assert out.index("<h4>Delete: 1 element</h4>") < out.index("<table>")
+    assert "ID 9007199254740993 | Detail Lines | &lt;/script&gt;&lt;img src=x&gt;" in out
+    assert label not in out and "private" not in out
+
+
 def test_page_has_no_network_and_cli_works(tmp_path):
     a = tmp_path / "a.json"
     a.write_text(json.dumps(AUDIT), encoding="utf-8")

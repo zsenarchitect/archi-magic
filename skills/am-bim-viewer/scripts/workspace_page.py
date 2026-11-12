@@ -4,7 +4,7 @@ import base64
 import hashlib
 from pathlib import Path
 
-from project_page import collect_findings, pair_preview_rows
+from project_page import collect_findings, pair_preview_rows, preview_deletion_lines
 
 
 ASSETS = Path(__file__).resolve().parents[1] / "workspace"
@@ -48,6 +48,7 @@ def describe_artifact(artifact):
             notices.append("This preview is blocked.")
         if data.get("review_only"):
             notices.append("This preview is review only.")
+        notices.extend(preview_deletion_lines(data))
         notices.extend(warning["text"] for warning in data.get("warnings", []))
         rows = [
             {"title": f"Change {index}",
