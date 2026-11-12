@@ -172,7 +172,8 @@ def test_issue_board_filters_use_exact_unambiguous_model_ids():
              "element_ids": [identifier, 3], "findings": [], "todos": [], "assignees": [],
              "comments": [], "related": []}
     board = {"header": {"title": "Board"}, "warnings": [], "issues": [issue]}
-    page = pp.build_page("Project", [], {}, board=board, model_facets=pp.model_issue_facets(model))
+    page = pp.build_page("Project", [], {}, board=board, viewer_name="model.viewer.html",
+                         model_facets=pp.model_issue_facets(model))
 
     class Parser(HTMLParser):
         facets = None
@@ -187,6 +188,7 @@ def test_issue_board_filters_use_exact_unambiguous_model_ids():
     assert "<option value='&lt;Walls&gt;'>&lt;Walls&gt;</option>" in page
     assert all(text not in page for text in ("<Walls>", "Adjacent ID", "Conflicting ID", "Other duplicate"))
     assert "name='level'" in page and "name='severity'" in page
+    assert "href='model.viewer.html#elements=9007199254740993,3'>Frame 1 of 2 issue elements" in page
     assert "name='category'" not in pp.build_page("Project", [], {}, board=board)
     script = page.split("<script>", 1)[1].split("</script>", 1)[0]
     digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
@@ -293,6 +295,31 @@ def test_project_page_builds_and_links_local_model(tmp_path, monkeypatch):
     assert f"href='{sibling}'" in out.read_text()
     assert str(model) not in out.read_text()
     assert model.read_text() == '{"elements": []}'
+
+
+def test_project_model_preserves_numeric_revit_ids_beyond_javascript_precision(tmp_path, monkeypatch):
+    model = tmp_path / "model.json"
+    identifier = 9007199254740993
+    original = {"elements": [{"id": identifier, "category": "Walls"}, {"id": 1}]}
+    model.write_text(json.dumps(original))
+    issue = {"number": 1, "status": "OPEN", "title": "Check", "severity": [], "element_ids": [identifier],
+             "findings": [], "todos": [], "assignees": [], "comments": [], "related": []}
+    board = {"header": {"title": "Board"}, "warnings": [], "issues": [issue]}
+    out = tmp_path / "project.html"
+
+    def build_model(command, **kwargs):
+        source = Path(command[3])
+        assert source != model
+        assert json.loads(source.read_text())["elements"] == [
+            {"id": str(identifier), "category": "Walls"}, {"id": 1},
+        ]
+        Path(command[4]).write_text("<!doctype html><title>Viewer</title>")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", build_model)
+    pp.write_project_with_model(out, model, "Project", [], {}, board, [])
+    assert f"#elements={identifier}" in out.read_text()
+    assert json.loads(model.read_text()) == original
 
 
 def test_project_page_preserves_old_report_if_model_build_fails(tmp_path, monkeypatch):

@@ -287,6 +287,15 @@ BOARD_FILTER_HASH = base64.b64encode(hashlib.sha256(BOARD_FILTER_SCRIPT.encode("
 BOARD_FACETS = ("severity", "category", "level")
 
 
+def issue_element_id(value):
+    if type(value) is int:
+        value = str(value)
+    if (not isinstance(value, str) or not value.isascii() or not value.isdecimal()
+            or len(value) > 19 or value.startswith("0") or int(value) > 2**63 - 1):
+        return None
+    return value
+
+
 def model_issue_facets(model):
     """Index category and level by exact model export ID, omitting ambiguous IDs."""
     if not isinstance(model, dict) or not isinstance(model.get("elements"), list):
@@ -295,11 +304,8 @@ def model_issue_facets(model):
     for element in model["elements"]:
         if not isinstance(element, dict):
             continue
-        identifier = element.get("id")
-        if type(identifier) is int:
-            identifier = str(identifier)
-        if (not isinstance(identifier, str) or not identifier.isascii() or not identifier.isdecimal()
-                or len(identifier) > 19 or identifier.startswith("0") or int(identifier) > 2**63 - 1):
+        identifier = issue_element_id(element.get("id"))
+        if identifier is None:
             continue
         if identifier in indexed:
             indexed[identifier] = None
@@ -309,7 +315,7 @@ def model_issue_facets(model):
     return indexed
 
 
-def render_board(board, model_facets=None):
+def render_board(board, model_facets=None, viewer_name=None):
     error = "Use the JSON output of board_cli.py parse for the issue board."
     if not isinstance(board, dict) or not isinstance(board.get("header"), dict):
         raise ValueError(error)
@@ -358,14 +364,21 @@ def render_board(board, model_facets=None):
         severity = sorted({value.strip() for value in issue["severity"] if value.strip()})
         options["severity"].update(severity)
         matches = []
-        for identifier in dict.fromkeys(issue["element_ids"]):
-            attributes = model_facets.get(str(identifier)) if model_facets else None
-            if attributes:
+        issue_ids = [identifier for item in dict.fromkeys(issue["element_ids"])
+                     if (identifier := issue_element_id(item)) is not None]
+        for identifier in issue_ids:
+            attributes = model_facets.get(identifier) if model_facets else None
+            if attributes is not None:
                 matches.append(attributes)
                 for name, value in attributes.items():
                     options[name].add(value)
+        link = ""
+        if viewer_name and matches:
+            href = f"{viewer_name}#elements={','.join(issue_ids)}"
+            label = "Frame issue elements" if len(matches) == len(issue_ids) else f"Frame {len(matches)} of {len(issue_ids)} issue elements"
+            link = f"<p><a href='{_e(href)}'>{label}</a></p>"
         data = json.dumps({"severity": severity, "elements": matches}, ensure_ascii=True)
-        rendered.append(f"<details data-facets='{_e(data)}'><summary>{_e(summary)}</summary><dl>{details}</dl></details>")
+        rendered.append(f"<details data-facets='{_e(data)}'><summary>{_e(summary)}</summary>{link}<dl>{details}</dl></details>")
     notices = "".join(f"<li>{_e(warning)}</li>" for warning in warnings)
     warnings_html = f"<h3>Board warnings</h3><ul class='warn'>{notices}</ul>" if notices else ""
     rows = "".join(rendered) if rendered else "<p>No issues in the board.</p>"
@@ -405,7 +418,7 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
         for k, label in (("error", "errors"), ("warning", "warnings"), ("info", "info"), ("total", "total"))
     )
     model_link = f"<p><a href='{_e(viewer_name)}'>Open 3D model</a></p>" if viewer_name else ""
-    board_html = render_board(board, model_facets) if board is not None else ""
+    board_html = render_board(board, model_facets, viewer_name) if board is not None else ""
     script_policy = f"; script-src 'sha256-{BOARD_FILTER_HASH}'" if board_html else ""
     script = f"<script>{BOARD_FILTER_SCRIPT}</script>" if board_html else ""
     return (
@@ -424,13 +437,23 @@ def build_page(title: str, findings: List[Dict[str, Any]], preview: Dict[str, An
 
 def write_project_with_model(output, model, title, findings, preview, board, model_health):
     builder = Path(__file__).resolve().with_name("build-viewer.mjs")
-    facets = model_issue_facets(load_json(model)) if board is not None else None
     with TemporaryDirectory(prefix=".project-viewer-", dir=output.parent) as temporary:
         staging = Path(temporary)
         built = staging / "viewer.html"
+        source = model.resolve()
+        facets = None
+        if board is not None:
+            data = load_json(source)
+            facets = model_issue_facets(data)
+            # Keep exact native IDs when the viewer reads JSON with JavaScript numbers.
+            for element in data["elements"]:
+                if isinstance(element, dict) and type(element.get("id")) is int and element["id"] > 2**53 - 1:
+                    element["id"] = str(element["id"])
+            source = staging / "model.json"
+            source.write_text(json.dumps(data, ensure_ascii=True, allow_nan=False), encoding="utf-8")
         try:
             subprocess.run(
-                ["node", str(builder), "--offline", str(model.resolve()), str(built)],
+                ["node", str(builder), "--offline", str(source), str(built)],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
         except FileNotFoundError as error:
