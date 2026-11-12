@@ -1,0 +1,122 @@
+"""Bind a reviewed route to a fresh disposable Revit fixture before a trial."""
+
+from hashlib import sha256
+import importlib
+import json
+import math
+import ntpath
+from pathlib import Path
+import sys
+
+import mep_route_preview as route_preview
+from view_duplicate_preview import snapshot_digest
+
+
+def installed_reader():
+    scripts = Path(route_preview.__file__).resolve().parents[2] / "am-issue-board" / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        reader = importlib.import_module("read_mep")
+    finally:
+        sys.path.pop(0)
+    if (Path(reader.__file__).resolve() != scripts / "read_mep.py"
+            or Path(reader.ib.__file__).resolve() != scripts / "issue_board.py"):
+        raise ValueError("Use the matching installed issue-board scripts for trial preflight.")
+    return reader
+
+
+def read_record(reader, document, request, field):
+    response = reader.run_query(document, request)
+    if response.get("status") != "ok":
+        raise ValueError(response.get("message") or "Revit could not reread the reviewed route evidence.")
+    return json.loads(response[field])
+
+
+def prepare(document, args, reader=None):
+    if sys.implementation.name != "cpython" or sys.version_info < (3, 8):
+        raise ValueError("Use the qualified CPython bridge for the route trial.")
+    path = document.PathName
+    if (args.get("disposable_fixture") is not True or document.IsWorkshared or document.IsReadOnly
+            or document.IsModifiable or str(document.Application.VersionNumber) != "2026"
+            or not path or not ntpath.isabs(path) or path.startswith(("\\", "//"))
+            or not ntpath.splitdrive(path)[0] or ntpath.splitext(path)[1].lower() != ".rvt"):
+        raise ValueError("Open the reviewed writable standalone Revit 2026 fixture.")
+    raw = args["route_input_json"].encode("utf-8")
+    if len(raw) > 256 * 1024:
+        raise ValueError("The reviewed route input exceeds its size limit.")
+    data = json.loads(raw, object_pairs_hook=route_preview.unique_object)
+    reviewed_preview = args["preview"]
+    computed = route_preview.preview(data)
+    computed["basis_sha256"] = sha256(raw).hexdigest()
+    if computed["blocked"] or json.loads(json.dumps(computed, allow_nan=False)) != reviewed_preview:
+        raise ValueError("The saved review does not match a complete route preview.")
+
+    route = computed["route"]
+    source = route["source"]
+    endpoints = route["endpoints"]
+    points = route["points_ft"]
+    segments = list(zip(points, points[1:]))
+    if (source["link_instance_id"] is not None or source["host_identity"] != source["document_identity"]
+            or len({row["element_id"] for row in endpoints}) != 2
+            or any(row["shape"] != "Round" for row in endpoints)
+            or not 1 <= len(segments) <= 25 or len(route["bends_degrees"]) != len(segments) - 1
+            or any(math.dist(a, b) < 1 / 120 or (
+                abs(a[2] - b[2]) > route_preview.EPSILON and
+                math.hypot(a[0] - b[0], a[1] - b[1]) > route_preview.EPSILON) for a, b in segments)):
+        raise ValueError("Use distinct round host endpoints and up to 25 level or vertical segments.")
+    if ("routing_bounds_ft" not in data or data.get("obstacles")
+            or (not route["obstacle_records"] and args.get("empty_obstacle_scope") is not True)):
+        raise ValueError("Review the routing area and native obstacles or explicitly confirm an empty scope.")
+
+    types_record = args["types_record"]
+    owners_record = args["owners_record"]
+    types = types_record["types"]
+    fitting = types["fitting"]
+    if (fitting["domain"] != endpoints[0]["domain"]
+            or fitting["diameter_ft"] != endpoints[0]["dimensions_ft"][0]):
+        raise ValueError("The reviewed curve type domain or diameter differs from the endpoints.")
+    elbow = route["elbow_record"]
+    if ((route["bends_degrees"] and (elbow is None or fitting["elbow"] is None))
+            or (elbow is not None and elbow["fitting"] != fitting)):
+        raise ValueError("The reviewed route and trial types disagree on elbow selection.")
+
+    reader = reader or installed_reader()
+    owner_inputs = [{key: row[key] for key in ("element_id", "element_uid", "connector_id")} for row in endpoints]
+    owners_query = {"source": source, "route_trial_owners": owner_inputs}
+    types_query = {"source": source, "route_trial_types": {
+        "elbow": {key: fitting[key] for key in ("curve_type_id", "curve_type_uid", "diameter_ft")},
+        "system_type": {key: types["system_type"][key] for key in ("id", "uid")}, "level": types["level"],
+    }}
+    obstacle_queries = []
+    for record in route["obstacle_records"]:
+        obstacle_source = record["source"]
+        obstacle_queries.append((record, {
+            "source": obstacle_source,
+            "link_instance_id": obstacle_source["link_instance_id"],
+            "link_instance_uid": obstacle_source["link_instance_uid"],
+            "route_obstacles": [
+                {key: row[key] for key in ("element_id", "element_uid")} for row in record["obstacles"]
+            ],
+        }))
+    expected_owners = [(row["element_id"], row["element_uid"]) for row in endpoints]
+    if (read_record(reader, document, owners_query, "trial_owners_json") != owners_record
+            or owners_record["snapshot"]["endpoints"] != endpoints
+            or [(row["element_id"], row["element_uid"]) for row in owners_record["snapshot"]["owners"]]
+            != expected_owners
+            or read_record(reader, document, types_query, "trial_types_json") != types_record
+            or any(read_record(reader, document, query, "obstacles_json") != record
+                   for record, query in obstacle_queries)):
+        raise ValueError("The reviewed owners, types or obstacles differ from the current fixture.")
+
+    return {
+        "kind": "mep-route-trial-preflight", "version": 1, "source": source,
+        "route_input_sha256": computed["basis_sha256"], "review_sha256": snapshot_digest(reviewed_preview),
+        "owners_sha256": snapshot_digest(owners_record), "types_sha256": snapshot_digest(types_record),
+    }
+
+
+if "inputs" in globals():
+    try:
+        result = {"status": "ok", "preflight_json": json.dumps(prepare(doc, inputs), ensure_ascii=True)}
+    except (AttributeError, KeyError, TypeError, ValueError, OSError, ImportError, RecursionError) as error:
+        result = {"status": "stopped", "message": str(error)}
