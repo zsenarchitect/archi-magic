@@ -53,8 +53,8 @@ class ReferenceLimit(ValueError):
     pass
 
 
-def transfer_state(document, DB):
-    if (not document.IsFamilyDocument or document.IsModified or document.IsModifiable
+def transfer_state(document, DB, *, inspect_trial=False):
+    if (not document.IsFamilyDocument or ((document.IsModified or document.IsModifiable) and not inspect_trial)
             or document.IsWorkshared or document.IsModelInCloud):
         raise ValueError("Use an unmodified standalone family document for the inventory.")
     state = family_state(document)
@@ -107,7 +107,7 @@ def transfer_state(document, DB):
                 issue("dimension_reference", eid(dimension), error)
     except ReferenceLimit as error:
         issue("reference_limit", None, error)
-    if document.IsModified or document.IsModifiable:
+    if (document.IsModified or document.IsModifiable) and not inspect_trial:
         raise ValueError("The family changed during the read.")
     result = {"definitions": definitions, "types": state["types"], "current_type": state["current_type"],
               "dimensions": sorted(dimensions, key=lambda row: row["uid"]),

@@ -145,3 +145,161 @@ def test_final_namespace_rejects_a_new_ambiguous_formula_binding(records):
         values["14"] = {"state": "value", "value": 12.0}
     with pytest.raises(ValueError, match="unsupported punctuation"):
         preview(*seal(records))
+
+
+@pytest.fixture
+def trial_states(records):
+    from copy import deepcopy
+
+    source, target, request = records
+    plan = preview(*seal(records))
+    baseline = target["state"]
+    changed = deepcopy(baseline)
+    added = {"Panel Width": "21", "Total Width": "22"}
+    for name, identifier in added.items():
+        row = plan["operations"][name]
+        field = source["state"]["definitions"][row["source_id"]]
+        changed["definitions"][identifier] = dict(field, id=identifier)
+        for type_name, values in changed["types"].items():
+            values[identifier] = dict(row["expected_values"][type_name])
+    return plan, baseline, changed, added
+
+
+@pytest.mark.parametrize("failure", [None, "label", "association", "existing_value", "new_formula_value"])
+def test_family_trial_compares_every_protected_effect(trial_states, failure):
+    from family_parameter_transfer_effects import verify_family_effects
+
+    plan, baseline, changed, added = trial_states
+    if failure == "label":
+        changed["dimensions"] = [{"label_id": "21"}]
+    elif failure == "association":
+        changed["definitions"]["10"]["associations"] = [{"owner_uid": "changed"}]
+    elif failure == "existing_value":
+        changed["types"]["Target B"]["10"]["value"] = 4.0
+    elif failure == "new_formula_value":
+        changed["types"]["Target A"]["22"]["value"] = 0.0
+    if failure:
+        with pytest.raises(ValueError, match="trial"):
+            verify_family_effects(plan, baseline, changed, added)
+    else:
+        observed = verify_family_effects(plan, baseline, changed, added)
+        assert observed["Target A"] == {"Panel Width": {"state": "value", "value": 4.0},
+                                        "Total Width": {"state": "value", "value": 5.0}}
+
+
+@pytest.mark.parametrize("unapproved_element", [False, True])
+def test_trial_rolls_back_even_after_a_provisional_commit(trial_states, monkeypatch, unapproved_element):
+    from types import SimpleNamespace
+    import probe_family_parameter_transfer as trial
+
+    plan, baseline, changed, added = trial_states
+    statuses = SimpleNamespace(Uninitialized="initial", Started="started", Committed="committed",
+                               RolledBack="rolled_back")
+    actions = []
+
+    class Events:
+        def __iadd__(self, record):
+            self.record = record
+            return self
+
+        def __isub__(self, record):
+            assert record is self.record
+            self.record = None
+            return self
+
+    class Scope:
+        def __init__(self, document, name):
+            self.name = name
+            self.status = statuses.Uninitialized
+
+        def Start(self):
+            self.status = statuses.Started
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+        def RollBack(self):
+            actions.append(self.__class__.__name__)
+            self.status = statuses.RolledBack
+            return self.status
+
+        def Dispose(self):
+            pass
+
+    class Transaction(Scope):
+        def Commit(self):
+            self.status = statuses.Committed
+            application.DocumentChanged.record(None, SimpleNamespace(
+                GetDocument=lambda: document, Operation="TransactionCommitted",
+                GetTransactionNames=lambda: [self.name], GetAddedElementIds=lambda: [],
+                GetDeletedElementIds=lambda: [], GetModifiedElementIds=lambda: [],
+            ))
+            return self.status
+
+    class Group(Scope):
+        pass
+
+    application = SimpleNamespace(DocumentChanged=Events())
+    document = SimpleNamespace(Application=application, Equals=lambda other: other is document)
+    db = SimpleNamespace(Transaction=Transaction, TransactionGroup=Group, TransactionStatus=statuses)
+    elements = {"20": ["owner-20", "version"]}
+    observed = dict(elements, **({"88": ["unreviewed-88", "version"]} if unapproved_element else {}))
+    monkeypatch.setattr(trial, "add_definitions", lambda *args: added)
+    monkeypatch.setattr(trial, "transfer_state", lambda *args, **kwargs: changed)
+    monkeypatch.setattr(trial, "inventory", lambda *args: observed)
+
+    result = trial.execute_trial(document, db, plan, baseline, elements, "20")
+    assert actions == ["Group"]
+    assert application.DocumentChanged.record is None
+    if unapproved_element:
+        assert result == {"status": "stopped", "reason": "The trial changed elements outside the reviewed family additions."}
+    else:
+        assert result["status"] == "trial_rolled_back"
+        assert result["added_ids"] == added
+
+
+def test_native_mutation_applies_literal_before_formula_and_restores_current_type(records, monkeypatch):
+    from types import SimpleNamespace
+    from family_parameter_transfer_effects import add_definitions
+
+    source, target, request = records
+    source["state"]["definitions"]["4"] = field("4", "Clearance")
+    source["state"]["definitions"]["2"]["formula"] = "Base Width * 2 + Clearance"
+    source["state"]["types"]["Narrow"]["4"] = {"state": "value", "value": 0.0}
+    source["state"]["types"]["Wide"]["4"] = {"state": "value", "value": 0.0}
+    request["selected"].append("Clearance")
+    plan = preview(*seal(records))
+    baseline = target["state"]
+    actions = []
+
+    class Manager:
+        Types = [SimpleNamespace(Name=name) for name in baseline["types"]]
+        CurrentType = Types[0]
+
+        def AddParameter(self, name, group, spec, instance):
+            actions.append(("add", name, group, spec, instance))
+            return SimpleNamespace(Definition=SimpleNamespace(Name=name), StorageType="Double",
+                                   CanAssignFormula=True, Id=SimpleNamespace(Value=len(actions)))
+
+        def Set(self, parameter, value):
+            actions.append(("value", self.CurrentType.Name, parameter.Definition.Name, value))
+
+        def SetFormula(self, parameter, formula):
+            actions.append(("formula", parameter.Definition.Name, formula))
+
+    manager = Manager()
+    db = SimpleNamespace(ForgeTypeId=lambda value: ("ForgeTypeId", value))
+    document = SimpleNamespace(IsFamilyDocument=True, IsModifiable=True, FamilyManager=manager, Regenerate=lambda: None)
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Double=lambda value: ("Double", value)))
+    assert add_definitions(document, db, plan, baseline) == {"Clearance": "1", "Panel Width": "2", "Total Width": "3"}
+    assert actions == [
+        ("add", "Clearance", ("ForgeTypeId", "geometry"), ("ForgeTypeId", "length"), False),
+        ("add", "Panel Width", ("ForgeTypeId", "geometry"), ("ForgeTypeId", "length"), False),
+        ("add", "Total Width", ("ForgeTypeId", "geometry"), ("ForgeTypeId", "length"), False),
+        ("value", "Target A", "Clearance", ("Double", 0.0)),
+        ("value", "Target B", "Clearance", ("Double", 0.0)),
+        ("formula", "Panel Width", "Base Width * 2 + Clearance"),
+        ("formula", "Total Width", "Panel Width + 1"),
+    ]
+    assert manager.CurrentType.Name == "Target A"

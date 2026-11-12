@@ -291,7 +291,15 @@ Set `source_sha256` and `target_sha256` to the reviewed read digests. List the e
 
 Review each proposed addition and the expected values for each target type. Equivalent target definitions are retained. The preview stops on incomplete reference evidence, incompatible retained values, or missing formula dependencies. Use a separate preview for each target.
 
-The preview makes no model changes. The private family trial and guarded project reload require native verification.
+The preview makes no model changes.
+
+### Trial the private family copy
+
+Use only a disposable Revit fixture. Open only the private writable copy of the loaded target. Keep its RFA in a separate folder with no companion files. Call `get_context` and confirm the open document. Obtain approval for the rollback-only trial. Run `scripts/probe_family_parameter_transfer.py` in guarded CPython dry-run mode.
+
+Supply `source_read`, `target_read`, `request`, and the reviewed `preview_sha256`. Set `disposable_fixture` to true. Supply `working_copy` with its absolute `workspace`, the directory `workspace_identity`, and the reviewed RFA `file` record. Use the directory identity and file record format from the family library scanner.
+
+The trial checks the copy against the loaded target read before editing. It rolls back the transaction group and checks the original family and file again. Stop on an unresolved result. Verify this trial in native Revit before use on project data. The replay and project reload also require native verification.
 
 ## Preview a CAD layout (issue #166)
 
