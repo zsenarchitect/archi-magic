@@ -24,7 +24,7 @@ Baseline e0df05c097aef9b39cc97f6720fb1883fad34e01. Filed gap confirmed: the issu
 ## Tabular HTML evidence
 
 - A later compatibility check used a public [French tabular Navisworks export](https://github.com/yormantbt-tech/Navisworks-BIM-4D-Report/blob/cd6544e8a20089e19e07a1ea5c4c232ae3389b1f/Sols%20Vs%20Ossature0.html), Git blob `a8e514b4ad7dd2559eb8496ddfcc696119fb7b6a`. The CLI read all 16 individual rows and 32 explicitly labelled element IDs. The checked export contains no clash GUIDs or selection-tree paths, so it yields a review report with no section-box or issue-board proposal. Its export version was unavailable.
-- The tabular adapter checks both header levels, item groups, and cell spans. Grouped tabular HTML and the live Revit workflow still need verification.
+- The tabular adapter checks both header levels, item groups, and cell spans. A [grouped tabular export](https://github.com/mcmordor/vdc-portfolio/blob/9af825108bbbeb17488e9cb526a94cec86c1214d/assets/documents/fc01-clash-review-original.html) (blob `362193c3899930cacd1e54b67ee8e1b5d25191de`) returned 33 standalone clashes and 31 group members. It skipped three summary rows. An independent HTML parse matched all 64 ordered names, statuses, and side IDs, including four unavailable sides. The export version was unavailable. The live Revit workflow still needs verification.
 
 ## Sequential HTML evidence
 
