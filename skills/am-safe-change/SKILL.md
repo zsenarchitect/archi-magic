@@ -213,6 +213,16 @@ The query checks actual boundary loops on the finish face. It keeps separate loo
 
 This query does not create finishes. Do not use its result as approval to change the model.
 
+## Preview wall, column and floor splits
+
+Use `python scripts/element_split_preview.py evidence.json > split-preview.json` for geometry review from prepared local evidence. Open the result with the existing change-preview renderer. The preview includes the input SHA-256 and reports proposed extents and exact-source cut identities. Keep the prepared evidence private. [Native qualification plan](../../docs/plans/2026-11-12-split-walls-columns-floors.md)
+
+The evidence object has `kind: element-split-evidence`, `frame: revit_host_internal_feet`, `host_identity` with `project_uid` and `path_sha256`, a positive `minimum_piece_ft`, and `elements`. Each element has `id`, `uid`, `type_id`, `type_uid`, `category`, `geometry`, and `cuts`. Use decimal strings for Revit IDs.
+
+- For `wall`, `architectural_column` and `structural_column`, give `base_ft` and `top_ft` in geometry. Each cut has `id`, `uid`, `kind: level`, and `elevation_ft` in the same project frame.
+- For `floor`, give `elevation_ft` and a simple convex `boundary_xy_ft` with the first vertex listed once. Each cut has `id`, `uid`, `kind` of `grid` or `line`, and `start_xy_ft` and `end_xy_ft`. A finite line must span each seam it intersects. Grid lines are extended through the supplied profile.
+- Exit 1 reports blocked rows. Exit 2 means the input or report exceeded a limit or had an invalid shape. Read the output as a geometry review. The native reader, dependency checks, instance parameter comparison, and the Keep/Discard workflow still require Revit qualification.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.
