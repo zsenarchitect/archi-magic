@@ -134,7 +134,7 @@ def probe(document, args):
     transaction = DB.Transaction(document, TRANSACTION_NAME)
     if group.Start() != DB.TransactionStatus.Started:
         return {"status": "transaction_unresolved", "message": "Revit did not start the rollback group."}
-    changes, trial_borrowing, failure = None, [], None
+    changes, trial_stacks, trial_borrowing, failure = None, {}, [], None
     try:
         if transaction.Start() != DB.TransactionStatus.Started:
             raise ValueError("Revit did not start the trial transaction.")
@@ -152,7 +152,9 @@ def probe(document, args):
         changes = capture_changes(events)
         if not required.issubset(changes["modified"]) or not set(changes["modified"]).issubset(allowed):
             raise ValueError("Revit reported modified views outside the reviewed change set or omitted a recipient.")
-        trial_borrowing = verify_state(snapshot, read_snapshot(document, request), plan["steps"])
+        observed = read_snapshot(document, request)
+        trial_borrowing = verify_state(snapshot, observed, plan["steps"])
+        trial_stacks = {view_id: observed["views"][view_id]["filters"] for view_id in allowed}
     except Exception as error:
         failure = str(error)
     if not rollback(transaction, group):
@@ -166,7 +168,8 @@ def probe(document, args):
                 "message": "A change was reported in another document. Reconcile both fixtures."}
     result = {"status": "trial_rolled_back" if failure is None else "stopped_and_rolled_back",
               "basis_sha256": plan["basis_sha256"], "document": plan["document"], "changes": changes,
-              "trial_ownership_changes": trial_borrowing, "remaining_ownership_changes": remaining_borrowing}
+              "trial_filter_stacks": trial_stacks, "trial_ownership_changes": trial_borrowing,
+              "remaining_ownership_changes": remaining_borrowing}
     if failure is not None:
         result["message"] = failure
     return result

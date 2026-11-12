@@ -209,6 +209,9 @@ def verify_rollback(plan, original_record, probe_record, fresh_record):
     if (receipt["status"] != "trial_rolled_back" or receipt["basis_sha256"] != plan["basis_sha256"]
             or receipt["document"] != plan["document"]):
         raise ValueError("The rollback probe receipt does not match the reviewed transfer.")
+    expected_stacks = {view_id: step["after"] for step in plan["steps"] for view_id in step["affected_ids"]}
+    if receipt.get("trial_filter_stacks") != expected_stacks:
+        raise ValueError("The measured trial filter stacks differ from the reviewed order, visibility or overrides.")
     allowed = set(plan["ownership_ids"])
     required = {step["recipient_id"] for step in plan["steps"]}
     changes = receipt["changes"]
