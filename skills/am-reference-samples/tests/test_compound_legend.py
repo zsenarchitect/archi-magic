@@ -319,8 +319,13 @@ def test_creation_uses_view_plane_and_rolls_back_on_late_failure(monkeypatch, tm
     dry = {"result": kept, "changes": {"added_ids": ids, "added_count": len(ids),
                                        "deleted_count": 0, "modified_count": 0}}
     preview.verify_dry_run(approved["plan"], dry)
-    dry["changes"]["modified_count"] = 1
     import pytest
+    wrong_geometry = json.loads(kept["legend_json"])
+    line = next(item for item in wrong_geometry["contents"] if item["kind"] == "line")
+    line["ends"][1][0] += 0.05
+    with pytest.raises(ValueError, match="section geometry"):
+        preview.verify_contents(approved["plan"], wrong_geometry)
+    dry["changes"]["modified_count"] = 1
     with pytest.raises(ValueError, match="only the reviewed view"):
         preview.verify_dry_run(approved["plan"], dry)
 

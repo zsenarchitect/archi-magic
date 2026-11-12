@@ -26,6 +26,7 @@ MAX_DETAILS = 2000
 VIEW_SCALE = 10
 SKETCH_LENGTH_FT = 2.0
 MEMBRANE_MARK_FT = 0.25
+COORD_TOLERANCE_FT = 1e-6
 CATEGORIES = ("Wall", "Floor")
 
 
@@ -185,6 +186,14 @@ def section_lines(item, top=0.0):
     return sorted({tuple(sorted(segment)) for segment in lines})
 
 
+def same_segment(actual, expected):
+    def matches(points):
+        return all(abs(a - b) <= COORD_TOLERANCE_FT
+                   for found, wanted in zip(points, expected) for a, b in zip(found, wanted))
+
+    return matches(actual) or matches(list(reversed(actual)))
+
+
 def note_text(item):
     def clean(value):
         return u" ".join(value.split()).replace(u"|", u"/")
@@ -238,13 +247,33 @@ def verify_contents(plan, receipt):
     ids = {positive_id(item["id"]) for item in contents}
     if len(ids) != len(contents) or receipt["view_id"] in ids:
         raise ValueError("The drafting view element inventory is ambiguous.")
-    notes = sorted(item["text"] for item in contents if item["kind"] == "note")
+    notes = {item["text"]: item for item in contents if item["kind"] == "note"}
     lines = [item for item in contents if item["kind"] == "line"]
     planned_notes = sorted(note_text(item).replace(u"\r", u"\n") for item in plan["types"])
     planned_lines = sum(len(section_lines(item)) for item in plan["types"])
-    if (len(contents) != len(notes) + len(lines) or notes != planned_notes or len(lines) != planned_lines
+    if (len(contents) != len(notes) + len(lines) or sorted(notes) != planned_notes or len(lines) != planned_lines
             or any(item["type_id"] != request["text_type_id"] for item in contents if item["kind"] == "note")):
         raise ValueError("The drafting view does not contain the reviewed layer tables and section line counts.")
+    unmatched = []
+    for line in lines:
+        ends = line["ends"]
+        if (not isinstance(ends, list) or len(ends) != 2
+                or any(not isinstance(point, list) or len(point) != 2
+                       or any(type(value) not in (int, float) or math.isnan(value) or math.isinf(value) for value in point)
+                       for point in ends)):
+            raise ValueError("The measured section geometry lacks finite line endpoints.")
+        unmatched.append(ends)
+    for item in plan["types"]:
+        bounds = notes[note_text(item).replace(u"\r", u"\n")]["bounds"]
+        if (not isinstance(bounds, list) or len(bounds) != 4
+                or any(type(value) not in (int, float) or math.isnan(value) or math.isinf(value) for value in bounds)
+                or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]):
+            raise ValueError("A layer table lacks measurable bounds for the section geometry check.")
+        for expected in section_lines(item, bounds[3] - MEMBRANE_MARK_FT):
+            found = next((index for index, actual in enumerate(unmatched) if same_segment(actual, expected)), None)
+            if found is None:
+                raise ValueError("The measured section geometry differs from the reviewed layer widths and layout.")
+            unmatched.pop(found)
     return ids | {receipt["view_id"]}
 
 

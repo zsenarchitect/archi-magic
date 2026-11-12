@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(preview.__file__), "lib"))
 from reference_samples import find_overlaps, layout_rows  # noqa: E402
 
 
-COORD_TOLERANCE_FT = 1e-6
 ROW_GAP_FT = 1.0
 SKETCH_GAP_FT = 2.0
 
@@ -52,14 +51,6 @@ def note_bounds(view, note):
 def line_ends(view, element):
     curve = element.GeometryCurve
     return [local(view, curve.GetEndPoint(index)) for index in (0, 1)]
-
-
-def same_segment(actual, expected):
-    def matches(points):
-        return all(abs(a - b) <= COORD_TOLERANCE_FT
-                   for found, wanted in zip(points, expected) for a, b in zip(found, wanted))
-
-    return matches(actual) or matches(list(reversed(actual)))
 
 
 def check_view(view):
@@ -140,14 +131,14 @@ def create_contents(document, view, plan):
     for note, segments in bands:
         x0, y0, _, y1 = note_bounds(view, note)
         sketch_xmax = max(xy[0] for segment in segments for xy in segment)
-        if x0 < sketch_xmax + SKETCH_GAP_FT - COORD_TOLERANCE_FT:
+        if x0 < sketch_xmax + SKETCH_GAP_FT - preview.COORD_TOLERANCE_FT:
             raise ValueError("A layer table overlaps or crowds its section sketch.")
         sketch_ys = [xy[1] for segment in segments for xy in segment]
         intervals.append((min(y0, min(sketch_ys)), max(y1, max(sketch_ys))))
     if find_overlaps(intervals):
         raise ValueError("The generated legend rows overlap.")
     for element, expected in drawn:
-        if not same_segment(line_ends(view, element), expected):
+        if not preview.same_segment(line_ends(view, element), expected):
             raise ValueError("Revit did not retain the reviewed section geometry.")
     check_budget(clock)
     return {key(element.Id) for element in notes + [curve for curve, _ in drawn]}
