@@ -8,7 +8,7 @@ from time import monotonic
 from System import Int64
 from pyrevit.api import DB
 
-from cad_layout_preview import FRAME, INPUT_LIMIT, fields, label, number
+from cad_layout_preview import FRAME, INPUT_LIMIT, fields, label, number, validate_mapping
 
 MM_PER_FOOT = 304.8
 MAX_GEOMETRY = 20000
@@ -36,7 +36,8 @@ def point_mm(transform, point):
 
 
 def scope(request):
-    fields(request, "link_id level_id segment_layers room_layers room_points_mm")
+    required = "link_id level_id segment_layers room_layers room_points_mm"
+    fields(request, required + " mapping" if isinstance(request, dict) and "mapping" in request else required)
     layers = {}
     for key in ("segment_layers", "room_layers"):
         raw = request[key]
@@ -58,6 +59,45 @@ def scope(request):
         for coordinate in point:
             number(coordinate, -1e7, 1e7)
     return layers, seeds
+
+
+def door_width(symbol, layer):
+    if (not isinstance(symbol, DB.FamilySymbol) or symbol.Category is None
+            or int(symbol.Category.Id.Value) != int(DB.BuiltInCategory.OST_Doors)
+            or symbol.Family is None
+            or symbol.Family.FamilyPlacementType != DB.FamilyPlacementType.OneLevelBasedHosted):
+        raise ValueError(f"Select a level-and-host-based door type for {layer}.")
+    width = symbol.get_Parameter(DB.BuiltInParameter.DOOR_WIDTH)
+    if width is None or width.StorageType != DB.StorageType.Double or not width.HasValue:
+        raise ValueError(f"The door type for {layer} has no verifiable type width.")
+    return width.AsDouble()
+
+
+def read_mapping(document, mapping, layers):
+    tolerance, _, _ = validate_mapping(mapping)
+    if (set(mapping["walls"]) | set(mapping["doors"]) != layers["segment_layers"]
+            or set(mapping["room_layers"]) != layers["room_layers"]):
+        raise ValueError("The mapping must cover exactly the selected DWG layers.")
+    verified = {**mapping, "walls": {}, "doors": {}}
+    evidence = []
+    for role in ("walls", "doors"):
+        for layer, entry in sorted(mapping[role].items()):
+            target = document.GetElement(element_id(entry["type_id"]))
+            if target is None or not target.UniqueId:
+                raise ValueError(f"The mapped Revit type for {layer} could not be identified.")
+            if role == "walls":
+                if not isinstance(target, DB.WallType) or target.Kind != DB.WallKind.Basic:
+                    raise ValueError(f"Select a Basic Wall type for {layer}.")
+                width = target.Width
+            else:
+                width = door_width(target, layer)
+            width_mm = number(float(width) * MM_PER_FOOT, 30, 10000)
+            if abs(width_mm - entry["width_mm"]) > tolerance:
+                raise ValueError(f"The mapped width for {layer} differs from Revit's {width_mm:.6g} mm.")
+            verified[role][layer] = {**entry, "width_mm": width_mm}
+            evidence.append({"role": role, "layer": layer, "type_id": entry["type_id"],
+                             "type_uid": str(target.UniqueId), "width_mm": width_mm})
+    return {"verified_mapping_json": encoded(verified, INPUT_LIMIT), "type_evidence": evidence}
 
 
 def linked_dwg(document, request):
@@ -170,6 +210,7 @@ def read_snapshot(document, request):
     level = document.GetElement(element_id(request["level_id"]))
     if not isinstance(level, DB.Level) or not level.UniqueId:
         raise ValueError("Select the existing Revit level for the CAD layout.")
+    mapping_evidence = read_mapping(document, request["mapping"], layers) if "mapping" in request else {}
     options = DB.Options()
     try:
         options.ComputeReferences = False
@@ -186,7 +227,7 @@ def read_snapshot(document, request):
     evidence = {"status": "review_required" if unresolved else "ok", "document": document_key,
                 "link_element_id": request["link_id"], "level_element_id": request["level_id"],
                 "snapshot_json": encoded(snapshot, INPUT_LIMIT), "room_candidates": candidates,
-                "unresolved": unresolved}
+                "unresolved": unresolved, **mapping_evidence}
     encoded(evidence, 2 * INPUT_LIMIT)
     return evidence
 

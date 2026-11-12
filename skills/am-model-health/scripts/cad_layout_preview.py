@@ -235,13 +235,8 @@ def rooms_conflict(a, b, tolerance):
     )
 
 
-def propose(snapshot, mapping):
-    fields(snapshot, "coordinate_frame link_id level_id level_mm segments room_loops")
+def validate_mapping(mapping):
     fields(mapping, "tolerance_mm minimum_overlap_mm door_setback_mm walls doors room_layers")
-    if snapshot["coordinate_frame"] != FRAME:
-        raise ValueError("Use Revit internal axes expressed in millimetres.")
-    link_id, level_id = (label(snapshot[key]) for key in ("link_id", "level_id"))
-    level = number(snapshot["level_mm"], -1e7, 1e7)
     tolerance = number(mapping["tolerance_mm"], 0.1, 25)
     minimum = number(mapping["minimum_overlap_mm"], 100, 1e6)
     setback = number(mapping["door_setback_mm"], tolerance, 1e5)
@@ -255,7 +250,17 @@ def propose(snapshot, mapping):
         fields(entry, "type_id width_mm")
         label(entry["type_id"])
         number(entry["width_mm"], 30, 10000)
+    return tolerance, minimum, setback
 
+
+def propose(snapshot, mapping):
+    fields(snapshot, "coordinate_frame link_id level_id level_mm segments room_loops")
+    if snapshot["coordinate_frame"] != FRAME:
+        raise ValueError("Use Revit internal axes expressed in millimetres.")
+    link_id, level_id = (label(snapshot[key]) for key in ("link_id", "level_id"))
+    level = number(snapshot["level_mm"], -1e7, 1e7)
+    tolerance, minimum, setback = validate_mapping(mapping)
+    wall_map, door_map, room_layers = (mapping[key] for key in ("walls", "doors", "room_layers"))
     segments, loops = snapshot["segments"], snapshot["room_loops"]
     if not isinstance(segments, list) or not isinstance(loops, list) or len(segments) > 400 or len(loops) > 32:
         raise ValueError("Use at most 400 segments and 32 room loops.")

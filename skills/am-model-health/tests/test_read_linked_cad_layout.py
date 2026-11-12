@@ -81,6 +81,14 @@ def linked_dwg(monkeypatch):
     class Style(Record):
         pass
 
+    class WallType(Record):
+        pass
+
+    class FamilySymbol(Record):
+        def get_Parameter(self, parameter):
+            assert parameter == "door-width"
+            return self.width
+
     class Options(Record):
         def Dispose(self):
             pass
@@ -97,12 +105,19 @@ def linked_dwg(monkeypatch):
     objects = {
         1: link, 2: Level(UniqueId="aa-2", ProjectElevation=feet(3000)),
         3: Record(IsExternalFileReference=lambda: True, GetExternalFileReference=lambda: reference),
+        80: WallType(UniqueId="wall-type", Kind="basic", Width=feet(200.25)),
+        81: FamilySymbol(UniqueId="door-type", Category=Record(Id=element_id(-2000014)),
+                         Family=Record(FamilyPlacementType="hosted"),
+                         width=Record(StorageType="double", HasValue=True, AsDouble=lambda: feet(900))),
         **{id: Style(GraphicsStyleCategory=Record(Name=label)) for id, label in
            [(10, "WALL"), (11, "DOOR"), (12, "ROOM")]},
     }
     db = Record(ElementId=element_id, Transform=Record(Identity=Transform(lambda v: v)),
                 GeometryInstance=Instance, Line=Line, PolyLine=Polyline, ImportInstance=Linked,
                 Level=Level, GraphicsStyle=Style, Options=Options,
+                WallType=WallType, WallKind=Record(Basic="basic"), FamilySymbol=FamilySymbol,
+                BuiltInCategory=Record(OST_Doors=-2000014), BuiltInParameter=Record(DOOR_WIDTH="door-width"),
+                FamilyPlacementType=Record(OneLevelBasedHosted="hosted"), StorageType=Record(Double="double"),
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
     api, system = ModuleType("pyrevit.api"), ModuleType("System")
     api.DB, system.Int64 = db, int
@@ -120,13 +135,21 @@ def read(document, request):
                           init_globals={"doc": document, "inputs": request})["result"]
 
 
+def layout_mapping():
+    return {"tolerance_mm": 1, "minimum_overlap_mm": 100, "door_setback_mm": 100,
+            "walls": {"WALL": {"type_id": "80", "width_mm": 200}},
+            "doors": {"DOOR": {"type_id": "81", "width_mm": 900}}, "room_layers": ["ROOM"]}
+
+
 def test_nested_mirror_rotation_and_translation_feed_real_layout_cli(linked_dwg, tmp_path):
     document, request, *_ = linked_dwg
     discovered = read(document, request)
     assert discovered["status"] == "review_required"
+    assert "verified_mapping_json" not in discovered
     candidate, = discovered["room_candidates"]
     assert candidate["vertices"][0] == pytest.approx([750, 2000, 3000])
     request["room_points_mm"] = {candidate["id"]: [-750, 500, 3000]}
+    request["mapping"] = layout_mapping()
     result = read(document, request)
     assert result["status"] == "ok" and not result["unresolved"]
     snapshot = json.loads(result["snapshot_json"])
@@ -134,16 +157,47 @@ def test_nested_mirror_rotation_and_translation_feed_real_layout_cli(linked_dwg,
     assert snapshot["segments"][1]["start"] == pytest.approx([550, -2000, 3000])
     assert snapshot["segments"][2]["start"] == pytest.approx([650, 500, 3000])
     assert snapshot["link_id"] == "aa-1" and snapshot["level_id"] == "aa-2"
+    assert json.loads(result["verified_mapping_json"])["walls"]["WALL"]["width_mm"] == pytest.approx(200.25)
+    assert request["mapping"]["walls"]["WALL"]["width_mm"] == 200
+    assert [(row["layer"], row["type_uid"]) for row in result["type_evidence"]] == [
+        ("WALL", "wall-type"), ("DOOR", "door-type")]
     geometry = tmp_path / "geometry.json"
     geometry.write_text(result["snapshot_json"])
     mapping = tmp_path / "mapping.json"
-    mapping.write_text(json.dumps({"tolerance_mm": 1, "minimum_overlap_mm": 100,
-                                   "door_setback_mm": 100, "walls": {"WALL": {"type_id": "80", "width_mm": 200}},
-                                   "doors": {"DOOR": {"type_id": "81", "width_mm": 900}}, "room_layers": ["ROOM"]}))
+    mapping.write_text(result["verified_mapping_json"])
     report = json.loads(subprocess.check_output([sys.executable, SCRIPTS / "cad_layout_preview.py",
                                                 geometry, "--mapping", mapping]))
     assert len(report["walls"]) == len(report["doors"]) == len(report["rooms"]) == 1
     assert not report["unresolved"]
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("width", "differs from Revit"),
+    ("wall_kind", "Basic Wall"),
+    ("category", "level-and-host-based door"),
+    ("placement", "level-and-host-based door"),
+    ("missing_width", "no verifiable type width"),
+    ("layers", "exactly the selected DWG layers"),
+])
+def test_refuses_unverified_native_mapping(linked_dwg, change, reason):
+    document, request, _, _, id_value, _ = linked_dwg
+    wall, door = (document.GetElement(id_value(identifier)) for identifier in (80, 81))
+    request["mapping"] = layout_mapping()
+    if change == "width":
+        request["mapping"]["walls"]["WALL"]["width_mm"] = 250
+    elif change == "wall_kind":
+        wall.Kind = "curtain"
+    elif change == "category":
+        door.Category.Id = id_value(-2000011)
+    elif change == "placement":
+        door.Family.FamilyPlacementType = "face"
+    elif change == "missing_width":
+        door.width.HasValue = False
+    else:
+        request["mapping"]["doors"].clear()
+    result = read(document, request)
+    assert result["status"] == "stopped" and reason in result["message"]
+    assert "verified_mapping_json" not in result
 
 
 def test_unknown_and_unsupported_geometry_is_visible_in_reader_evidence(linked_dwg):
