@@ -197,12 +197,20 @@ def test_native_entry_creates_new_rows_and_rolls_back_late_failure(monkeypatch):
     assert kept["status"] == "ok", kept
     result, ids = dp.verify_contents(artifact["plan"], kept)
     assert len(ids) == 6
-    dry = {"result": kept, "changes": {"added_ids": list(ids), "added_count": len(ids),
-                                       "modified_count": 0, "deleted_count": 0}}
-    dp.verify_dry_run(artifact["plan"], dry)
-    dry["changes"]["added_ids"] = list(ids)[:-1] + ["2"]
-    with pytest.raises(ValueError, match="telemetry"):
-        dp.verify_dry_run(artifact["plan"], dry)
+    additions = [{"id": int(identifier)} for identifier in sorted(ids, key=int)]
+    changes = {"added": additions, "added_count": len(ids), "modified": [], "deleted": [],
+               "modified_count": 0, "deleted_count": 0, "by_category": {"Datums": len(ids)}}
+    dry = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "run_id": "datum-trial",
+           "exit_code": 0, "result_truncated": False, "result": kept, "changes": changes}
+    with pytest.raises(ValueError, match="successful rolled-back datum dry run"):
+        dp.verify_dry_run(artifact["plan"], dict(dry, mode="modify", decision="committed", approval="user"))
+    dp.verify_dry_run(artifact["plan"], {"response": dry})
+    for invalid in (dict(changes, added=additions + additions[:1]),
+                    dict(changes, added=additions[:-1] + [{"id": 2}]),
+                    dict(changes, modified=[{"id": 2}]),
+                    dict(changes, by_category={"Datums": len(ids) - 1})):
+        with pytest.raises(ValueError, match="telemetry"):
+            dp.verify_dry_run(artifact["plan"], dict(dry, changes=invalid))
     verified = run(mode="verify", plan=artifact["plan"], created=result["datums"])
     assert json.loads(verified["datums_json"]) == result
     repeat = dp.compute(dp.snapshot_from(run(request=request())))

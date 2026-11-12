@@ -218,7 +218,10 @@ def compute(snapshot):
 
 
 def runtime_result(record):
-    result = record.get("result", record)
+    envelope = record.get("response", record)
+    if envelope.get("status", "ok") != "ok" or envelope.get("error") or envelope.get("result_truncated"):
+        raise ValueError("Use the full successful Revit run result.")
+    result = envelope.get("result", envelope)
     if not isinstance(result, dict) or result.get("status") != "ok":
         raise ValueError("Use the full successful Revit run result.")
     return result
@@ -245,15 +248,31 @@ def verify_contents(plan, record):
     return receipt, ids
 
 
-def verify_dry_run(plan, record):
+def verify_dry_run(plan, saved):
+    record = saved.get("response", saved)
+    run_id = record.get("run_id")
+    exit_code = record.get("exit_code")
+    if (record.get("mode") != "dry_run" or record.get("status") != "ok"
+            or record.get("decision") != "rolled_back" or record.get("approval") is not None
+            or not isinstance(run_id, TEXT) or not run_id.strip()
+            or not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code != 0
+            or record.get("result_truncated") is not False
+            or any(record.get(key) for key in (
+                "error", "failures", "dialogs", "warnings", "blocked", "closed_documents", "unclosed_documents"))):
+        raise ValueError("Save the complete successful rolled-back datum dry run.")
     _, ids = verify_contents(plan, record)
     changes = record.get("changes") or {}
-    added = changes.get("added_ids")
-    if added is None:
-        added = [item["id"] for item in changes.get("added", [])]
-    if (changes.get("added_count") != len(ids) or {str(item) for item in added} != ids
-            or changes.get("modified_count") != 0 or changes.get("deleted_count") != 0
-            or changes.get("other_documents")):
+    added = changes.get("added")
+    categories = changes.get("by_category")
+    if (not isinstance(added, list) or len(added) != len(ids)
+            or {str(item["id"]) for item in added} != ids
+            or any(type(changes.get(key + "_count")) is not int or changes[key + "_count"] != count
+                   for key, count in (("added", len(ids)), ("modified", 0), ("deleted", 0)))
+            or any(changes.get(key) != [] for key in ("modified", "deleted"))
+            or any(changes.get(key + "_ids") for key in ("added", "modified", "deleted"))
+            or changes.get("other_documents") or not isinstance(categories, dict)
+            or any(type(count) is not int or count <= 0 for count in categories.values())
+            or sum(categories.values()) != len(ids)):
         raise ValueError("Dry-run telemetry differs from the reviewed datum additions.")
 
 
