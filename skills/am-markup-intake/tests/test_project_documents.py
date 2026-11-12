@@ -185,3 +185,33 @@ def test_vector_pdf_table_extracts_actual_page_and_table(tmp_path):
 def test_does_not_open_remote_documents(path):
     result = invoke("extract", path, "--sheet", "Room Data")
     assert result.returncode == 2 and "local" in result.stderr and not result.stdout
+
+
+def test_literal_sheet_number_column_preserves_text_and_hashes_exact_workbook(tmp_path):
+    from hashlib import sha256
+
+    path = tmp_path / "Drawing index.xlsx"
+    workbook(path, [("Issue index", ""), ("Sheet Number", "Sheet Name"), ("001", "Cover")])
+    before = path.read_bytes()
+    report = invoke("extract", path, "--sheet", "Room Data", "--header-row", 2,
+                    "--literal-text-column", "Sheet Number")
+    assert report.returncode == 0, report.stderr
+    result = json.loads(report.stdout)
+    assert result["rows"] == [{"source_row": 3, "cells": ["001", "Cover"]}]
+    assert result["source"]["sha256"] == sha256(before).hexdigest()
+    assert result["source"]["literal_text_column"] == "Sheet Number"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("number", [1, " 001 ", None])
+def test_literal_sheet_number_column_rejects_ambiguous_cells(tmp_path, number):
+    path = tmp_path / "Drawing index.xlsx"
+    workbook(path, [("Sheet Number", "Sheet Name"), (number, "Cover")])
+    book = openpyxl.load_workbook(path)
+    book.active["A2"].number_format = "000"
+    book.save(path)
+    book.close()
+    before = path.read_bytes()
+    report = invoke("extract", path, "--sheet", "Room Data", "--literal-text-column", "Sheet Number")
+    assert report.returncode == 2 and "row 2" in report.stderr and "literal text" in report.stderr
+    assert not report.stdout and path.read_bytes() == before
