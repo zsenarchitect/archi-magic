@@ -16,7 +16,9 @@ from family_library_discovery import (
     MAX_CATALOG_BYTES, MAX_FAMILIES, MAX_FAMILY_BYTES, MAX_SECONDS, WindowsDirectory,
     checked_file, child_info, directory_info, identity, manifest_digest, pinned_directory, pinned_root, root_path, windows,
 )
-from family_library_thumbnails import MAX_IMAGE_BYTES, png_record, render_thumbnails
+from family_library_catalog import catalog_candidates
+from family_library_thumbnails import MAX_IMAGE_BYTES, exact_symbol, png_record, preview_bytes, render_thumbnails
+from read_family_placement import parameter_state
 from read_batch_models import normalized_path
 from stage_family_library import MAX_MANIFEST, check_file_record, make_directory, new_file, parts, verify_pair
 
@@ -206,6 +208,7 @@ def read_family(ui, receipt, source_path, parameter_names):
         "staging_sha256": receipt["staging_sha256"], "discovery_sha256": receipt["discovery_sha256"],
         "source_path": source_path, "rfa": pair["rfa"], "catalog": pair["catalog"],
         "catalog_coverage": "pending" if pair["catalog"] else "absent",
+        "catalog_types": [], "catalog_issues": [], "catalog_blocked_embedded": [],
         "revit_year": bounded_text(app.VersionNumber), "revit_build": bounded_text(app.VersionBuild),
         "requested_parameters": sorted(parameter_names),
         **metadata,
@@ -232,16 +235,82 @@ def capture_thumbnails(ui, path, metadata, deadline):
         return render_thumbnails(scratch, DB, path, metadata, deadline)
 
 
+def catalog_scratch(ui, path, metadata, candidates, deadline):
+    from pyrevit.api import DB
+
+    types, thumbnails, issues = [], [], []
+    assets = {}
+    with worker_document(ui, lambda app: app.NewProjectDocument(DB.UnitSystem.Metric)) as scratch:
+        if scratch.IsFamilyDocument or scratch.PathName or scratch.IsWorkshared or scratch.IsModelInCloud:
+            raise WorkerUnresolved("Revit did not create an unsaved scratch project for the catalog.")
+        families = DB.FilteredElementCollector(scratch).OfClass(DB.Family)
+        if any(str(family.Name).casefold() == metadata["family"].casefold() for family in families):
+            return [], [], {}, [{"reason": "scratch_name_collision"}]
+        for name in candidates:
+            if monotonic() >= deadline:
+                issues.append({"reason": "time_limit"})
+                break
+            symbol = exact_symbol(scratch, DB, path, name, metadata)
+            if symbol is None:
+                issues.append({"type": name, "reason": "native_type_unavailable"})
+                continue
+            values = {field["id"]: parameter_state(symbol, field) for field in metadata["parameters"]}
+            types.append({"name": name, "values": values})
+            row = {"type": name, "status": "preview_unavailable"}
+            data = preview_bytes(symbol)
+            if data is not None:
+                try:
+                    image = png_record(data)
+                except ValueError:
+                    row["status"] = "invalid_preview"
+                else:
+                    row.update(status="available", image=image)
+                    assets[image["file"]] = data
+            thumbnails.append(row)
+    return types, thumbnails, assets, issues
+
+
+def capture_catalog(ui, path, metadata, deadline, native=catalog_scratch):
+    catalog = metadata["catalog"]
+    data = BytesIO()
+    with pinned_root(path.parent) as parent:
+        name = catalog["basename"]
+        checked = checked_file(parent, name, child_info(parent, name), MAX_CATALOG_BYTES,
+                               {"bytes": 0, "deadline": monotonic() + MAX_SECONDS}, data)
+        if checked != catalog:
+            raise ValueError("The staged catalog changed before qualification.")
+    embedded = [row["name"] for row in metadata["embedded_types"]]
+    names, blocked, issues = catalog_candidates(data.getvalue(), embedded, MAX_TYPES - len(embedded))
+    types, thumbnails, assets = [], [], {}
+    if names:
+        types, thumbnails, assets, native_issues = native(ui, path, metadata, names, deadline)
+        issues.extend(native_issues)
+        verified = [row["name"] for row in types]
+        if len(set(verified)) != len(verified) or set(verified) - set(names):
+            raise ValueError("The worker returned an unreviewed or duplicate catalog type.")
+        if set(verified) != set(names) and not native_issues:
+            issues.append({"reason": "native_coverage_incomplete"})
+    elif not issues:
+        issues.append({"reason": "empty_catalog"})
+    updated = dict(metadata, catalog_types=types, catalog_blocked_embedded=blocked, catalog_issues=issues,
+                   catalog_coverage="complete" if not issues else "partial")
+    updated.pop("metadata_sha256")
+    updated["metadata_sha256"] = manifest_digest(updated)
+    return updated, thumbnails, assets
+
+
 def verify_thumbnail_assets(parent, records, metadata, requested):
     if not requested:
         if records:
             raise ValueError("A metadata-only request returned thumbnails.")
         return
-    expected = [row["name"] for row in metadata["embedded_types"]]
-    if [row["type"] for row in records] != expected:
-        raise ValueError("The thumbnail rows do not match the exact embedded types.")
-    if metadata["catalog"] is not None and any(row["status"] != "catalog_pending" for row in records):
-        raise ValueError("A paired family needs native catalog verification before publishing previews.")
+    embedded = [row["name"] for row in metadata["embedded_types"]]
+    catalog = [row["name"] for row in metadata["catalog_types"]]
+    expected = embedded + catalog
+    if len(expected) > MAX_TYPES or len(set(expected)) != len(expected) or [row["type"] for row in records] != expected:
+        raise ValueError("The thumbnail rows do not match the exact verified types.")
+    if metadata["catalog"] is not None and any(row["status"] != "catalog_pending" for row in records[:len(embedded)]):
+        raise ValueError("The paired embedded types require separate thumbnail qualification.")
     checked = {}
     for row in records:
         if row["status"] in {"scratch_name_collision", "time_limit", "preview_unavailable",
@@ -323,7 +392,7 @@ def worker_request(parent, directory):
     return request
 
 
-def run_worker(ui, runtime, raw_directory, thumbnail_reader=capture_thumbnails):
+def run_worker(ui, runtime, raw_directory, thumbnail_reader=capture_thumbnails, catalog_reader=capture_catalog):
     """Consume one prepared request and write a receipt after the worker is empty."""
     directory = root_path(raw_directory)
     with pinned_root(directory) as parent:
@@ -340,7 +409,13 @@ def run_worker(ui, runtime, raw_directory, thumbnail_reader=capture_thumbnails):
         thumbnails, assets = [], {}
         if request["thumbnails"]:
             with staged_pair(request["staging"], request["source_path"]) as (path, _):
-                thumbnails, assets = thumbnail_reader(ui, path, metadata, deadline)
+                if metadata["catalog"] is None:
+                    thumbnails, assets = thumbnail_reader(ui, path, metadata, deadline)
+                else:
+                    thumbnails = [{"type": row["name"], "status": "catalog_pending"}
+                                  for row in metadata["embedded_types"]]
+                    metadata, catalog_thumbnails, assets = catalog_reader(ui, path, metadata, deadline)
+                    thumbnails.extend(catalog_thumbnails)
         for name, data in assets.items():
             if png_record(data)["file"] != name:
                 raise ValueError("A thumbnail asset name does not match its bytes.")

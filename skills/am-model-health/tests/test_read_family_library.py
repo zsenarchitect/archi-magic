@@ -74,7 +74,7 @@ def stage_fixture(tmp_path, monkeypatch, *, catalog=True):
     destination.mkdir()
     (root / "Fixture.rfa").write_bytes(b"reviewed family")
     if catalog:
-        (root / "Fixture.txt").write_bytes(b"reviewed catalog")
+        (root / "Fixture.txt").write_bytes(catalog if isinstance(catalog, bytes) else b"reviewed catalog")
     monkeypatch.setattr(staging, "free_bytes", lambda parent: 10 * staging.HEADROOM)
     receipt = staging.stage(discover(str(root)), ["Fixture.rfa"], str(destination))
     pair = Path(receipt["workspace"]) / receipt["pairs"][0]["directory"]
@@ -321,7 +321,8 @@ def test_catalog_pair_reports_previews_pending_without_opening_scratch(staged):
     ui = SimpleNamespace(Application=worker, ActiveUIDocument=None)
     run_worker(ui, "pyrevit-fixture", str(directory))
     result = collect_worker(str(directory))
-    assert result["metadata"]["catalog_coverage"] == "pending"
+    assert result["metadata"]["catalog_coverage"] == "partial"
+    assert result["metadata"]["catalog_blocked_embedded"] == ["600 × 900"]
     assert result["thumbnails"] == [{"type": "600 × 900", "status": "catalog_pending"}]
     assert len(worker.opened) == 1 and not list(directory.glob("*.png"))
 
@@ -365,7 +366,7 @@ def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypa
     assert selection["source"]["path"] == paths[0]
     assert selection["type_values"]["43"] == {"state": "value", "value": 2.0}
     assert selection["placement_type"] == "OneLevelBased"
-    with pytest.raises(ValueError, match="exact embedded type"):
+    with pytest.raises(ValueError, match="exact verified type"):
         select_for_placement(index, token, paths[0], "600 x 900")
     first = Path(found["matches"][0]["thumbnail"]["path"])
     first.write_bytes(fixture_png(200))
@@ -397,3 +398,53 @@ def test_publish_and_search_keep_same_named_families_distinct(tmp_path, monkeypa
         {"path": "B/Fixture.rfa", "status": "worker_unavailable"},
     ]
     assert not list(Path(index).glob("thumbnail-*.png"))
+
+
+def test_catalog_candidates_preserve_exact_names_and_report_collisions():
+    from family_library_catalog import catalog_candidates
+
+    text = ';Width##LENGTH##FEET\r\n48"" x 60"";5\r\n"Style; B";6\r\nSame;3\r\nsame;4\r\nEmbedded;2\r\n'
+    names, blocked, issues = catalog_candidates(text.encode("utf-16"), ["Embedded"], 10)
+    assert names == ['48" x 60"', "Style; B"]
+    assert blocked == ["Embedded"]
+    assert [item["line"] for item in issues if item["reason"] == "type_name_collision"] == [4, 5, 6]
+
+
+def test_only_native_verified_catalog_types_can_be_selected(tmp_path, monkeypatch):
+    from family_library_index import begin, publish, search, select_for_placement
+    from read_family_library import capture_catalog
+
+    data = ",Width##LENGTH##FEET\n600 × 900,2\nVerified catalog type,4\nMissing catalog type,5\n".encode()
+    receipt, pair = stage_fixture(tmp_path, monkeypatch, catalog=data)
+    root = str(tmp_path.resolve() / "library")
+    index = str(tmp_path.resolve() / "index")
+    manifest = discover(root)
+    refresh = begin(index, manifest, ["Width"], "fixture", "pyrevit-fixture")
+    directory = prepare_worker(receipt, "Fixture.rfa", ["Width"], "2026", "fixture", "pyrevit-fixture",
+                               generation=refresh["token"])
+    ui = SimpleNamespace(Application=Worker(), ActiveUIDocument=None)
+
+    def native(current_ui, path, metadata, names, deadline):
+        assert current_ui is ui and path == pair / "Fixture.rfa"
+        assert names == ["Verified catalog type", "Missing catalog type"]
+        row = {"name": names[0], "values": {
+            "43": {"state": "value", "value": 4.0}, "45": {"state": "unset"},
+        }}
+        return [row], [{"type": names[0], "status": "preview_unavailable"}], {}, [
+            {"type": names[1], "reason": "native_type_unavailable"},
+        ]
+
+    run_worker(ui, "pyrevit-fixture", str(directory),
+               catalog_reader=lambda *args: capture_catalog(*args, native=native))
+    publish(index, refresh["token"], [str(directory)])
+    found = search(index, parameter="43", equals="4")
+    assert [(row["type"], row["type_origin"], row["selectable"]) for row in found["matches"]] == [
+        ("Verified catalog type", "catalog", True),
+    ]
+    assert found["matches"][0]["catalog_coverage"] == "partial"
+    selected = select_for_placement(index, refresh["token"], "Fixture.rfa", "Verified catalog type")
+    assert selected["source"]["catalog"]["bytes"] == len(data)
+    assert selected["type_origin"] == "catalog"
+    for rejected in ("600 × 900", "Missing catalog type"):
+        with pytest.raises(ValueError, match="exact verified type"):
+            select_for_placement(index, refresh["token"], "Fixture.rfa", rejected)

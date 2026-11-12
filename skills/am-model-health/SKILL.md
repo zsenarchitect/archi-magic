@@ -187,14 +187,14 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 1. Run `family_library_discovery.py` to create a discovery manifest. Run `stage_family_library.py` with that manifest and the exact family path to create a staging receipt. Use Python 3.13 or newer for Windows staging.
 2. Prepare one native request with `python scripts/read_family_library.py prepare staging.json --path "Fixtures/Example.rfa" --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use the expected loaded build identifiers. Keep the printed worker directory private.
 3. Set `ARCHI_MAGIC_FAMILY_WORKER_DIR` to the printed directory in the shell that launches the worker. Run `pyrevit run scripts/read_family_library.py --revit=2026` with no model arguments. Use a CPython-capable batch runner. Set a timeout outside Revit and confirm the disposable process exits.
-4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt lists thumbnail availability for each embedded type and reports catalog coverage separately. Add `--metadata-only` during preparation to qualify the metadata read alone. Prepare a new request for any retry.
+4. Run `python scripts/read_family_library.py collect "<worker-directory>"` after the host exits. Check the build, family, category, embedded types, and selected type parameter values. The receipt lists thumbnails and catalog coverage. The worker confirms catalog types in an empty scratch project. Add `--metadata-only` during preparation to qualify the metadata read alone. Prepare a new request for any retry.
 
 ### Publish and search a local family index
 
 1. Run `python scripts/family_library_index.py begin <private-index-directory> discovery.json --parameter Width --revit-build "<build>" --pyrevit-build "<build>"`. Use a separate index folder outside the library.
 2. Stage the exact sources from that manifest. Prepare each worker with the same parameter selection and builds. Pass the refresh token as `--generation` to the worker's prepare command. Run one worker at a time.
 3. Run `python scripts/family_library_index.py publish <private-index-directory> <token> --worker <worker-directory>`. Repeat `--worker` for each completed receipt. Read the coverage for sources without a receipt.
-4. Run `python scripts/family_library_index.py search <private-index-directory> --name window --category windows`. Add `--parameter <ID-or-name> --equals <value>` to filter by a type parameter. Numeric filters use the stored Revit internal value. Use the source path to distinguish equal family and type names.
+4. Run `python scripts/family_library_index.py search <private-index-directory> --name window --category windows`. Add `--parameter <ID-or-name> --equals <value>` to filter by a type parameter. Numeric filters use the stored Revit internal value. Use the source path to distinguish equal family and type names. Check `selectable` for types with catalog conflicts.
 
 ### Review a family placement
 
@@ -208,7 +208,7 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 1. Use a saved, standalone disposable project in Revit 2026. Use a reviewed nonzero level and rotation. Call `get_context` and check the active project, Revit build, CPython engine, and ask policy.
 2. Review the placement preview. Check ownership for its `ownership_ids`. Use the empty scope for active reuse or a new family with no existing write targets.
 3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`. For a missing type, also pass the exact `staging` receipt.
-4. Read the provisional element IDs, measured position, rotation, and rollback result. Stop on any unexpected effect or unresolved rollback. The missing-type trial allows only one new family, one new type, and one new instance. Test catalogs, existing siblings, and Keep/Discard separately.
+4. Read the provisional element IDs, measured position, rotation, and rollback result. Stop on any unexpected effect or unresolved rollback. The missing-type trial allows only one new family, one new type, and one new instance. Use a worker-verified catalog type to test a paired load. Existing siblings and Keep/Discard require separate native qualification.
 
 ## Preview a CAD layout (issue #166)
 

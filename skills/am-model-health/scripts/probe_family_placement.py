@@ -127,8 +127,10 @@ def trial(document, DB, args):
     if fresh["review"] != review:
         raise ValueError("The saved project, symbol, level, or ownership scope changed after review.")
     if review["action"] == "load":
-        if before["same_name_families"] or current["source"]["catalog"] is not None:
-            raise ValueError("Qualify sibling preservation and paired catalogs separately.")
+        if before["same_name_families"]:
+            raise ValueError("Qualify sibling preservation separately.")
+        if current["source"]["catalog"] is not None and current.get("type_origin") != "catalog":
+            raise ValueError("Use a natively read catalog type for a paired load trial.")
         with staged_pair(args["staging"], current["source"]["path"]) as (path, pair):
             if (pair["rfa"], pair["catalog"]) != (current["source"]["rfa"], current["source"]["catalog"]):
                 raise ValueError("The staged load does not match the reviewed source pair.")

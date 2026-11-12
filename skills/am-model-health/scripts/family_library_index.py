@@ -229,7 +229,7 @@ def publish(raw_index, token, workers):
                     or metadata["rfa"] != source["rfa"] or metadata["catalog"] != source["catalog"]):
                 raise ValueError("A worker does not belong to this refresh and source pair.")
             entry = {"status": "indexed", "source": source, "metadata": metadata, "thumbnails": result["thumbnails"]}
-            row_count = len(metadata["embedded_types"])
+            row_count = len(metadata["embedded_types"]) + len(metadata["catalog_types"])
             entry_size = len(json.dumps({relative: entry}, ensure_ascii=True, separators=(",", ":")))
             if count + row_count > MAX_ROWS or size + entry_size > MAX_INDEX_BYTES - 2 * 1024 * 1024:
                 entries[relative] = {"status": "index_limit"}
@@ -288,6 +288,14 @@ def matches_parameter_value(record, expected):
     return normalized(value) == normalized(expected)
 
 
+def indexed_types(metadata):
+    blocked = set(metadata["catalog_blocked_embedded"])
+    for row in metadata["embedded_types"]:
+        yield row, "embedded", row["name"] not in blocked and metadata["catalog_coverage"] != "pending"
+    for row in metadata["catalog_types"]:
+        yield row, "catalog", True
+
+
 def search(raw_index, *, name="", category="", parameter=None, equals=None, limit=100):
     """Search one published index without opening Revit or the source files."""
     if (not 1 <= limit <= 500 or (parameter is not None and not normalized(parameter))
@@ -307,7 +315,7 @@ def search(raw_index, *, name="", category="", parameter=None, equals=None, limi
                                                           metadata["category"]["id"]):
                 continue
             thumbnails = {row["type"]: row for row in entry["thumbnails"]}
-            for row in metadata["embedded_types"]:
+            for row, origin, selectable in indexed_types(metadata):
                 if normalized(name) not in normalized(metadata["family"] + " " + row["name"]):
                     continue
                 value = None
@@ -337,7 +345,7 @@ def search(raw_index, *, name="", category="", parameter=None, equals=None, limi
                         thumbnail = {"status": "available", "image": image, "path": str(path / leaf)}
                 matches.append({
                     "family": metadata["family"], "type": row["name"], "category": metadata["category"],
-                    "path": relative, "source_pair": {"rfa": metadata["rfa"], "catalog": metadata["catalog"]},
+                    "path": relative, "type_origin": origin, "selectable": selectable, "source_pair": {"rfa": metadata["rfa"], "catalog": metadata["catalog"]},
                     "thumbnail": thumbnail, "parameter": value, "catalog_coverage": metadata["catalog_coverage"],
                     "embedded_type_coverage": metadata["embedded_type_coverage"],
                 })
@@ -350,7 +358,7 @@ def search(raw_index, *, name="", category="", parameter=None, equals=None, limi
 
 
 def select_for_placement(raw_index, generation, relative, type_name):
-    """Bind a published, still-current source and exact embedded type."""
+    """Bind a published, still-current source and exact verified type."""
     path = root_path(raw_index)
     with pinned_root(path) as parent, index_lock(path, parent):
         index = read_record(parent, "index.json", "family-library-index")
@@ -360,9 +368,10 @@ def select_for_placement(raw_index, generation, relative, type_name):
         if not entry or entry["status"] != "indexed":
             raise ValueError("This family source is unavailable in the published index.")
         metadata = entry["metadata"]
-        matches = [row for row in metadata["embedded_types"] if row["name"] == type_name]
+        matches = [(row, origin) for row, origin, selectable in indexed_types(metadata)
+                   if row["name"] == type_name and selectable]
         if len(matches) != 1:
-            raise ValueError("Select an exact embedded type from the published family.")
+            raise ValueError("Select an exact verified type from the published family.")
         live = discover(index["root"])
         current = [row for row in live["files"] if row["path"] == relative]
         if live["root_identity"] != index["root_identity"] or current != [entry["source"]]:
@@ -372,9 +381,9 @@ def select_for_placement(raw_index, generation, relative, type_name):
             "generation": generation, "index_sha256": index["sha256"],
             "root": index["root"], "root_identity": index["root_identity"],
             "source": current[0], "family": metadata["family"], "category": metadata["category"],
-            "type": type_name, "placement_type": metadata["placement_type"],
+            "type": type_name, "type_origin": matches[0][1], "placement_type": metadata["placement_type"],
             "revit_build": metadata["revit_build"], "parameters": metadata["parameters"],
-            "type_values": matches[0]["values"],
+            "type_values": matches[0][0]["values"],
         }
         return dict(selection, selection_sha256=manifest_digest(selection))
 
