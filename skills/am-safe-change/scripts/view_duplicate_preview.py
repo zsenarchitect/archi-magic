@@ -212,19 +212,39 @@ def check_receipt(plan, receipt):
                 raise ValueError("An existing dependent family view differs from the approved batch.")
 
 
+def require_rollback_record(record, mode):
+    envelope = record.get("response", record)
+    run_id, exit_code = envelope.get("run_id"), envelope.get("exit_code")
+    if ((envelope.get("mode"), envelope.get("status"), envelope.get("decision")) != (mode, "ok", "rolled_back")
+            or not isinstance(run_id, TEXT) or not run_id.strip() or envelope.get("result_truncated") is not False
+            or type(exit_code) is not int or exit_code != 0 or envelope.get("approval") is not None
+            or any(envelope.get(field) for field in ("error", "failures", "warnings", "blocked", "dialogs",
+                                                     "unclosed_documents"))):
+        raise ValueError("Use a complete Revit %s record that successfully rolled back." % mode)
+    return envelope
+
+
 def verify_dry_run(plan, record):
+    record = require_rollback_record(record, "dry_run")
     receipt = read_payload(record, "receipt_json")
     check_receipt(plan, receipt)
     changes = record["changes"]
-    added = changes.get("added_ids")
-    if added is None:
-        added = [row["id"] for row in changes.get("added", [])]
+    added = [row["id"] for row in changes.get("added", [])]
+    legacy_added = changes.get("added_ids")
+    if legacy_added is not None:
+        if "added" in changes and sorted(map(str, added)) != sorted(map(str, legacy_added)):
+            raise ValueError("The runtime change record contains conflicting addition lists.")
+        added = legacy_added
     added = sorted((element_id(str(item)) for item in added), key=int)
     modified = sorted((element_id(str(row["id"])) for row in changes.get("modified", [])), key=int)
     reported = receipt["changes"]
     categories = changes["by_category"]
-    if (changes["added_count"] != len(added) or changes["modified_count"] != len(modified)
-            or changes["deleted_count"] != 0 or changes.get("other_documents")
+    if (any(type(changes.get(field)) is not int for field in ("added_count", "modified_count", "deleted_count"))
+            or changes["added_count"] != len(added) or changes["modified_count"] != len(modified)
+            or len(set(added)) != len(added) or len(set(modified)) != len(modified) or set(added) & set(modified)
+            or changes["deleted_count"] != 0 or any(changes.get(field) for field in
+                ("deleted", "deleted_ids", "modified_ids", "other_documents"))
+            or any(type(value) is not int or value <= 0 for value in categories.values())
             or sum(categories.values()) != len(added) + len(modified)
             or added != reported["added"] or modified != reported["modified"] or reported["deleted"]
             or not set(modified).issubset(plan["ownership_ids"])):
@@ -256,11 +276,20 @@ def run_verification(command, plan_path, record_path, dry_run_path=None):
             raise ValueError("The original Revit model state differs from the approved baseline.")
         print("The original Revit model matches the approved baseline.")
     elif command == "compare":
-        receipt = read_payload(read_record(record_path), "verification_json")
-        check_receipt(plan, receipt)
         if not dry_run_path:
             raise ValueError("Supply the full dry-run record for comparison.")
-        dry = verify_dry_run(plan, read_record(dry_run_path))
+        query = require_rollback_record(read_record(record_path), "query")
+        dry_record = require_rollback_record(read_record(dry_run_path), "dry_run")
+        changes = query["changes"]
+        if (query["run_id"] == dry_record["run_id"]
+                or any(type(changes.get(field)) is not int or changes[field] != 0
+                       for field in ("added_count", "modified_count", "deleted_count"))
+                or any(changes.get(field) for field in ("added", "modified", "deleted", "added_ids", "modified_ids",
+                                                        "deleted_ids", "by_category", "other_documents"))):
+            raise ValueError("Use a distinct read-only Revit query to verify the kept batch.")
+        receipt = read_payload(query, "verification_json")
+        check_receipt(plan, receipt)
+        dry = verify_dry_run(plan, dry_record)
         if repeatable_state(receipt) != repeatable_state(dry):
             raise ValueError("The independently verified kept batch differs from the approved dry run.")
         print("The independently verified kept batch matches the approved dry run.")
