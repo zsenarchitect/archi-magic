@@ -198,7 +198,12 @@ def host_run(ui, DB, runtime, directory):
 if __name__ == "__main__":
     if not globals().get("__batchexec__"):
         raise RuntimeError("Run this worker only in a qualified pyRevit batch host.")
-    from pyrevit import versionmgr
+    import clr
     from pyrevit.api import DB
-    host_run(__revit__, DB, versionmgr.get_loaded_build_version(),
+    from pyRevitLabs.Common import PyRevitBuildVersion
+    from PyRevitLabs.PyRevit.Runtime import ScriptExecutor
+
+    # The batch launcher can seed its session version from the clone on disk.
+    runtime_assembly = clr.GetClrType(ScriptExecutor).Assembly
+    host_run(__revit__, DB, PyRevitBuildVersion.FromAssembly(runtime_assembly),
              os.path.dirname(os.path.abspath(__file__)))

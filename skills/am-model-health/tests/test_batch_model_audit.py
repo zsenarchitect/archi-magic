@@ -1,5 +1,6 @@
 from hashlib import sha256
 import json
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -113,7 +114,45 @@ def test_five_inputs_stage_and_collect_with_unchanged_hashes(batch, monkeypatch)
     assert plan["run_id"] == report["run_id"]
 
 
-@pytest.mark.parametrize("mutant", ["missing", "stale", "duplicate", "wrong_digest"])
+@pytest.mark.parametrize("loaded_build", ["7.0.1.26312+1155", None])
+def test_staged_worker_reads_version_from_loaded_runtime(batch, monkeypatch, loaded_build):
+    _, work, _, _ = batch
+    ui, db, events = fake_host(monkeypatch, workshared=True)
+    executor = object()
+    assembly = object()
+
+    def get_clr_type(script_executor):
+        assert script_executor is executor
+        return SimpleNamespace(Assembly=assembly)
+
+    def read_build(loaded_assembly):
+        assert loaded_assembly is assembly
+        return loaded_build
+
+    monkeypatch.setitem(sys.modules, "clr", SimpleNamespace(GetClrType=get_clr_type))
+    monkeypatch.setitem(sys.modules, "pyRevitLabs.Common", SimpleNamespace(
+        PyRevitBuildVersion=SimpleNamespace(FromAssembly=read_build)))
+    monkeypatch.setitem(sys.modules, "PyRevitLabs.PyRevit.Runtime", SimpleNamespace(ScriptExecutor=executor))
+    monkeypatch.setitem(sys.modules, "pyrevit", SimpleNamespace(versionmgr=SimpleNamespace(
+        get_loaded_build_version=lambda: "7.0.0.26278+2233")))
+    monkeypatch.setitem(sys.modules, "pyrevit.api", SimpleNamespace(DB=db))
+
+    def execute():
+        runpy.run_path(str(work / "read_batch_models.py"), run_name="__main__",
+                       init_globals={"__batchexec__": True, "__revit__": ui})
+
+    receipt = work / "host-receipt.json"
+    if loaded_build is None:
+        with pytest.raises(ValueError, match="loaded pyRevit build"):
+            execute()
+        assert not receipt.exists()
+    else:
+        execute()
+        assert json.loads(receipt.read_text())["runtime"]["pyrevit_build"] == loaded_build
+    assert events == []
+
+
+@pytest.mark.parametrize("mutant", ["missing", "stale", "duplicate", "wrong_digest", "unknown_build"])
 def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch, mutant):
     _, work, plan, _ = batch
     ui, db, _ = fake_host(monkeypatch)
@@ -125,6 +164,8 @@ def test_invalid_receipts_keep_all_rows_and_no_audited_claim(batch, monkeypatch,
             data["run_id"] = "stale"
         elif mutant == "duplicate":
             data["rows"][0] = data["rows"][1]
+        elif mutant == "unknown_build":
+            data["runtime"]["pyrevit_build"] = "Unknown"
         else:
             data["rows"][0]["sha256"] = "0" * 64
         receipt.write_text(json.dumps(data))

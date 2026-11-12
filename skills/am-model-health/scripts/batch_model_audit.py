@@ -181,7 +181,8 @@ def read_receipt(work, plan, models):
         raise ValueError("Receipt does not belong to this batch.")
     runtime = receipt["runtime"]
     if set(runtime) != {"revit_build", "pyrevit_build", "engine", "engine_version"} or not all(
-        isinstance(value, str) and RUNTIME.fullmatch(value) for value in runtime.values()
+        isinstance(value, str) and RUNTIME.fullmatch(value) and value.strip().lower() != "unknown"
+        for value in runtime.values()
     ):
         raise ValueError("Receipt did not record the actual host runtime.")
     rows = receipt["rows"]
