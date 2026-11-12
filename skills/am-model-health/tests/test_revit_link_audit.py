@@ -218,12 +218,13 @@ def test_long_windows_paths_and_conflicting_ifc_source_risk(query, capsys):
         "private-long-owner", "private-long-model", "private-long-server", "private-device"))
 
 
-def test_rvt_audit_keeps_personal_saved_path_when_resolved_path_is_shared(query, capsys):
+@pytest.mark.parametrize("saved_path_type", ["Absolute", None])
+def test_rvt_audit_keeps_personal_saved_path_when_resolved_path_is_shared(query, capsys, saved_path_type):
     execute, _ = query
     shared = NS(path=r"\\private-server\share\private-model.rvt", CloudPath=False, ServerPath=False)
     personal = NS(path=r"C:\Users\private-owner\Documents\private-model.rvt", CloudPath=False, ServerPath=False)
     conflicting = LinkType(1, None)
-    conflicting.PathType = "Absolute"
+    conflicting.PathType = saved_path_type
     conflicting.GetExternalFileReference = lambda: NS(GetAbsolutePath=lambda: shared, GetPath=lambda: personal)
     control = LinkType(2, None)
     control.PathType = "Relative"
@@ -231,6 +232,7 @@ def test_rvt_audit_keeps_personal_saved_path_when_resolved_path_is_shared(query,
         GetAbsolutePath=lambda: personal, GetPath=lambda: NS(path=r"..\links\private-model.rvt"))
     result = execute(Document([conflicting, control], {}))
     first, second = result["revit_links"]["types"]
+    assert first["saved_model_path_type"] == saved_path_type
     assert (first["model_path_kind"], first["source_path_kind"], first["path_risk"]) == ("network", None, "personal")
     assert first["source_path_kind_candidates"] == ["network", "personal"]
     assert (second["saved_model_path_type"], second["source_path_kind"], second["path_risk"]) == (
