@@ -161,6 +161,16 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
 
+## Check spacing for linked MEP openings (issue #152)
+
+Run `python scripts/mep_penetration_spacing.py measured-outlines.json` to review the material left between openings in one host.
+
+Set `kind` to `mep-penetration-host-spacing` and `frame` to `host_face_internal_feet`. Set the exact `host_uid` and the approved `minimum_web_ft`. Set `complete` to true only when the prepared evidence covers every existing cut in the reviewed host.
+
+Supply `proposed` and `existing` arrays. Give each outline a unique `key` and two `center` coordinates. Use `shape: "round"` with `diameter`. Use `shape: "rectangular"` with `width`, `height`, and `angle_rad`.
+
+Exit 1 lists conflicts. Exit 2 means the spacing check stopped. This command uses prepared measurements. Native geometry collection, tracking, and placement are pending.
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.
