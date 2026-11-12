@@ -695,6 +695,15 @@ def verify_view_run(plan, outcome, run, readback):
     return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
 
 
+def kept_board_source(record):
+    if "result" not in record and "mode" not in record:
+        return record
+    changes = runtime_changes(record, "query", "ok", "rolled_back")
+    if not matches_changes(changes):
+        raise ValueError("The board baseline must come from a query that left the model unchanged.")
+    return record["result"]
+
+
 def board_identity(source, host):
     if source["host_identity"] != host:
         raise ValueError("The board is not in the verified project.")
@@ -839,8 +848,8 @@ def main(argv=None):
         board = runtime_record(args.board) if args.board else None
         archive = runtime_record(args.archive) if args.archive else None
         if kept_board:
-            board = board.get("result", board)
-            archive = archive.get("result", archive) if archive is not None else None
+            board = kept_board_source(board)
+            archive = kept_board_source(archive) if archive is not None else None
             if args.archive and not isinstance(archive, dict):
                 raise ValueError("The archive query did not return a note.")
         plan, skipped = board_preview(board, archive, clashes) if args.board and not kept_board else (None, [])

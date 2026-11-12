@@ -238,6 +238,16 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
         def proposal():
             return json.loads(subprocess.run(handoff, check=True, capture_output=True, text=True).stdout)
 
+        board_result = json.loads(note.read_text())
+        board_query = dict(response, run_id="board-baseline", result=board_result)
+        for bad_query in (dict(board_query, status="error"),
+                          dict(board_query, result_truncated=True),
+                          dict(board_query, changes=dict(unchanged, modified_count=1,
+                                                         modified=[{"id": 150, "class": "TextNote"}]))):
+            note.write_text(json.dumps({"response": bad_query}))
+            refused = subprocess.run(handoff, capture_output=True, text=True)
+            assert refused.returncode == 2 and not refused.stdout
+        note.write_text(json.dumps({"response": board_query}))
         proposed = proposal()
         board_plan = proposed["plan"]
         assert proposed["board_handoff"] == "planned"
