@@ -300,6 +300,18 @@ def point(value):
 
 def element_snapshot(raw):
     doc = json_input(raw)
+    doc = doc.get("response", doc)
+    if "result" in doc:
+        if doc.get("status", "ok") != "ok" or doc.get("error"):
+            raise ValueError("The Revit clash snapshot did not complete.")
+        doc = doc["result"]
+    if "snapshot_json" in doc:
+        if doc.get("status") != "ok":
+            raise ValueError("The Revit clash snapshot did not complete.")
+        encoded = doc["snapshot_json"]
+        if not isinstance(encoded, str) or not encoded.isascii() or len(encoded) > LIMIT:
+            raise ValueError("The Revit clash snapshot is unavailable or exceeds its limit.")
+        doc = json_input(encoded.encode("ascii"))
     if doc["coordinate_frame"] != FRAME or not text(doc["host_id"]):
         raise ValueError("Use a named Revit host snapshot in internal feet.")
     sources = doc["sources"]
