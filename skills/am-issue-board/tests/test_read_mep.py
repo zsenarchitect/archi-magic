@@ -215,6 +215,63 @@ def test_repair_parameter_query_pins_instance_values_and_rejects_drift(runtime):
     assert stopped["status"] == "incomplete" and "standalone" in stopped["message"]
 
 
+@pytest.mark.parametrize("discipline", ["duct", "pipe"])
+def test_system_rename_query_reports_memberships_and_name_collisions(runtime, discipline):
+    class FixtureSystem:
+        def GetTypeId(self):
+            return ElementId(30)
+
+    runtime.MEPSystem = FixtureSystem
+    runtime.Mechanical = NS(MechanicalSystem=FixtureSystem if discipline == "duct" else type("MechanicalSystem", (), {}))
+    runtime.Plumbing = NS(PipingSystem=FixtureSystem if discipline == "pipe" else type("PipingSystem", (), {}))
+    system, peer = FixtureSystem(), FixtureSystem()
+    system.Id, system.UniqueId, system.GroupId, system.Name = ElementId(31), "supply-one", ElementId(-1), "Old"
+    peer.Id, peer.UniqueId, peer.Name = ElementId(32), "supply-two", "Reserved"
+    duct = Duct([NS(Id=1, ConnectorType="End", MEPSystem=system)])
+    duct.Id, duct.GroupId = ElementId(41), ElementId(-1)
+    terminal = NS(Id=ElementId(42), UniqueId="terminal", GroupId=ElementId(-1),
+                  MEPModel=NS(ConnectorManager=NS(Connectors=[NS(Id=2, ConnectorType="End", MEPSystem=system)])))
+    setattr(system, "DuctNetwork" if discipline == "duct" else "PipingNetwork", [duct])
+    system.Elements, system.BaseEquipment = [terminal], None
+
+    class Systems(Collector):
+        def OfClass(self, cls):
+            assert cls is FixtureSystem
+            return self
+
+        def __iter__(self):
+            return iter((system, peer))
+
+    runtime.FilteredElementCollector = Systems
+    document = model("rename", {30: NS(Id=ElementId(30), UniqueId="type", SystemClassification="SupplyAir"),
+                                31: system, 32: peer, 41: duct, 42: terminal})
+    document.IsWorkshared = document.IsModelInCloud = document.IsLinked = document.IsReadOnly = False
+    source = execute(document, describe=True)["source"]
+    scope = {"id": "31", "uid": "supply-one", "name": "SUPPLY-01"}
+
+    result = execute(document, source=source, repair_system_name=scope)
+    assert result["status"] == "ok", result
+    data = json.loads(result["repair_system_name_json"])
+    assert data["system"]["name"] == "Old"
+    assert data["system"]["roles"] == {"network": ["41"], "terminals": ["42"], "base_equipment": []}
+    assert [row["assignments"] for row in data["system"]["members"]] == [
+        [{"connector_id": 1, "system": {"id": "31", "uid": "supply-one"}}],
+        [{"connector_id": 2, "system": {"id": "31", "uid": "supply-one"}}],
+    ]
+    assert data["name_conflicts"] == []
+
+    peer.Name = "supply-01"
+    result = execute(document, source=source, repair_system_name=scope)
+    assert json.loads(result["repair_system_name_json"])["name_conflicts"] == [
+        {"id": "32", "uid": "supply-two", "name": "supply-01"},
+    ]
+
+    duct.ConnectorManager.Connectors[0].MEPSystem = peer
+    rejected = execute(document, source=source, repair_system_name=scope)
+    assert rejected["status"] == "incomplete"
+    assert "system assignment" in rejected["message"]
+
+
 def connector(identifier, *, connected, system):
     return NS(Id=identifier, ConnectorType="End", Shape="Round", Domain="DomainHvac",
               IsConnected=connected, Origin=point(identifier, 2, 3), MEPSystem=system)

@@ -410,14 +410,17 @@ def route_visit(clock, coverage):
         raise ReadError("The route connector and system membership visit limit was reached.")
 
 
+def system_network(system):
+    if isinstance(system, DB.Mechanical.MechanicalSystem):
+        return system.DuctNetwork
+    if isinstance(system, DB.Plumbing.PipingSystem):
+        return system.PipingNetwork
+    raise ReadError("A reviewed owner belongs to an unsupported MEP system.")
+
+
 def route_system_snapshot(source, system, clock, coverage):
     identity = route_element_identity(system)
-    if isinstance(system, DB.Mechanical.MechanicalSystem):
-        network = system.DuctNetwork
-    elif isinstance(system, DB.Plumbing.PipingSystem):
-        network = system.PipingNetwork
-    else:
-        raise ReadError("A reviewed owner belongs to an unsupported MEP system.")
+    network = system_network(system)
     system_type = source.GetElement(system.GetTypeId())
     members = {}
     for collection in (network, system.Elements):
@@ -491,9 +494,13 @@ def read_route_trial_owners(source, transform, requested, clock, coverage, requi
             "systems": [systems[key] for key in sorted(systems, key=int)]}
 
 
-def read_repair_parameters(source, request, clock):
+def require_repair_project(source):
     if source.IsWorkshared or source.IsModelInCloud or source.IsLinked or source.IsReadOnly:
-        raise ReadError("Use a saved, editable standalone Revit project for parameter repair.")
+        raise ReadError("Use a saved, editable standalone Revit project for MEP repair.")
+
+
+def read_repair_parameters(source, request, clock):
+    require_repair_project(source)
     if not isinstance(request, dict) or set(request) != {"guid", "elements"}:
         raise ReadError("Supply one shared parameter GUID and the reviewed instance IDs and UIDs.")
     guid_text = request["guid"]
@@ -557,6 +564,88 @@ def read_repair_parameters(source, request, clock):
     return {"guid": str(guid).lower(), "elements": rows}
 
 
+def read_system_name_repair(source, request, clock):
+    require_repair_project(source)
+    if not isinstance(request, dict) or set(request) != {"id", "uid", "name"}:
+        raise ReadError("Supply a reviewed MEP system ID and UID and the proposed name.")
+    name = request["name"]
+    if (not isinstance(name, TEXT) or not 1 <= len(name) <= 160 or name != name.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise ReadError("Use a nonblank proposed system name with at most 160 characters.")
+    system = source.GetElement(element_id(request["id"]))
+    identity = route_element_identity(system)
+    if identity != {"id": request["id"], "uid": request["uid"]} or system.GroupId.Value > 0:
+        raise ReadError("Use the exact reviewed ungrouped MEP system.")
+    network = system_network(system)
+    original_name = system.Name
+    if not isinstance(original_name, TEXT) or not original_name or len(original_name) > 160:
+        raise ReadError("The original MEP system name is unavailable.")
+
+    roles, members = {}, {}
+    base = system.BaseEquipment
+    visits = 0
+    for role, elements in (("network", network), ("terminals", system.Elements),
+                           ("base_equipment", [] if base is None else [base])):
+        role_ids = set()
+        for element in elements:
+            check_time(clock)
+            visits += 1
+            item = route_element_identity(element)
+            key = item["id"]
+            if visits > 500 or key in role_ids or element.GroupId.Value > 0:
+                raise ReadError("The system membership exceeds its limit or contains grouped or repeated members.")
+            if key in members and route_element_identity(members[key]) != item:
+                raise ReadError("The system has inconsistent member identities.")
+            role_ids.add(key)
+            members[key] = element
+        roles[role] = sorted(role_ids, key=int)
+
+    member_rows = []
+    coverage = {"connectors_visited": 0}
+    for key in sorted(members, key=int):
+        element = members[key]
+        assignments = {}
+        for connector in connector_collection(element):
+            route_visit(clock, coverage)
+            kind = str(connector.ConnectorType)
+            if kind in ("Logical", "Reference"):
+                continue
+            connector_id = int(connector.Id)
+            if (kind not in ("End", "Curve", "Physical") or connector_id in assignments
+                    or len(assignments) >= ELEMENT_CONNECTOR_LIMIT):
+                raise ReadError("A system member has unsupported or ambiguous connectors.")
+            current = connector.MEPSystem
+            assignments[connector_id] = route_element_identity(current) if current is not None else None
+        if identity not in assignments.values():
+            raise ReadError("A reviewed member has no matching physical system assignment.")
+        member_rows.append(dict(route_element_identity(element), assignments=[
+            {"connector_id": key, "system": assignments[key]} for key in sorted(assignments)
+        ]))
+
+    collisions = []
+    collision_clock = Stopwatch.StartNew()
+    with DB.FilteredElementCollector(source) as collector:
+        systems = collector.OfClass(DB.MEPSystem).WhereElementIsNotElementType()
+        for index, candidate in enumerate(systems, 1):
+            check_time(clock)
+            if index > 5000 or collision_clock.ElapsedMilliseconds >= 5000:
+                raise ReadError("The system name collision scan exceeded its limit.")
+            other = route_element_identity(candidate)
+            other_name = candidate.Name
+            if not isinstance(other_name, TEXT) or len(other_name) > 160:
+                raise ReadError("A system name could not be read for collision checking.")
+            if other != identity and other_name.upper() == name.upper():
+                collisions.append(dict(other, name=other_name))
+    if collision_clock.ElapsedMilliseconds >= 5000:
+        raise ReadError("The system name collision scan exceeded its limit.")
+    system_type = source.GetElement(system.GetTypeId())
+    return {
+        "system": dict(identity, name=original_name, system_type=route_element_identity(system_type),
+                       classification=str(system_type.SystemClassification), roles=roles, members=member_rows),
+        "proposed_name": name, "name_conflicts": sorted(collisions, key=lambda row: int(row["id"])),
+    }
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -567,18 +656,22 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
-        if "repair_parameters" in request:
-            if set(request) != {"source", "repair_parameters"}:
-                raise ReadError("Use a separate host-project query for parameter repair.")
-            repair_request = request["repair_parameters"]
-            repair = read_repair_parameters(source, repair_request, clock)
+        if "repair_parameters" in request or "repair_system_name" in request:
+            if "repair_parameters" in request:
+                field, kind, read_repair = "repair_parameters", "mep-parameter-repair-evidence", read_repair_parameters
+            else:
+                field, kind, read_repair = "repair_system_name", "mep-system-name-repair-evidence", read_system_name_repair
+            if set(request) != {"source", field}:
+                raise ReadError("Use a separate host-project query for MEP repair.")
+            repair_request = request[field]
+            repair = read_repair(source, repair_request, clock)
             current_source, _, current_identity = resolve_source(host, None, None)
-            if current_identity != identity or read_repair_parameters(current_source, repair_request, clock) != repair:
-                raise ReadError("The repair scope or parameter values changed while being read.")
+            if current_identity != identity or read_repair(current_source, repair_request, clock) != repair:
+                raise ReadError("The repair scope or values changed while being read.")
             check_time(clock)
-            payload = dict(repair, kind="mep-parameter-repair-evidence", version=1, source=identity)
+            payload = dict(repair, kind=kind, version=1, source=identity)
             encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-            result = {"status": "ok", "repair_parameters_json": encoded}
+            result = {"status": "ok", field + "_json": encoded}
             if len(encoded) > SNAPSHOT_LIMIT or len(json.dumps(result, ensure_ascii=True)) > ENVELOPE_LIMIT:
                 raise ReadError("The repair evidence exceeded its encoded result limit.")
             return result
