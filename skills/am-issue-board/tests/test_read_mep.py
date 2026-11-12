@@ -425,6 +425,7 @@ def test_category_discovery_is_bounded_and_distinguishes_complete_empty(runtime)
     ("empty", 0, "empty_scope", []),
     ("mixed", 2, None, []),
     ("wrong_count", 2, None, []),
+    ("duplicate_uid", 2, None, []),
     ("incomplete_inventory", 2, None, []),
 ])
 def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, status, rules):
@@ -446,6 +447,11 @@ def test_native_snapshot_to_audit_cli(runtime, tmp_path, scenario, exit_code, st
         snapshot["elements"] = snapshot["snapshot"]["elements"]
     elif scenario == "wrong_count":
         snapshot["snapshot"]["coverage"]["connectors_retained"] += 1
+    elif scenario == "duplicate_uid":
+        payload = snapshot["snapshot"]
+        payload["elements"].append(dict(payload["elements"][0], id="43"))
+        for key in payload["coverage"]:
+            payload["coverage"][key] *= 2
     elif scenario == "incomplete_inventory":
         snapshot["snapshot"]["status"] = "incomplete"
     source_path, report_path = tmp_path / "snapshot.json", tmp_path / "report.json"
@@ -476,6 +482,8 @@ def test_large_native_audit_uses_complete_runtime_pages(runtime, tmp_path):
     system = NS(Id=ElementId(9), Name="SA-01", GetTypeId=lambda: ElementId(10))
     connected = [connector(index, connected=True, system=system) for index in range(4)]
     ducts = {identifier: Duct(connected, flow=120) for identifier in range(1000, 1500)}
+    for identifier, duct in ducts.items():
+        duct.UniqueId = f"duct-{identifier}"
     host = model("host", {10: NS(SystemClassification="SupplyAir", CalculationLevel="Flow"), **ducts})
     request = {"source": execute(host, describe=True)["source"], "element_ids": [str(item) for item in ducts]}
     result = execute(host, **request)

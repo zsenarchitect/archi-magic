@@ -458,16 +458,19 @@ def run_native_audit(data):
             or not 0 <= inventory["connectors_retained"] <= inventory["connectors_visited"] <= 4000
             or inventory["connectors_retained"] > 2000):
         raise ValueError("The native MEP snapshot does not have complete inventory counts.")
-    seen, findings, targets, diagnostics = set(), [], {}, []
+    seen_ids, seen_uids = set(), set()
+    findings, targets, diagnostics = [], {}, []
     coverage = {key: dict.fromkeys(("evaluated", "unavailable", "not_applicable"), 0) for key in NATIVE_CHECKS}
     for row in rows:
-        if (not positive_id(row["id"]) or row["id"] in seen
+        if (not positive_id(row["id"]) or row["id"] in seen_ids
                 or not isinstance(row["uid"], str) or not 0 < len(row["uid"]) <= 160
+                or row["uid"] in seen_uids
                 or row["category"] not in SYSTEM_CATEGORIES | DISTRIBUTION_CATEGORIES
                 or (clearance is None and row["category"] == "Mechanical Equipment"
                     and row["clearance"] != "unavailable")):
             raise ValueError("The native MEP snapshot contains an invalid element identity or category.")
-        seen.add(row["id"])
+        seen_ids.add(row["id"])
+        seen_uids.add(row["uid"])
         violations, checks = native_element_findings(row)
         for check, state in checks.items():
             coverage[check][state] += 1
