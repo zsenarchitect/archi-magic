@@ -1,6 +1,7 @@
 """Read the exact active writable family copy before deriving new batch types."""
 
 import json
+from uuid import uuid4
 
 from family_library_discovery import manifest_digest
 from prepare_batch_family_derivation import verified_working_copy
@@ -96,6 +97,7 @@ else:
     from pyrevit.api import DB
     try:
         read = read_working_family(active_family, query_inputs["derivation"], DB)
-        result = {"status": "ok", "snapshot_json": json.dumps(read, ensure_ascii=True, allow_nan=False)}
+        result = {"status": "ok", "snapshot_json": json.dumps(read, ensure_ascii=True, allow_nan=False),
+                  "audit_token": uuid4().hex, "trial_transaction": query_inputs.get("trial_transaction")}
     except (AttributeError, KeyError, OSError, OverflowError, TypeError, ValueError) as error:
         result = {"status": "blocked", "reason": str(error)}

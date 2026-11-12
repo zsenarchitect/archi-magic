@@ -1,6 +1,7 @@
 """Qualify reviewed type derivation with mandatory rollback in an active private family."""
 
 import math
+import re
 from uuid import uuid4
 
 from batch_family_derivation_preview import build_preview, working_read
@@ -75,15 +76,20 @@ def validate_effects(original, current, events, owner):
         raise ValueError("The trial changed elements outside the reviewed family owner.")
 
 
-def run_trial(document, DB, args):
-    if (set(args) != {"disposable_fixture", "derivation", "working_read", "preview", "preview_sha256"}
-            or args["disposable_fixture"] is not True):
+def run_trial(document, DB, args, *, handoff=None):
+    required = {"disposable_fixture", "derivation", "working_read", "preview", "preview_sha256"}
+    if (set(args) != required or args["disposable_fixture"] is not True):
         raise ValueError("Use the reviewed derivation in an active private disposable family.")
     plan = args["derivation"]
     preview = args["preview"]
     if (manifest_digest(preview) != args["preview_sha256"]
             or build_preview(plan, args["working_read"]) != preview):
         raise ValueError("The derivation preview changed after review.")
+    recorded = args["working_read"].get("response", args["working_read"])
+    recorded = recorded.get("result", recorded)
+    token = recorded.get("audit_token")
+    if not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token):
+        raise ValueError("Use the original saved family query with its audit token.")
     baseline = working_read(args["working_read"])
     current = read_working_family(document, plan, DB)
     if current != baseline:
@@ -94,10 +100,10 @@ def run_trial(document, DB, args):
     state = baseline["state"]
     if state["current_type"] not in state["types"]:
         raise ValueError("The working family has no exact current seed type.")
-    return execute_trial(document, DB, args, plan, baseline, original)
+    return execute_trial(document, DB, args, plan, baseline, original, token, handoff=handoff)
 
 
-def execute_trial(document, DB, args, plan, baseline, original):
+def execute_trial(document, DB, args, plan, baseline, original, token, *, handoff=None):
     transaction_name = TRANSACTION_NAME + " " + uuid4().hex
     events = []
     invalid = False
@@ -124,6 +130,7 @@ def execute_trial(document, DB, args, plan, baseline, original):
         failure = None
         regeneration_failed = False
         restored = False
+        handed_off = False
         observed = None
         application.DocumentChanged += record
         try:
@@ -137,13 +144,18 @@ def execute_trial(document, DB, args, plan, baseline, original):
                 raise ValueError("Revit reported unexpected provisional events.")
             observed = compare_state(plan, baseline["state"], family_state(document))
             validate_effects(original, inventory(document, DB), events, baseline["owner"]["id"])
+            if handoff is not None:
+                handoff(observed, events)
+                if group.Assimilate() != status.Committed or group.GetStatus() != status.Committed:
+                    raise ValueError("Revit did not transfer the checked family edits to the bridge.")
+                handed_off = True
         except Exception as error:
             regeneration_failed = type(error).__name__ == "RegenerationFailedException"
             failure = str(error) if isinstance(error, ValueError) else type(error).__name__
         finally:
             closing = True
             try:
-                restored = rollback(transaction, group, status)
+                restored = handed_off or rollback(transaction, group, status)
             except Exception:
                 restored = False
             finally:
@@ -157,7 +169,13 @@ def execute_trial(document, DB, args, plan, baseline, original):
                     except Exception:
                         restored = False
     if not restored or regeneration_failed:
+        if handoff is not None:
+            raise RuntimeError("The family edit did not close cleanly. The bridge must roll it back.")
         return {"status": "transaction_unresolved", "reason": failure or "Revit did not confirm rollback."}
+    evidence = {"preview_sha256": args["preview_sha256"], "working_read_sha256": baseline["working_read_sha256"],
+                "baseline_audit_token": token, "transaction": transaction_name, "types": observed, "effects": events}
+    if handed_off:
+        return dict(evidence, status="awaiting_bridge_decision")
     try:
         if read_working_family(document, plan, DB) != baseline or inventory(document, DB) != original:
             return {"status": "transaction_unresolved", "reason": "The working family changed after rollback."}
@@ -165,9 +183,7 @@ def execute_trial(document, DB, args, plan, baseline, original):
         return {"status": "transaction_unresolved", "reason": type(error).__name__}
     if failure:
         return {"status": "stopped", "reason": failure, "rollback_verified": True, "effects": events}
-    return {"status": "trial_rolled_back", "preview_sha256": args["preview_sha256"],
-            "working_read_sha256": baseline["working_read_sha256"], "transaction": transaction_name,
-            "types": observed, "effects": events, "rollback_verified": True}
+    return dict(evidence, status="trial_rolled_back", rollback_verified=True)
 
 
 try:

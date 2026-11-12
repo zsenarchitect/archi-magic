@@ -242,7 +242,10 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 1. Run `python scripts/batch_family_derivation_preview.py --derivation derivation.json --family-read family-read.json`. Review the exact seeds, target names, size changes, and calculated parameters.
 2. Call `get_context` and confirm the exact disposable family. Obtain approval for the rollback-only trial. Run `probe_batch_family_derivation.py` in guarded CPython dry-run mode.
 3. Pass `disposable_fixture: true`, the receipt as `derivation`, the saved query as `working_read`, and the reviewed `preview`. Pass its `preview_sha256` from `family_library_discovery.manifest_digest(preview)`.
-4. Check the measured values and rollback result. Save the full trial record. Keep and export still require independent verification and native qualification.
+4. Save the full trial record. Run the family query again with the same derivation. Pass the trial's `transaction` as `trial_transaction`. Save the full fresh query.
+5. Run `python scripts/verify_batch_family_derivation.py derivation.json preview.json before.json trial.json after.json`. Check the measured values, effects, and restored family state.
+6. Recheck the active family and ask policy. Obtain approval to replay. Run `apply_batch_family_derivation.py` in guarded CPython modify mode. Pass the same trial inputs as `derivation_run` and the full records as `before`, `trial`, and `after`.
+7. Use Revit's Keep or Discard prompt. Save the full modify record. A kept family still requires independent readback and private export before a project load.
 
 ## Preview a CAD layout (issue #166)
 

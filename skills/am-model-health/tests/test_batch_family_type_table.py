@@ -266,7 +266,7 @@ def test_working_family_read_binds_exact_seed_and_writable_definition(derivation
 
 
 @pytest.mark.parametrize("failure", [None, "inheritance", "effect"])
-def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, failure):
+def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, failure, monkeypatch):
     from types import SimpleNamespace
     from batch_family_derivation_preview import build_preview
     from prepare_batch_family_derivation import create_working_copy
@@ -330,6 +330,10 @@ def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, f
         def GetStatus(self):
             return self.status
 
+        def Assimilate(self):
+            self.status = "Committed"
+            return self.status
+
         def RollBack(self):
             manager.Types = [seed]
             manager.CurrentType = seed
@@ -376,8 +380,11 @@ def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, f
                                                    ConvertToInternalUnits=lambda value, unit: value))
     baseline = read_working_family(document, plan, db)
     preview = build_preview(plan, baseline)
-    report = run_trial(document, db, {"disposable_fixture": True, "derivation": plan, "working_read": baseline,
-                                      "preview": preview, "preview_sha256": manifest_digest(preview)})
+    baseline_result = {"status": "ok", "snapshot_json": json.dumps(baseline), "audit_token": "a" * 32,
+                       "trial_transaction": None}
+    requested = {"disposable_fixture": True, "derivation": plan, "working_read": baseline_result,
+                 "preview": preview, "preview_sha256": manifest_digest(preview)}
+    report = run_trial(document, db, requested)
     assert report["rollback_verified"] is True
     assert manager.Types == [seed] and manager.CurrentType is seed
     assert not document.Application.DocumentChanged
@@ -387,3 +394,42 @@ def test_derivation_trial_verifies_seed_sizes_and_rolls_back(derivation_input, f
         assert report["status"] == "trial_rolled_back"
         assert report["types"]["New"] == {"42": {"state": "value", "value": 4.0},
                                          "43": {"state": "value", "value": 8.0}}
+
+        import apply_batch_family_derivation as writer
+        from verify_batch_family_derivation import verify
+
+        def envelope(run_id, mode, result):
+            return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "no_changes",
+                    "exit_code": 0, "result_truncated": False, "engine": {"requested": "cpython"},
+                    "blocked": [], "dialogs": [], "failures": [], "warnings": [],
+                    "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
+                    "result": result}
+
+        before = envelope("before-run", "query", baseline_result)
+        trial = envelope("trial-run", "dry_run", report)
+        after_result = dict(baseline_result, audit_token="b" * 32, trial_transaction=report["transaction"])
+        after = envelope("after-run", "query", after_result)
+        assert verify(plan, preview, before, trial, after)["types"] == report["types"]
+        with pytest.raises(ValueError, match="exact reviewed rollback"):
+            verify(plan, preview, before, trial, envelope("after-run", "query", baseline_result))
+
+        requested["working_read"] = before
+        args = {"derivation_run": requested, "before": before, "trial": trial, "after": after}
+        calls = []
+
+        def policy(context):
+            calls.append(context)
+            if len(calls) == 2:
+                raise ValueError("The live ask policy changed.")
+
+        monkeypatch.setattr(writer, "require_ask", policy)
+        rejected = writer.apply(document, db, args, "context")
+        assert rejected["status"] == "stopped"
+        assert rejected["rollback_verified"] and manager.Types == [seed]
+
+        monkeypatch.setattr(writer, "require_ask", calls.append)
+        replay = writer.apply(document, db, args, "context")
+        assert replay["status"] == "awaiting_bridge_decision"
+        assert replay["types"] == report["types"]
+        assert [row.Name for row in manager.Types] == ["Seed", "New"]
+        assert not document.Application.DocumentChanged

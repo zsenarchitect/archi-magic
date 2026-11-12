@@ -11,7 +11,8 @@ from read_family_library import encode_record
 
 
 def working_read(value):
-    response = value.get("result", value)
+    response = value.get("response", value)
+    response = response.get("result", response)
     return json.loads(response["snapshot_json"]) if "snapshot_json" in response else response
 
 
