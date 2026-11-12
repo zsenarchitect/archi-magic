@@ -44,7 +44,9 @@ Show Revit geometry as an interactive 3D page next to the conversation.
 2. **Build the page.** Use `/bim-view <path.json>` (the mod), or with node: `node "<this skill dir>\scripts\build-viewer.mjs" <path.json>`. With no path, both build the demo model. The mod cannot read files over 4 MiB (about 80,000 triangles). Use the node script for larger models.
 3. **Open it from the project folder.** The exporter writes to the temp folder. The Browser pane shows a local file outside the project folder (the session's working folder) as a static snapshot: page scripts do not run, so the viewer looks empty, with no error in the console. So first copy the `.viewer.html` into the working folder (for example `.\bim-viewer-out\`). Then open the `file:///...viewer.html` URL of that copy in the Browser pane (`preview_start` with `url`). If no Browser pane is available, give the user the path, or run `/bim-view <path> --open` to use the default browser. The copy is a snapshot. Export again after the Revit model changes.
 
-   **The viewer is empty?** The page is probably outside the project folder. Copy it into the working folder and open that copy. If it is still empty, read the console for errors (the page loads three.js from a CDN, so it needs internet access).
+   **Build for offline use.** Run `npm ci` in the skill folder once to install the pinned Three.js dependency. Then run `node scripts/build-viewer.mjs --offline <model.json> <model.viewer.html>`. Open the generated HTML directly. It embeds Three.js and uses local font fallbacks.
+
+   **The viewer is empty?** The page is probably outside the project folder. Copy it into the working folder and open that copy. If it is still empty, read the console for errors. The default build needs internet access to load Three.js from the CDN.
 
 ## Viewer controls (Rhino defaults)
 
