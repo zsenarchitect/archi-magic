@@ -157,6 +157,64 @@ def execute(document, **request):
     return runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": request})["result"]
 
 
+def test_repair_parameter_query_pins_instance_values_and_rejects_drift(runtime):
+    guid = "62cba752-ce75-4604-93a8-f58f02909dc7"
+    empty = NS(Id=ElementId(21), UniqueId="empty", Category=NS(Id=ElementId(Enum.OST_DuctCurves)),
+               GroupId=ElementId(-1))
+    filled = NS(Id=ElementId(22), UniqueId="filled", Category=empty.Category, GroupId=ElementId(-1))
+    blank_parameter = NS(Element=empty, IsShared=True, GUID=guid, Id=ElementId(90),
+                         StorageType="string", IsReadOnly=False, HasValue=True, AsString=lambda: "")
+    value_parameter = NS(Element=filled, IsShared=True, GUID=guid, Id=ElementId(90),
+                         StorageType="string", IsReadOnly=False, HasValue=True, AsString=lambda: "Review kept text")
+    empty.get_Parameter = lambda key: blank_parameter if key == guid else None
+    filled.get_Parameter = lambda key: value_parameter if key == guid else None
+    runtime.StorageType.String = "string"
+    runtime.InstanceBinding = type("InstanceBinding", (), {})
+    binding = runtime.InstanceBinding()
+    binding.Categories = NS(Contains=lambda category: category is empty.Category)
+    definition = object()
+    runtime.SharedParameterElement = NS(Lookup=lambda document, key: NS(GetDefinition=lambda: definition))
+    document = model("repair", {21: empty, 22: filled})
+    document.IsWorkshared = document.IsModelInCloud = document.IsLinked = document.IsReadOnly = False
+    document.ParameterBindings = NS(Contains=lambda key: key is definition, get_Item=lambda key: binding)
+    source = execute(document, describe=True)["source"]
+    request = {"source": source, "repair_parameters": {"guid": guid, "elements": [
+        {"id": "21", "uid": "empty"}, {"id": "22", "uid": "filled"},
+    ]}}
+
+    output = execute(document, **request)
+    assert output["status"] == "ok", output
+    rows = json.loads(output["repair_parameters_json"])["elements"]
+    assert [(row["id"], row["state"], row["has_value"], row["value"]) for row in rows] == [
+        ("21", "empty", True, ""), ("22", "already_filled", True, "Review kept text"),
+    ]
+
+    blank_parameter.HasValue = False
+    blank_parameter.AsString = lambda: None
+    rows = json.loads(execute(document, **request)["repair_parameters_json"])["elements"]
+    assert rows[0]["state"] == "unset" and rows[0]["value"] is None
+
+    changing = iter([None, "Changed during read"])
+    blank_parameter.AsString = lambda: next(changing)
+    stopped = execute(document, **request)
+    assert stopped["status"] == "incomplete" and "changed while being read" in stopped["message"]
+    assert "repair_parameters_json" not in stopped
+
+    blank_parameter.AsString = lambda: None
+    blank_parameter.Element = filled
+    stopped = execute(document, **request)
+    assert stopped["status"] == "incomplete" and "parameter owner" in stopped["message"]
+
+    blank_parameter.Element = empty
+    document.ParameterBindings.get_Item = lambda key: object()
+    stopped = execute(document, **request)
+    assert stopped["status"] == "incomplete" and "instance parameter binding" in stopped["message"]
+
+    document.IsLinked = True
+    stopped = execute(document, **request)
+    assert stopped["status"] == "incomplete" and "standalone" in stopped["message"]
+
+
 def connector(identifier, *, connected, system):
     return NS(Id=identifier, ConnectorType="End", Shape="Round", Domain="DomainHvac",
               IsConnected=connected, Origin=point(identifier, 2, 3), MEPSystem=system)

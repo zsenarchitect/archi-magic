@@ -491,6 +491,72 @@ def read_route_trial_owners(source, transform, requested, clock, coverage, requi
             "systems": [systems[key] for key in sorted(systems, key=int)]}
 
 
+def read_repair_parameters(source, request, clock):
+    if source.IsWorkshared or source.IsModelInCloud or source.IsLinked or source.IsReadOnly:
+        raise ReadError("Use a saved, editable standalone Revit project for parameter repair.")
+    if not isinstance(request, dict) or set(request) != {"guid", "elements"}:
+        raise ReadError("Supply one shared parameter GUID and the reviewed instance IDs and UIDs.")
+    guid_text = request["guid"]
+    if (not isinstance(guid_text, TEXT)
+            or not re.match(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z", guid_text)
+            or guid_text == "00000000-0000-0000-0000-000000000000"):
+        raise ReadError("Use a nonzero shared parameter GUID.")
+    guid = Guid(guid_text.lower())
+    targets = request["elements"]
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 50:
+        raise ReadError("Supply one to 50 reviewed MEP instances.")
+
+    shared = DB.SharedParameterElement.Lookup(source, guid)
+    binding = None
+    if shared is not None:
+        definition = shared.GetDefinition()
+        bindings = source.ParameterBindings
+        if bindings.Contains(definition):
+            binding = bindings.get_Item(definition)
+            if not isinstance(binding, DB.InstanceBinding):
+                raise ReadError("Use a shared instance parameter binding.")
+
+    categories = {int(getattr(DB.BuiltInCategory, name)) for name, _ in CATEGORIES}
+    rows, seen_ids, seen_uids = [], set(), set()
+    for target in targets:
+        check_time(clock)
+        if not isinstance(target, dict) or set(target) != {"id", "uid"}:
+            raise ReadError("Each repair target needs an exact ID and UID.")
+        element = source.GetElement(element_id(target["id"]))
+        actual = route_element_identity(element)
+        if (actual != target or actual["id"] in seen_ids or actual["uid"] in seen_uids
+                or isinstance(element, DB.ElementType) or element.GroupId.Value > 0
+                or element.Category is None or element.Category.Id.Value not in categories):
+            raise ReadError("Use distinct, exact and ungrouped MEP instances in the reviewed host.")
+        seen_ids.add(actual["id"])
+        seen_uids.add(actual["uid"])
+        row = dict(actual, category_id=str(element.Category.Id.Value), state="missing_parameter")
+        parameter = element.get_Parameter(guid)
+        if parameter is not None:
+            if (not parameter.IsShared or str(parameter.GUID).lower() != str(guid).lower()
+                    or route_element_identity(parameter.Element) != actual
+                    or (binding is not None and not binding.Categories.Contains(element.Category))):
+                raise ReadError("The shared parameter owner, GUID or instance binding differs from the review.")
+            is_text = parameter.StorageType == DB.StorageType.String
+            value = parameter.AsString() if is_text else None
+            has_value = bool(parameter.HasValue)
+            read_only = bool(parameter.IsReadOnly)
+            if value is not None and (not isinstance(value, TEXT) or len(value) > 4096):
+                raise ReadError("A text parameter exceeds the repair evidence limit.")
+            if not is_text:
+                state = "unsupported_storage"
+            elif read_only:
+                state = "read_only"
+            elif value and value.strip():
+                state = "already_filled"
+            else:
+                state = "empty" if has_value else "unset"
+            row.update(parameter_id=str(parameter.Id.Value), storage=str(parameter.StorageType),
+                       state=state, read_only=read_only, has_value=has_value, value=value)
+        rows.append(row)
+    return {"guid": str(guid).lower(), "elements": rows}
+
+
 def run_query(host, request):
     clock = Stopwatch.StartNew()
     coverage = {"elements": 0, "connectors_visited": 0, "connectors_retained": 0}
@@ -501,6 +567,21 @@ def run_query(host, request):
             return {"status": "ok", "source": identity}
         if request.get("source") != identity:
             raise ReadError("The source differs from the reviewed project or link.")
+        if "repair_parameters" in request:
+            if set(request) != {"source", "repair_parameters"}:
+                raise ReadError("Use a separate host-project query for parameter repair.")
+            repair_request = request["repair_parameters"]
+            repair = read_repair_parameters(source, repair_request, clock)
+            current_source, _, current_identity = resolve_source(host, None, None)
+            if current_identity != identity or read_repair_parameters(current_source, repair_request, clock) != repair:
+                raise ReadError("The repair scope or parameter values changed while being read.")
+            check_time(clock)
+            payload = dict(repair, kind="mep-parameter-repair-evidence", version=1, source=identity)
+            encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            result = {"status": "ok", "repair_parameters_json": encoded}
+            if len(encoded) > SNAPSHOT_LIMIT or len(json.dumps(result, ensure_ascii=True)) > ENVELOPE_LIMIT:
+                raise ReadError("The repair evidence exceeded its encoded result limit.")
+            return result
         if "route_trial_owners" in request:
             if link_id is not None or set(request) != {"source", "route_trial_owners"}:
                 raise ReadError("Use a separate host-project query for route trial owners.")
