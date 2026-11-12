@@ -96,6 +96,15 @@ def test_same_pair_at_the_correct_anchor_is_a_noop_and_wrong_anchor_blocks():
     plan = preview.compute(data)
     assert plan["steps"] == [] and not plan["blocked"] and plan["ownership_ids"] == []
     assert all(row[-1] == "Already placed" for row in plan["after"])
+    legend = data["sheets"][1]["placements"][0]
+    original = legend["rectangles_ft"]
+    for label_bounds, reason in (([0.8, 0.01, 1.2, 0.09], "exceeds the reviewed sheet area"),
+                                 ([1.8, 0.8, 1.95, 1.0], "overlaps another sheet object")):
+        legend["rectangles_ft"] = original + [label_bounds]
+        repeated = preview.compute(data)
+        assert repeated["blocked"] and repeated["steps"] == []
+        assert any(warning["row"] == "2" and reason in warning["text"] for warning in repeated["warnings"])
+    legend["rectangles_ft"] = original
     data["sheets"][1]["placements"][0]["point_ft"] = [1.01, 1]
     plan = preview.compute(data)
     assert plan["blocked"] and plan["after"][1][4] == [1.01, 1] and plan["steps"] == []

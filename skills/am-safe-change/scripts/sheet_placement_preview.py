@@ -113,6 +113,14 @@ def sheet_contents(sheet):
     return geometry, pairs
 
 
+def layout_problem(shapes, usable, clearance, obstacles):
+    if any(not fits(shape, usable, clearance) for shape in shapes):
+        return "A measured placement or viewport label exceeds the reviewed sheet area."
+    if any(overlap(shape, obstacle, clearance) for other in obstacles for obstacle in other for shape in shapes):
+        return "A measured placement or viewport label overlaps another sheet object."
+    return None
+
+
 def compute(snapshot):
     fields(snapshot, ("kind", "complete", "document", "request", "views", "sheets", "viewport_eligible_pairs"))
     if snapshot["kind"] != "sheet-placement-snapshot" or snapshot["complete"] is not True:
@@ -138,7 +146,7 @@ def compute(snapshot):
         eligible_pairs.add(pair)
 
     graphics = set()
-    existing = {}
+    existing, sheet_geometry = {}, {}
     for sheet_id, sheet in sheets.items():
         fields(sheet, ("id", "uid", "number", "outline_ft", "title_block_id", "title_block_uid",
                        "revision_sha256", "ownership_ok", "placements", "obstacles"))
@@ -151,6 +159,7 @@ def compute(snapshot):
         if type(sheet["ownership_ok"]) is not bool:
             raise ValueError("The destination sheet ownership state is unavailable.")
         geometry, existing[sheet_id] = sheet_contents(sheet)
+        sheet_geometry[sheet_id] = geometry
         if graphics.intersection(geometry):
             raise ValueError("A graphic appears on more than one reviewed sheet.")
         graphics.update(geometry)
@@ -183,6 +192,10 @@ def compute(snapshot):
         if matching:
             if old and old["kind"] == view["kind"] and same_point(old["point_ft"], point):
                 action = "Already placed"
+                geometry = sheet_geometry[sheet_id]
+                reason = layout_problem(geometry[old["id"]], request["sheets"][sheet_id]["usable_ft"],
+                                        request["clearance_ft"],
+                                        (shapes for other, shapes in geometry.items() if other != old["id"]))
             else:
                 reason = "This view has an existing placement at a different anchor or multiple placements."
         elif not view["eligible"] or view["saved_position"]:
@@ -235,11 +248,10 @@ def verify_layout(plan, snapshot, placements):
             raise ValueError("A placement identity or its measured anchor differs from the approved plan.")
         sheet_id = step["sheet_id"]
         clearance = plan["request"]["clearance_ft"]
-        if any(not fits(shape, plan["request"]["sheets"][sheet_id]["usable_ft"], clearance) for shape in shapes):
-            raise ValueError("A measured placement or viewport label exceeds the reviewed sheet area.")
-        if any(overlap(shape, obstacle, clearance) for shape in shapes
-               for other in occupied[sheet_id].values() for obstacle in other):
-            raise ValueError("A measured placement or viewport label overlaps another sheet object.")
+        problem = layout_problem(shapes, plan["request"]["sheets"][sheet_id]["usable_ft"],
+                                 clearance, occupied[sheet_id].values())
+        if problem:
+            raise ValueError(problem)
         seen.add(identifier)
         occupied[sheet_id][identifier] = shapes
     return placements
