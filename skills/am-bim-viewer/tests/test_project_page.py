@@ -64,3 +64,34 @@ def test_page_has_no_network_and_cli_works(tmp_path):
     page = out.read_text(encoding="utf-8")
     assert "http://" not in page and "https://" not in page
     assert "default-src 'none'" in page
+
+
+def test_preview_pairs_reordered_rows_and_shows_additions_and_removals():
+    preview = {
+        "columns": ["Description", "ElementId"],
+        "keyColumn": "ElementId",
+        "changedColumns": ["Description"],
+        "before": [["Old", "9007199254740993"], ["Retired", "2"], ["Same", "3"]],
+        "after": [["Added <item>", "4"], ["Same", "3"], ["New", "9007199254740993"]],
+    }
+    out = pp.render_preview(preview)
+    assert "<del>Old</del> &rarr; <ins>New</ins></td><td>9007199254740993</td>" in out
+    assert "<td>Removed</td><td>Retired</td><td>2</td>" in out
+    assert "<td>Added</td><td>Added &lt;item&gt;</td><td>4</td>" in out
+    assert "<td>Unchanged</td><td>Same</td><td>3</td>" in out
+
+
+def test_creation_only_preview_shows_rows_and_blocking_status():
+    preview = {
+        "columns": ["Id", "Name"],
+        "keyColumn": "Id",
+        "changedColumns": ["Name"],
+        "before": [],
+        "after": [["1", "New view"]],
+        "blocked": True,
+        "warnings": [{"text": "Name already used", "blocking": True}],
+    }
+    out = pp.render_preview(preview)
+    assert "<td>Added</td><td>1</td><td>New view</td>" in out
+    assert "Preview blocked" in out and "Name already used" in out
+    assert "Approve or discard" not in out
