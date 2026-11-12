@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -75,7 +76,7 @@ def snapshot_file(source, snapshot, *, limit=FILE_LIMIT):
     return digest.hexdigest()
 
 
-def run_decoder(args, directory, *, timeout=35):
+def run_decoder(args, directory, *, timeout=35, process_group=False):
     buffers = [bytearray(), bytearray()]
     exceeded = Event()
 
@@ -88,7 +89,8 @@ def run_decoder(args, directory, *, timeout=35):
                 buffer.extend(chunk)
 
     with subprocess.Popen(
-        args, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        args, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=process_group,
     ) as process:
         threads = [
             Thread(target=drain, args=(pipe, buffer, limit), daemon=True)
@@ -99,12 +101,23 @@ def run_decoder(args, directory, *, timeout=35):
         for thread in threads:
             thread.start()
         deadline = monotonic() + timeout
+        timed_out = False
         try:
-            while process.poll() is None and not exceeded.wait(0.02):
-                if monotonic() >= deadline:
+            while process.poll() is None or (process_group and any(thread.is_alive() for thread in threads)):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
                     raise ValueError("Drawing decoder timed out.")
+                if exceeded.wait(min(remaining, 0.02)):
+                    break
         finally:
-            if process.poll() is None:
+            if process_group and (timed_out or exceeded.is_set() or process.poll() is None
+                                  or any(thread.is_alive() for thread in threads)):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif process.poll() is None:
                 process.kill()
             process.wait()
             for thread in threads:
@@ -190,7 +203,7 @@ def text_value(value):
     return value
 
 
-def dwg_inventory(doc, version):
+def dwg_inventory(doc, version, *, graph=False):
     if doc["FILEHEADER"]["version"] != version or doc["created_by"] != "LibreDWG 0.14":
         raise ValueError("Unexpected DWG decoder version or source signature.")
     records = doc["OBJECTS"]
@@ -220,7 +233,15 @@ def dwg_inventory(doc, version):
             flagged = bool(record.get("blkisxref") or record.get("xrefoverlaid"))
             path = text_value(record.get("xref_pname", ""))
             if flagged or path:
-                xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
+                row = {"name": name, "path": path, "flags_consistent": bool(path) == flagged}
+                if graph:
+                    attach, overlay = record.get("blkisxref", 0), record.get("xrefoverlaid", 0)
+                    if (type(attach) not in (bool, int) or type(overlay) not in (bool, int)
+                            or attach not in (0, 1) or overlay not in (0, 1)):
+                        row["mode"] = "unknown"
+                    else:
+                        row["mode"] = "overlay" if overlay else "attach" if attach else "unknown"
+                xrefs.append(row)
             elif not name.casefold().startswith(LAYOUT_PREFIXES):
                 blocks[key] = {"name": name, "count": 0, "insert_handles": [], "attributes": [], "definitions": []}
     for key, record in selected.items():
@@ -262,7 +283,7 @@ def dxf_attribute_text(attribute):
     return text_value(value)
 
 
-def dxf_worker(snapshot):
+def dxf_worker(snapshot, *, graph=False):
     import ezdxf
     from ezdxf.blkrefs import find_unreferenced_blocks
     if ezdxf.__version__ != "1.4.5":
@@ -291,7 +312,10 @@ def dxf_worker(snapshot):
         path = text_value(entity.dxf.xref_path)
         flagged = entity.is_xref or entity.is_xref_overlay
         if flagged or path:
-            xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
+            row = {"name": name, "path": path, "flags_consistent": bool(path) == flagged}
+            if graph:
+                row["mode"] = "overlay" if entity.is_xref_overlay else "attach" if entity.is_xref else "unknown"
+            xrefs.append(row)
         elif not entity.is_layout_block:
             if (layout.name in unreferenced and not name.startswith(("*", "_")) and "|" not in name
                     and not entity.is_anonymous and not entity.dxf.flags & (entity.EXTERNAL | entity.RESOLVED)):
@@ -316,36 +340,56 @@ def dxf_worker(snapshot):
             "unassociated_attributes": [], "unassociated_definitions": [], "notes": []}
 
 
+def decode_snapshot(snapshot, decoder, *, timeout=None):
+    graph = timeout is not None
+    options = {"timeout": timeout, "process_group": True} if graph else {}
+    if snapshot.suffix == ".dwg":
+        if not decoder or not Path(decoder).is_absolute():
+            raise ValueError("Give the absolute path to the trusted LibreDWG 0.14 dwgread executable.")
+        exe = local_path(decoder)
+        if not exe.is_file():
+            raise ValueError("The selected DWG decoder does not exist.")
+        with snapshot.open("rb") as stream:
+            version = stream.read(6).decode("ascii")
+        if version not in VERSIONS:
+            raise ValueError("The qualified DWG versions are AC1015 and AC1032.")
+        raw, log = run_decoder([str(exe), "-O", "JSON", str(snapshot)], snapshot.parent, **options)
+        result = dwg_inventory(validate_json(raw, dwg=True), version, graph=graph)
+        tool = "LibreDWG 0.14"
+    else:
+        args = [sys.executable, str(Path(__file__).resolve()), "_dxf_worker", str(snapshot)]
+        if graph:
+            args.append("--graph")
+        raw, log = run_decoder(args, snapshot.parent, **options)
+        result = validate_json(raw)
+        tool = "ezdxf 1.4.5"
+    if re.search(rb"^\s*WARN(?:ING)?\b", log, re.M | re.I):
+        result["notes"].append("The drawing decoder reported warnings.")
+    return result, tool
+
+
+def finish_inventory(result, source, digest, tool, *, xref_scope):
+    if any(type(result["header"][field]) is not int or not 0 <= result["header"][field] < len(labels)
+           for field, labels in DRAWING_SETTINGS.items()):
+        result["notes"].append("One or more drawing unit settings were absent or unrecognized.")
+    result["notes"] = list(dict.fromkeys(result["notes"]))
+    result.update(filename=source.name, sha256=digest, decoder=tool, coverage={
+        "xref_scope": xref_scope,
+        "layer_style_policy": "not_assessed",
+        "required_attribute_policy": "not_assessed",
+        "purge_eligibility": "not_assessed",
+        "block_purge_review": "known_dxf_references" if source.suffix.lower() == ".dxf" else "not_assessed",
+    })
+    return result
+
+
 def inspect_drawing(raw_source, decoder):
     source = local_path(raw_source)
     source = source.parent.resolve(strict=True) / source.name
-    suffix = source.suffix.lower()
     with TemporaryDirectory(prefix="archi-cad-") as temporary:
-        work = Path(temporary)
-        snapshot = work / ("drawing" + suffix)
+        snapshot = Path(temporary) / ("drawing" + source.suffix.lower())
         digest = snapshot_file(source, snapshot)
-        if suffix == ".dwg":
-            if not decoder or not Path(decoder).is_absolute():
-                raise ValueError("Give the absolute path to the trusted LibreDWG 0.14 dwgread executable.")
-            exe = local_path(decoder)
-            if not exe.is_file():
-                raise ValueError("The selected DWG decoder does not exist.")
-            with snapshot.open("rb") as stream:
-                version = stream.read(6).decode("ascii")
-            if version not in VERSIONS:
-                raise ValueError("The qualified DWG versions are AC1015 and AC1032.")
-            raw, log = run_decoder([str(exe), "-O", "JSON", str(snapshot)], work)
-            result = dwg_inventory(validate_json(raw, dwg=True), version)
-            tool = "LibreDWG 0.14"
-        else:
-            raw, log = run_decoder([
-                sys.executable, str(Path(__file__).resolve()), "_dxf_worker", str(snapshot),
-            ], work)
-            result = validate_json(raw)
-            tool = "ezdxf 1.4.5"
-        if re.search(rb"^\s*WARN(?:ING)?\b", log, re.M | re.I):
-            result["notes"].append("The drawing decoder reported warnings.")
-
+        result, tool = decode_snapshot(snapshot, decoder)
     for xref in result["xrefs"]:
         status, circular = read_xref_path(xref["path"], source) if xref["flags_consistent"] else (
             "unchecked", False,
@@ -355,23 +399,12 @@ def inspect_drawing(raw_source, decoder):
         result["notes"].append("Nested Xrefs and cycles were not inspected.")
     if any(xref["status"] == "unchecked" for xref in result["xrefs"]):
         result["notes"].append("Some Xref paths were outside the supported local path scope.")
-    if any(type(result["header"][field]) is not int or not 0 <= result["header"][field] < len(labels)
-           for field, labels in DRAWING_SETTINGS.items()):
-        result["notes"].append("One or more drawing unit settings were absent or unrecognized.")
-    result["notes"] = list(dict.fromkeys(result["notes"]))
-    result.update(filename=source.name, sha256=digest, decoder=tool, coverage={
-        "xref_scope": "drawing_directory_only",
-        "layer_style_policy": "not_assessed",
-        "required_attribute_policy": "not_assessed",
-        "purge_eligibility": "not_assessed",
-        "block_purge_review": "known_dxf_references" if suffix == ".dxf" else "not_assessed",
-    })
-    return result
+    return finish_inventory(result, source, digest, tool, xref_scope="drawing_directory_only")
 
 
-if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "_dxf_worker":
+if __name__ == "__main__" and sys.argv[1:2] == ["_dxf_worker"] and len(sys.argv) in (3, 4):
     try:
-        print(json.dumps(dxf_worker(sys.argv[2]), ensure_ascii=True))
+        print(json.dumps(dxf_worker(sys.argv[2], graph=sys.argv[3:] == ["--graph"]), ensure_ascii=True))
     except ImportError:
         print("Optional ezdxf 1.4.5 not available", file=sys.stderr)
         sys.exit(2)
