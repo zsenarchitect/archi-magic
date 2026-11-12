@@ -213,6 +213,7 @@ def r2000_attribute_owners(records, selected):
         entities[identifier] = None if identifier in entities else record
 
     claims = {}
+    conflicts = set()
     budget = 2 * len(records)
 
     def chain(first, last, owner, entity_kind):
@@ -229,11 +230,11 @@ def r2000_attribute_owners(records, selected):
             if entity_kind == "ATTRIB" and record["entity"] != entity_kind:
                 return []
             if record["entity"] == entity_kind:
-                direct = absolute_ref(record.get("ownerhandle"))
-                if direct not in (None, 0, owner):
-                    return []
                 found.append(current)
             if current == last:
+                if any(absolute_ref(entities[key].get("ownerhandle")) not in (None, 0, owner) for key in found):
+                    conflicts.update(found)
+                    return []
                 return found
             seen.add(current)
             previous, current = current, absolute_ref(record.get("next_entity"))
@@ -241,7 +242,7 @@ def r2000_attribute_owners(records, selected):
 
     for identifier, record in selected.items():
         if budget < 0:
-            return {}
+            return {}, conflicts
         if record.get("object") == "BLOCK_HEADER":
             first, last = (absolute_ref(record.get(field)) for field in ("first_entity", "last_entity"))
             kind = "ATTDEF"
@@ -258,7 +259,7 @@ def r2000_attribute_owners(records, selected):
             continue
         for target in chain(first, last, identifier, kind):
             claims.setdefault(target, set()).add(identifier)
-    return claims if budget >= 0 else {}
+    return (claims if budget >= 0 else {}), conflicts
 
 
 def dwg_inventory(doc, version, *, graph=False):
@@ -277,7 +278,7 @@ def dwg_inventory(doc, version, *, graph=False):
                 raise ValueError("Relevant drawing records have duplicate handles.")
             selected[key] = record
 
-    inferred_owners = r2000_attribute_owners(records, selected) if version == "AC1015" else {}
+    inferred_owners, conflicts = r2000_attribute_owners(records, selected) if version == "AC1015" else ({}, set())
     layer_counts = Counter(absolute_ref(record.get("layer")) for record in records if "layer" in record)
     layers, xrefs, blocks, notes = [], [], {}, []
     values, definitions = [], []
@@ -316,7 +317,7 @@ def dwg_inventory(doc, version, *, graph=False):
             is_value = kind == "ATTRIB"
             owner_id = absolute_ref(record.get("ownerhandle"))
             inferred = inferred_owners.get(key, set())
-            if len(inferred) > 1:
+            if key in conflicts or len(inferred) > 1:
                 owner_id = None
             elif not owner_id and inferred:
                 owner_id = next(iter(inferred))
