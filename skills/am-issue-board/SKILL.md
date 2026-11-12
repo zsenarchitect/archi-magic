@@ -161,6 +161,10 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
 
+- Review the saved report and select finding IDs from that report.
+- Run `python skills/am-issue-board/scripts/board_cli.py mep-ops findings.json MEP-0001 > ops.json`.
+- Pass `ops.json` to the board batch planner with a fresh note read. Review the plan, run the dry run, and use Keep/Discard in Revit.
+
 ## Rules
 
 - Never renumber issues. Never reuse a number.

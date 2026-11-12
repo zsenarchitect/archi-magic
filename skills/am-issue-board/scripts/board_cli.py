@@ -11,6 +11,7 @@ The READ file is the "note" object from read_board.py, saved as JSON
     python board_cli.py comment READ.json NUMBER DATE USER "comment"
     python board_cli.py relate  READ.json A B
     python board_cli.py batch   READ.json OPS.json
+    python board_cli.py mep-ops FINDINGS.json FINDING_ID [FINDING_ID ...]
     python board_cli.py archive READ.json ARCHIVE.json [--status DONE] [--title "..."]
     python board_cli.py replace READ.json NUMBER finding|todo LINES.json
 
@@ -34,6 +35,7 @@ Exit code 2 = the plan cannot be made (the message says why).
 import io
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +79,54 @@ def load_ops(path):
     return data
 
 
+def mep_operations(report, selection):
+    if not 1 <= len(selection) <= 100 or len(set(selection)) != len(selection):
+        raise ValueError("Select one to 100 distinct IDs from the reviewed MEP report.")
+    rows = report.get("findings") if isinstance(report, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("Expected an MEP findings report.")
+    reviewed = set(selection)
+    findings = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            raise ValueError("Every report row needs a finding ID.")
+        if row["id"] in reviewed:
+            if row["id"] in findings:
+                raise ValueError("A selected finding ID is ambiguous.")
+            findings[row["id"]] = row
+    if reviewed != findings.keys():
+        raise ValueError("A selected finding ID is absent from the MEP report.")
+
+    ops = []
+    for finding_id in selection:
+        row = findings[finding_id]
+        rule = row["ruleId"]
+        severity = row["severity"]
+        raw_element_id = row["elementId"]
+        element_id = str(raw_element_id)
+        if not (isinstance(rule, str) and re.fullmatch(r"MEP-[A-Z]+-[0-9]{2}", rule)
+                and severity in ("error", "warning", "info")
+                and type(raw_element_id) in (int, str)
+                and re.fullmatch(r"[1-9][0-9]{0,18}", element_id)
+                and int(element_id) <= 2**63 - 1):
+            raise ValueError("A selected finding lacks a valid MEP rule, severity, or Revit element ID.")
+        raw_message = row["message"]
+        message = " ".join(raw_message.split()) if isinstance(raw_message, str) else ""
+        if not message or not message.isprintable():
+            raise ValueError("A selected finding needs a readable message.")
+        # The report text may describe other IDs. The board must link only the reviewed target.
+        message = ib.ID_RE.sub(r"ID \1", message)
+        lines = ["Audited element id" + element_id, message]
+        point = row.get("location")
+        if isinstance(point, dict):
+            coords = [point.get(axis) for axis in "xyz"]
+            if all(type(value) in (int, float) and -float("inf") < value < float("inf") for value in coords):
+                lines.append("Audit coordinates (x, y, z): " + ", ".join(map(str, coords)))
+        ops.append({"op": "add", "issue": {"title": rule + " audit finding", "status": "OPEN",
+                                            "severity": severity.capitalize(), "findings": lines}})
+    return {"ops": ops}
+
+
 def main(argv):
     if len(argv) < 2:
         sys.stderr.write(__doc__)
@@ -86,6 +136,8 @@ def main(argv):
         if cmd == "create":
             spec = load(argv[1])
             out = ib.plan_create(spec["title_line"], spec.get("issues", []), spec.get("next_number"))
+        elif cmd == "mep-ops":
+            out = mep_operations(load(argv[1]), argv[2:])
         elif cmd == "batch":
             text, formats = read_note(argv[1])
             out = ib.plan_batch(text, load_ops(argv[2]), formats)
