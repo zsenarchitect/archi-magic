@@ -314,9 +314,11 @@ def tabular_clashes(reader):
             selected = {field: text(aligned[index][2]) for field, index in keys.items() if index in aligned}
             if not selected["name"]:
                 raise ValueError("A clash row does not have a name.")
+            row_group = selected.get("group")
             if css in ("childRow", "childRowLast"):
                 if group_name is None or ("group" in keys and selected["group"] != group_name):
                     raise ValueError("A child clash is outside its reported group.")
+                row_group = group_name
                 child_started = css == "childRow"
                 if not child_started:
                     group_name = None
@@ -339,6 +341,8 @@ def tabular_clashes(reader):
             report.append({"guid": None, "name": selected["name"],
                            "source_status": selected.get("status", "").casefold(), "source_point": None,
                            "objects": objects})
+            if row_group:
+                report[-1]["source_group"] = row_group
         if child_started:
             raise ValueError("A clash group is missing its final child row.")
         incomplete_groups += int(group_name is not None)
@@ -377,8 +381,10 @@ class SequentialReport(HTMLParser):
         if len(parent) >= 24 or self.parts is not None:
             raise ValueError("Unsupported nested sequential clash field.")
         if node == self.VIEWPOINT:
-            if parent != self.CONTAINER or len(self.clashes) >= 300:
-                raise ValueError("Unexpected clash viewpoint or report size.")
+            if parent != self.CONTAINER:
+                raise ValueError("Unsupported nested sequential report. Export Individual Clashes Only or HTML (Tabular).")
+            if len(self.clashes) >= 300:
+                raise ValueError("Too many individual clashes.")
             self.fields, self.items = {}, []
         if parent == viewpoint and node == self.SIDE:
             self.parts = []
@@ -414,7 +420,7 @@ class SequentialReport(HTMLParser):
                 raise ValueError("Incomplete sequential clash property.")
             label, value = self.pair
             label = label.casefold()
-            if not self.items and label in ("name", "status"):
+            if not self.items and label in ("name", "status", "clash group"):
                 if label in self.fields:
                     raise ValueError("The viewpoint repeats a clash field.")
                 self.fields[label] = text(value)
@@ -431,12 +437,14 @@ class SequentialReport(HTMLParser):
             self.parts = None
         elif parent == self.CONTAINER and node == self.VIEWPOINT:
             if len(self.items) != 2 or not self.fields.get("name"):
-                raise ValueError("The sequential clash lacks a name or two item sections.")
+                raise ValueError("A sequential entry lacks a name or two items. Export Individual Clashes Only with item data.")
             for item in self.items:
                 item.setdefault("element_id", None)
             self.clashes.append({"guid": None, "name": self.fields["name"],
                                  "source_status": self.fields.get("status", "").casefold(),
                                  "source_point": None, "objects": self.items})
+            if self.fields.get("clash group"):
+                self.clashes[-1]["source_group"] = self.fields["clash group"]
 
 
 def parse_html_report(data):

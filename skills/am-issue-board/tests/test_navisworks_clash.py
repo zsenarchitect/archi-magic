@@ -222,6 +222,7 @@ def test_grouped_tabular_reads_children_and_preserves_missing_item_scope(tmp_pat
     assert [(row["name"], [item["element_id"] for item in row["objects"]]) for row in data["clashes"]] == [
         ("First", ["42", None]), ("Second", ["42", "43"]), ("Standalone", ["42", None]),
     ]
+    assert [row.get("source_group") for row in data["clashes"]] == ["Group A", "Group A", None]
     assert data["warnings"][:2] == [
         "Skipped 2 group summary rows.",
         "Some groups have no individual rows. Export Everything to review all clashes.",
@@ -263,13 +264,13 @@ def sequential_pair(name, value):
             f'<span class="value">{value}</span></span>')
 
 
-def sequential_report(left=None, right=None, side="Item 2"):
+def sequential_report(left=None, right=None, side="Item 2", group=""):
     left = sequential_pair("Element ID", "42") if left is None else left
     right = sequential_pair("Element ID", "9007199254740993") if right is None else right
     return ('<html><head><meta charset="utf-8"></head><body><div class="animation">'
             f'{sequential_pair("Status", "OK")}<div class="viewpoint"><a href="ignored"><img src="ignored"></a>'
             f'{sequential_pair("Name", "Wall &amp; pipe")}{sequential_pair("Status", "New")}'
-            f'<h4 class="clashobject">Item 1</h4>{left}'
+            f'{group}<h4 class="clashobject">Item 1</h4>{left}'
             f'<h4 class="clashobject">{side}</h4>{right}</div></div></body></html>')
 
 
@@ -291,6 +292,19 @@ def test_sequential_html_reads_item_scoped_ids_without_creating_a_board_plan(inp
     assert result.returncode == 0, result.stderr
     row, = json.loads(result.stdout)["clashes"]
     assert [item["element_id"] for item in row["objects"]] == [None, None]
+
+
+def test_flat_sequential_export_keeps_explicit_clash_group(tmp_path):
+    group = sequential_pair("Clash Group", "Group &amp; A")
+    source = tmp_path / "individual.html"
+    source.write_text(sequential_report(group=group), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    row, = json.loads(result.stdout)["clashes"]
+    assert row["source_group"] == "Group & A"
+    source.write_text(sequential_report(group=group + group), encoding="utf-8")
+    rejected = invoke(source)
+    assert rejected.returncode == 2 and not rejected.stdout
 
 
 @pytest.mark.parametrize("html", [
