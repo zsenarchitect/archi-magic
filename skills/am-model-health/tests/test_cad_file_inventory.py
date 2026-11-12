@@ -455,3 +455,64 @@ def test_xref_stage_rejects_renamed_ancestor(tmp_path):
             nested.rename(root / "moved")
             with pytest.raises(FileNotFoundError):
                 graph.stage_drawing(descriptor, root, parts, file, metadata, root / "stage.dxf")
+
+
+def r2000_linked_attributes():
+    def ref(value):
+        return [4, 1, value, value]
+
+    return {
+        "FILEHEADER": {"version": "AC1015"},
+        "created_by": "LibreDWG 0.14",
+        "HEADER": {"INSUNITS": 4},
+        "OBJECTS": [
+            {"object": "BLOCK_HEADER", "handle": [0, 1, 51], "name": "TITLE",
+             "first_entity": ref(53), "last_entity": ref(54)},
+            {"entity": "LINE", "handle": [0, 1, 53], "next_entity": ref(54)},
+            {"entity": "ATTDEF", "handle": [0, 1, 54], "tag": "SHEET",
+             "default_value": "seed", "flags": 0, "prev_entity": ref(53)},
+            {"entity": "INSERT", "handle": [0, 1, 55], "block_header": ref(51), "has_attribs": 1,
+             "first_attrib": ref(57), "last_attrib": ref(57), "seqend": ref(56)},
+            {"entity": "SEQEND", "handle": [0, 1, 56], "ownerhandle": ref(55)},
+            {"entity": "ATTRIB", "handle": [0, 1, 57], "tag": "SHEET", "text_value": "A101"},
+            {"entity": "INSERT", "handle": [0, 1, 58], "block_header": ref(51), "has_attribs": 1,
+             "first_attrib": ref(60), "last_attrib": ref(61), "seqend": ref(59)},
+            {"entity": "SEQEND", "handle": [0, 1, 59], "ownerhandle": ref(58)},
+            {"entity": "ATTRIB", "handle": [0, 1, 60], "tag": "SHEET", "text_value": "", "next_entity": ref(61)},
+            {"entity": "ATTRIB", "handle": [0, 1, 61], "tag": "DRAWN_BY", "text_value": "RD", "prev_entity": ref(60)},
+        ],
+    }
+
+
+def test_r2000_native_links_attach_values_to_exact_inserts_without_owner_fields():
+    from dwg_cad_audit import check_attribute_policy
+
+    inventory = dwg_inventory(r2000_linked_attributes(), "AC1015")
+    block, = inventory["blocks"]
+    assert block["definitions"] == [
+        {"handle": 54, "tag": "SHEET", "value": "seed", "constant": False, "insert_handle": None},
+    ]
+    assert [(row["insert_handle"], row["tag"], row["value"]) for row in block["attributes"]] == [
+        (55, "SHEET", "A101"), (58, "SHEET", ""), (58, "DRAWN_BY", "RD"),
+    ]
+    findings, coverage = check_attribute_policy(inventory, {"title": ("TITLE", ["SHEET"])})
+    assert [(row["insert_handle"], row["state"]) for row in findings] == [(58, "blank")]
+    assert coverage["checked_fields"] == 2 and coverage["unchecked_fields"] == []
+
+
+@pytest.mark.parametrize("failure", ["wrong_seqend", "broken_chain", "shared_attribute"])
+def test_r2000_attribute_links_keep_unverified_values_unassociated(failure):
+    from dwg_cad_audit import check_attribute_policy
+
+    data = r2000_linked_attributes()
+    if failure == "wrong_seqend":
+        data["OBJECTS"][7]["ownerhandle"] = [4, 1, 55, 55]
+    elif failure == "broken_chain":
+        data["OBJECTS"][9]["prev_entity"] = [4, 1, 55, 55]
+    else:
+        data["OBJECTS"][3].update(first_attrib=[4, 1, 60, 60], last_attrib=[4, 1, 61, 61])
+    inventory = dwg_inventory(data, "AC1015")
+    assert {row["handle"] for row in inventory["unassociated_attributes"]} >= {60, 61}
+    findings, coverage = check_attribute_policy(inventory, {"title": ("TITLE", ["SHEET"])})
+    assert not findings
+    assert {"block": "TITLE", "insert_handle": 58, "tag": "SHEET"} in coverage["unchecked_fields"]
