@@ -252,6 +252,42 @@ def test_cli_import_export_preserves_cameras_and_components(board, tmp_path):
     assert archived["skipped_topic_guids"] == [TOPIC]
 
 
+def test_export_preserves_viewpoints_from_successive_imports(board, tmp_path):
+    first, second = tmp_path / "first.bcfzip", tmp_path / "second.bcfzip"
+    second_guid = "f281d5fc-2d30-496c-8893-c8f351c86804"
+    seed(first)
+    seed(second, dict(topic(), guid=second_guid, title="Second issue", viewpoints=[viewpoint(1)]))
+    saved_metadata = []
+    for source in (first, second):
+        imported = invoke("import", board, "--input", source)
+        assert imported.returncode == 0, imported.stderr
+        preview = json.loads(imported.stdout)
+        snapshot(board, preview["plan"]["final_text"])
+        metadata = source.with_suffix(".json")
+        metadata.write_text(json.dumps(preview["metadata_after_keep"]))
+        saved_metadata.extend(("--metadata", metadata))
+
+    output = tmp_path / "both.bcfzip"
+    result = invoke("export", board, "--output", output, "--author", "author@example.com", *saved_metadata)
+    assert result.returncode == 0, result.stderr
+    topics, warnings = bcf.read_topics(output)
+    assert warnings == []
+    assert {item["guid"]: item["viewpoints"] for item in topics} == {
+        TOPIC: [viewpoint(0), viewpoint(1)], second_guid: [viewpoint(1)],
+    }
+
+    conflict = tmp_path / "conflict.json"
+    receipt = json.loads(saved_metadata[1].read_text())
+    receipt["topics"]["1"]["viewpoints"] = [viewpoint(1)]
+    conflict.write_text(json.dumps(receipt))
+    rejected = tmp_path / "rejected.bcfzip"
+    result = invoke("export", board, "--output", rejected, "--author", "author@example.com",
+                    *saved_metadata, "--metadata", conflict)
+    assert result.returncode == 2
+    assert "Conflicting metadata for board issue 1" in result.stderr
+    assert not rejected.exists()
+
+
 def test_external_text_cannot_inject_board_grammar(board, tmp_path):
     source = tmp_path / "hostile.bcf"
     data = topic()
