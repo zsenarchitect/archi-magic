@@ -16,6 +16,7 @@ MAX_FILE = 128 * 1024 * 1024
 MAX_ELEMENTS = 2000
 MAX_OBJECTS = 5000
 MAX_VIEWS = 100
+PREVIEW_VIEW_NAME = "Archi Magic Family Preview"
 TEXT = (str, type(u""))
 
 
@@ -107,6 +108,7 @@ def view_state(view):
         state.update({"perspective": bool(view.IsPerspective), "locked": bool(view.IsLocked),
                       "section_box": bool(view.IsSectionBoxActive), "crop_box": bool(view.CropBoxActive),
                       "view_template_id": id_value(view.ViewTemplateId),
+                      "view_type_id": id_value(view.GetTypeId()),
                       "display_style": str(view.DisplayStyle), "background": background(view),
                       "orientation": orientation(view.GetOrientation()),
                       "saved_orientation_api": hasattr(view, "GetSavedOrientation"),
@@ -124,6 +126,20 @@ def available_view_types(document, clock):
                 raise ValueError("The family view type read exceeded its limits.")
             if item.ViewFamily == DB.ViewFamily.ThreeDimensional:
                 rows.append({"id": id_value(item.Id), "uid": str(item.UniqueId)})
+        return sorted(rows, key=lambda row: int(row["id"]))
+    finally:
+        collector.Dispose()
+
+
+def named_preview_views(document, clock):
+    collector = DB.FilteredElementCollector(document)
+    try:
+        rows = []
+        for index, view in enumerate(collector.OfClass(DB.View)):
+            if index >= MAX_VIEWS or clock.ElapsedMilliseconds >= 10000:
+                raise ValueError("The family view name read exceeded its limits.")
+            if view.Name.lower() == PREVIEW_VIEW_NAME.lower():
+                rows.append(view_state(view))
         return sorted(rows, key=lambda row: int(row["id"]))
     finally:
         collector.Dispose()
@@ -204,6 +220,7 @@ def read_family(document, request):
               "family_type": current_type.Name if current_type is not None else None,
               "active_view": active_state, "preview_view": preview_state, "force_preview_update": forced,
               "three_dimensional_view_types": available_view_types(document, clock),
+              "named_preview_views": named_preview_views(document, clock),
               "geometry": None}
     if category and category.CategoryType == DB.CategoryType.Annotation:
         result["classification"] = "annotation"

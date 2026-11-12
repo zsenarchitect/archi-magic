@@ -32,6 +32,9 @@ Verify each family immediately before opening its staged file. The same command 
 
 Call `get_context` and `get_skill("revit-scripting")` on the disposable host. Open the verified staged family and activate an uncropped orthographic 3D view if one is available. Run `skills/am-model-health/scripts/read_family_preview.py` with `run_query`. Pass the two fields from `revit_inputs` as the query inputs. Read `snapshot_json` for the current thumbnail view, active view settings, and solid extents in internal feet. The solid check uses geometry returned for that view. It does not establish the final rendered thumbnail. Leave clipped, missing, or unexamined geometry unresolved.
 
+Save the query response as `read.json`. Save `{"view_type_id":"123"}` as `intent.json` using a 3D view type ID from the query. Run `python skills/am-safe-change/scripts/family_preview_plan.py read.json intent.json > preview.json`. Use the standard schedule viewer to review the change. The preset uses an isometric direction, Revit Shading, and a uniform light gray background. Revit determines the saved image framing. Reuse an existing named preview only with a prior receipt containing `view_uid`, `family_uid`, and `saved_file_sha256` for that staged output. Stop if the preview contains no steps.
+
+
 
 ## Test fixtures and remaining evidence
 
