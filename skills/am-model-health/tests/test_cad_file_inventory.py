@@ -506,7 +506,7 @@ def test_r2000_native_links_attach_values_to_exact_inserts_without_owner_fields(
     assert coverage["checked_fields"] == 2 and coverage["unchecked_fields"] == []
 
 
-@pytest.mark.parametrize("failure", ["wrong_seqend", "broken_chain", "shared_attribute"])
+@pytest.mark.parametrize("failure", ["wrong_seqend", "broken_chain", "shared_attribute", "conflicting_direct_owner"])
 def test_r2000_attribute_links_keep_unverified_values_unassociated(failure):
     from dwg_cad_audit import check_attribute_policy
 
@@ -515,6 +515,8 @@ def test_r2000_attribute_links_keep_unverified_values_unassociated(failure):
         data["OBJECTS"][7]["ownerhandle"] = [4, 1, 55, 55]
     elif failure == "broken_chain":
         data["OBJECTS"][9]["prev_entity"] = [4, 1, 55, 55]
+    elif failure == "conflicting_direct_owner":
+        data["OBJECTS"][8]["ownerhandle"] = [4, 1, 55, 55]
     else:
         data["OBJECTS"][3].update(first_attrib=[4, 1, 60, 60], last_attrib=[4, 1, 61, 61])
     inventory = dwg_inventory(data, "AC1015")
