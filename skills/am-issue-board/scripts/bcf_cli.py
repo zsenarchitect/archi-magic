@@ -242,11 +242,14 @@ def verify_import(args):
 def export_topics(args):
     _, _, board, _ = read_board(args.board)
     metadata = {}
-    if args.metadata:
-        data = board_cli.load(bounded(args.metadata))
+    for path in args.metadata or ():
+        data = board_cli.load(bounded(path))
         if bcf.uuid_text(data["board_uuid"]) != args.board_uuid or not isinstance(data["topics"], dict):
             raise ValueError("metadata does not match this board UUID")
-        metadata = data["topics"]
+        for number, topic in data["topics"].items():
+            if number in metadata and metadata[number] != topic:
+                raise ValueError(f"Conflicting metadata for board issue {number}.")
+            metadata[number] = topic
     known = {str(row["number"]) for row in board["issues"]}
     if set(metadata) - known:
         raise ValueError("metadata contains a board issue number absent from this snapshot")
@@ -303,7 +306,7 @@ def main(argv=None):
     verify.add_argument("--readback", type=Path)
     write.add_argument("--output", type=Path, required=True)
     write.add_argument("--author", required=True)
-    write.add_argument("--metadata", type=Path)
+    write.add_argument("--metadata", type=Path, action="append", help="Repeat for each applicable metadata file.")
     args = parser.parse_args(argv)
     try:
         if args.mode == "verify-import":
