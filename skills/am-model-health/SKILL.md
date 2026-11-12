@@ -209,6 +209,8 @@ Review the returned `preview_json` and keep its `geometry_sha256` when present. 
 
 Read `wall_collision_scan` for measured overlaps between proposed wall bodies and existing host solids. The reported volume is the largest intersection with one solid from the candidate element. Check unresolved geometry, linked models, room boundaries, and the entries in `other_checks` separately. Verify these results in the disposable Revit model before using them for placement.
 
+Read `existing_room_boundaries` for the native area, phase, finish boundary digest, and source elements of nearby host rooms. A linked boundary identifies both the host link instance and its source element. Review any room with incomplete boundary evidence. This read does not inspect Revit's plan circuits.
+
 ## Area scheme cross-dependent standing check (issue #197)
 
 Check whether any `AreaScheme.GetDependentElements()` list contains `Areas` belonging to a different `AreaScheme` (`AREA-DEP-01`: `"Scheme '<X>' will take <N> area(s) of scheme '<Y>' with it"`).

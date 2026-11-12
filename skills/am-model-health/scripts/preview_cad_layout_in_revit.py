@@ -7,6 +7,7 @@ from pyrevit.api import DB
 
 from cad_layout_preview import classify_room_boundaries, fields, number, propose
 from check_cad_wall_collisions import check_wall_collisions
+from read_cad_room_boundaries import read_existing_room_boundaries
 from read_cad_layout_surroundings import MAX_SECONDS, scan_surroundings
 from read_linked_cad_layout import EVIDENCE_LIMIT, MM_PER_FOOT, element_id, encoded, read_snapshot, sha256
 
@@ -83,6 +84,7 @@ def read_preview(document, request):
         scan = scan_surroundings(document, proposal, walls, deadline)
         result["existing_model_scan"] = scan
         result["wall_collision_scan"] = check_wall_collisions(document, proposal, walls, scan, deadline)
+        result["existing_room_boundaries"] = read_existing_room_boundaries(document, scan, deadline)
     return {"status": status, "preview_json": encoded(result, EVIDENCE_LIMIT)}
 
 

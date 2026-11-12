@@ -57,6 +57,9 @@ def linked_dwg(monkeypatch):
         def GetEndPoint(self, index):
             return self.points[index]
 
+        def Dispose(self):
+            pass
+
         @staticmethod
         def CreateBound(start, end):
             return Record(start=start, end=end, Dispose=lambda: None)
@@ -91,6 +94,12 @@ def linked_dwg(monkeypatch):
         pass
 
     class Phase(Record):
+        pass
+
+    class Room(Record):
+        pass
+
+    class RevitLink(Record):
         pass
 
     class Style(Record):
@@ -186,7 +195,8 @@ def linked_dwg(monkeypatch):
         81: FamilySymbol(UniqueId="door-type", VersionGuid="door-v1", Category=Record(Id=element_id(-2000014)),
                          Family=Record(FamilyPlacementType="hosted"),
                          width=Record(StorageType="double", HasValue=True, AsDouble=lambda: feet(900))),
-        95: Phase(UniqueId="phase-id", VersionGuid="phase-v1"),
+        95: Phase(Id=element_id(95), UniqueId="phase-id", VersionGuid="phase-v1"),
+        96: Phase(Id=element_id(96), UniqueId="phase-later", VersionGuid="phase-later-v1"),
         **{id: Style(GraphicsStyleCategory=Record(Name=label)) for id, label in
            [(10, "WALL"), (11, "DOOR"), (12, "ROOM")]},
     }
@@ -195,7 +205,7 @@ def linked_dwg(monkeypatch):
         "OST_StructuralColumns", "OST_Floors", "OST_Ceilings", "OST_Roofs", "OST_Curtain_Systems",
         "OST_GenericModel", "OST_RvtLinks")}
     db = Record(ElementId=element_id, Transform=Record(Identity=Transform(lambda v: v)),
-                GeometryInstance=Instance, Line=Line, PolyLine=Polyline, ImportInstance=Linked,
+                GeometryInstance=Instance, Line=Line, Arc=Arc, PolyLine=Polyline, ImportInstance=Linked,
                 XYZ=xyz, CurveLoop=CurveLoop, Solid=Solid, Curve=Line, Point=type("Point", (), {}),
                 GeometryCreationUtilities=Record(CreateExtrusionGeometry=extrusion),
                 BooleanOperationsUtils=Record(ExecuteBooleanOperation=intersection),
@@ -204,12 +214,14 @@ def linked_dwg(monkeypatch):
                 Level=Level, GraphicsStyle=Style, Options=Options,
                 WallType=WallType, WallKind=Record(Basic="basic"), FamilySymbol=FamilySymbol,
                 BuiltInCategory=Record(**{**categories, "OST_Doors": -2000014}),
-                BuiltInParameter=Record(DOOR_WIDTH="door-width", VIEW_PHASE="view-phase"),
+                BuiltInParameter=Record(DOOR_WIDTH="door-width", VIEW_PHASE="view-phase", ROOM_PHASE_ID="room-phase"),
                 FamilyPlacementType=Record(OneLevelBasedHosted="hosted"),
                 StorageType=Record(Double="double", ElementId="element-id"),
                 ViewPlan=ViewPlan, ViewType=Record(FloorPlan="floor"), Phase=Phase,
                 DesignOption=Record(GetActiveDesignOptionId=lambda doc: doc.active_option),
                 FilteredElementCollector=Collector,
+                Architecture=Record(Room=Room), RevitLinkInstance=RevitLink,
+                SpatialElementBoundaryOptions=Options, SpatialElementBoundaryLocation=Record(Finish="finish"),
                 ModelPathUtils=Record(ConvertModelPathToUserVisiblePath=lambda value: value))
     api, system, generic = ModuleType("pyrevit.api"), ModuleType("System"), ModuleType("System.Collections.Generic")
     api.DB, system.Int64, generic.List = db, int, NativeList
@@ -219,6 +231,7 @@ def linked_dwg(monkeypatch):
     monkeypatch.delitem(sys.modules, "read_linked_cad_layout", raising=False)
     monkeypatch.delitem(sys.modules, "read_cad_layout_surroundings", raising=False)
     monkeypatch.delitem(sys.modules, "check_cad_wall_collisions", raising=False)
+    monkeypatch.delitem(sys.modules, "read_cad_room_boundaries", raising=False)
     view = ViewPlan(Id=element_id(93), ViewType="floor", IsTemplate=False, UniqueId="plan-id", VersionGuid="plan-v1",
                     GenLevel=objects[2], get_Parameter=lambda _: Record(
                         StorageType="element-id", HasValue=True, AsElementId=lambda: element_id(95)))
@@ -276,6 +289,7 @@ def test_native_entry_point_pins_view_and_geometry_after_json_transport(linked_d
     assert [item["kind"] for item in room["boundary_edges"]].count("wall_face") == 1
     assert preview.pop("existing_model_scan")["status"] == "none_found"
     assert preview.pop("wall_collision_scan")["status"] == "none_measured"
+    assert preview.pop("existing_room_boundaries")["status"] == "none_found"
     digest = preview.pop("geometry_sha256")
     canonical = json.dumps(preview, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
     assert digest == sha256(canonical.encode("ascii")).hexdigest()
@@ -361,6 +375,59 @@ def test_native_wall_measurement_distinguishes_contact_overlap_and_unavailable_g
     assert scan["measured"][0]["maximum_overlap_mm3"] == pytest.approx(800000)
     assert scan["measured"][1]["maximum_overlap_mm3"] == 0
     assert scan["unresolved"] == [{"id": "103", "walls": ["wall-1"], "reason": "unsupported_geometry"}]
+
+
+def test_room_boundary_digest_tracks_later_phase_geometry_and_linked_sources(linked_dwg):
+    document, _, _, _, id_value, _ = linked_dwg
+    request = placement_request(linked_dwg)
+    box = ((500, -100, 3100), (900, 500, 5500))
+    host_wall = existing_element(id_value, 101, box)
+    linked_wall = Record(UniqueId="linked-wall-v1")
+    link = document.db.RevitLinkInstance(**vars(existing_element(id_value, 102, box)),
+                                        GetLinkDocument=lambda: Record(GetElement=lambda _: linked_wall))
+    room = document.db.Architecture.Room(**vars(existing_element(id_value, 103, box, created=95)))
+    room.LevelId = id_value(2)
+    room.Location = Record(Point=document.db.XYZ(700 / 304.8, 200 / 304.8, 3200 / 304.8))
+    room.DesignOption = None
+    room.Area = 240000 / 304.8 ** 2
+    room.get_Parameter = lambda name: Record(StorageType="element-id", HasValue=True,
+                                            AsElementId=lambda: id_value(96)) if name == "room-phase" else None
+    document.existing = {"OST_Walls": [host_wall], "OST_RvtLinks": [link], "OST_Rooms": [room]}
+
+    def segment(start, end, source=101, linked=-1):
+        return Record(ElementId=id_value(source), LinkElementId=id_value(linked),
+                      GetCurve=lambda: document.db.Line(10, start, end), Dispose=lambda: None)
+
+    def loops(options):
+        assert options.SpatialElementBoundaryLocation == "finish"
+        return [ring]
+
+    def observations():
+        return json.loads(native_preview(document, request)["preview_json"])["existing_room_boundaries"]
+
+    a, b, c, d = (500, -100, 3100), (900, -100, 3100), (900, 500, 3100), (500, 500, 3100)
+    ring = [segment(a, b, 102, 88), segment(b, c), segment(c, d), segment(d, a)]
+    room.GetBoundarySegments = loops
+    first = observations()
+    assert first["status"] == "measured", first
+    row, = first["rooms"]
+    assert row["phase_id"] == "96" and row["phase_uid"] == "phase-later"
+    assert row["segment_count"] == 4 and row["native_area_mm2"] == pytest.approx(240000)
+    assert row["boundary_sources"] == [["101", "existing-101", "", ""],
+                                       ["102", "existing-102", "88", "linked-wall-v1"]]
+    ring = [segment(c, b), segment(b, a, 102, 88), segment(a, d), segment(d, c)]
+    assert observations() == first
+
+    linked_wall.UniqueId = "linked-wall-reloaded"
+    assert observations()["rooms"][0]["boundary_sha256"] != row["boundary_sha256"]
+    c = (900, 520, 3100)
+    ring = [segment(a, b, 102, 88), segment(b, c), segment(c, d), segment(d, a)]
+    moved = observations()
+    assert moved["rooms"][0]["boundary_sha256"] != row["boundary_sha256"]
+    ring.pop()
+    stopped = observations()
+    assert stopped["status"] == "incomplete" and stopped["rooms"] == []
+    assert stopped["unresolved"] == [{"id": "103", "reason": "open_or_repeated_room_boundary"}]
 
 
 def test_native_entry_point_shows_boundary_conflicts_without_a_geometry_digest(linked_dwg):
