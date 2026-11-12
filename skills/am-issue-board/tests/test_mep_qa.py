@@ -196,3 +196,25 @@ def test_nonpositive_flow_keeps_its_diagnostic(clean_mep_elements, flow):
     findings = run_mep_audit([duct])["findings"]
     assert [(finding["ruleId"], finding["elementId"]) for finding in findings] == [("MEP-FLOW-01", 101)]
     assert "zero or negative calculated flow" in findings[0]["message"]
+
+
+@pytest.mark.parametrize("connectors", [None, [], {}, [{"domain": "Hvac"}], [{"isConnected": 0}],
+                                        [{"isConnected": "false"}], [None]])
+def test_missing_connector_evidence_is_not_a_verified_connection(clean_mep_elements, connectors):
+    duct = clean_mep_elements[0]
+    duct["connectors"] = connectors
+    findings = run_mep_audit([duct])["findings"]
+    assert [(row["ruleId"], row["severity"], row["elementId"]) for row in findings] == [
+        ("MEP-CON-02", "warning", 101),
+    ]
+
+
+def test_partial_connector_evidence_preserves_verified_open_end(clean_mep_elements):
+    duct = clean_mep_elements[0]
+    duct["connectors"] = [{"isConnected": False, "origin": {"x": 1, "y": 2, "z": 3}}, {}]
+    findings = run_mep_audit([duct])["findings"]
+    assert [(row["ruleId"], row["severity"], row["elementId"]) for row in findings] == [
+        ("MEP-CON-01", "error", 101),
+        ("MEP-CON-02", "warning", 101),
+    ]
+    assert findings[0]["location"] == {"x": 1, "y": 2, "z": 3}

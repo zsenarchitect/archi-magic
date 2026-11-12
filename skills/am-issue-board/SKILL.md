@@ -155,7 +155,8 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 
 - **Audit checks**:
   - `MEP-SYS-01`: System classification and naming convention.
-  - `MEP-CON-01`: Open connectors and broken distribution ends.
+  - `MEP-CON-01`: Confirmed open connectors.
+  - `MEP-CON-02`: Missing connector inventory on distribution elements or unknown connection states.
   - `MEP-FLOW-01`: Missing duct or pipe dimensions, missing or unreadable airflow on active duct runs, and zero or negative calculated airflow.
   - `MEP-CLR-01`: Mechanical equipment maintenance clearance zones.
 - **Run audit**:

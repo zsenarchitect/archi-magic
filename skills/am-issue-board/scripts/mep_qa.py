@@ -68,28 +68,50 @@ def check_mep_system(element: Dict[str, Any]) -> List[Dict[str, Any]]:
     return findings
 
 
+DISTRIBUTION_CATEGORIES = {
+    "Ducts", "Flex Ducts", "Duct Fittings", "Pipes", "Flex Pipes", "Pipe Fittings",
+    "Conduits", "Conduit Fittings", "Cable Trays", "Cable Tray Fittings",
+}
+
+
 def check_open_connectors(element: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Check for open / unconnected connectors on distribution runs (MEP-CON-01)."""
+    """Distinguish confirmed open ends from incomplete connector evidence."""
     findings: List[Dict[str, Any]] = []
     connectors = element.get("connectors", [])
     category = str(element.get("category", ""))
+    base = {
+        "elementId": element.get("id"),
+        "category": category,
+        "level": element.get("level", "Unassigned"),
+        "location": element.get("location"),
+    }
+    invalid_inventory = not isinstance(connectors, list)
+    if invalid_inventory:
+        connectors = []
+    incomplete = invalid_inventory or (not connectors and category in DISTRIBUTION_CATEGORIES)
 
-    # Terminals or caps can have 1 open connector; ducts/pipes/fittings should connect
-    for idx, conn in enumerate(connectors):
-        is_connected = conn.get("isConnected", True)
-        if not is_connected:
-            domain = conn.get("domain", "Unknown")
-            pt = conn.get("origin")
+    for idx, connector in enumerate(connectors):
+        connected = connector.get("isConnected") if isinstance(connector, dict) else None
+        if type(connected) is not bool:
+            incomplete = True
+        elif not connected:
+            domain = connector.get("domain", "Unknown")
             findings.append({
+                **base,
                 "ruleId": "MEP-CON-01",
                 "severity": "error" if "Fitting" in category or "Duct" in category or "Pipe" in category else "warning",
-                "elementId": element.get("id"),
-                "category": category,
-                "level": element.get("level", "Unassigned"),
-                "message": f"Open connector #{idx} ({domain}) on {category} ID {element.get('id')}.",
-                "location": pt or element.get("location"),
+                "message": f"Open connector #{idx} ({domain}) on {category} ID {base['elementId']}.",
+                "location": connector.get("origin") or base["location"],
             })
 
+    if incomplete:
+        findings.append({
+            **base,
+            "ruleId": "MEP-CON-02",
+            "severity": "warning",
+            "message": f"Connector data is incomplete for {category} ID {base['elementId']}. "
+                       "Check the connector inventory and connection states in Revit.",
+        })
     return findings
 
 
