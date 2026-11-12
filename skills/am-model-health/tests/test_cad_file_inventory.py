@@ -28,6 +28,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
     doc.header["$INSUNITS"] = 4
     doc.header["$MEASUREMENT"] = 1
     doc.layers.new("NonStandard", dxfattribs={"color": 3})
+    for name in ("A", "A-WALL-", "A-WALL-FULL"):
+        doc.layers.new(name)
     model = doc.modelspace()
     model.add_line((0, 0), (1, 0), dxfattribs={"layer": "NonStandard"})
     xref.define(doc, "Missing", "xref/missing.dwg")
@@ -42,7 +44,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
     assert result.returncode == 3, result.stderr
     report = json.loads(result.stdout)
     assert report["status"] == "incomplete"
-    assert ("CAD-LAY-01", "NonStandard") in {(f["ruleId"], f["target"]) for f in report["findings"]}
+    layer_findings = {f["target"] for f in report["findings"] if f["ruleId"] == "CAD-LAY-01"}
+    assert layer_findings == {"0", "A", "A-WALL-", "NonStandard"}
     assert ("CAD-XREF-01", "Missing") in {(f["ruleId"], f["target"]) for f in report["findings"]}
     drawing = report["inventory"]
     assert drawing["sha256"] == hashlib.sha256(original).hexdigest()
@@ -50,7 +53,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
                                  "flags_consistent": True, "status": "missing", "isCircular": False}]
     title = next(b for b in drawing["blocks"] if b["name"] == "Title")
     assert title["count"] == 1
-    assert title["definitions"] == [{"tag": "MARK", "value": "Default"}]
+    assert title["insert_handles"] == [insert.dxf.handle]
+    assert title["definitions"] == [{"tag": "MARK", "value": "Default", "constant": False}]
     assert title["attributes"] == [{"tag": "MARK", "value": "Actual", "insert_handle": insert.dxf.handle}]
     assert source.read_bytes() == original
     refused = run(source, "--output", source)
@@ -95,9 +99,9 @@ def test_dwg_inventory_uses_absolute_handles_and_retains_orphans():
     assert result["layers"][0]["entityCount"] == 1
     assert result["xrefs"] == [{"name": "External", "path": "local.dwg", "flags_consistent": True}]
     assert result["blocks"] == [{
-        "name": "Title", "count": 1,
+        "name": "Title", "count": 1, "insert_handles": [20],
         "attributes": [{"handle": 22, "tag": "MARK", "value": "Actual", "insert_handle": 20}],
-        "definitions": [{"handle": 21, "tag": "MARK", "value": "Default", "insert_handle": None}],
+        "definitions": [{"handle": 21, "tag": "MARK", "value": "Default", "insert_handle": None, "constant": None}],
     }]
     assert result["unassociated_attributes"] == [{"handle": 23, "tag": "OTHER", "value": "Unassigned"}]
     assert result["notes"]
@@ -128,3 +132,409 @@ def test_bounds_and_legacy_inventory(tmp_path):
     output.write_text("old")
     assert run(source, "--output", output, "--summary").returncode == 0
     assert json.loads(output.read_text())["drawing_name"] == "Legacy.dwg"
+
+
+def test_dxf_purge_review_excludes_indirect_and_protected_blocks(tmp_path):
+    source = tmp_path / "block-review.dxf"
+    doc = ezdxf.new("R2000")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    for name in ("Unused", "Nested", "Parent", "Paper", "Arrow", "ExtendedData", "ExternalDependent"):
+        doc.blocks.new(name)
+    doc.blocks.new("*U1", dxfattribs={"flags": 1})
+    doc.blocks.get("ExternalDependent").block.dxf.flags = 16
+    doc.blocks.get("Parent").add_blockref("Nested", (0, 0))
+    doc.modelspace().add_blockref("Parent", (1, 1))
+    doc.paperspace().add_blockref("Paper", (1, 1))
+    doc.header["$DIMBLK"] = "Arrow"
+    doc.appids.new("REVIEW_FIXTURE")
+    line = doc.modelspace().add_line((0, 0), (1, 0))
+    line.set_xdata("REVIEW_FIXTURE", [(1005, doc.blocks.get("ExtendedData").block_record_handle)])
+    doc.saveas(source)
+    original = source.read_bytes()
+
+    result = run(source)
+    assert result.returncode == 0, result.stderr
+    inventory = json.loads(result.stdout)["inventory"]
+    assert inventory["coverage"]["block_purge_review"] == "known_dxf_references"
+    assert inventory["coverage"]["purge_eligibility"] == "not_assessed"
+    assert inventory["purge_candidates"] == [{"kind": "block", "name": "Unused"}]
+    assert source.read_bytes() == original
+
+
+def test_dxf_layer_policy_checks_linetype_aci_and_true_color_without_edits(tmp_path):
+    source, policy = tmp_path / "drawing.dxf", tmp_path / "standards.json"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    layer = doc.layers.new("A-WALL", dxfattribs={"color": 3})
+    layer.off()
+    doc.layers.new("A-DOOR", dxfattribs={"color": 3, "true_color": 0x225588})
+    doc.layers.new("A-FLOR", dxfattribs={"color": 5})
+    doc.saveas(source)
+    original = source.read_bytes()
+    policy.write_text(json.dumps({"layers": {
+        "a-wall": {"aci": 3, "linetype": "continuous"},
+        "A-DOOR": {"aci": 3},
+        "A-FLOR": {"aci": 4, "linetype": "Dashed"},
+        "A-ANNO": {"aci": 3},
+    }}))
+    result = run(source, "--layer-policy", policy)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    checks = [f for f in report["findings"] if f["ruleId"] == "CAD-LAY-02"]
+    assert [(f["target"], f["field"], f["observed_field"], f["actual"]) for f in checks] == [
+        ("A-DOOR", "aci", "rgb", "#225588"), ("A-FLOR", "aci", "aci", 5),
+        ("A-FLOR", "linetype", "linetype", "Continuous"),
+    ]
+    evidence = report["inventory"]["layer_policy"]
+    assert evidence == {"sha256": hashlib.sha256(policy.read_bytes()).hexdigest(), "checked_fields": 5,
+                        "unchecked_fields": [], "unmatched_layers": ["A-ANNO"]}
+    assert report["inventory"]["coverage"]["layer_style_policy"] == "checked"
+    assert source.read_bytes() == original
+
+    policy.write_text('{"layers":{"A-DOOR":{"rgb":"#225588"}}}')
+    matches = json.loads(run(source, "--layer-policy", policy).stdout)
+    assert not any(f["ruleId"] == "CAD-LAY-02" for f in matches["findings"])
+    policy.write_text('{"layers":{"A-ANNO":{"aci":3}}}')
+    absent = run(source, "--layer-policy", policy)
+    assert absent.returncode == 3
+    assert json.loads(absent.stdout)["inventory"]["coverage"]["layer_style_policy"] == "incomplete"
+
+
+def test_layer_policy_keeps_unreadable_dwg_color_separate_from_linetype(tmp_path, monkeypatch):
+    from dwg_cad_audit import check_layer_policy
+
+    records = [
+        {"object": "LAYER", "handle": [0, 1, 10], "name": "A-WALL",
+         "color": {"index": 3, "rgb": "c3000003"}, "ltype": [12, 1, 9, 15]},
+        {"object": "LTYPE", "handle": [0, 1, 15], "name": "Continuous"},
+    ]
+    native = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14", "OBJECTS": records,
+              "HEADER": {"INSUNITS": 4}, "Template": {"MEASUREMENT": 1}}
+    drawing = dwg_inventory(native, "AC1032")
+    findings, evidence = check_layer_policy(drawing, {"a-wall": ("A-WALL", {"aci": 3, "linetype": "Dashed"})})
+    assert [(f["field"], f["actual"]) for f in findings] == [("linetype", "Continuous")]
+    assert evidence == {"checked_fields": 1, "unchecked_fields": [{"layer": "A-WALL", "field": "aci"}],
+                        "unmatched_layers": []}
+
+    source, policy, output = (tmp_path / name for name in ("sample.dwg", "policy.json", "report.json"))
+    source.write_bytes(b"AC1032fixture")
+    monkeypatch.setattr("cad_file_inventory.run_decoder", lambda *_: (json.dumps(native).encode(), b""))
+    policy.write_text('{"layers":{"A-WALL":{"aci":3,"linetype":"Continuous"}}}')
+    assert audit_file(SimpleNamespace(input=str(source), dwgread=sys.executable, output=str(output),
+                                      summary=False, layer_policy=str(policy))) == 3
+    assert json.loads(output.read_text())["inventory"]["coverage"]["layer_style_policy"] == "incomplete"
+
+
+def test_layer_policy_rejects_duplicate_names_and_conflicting_color_modes(tmp_path):
+    from dwg_cad_audit import read_layer_policy
+
+    policy = tmp_path / "bad.json"
+    for raw in ('{"layers":{"A-WALL":{"aci":3},"a-wall":{"aci":4}}}',
+                '{"layers":{"A-WALL":{"aci":3,"rgb":"#225588"}}}',
+                '{"layers":{"A-WALL":{"aci":3,"aci":4}}}'):
+        policy.write_text(raw)
+        with pytest.raises(ValueError):
+            read_layer_policy(str(policy))
+
+
+def test_dxf_required_attributes_are_checked_per_insert(tmp_path):
+    source, policy = tmp_path / "drawing.dxf", tmp_path / "title-tags.json"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    block = doc.blocks.new("Title")
+    block.add_attdef("SHEET", text="Generic default")
+    block.add_attdef("OFFICE", text="Filled constant", dxfattribs={"flags": 2})
+    model = doc.modelspace()
+    complete = model.add_blockref("Title", (0, 0))
+    complete.add_attrib("Sheet", "A101")
+    missing = doc.paperspace().add_blockref("Title", (1, 0))
+    blank = model.add_blockref("Title", (2, 0))
+    blank.add_attrib("SHEET", " ")
+    duplicate = model.add_blockref("Title", (3, 0))
+    duplicate.add_attrib("sheet", "A102")
+    duplicate.add_attrib("SHEET", "A103")
+    doc.saveas(source)
+    original = source.read_bytes()
+    policy.write_text('{"blocks":{"title":["SHEET","OFFICE"],"Unplaced":["TAG"]}}')
+
+    result = run(source, "--attribute-policy", policy)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    findings = [f for f in report["findings"] if f["ruleId"] == "CAD-BLK-02"]
+    assert {(f["insert_handle"], f["tag"], f["state"]) for f in findings} == {
+        (missing.dxf.handle, "SHEET", "missing"), (blank.dxf.handle, "SHEET", "blank"),
+        (duplicate.dxf.handle, "SHEET", "duplicate"),
+    }
+    assert report["inventory"]["attribute_policy"] == {
+        "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(), "checked_fields": 8,
+        "unchecked_fields": [], "unmatched_blocks": ["Unplaced"],
+    }
+    assert report["inventory"]["coverage"]["required_attribute_policy"] == "checked"
+    assert source.read_bytes() == original
+
+
+def test_dwg_policy_marks_unknown_attribute_values_unchecked():
+    from dwg_cad_audit import check_attribute_policy
+
+    data = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14",
+            "HEADER": {"INSUNITS": 4}, "Template": {"MEASUREMENT": 1}, "OBJECTS": [
+                {"object": "BLOCK_HEADER", "handle": [0, 1, 30], "name": "Title"},
+                {"entity": "MINSERT", "handle": [0, 1, 20], "block_header": [12, 1, 9, 30]},
+                {"entity": "ATTDEF", "handle": [0, 1, 21], "tag": "OFFICE", "default_value": "Value",
+                 "ownerhandle": [12, 1, 9, 30], "flags": 2},
+                {"entity": "ATTRIB", "handle": [0, 1, 22], "tag": "SHEET", "text_value": "uncertain fallback",
+                 "ownerhandle": [12, 1, 9, 20], "mtext_type": 2},
+            ]}
+    drawing = dwg_inventory(data, "AC1032")
+    findings, evidence = check_attribute_policy(drawing, {"title": ("Title", ["OFFICE", "SHEET", "DATE"])})
+    assert [(f["insert_handle"], f["tag"], f["state"]) for f in findings] == [(20, "DATE", "missing")]
+    assert evidence == {"checked_fields": 2, "unchecked_fields": [{"block": "Title", "insert_handle": 20,
+                                                                  "tag": "SHEET"}], "unmatched_blocks": []}
+
+
+def test_dxf_insertion_units_and_pattern_standard_are_checked_independently(tmp_path):
+    source = tmp_path / "survey.dxf"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 21
+    doc.header["$MEASUREMENT"] = 1
+    doc.saveas(source)
+    original = source.read_bytes()
+
+    ordinary = run(source, "--summary")
+    assert ordinary.returncode == 0, ordinary.stderr
+    summary = json.loads(ordinary.stdout)
+    assert summary["status"] == "audited"
+    assert summary["summary"] == {"errors": 0, "warnings": 0, "infos": 0}
+    assert summary["units"]["$INSUNITS"] == {"code": 21, "label": "US Survey Feet",
+                                            "expected_code": None, "expected_label": None}
+    assert summary["units"]["$MEASUREMENT"]["label"] == "Metric"
+
+    matched = run(source, "--expected-insunits", 21, "--expected-measurement", 1)
+    assert matched.returncode == 0 and json.loads(matched.stdout)["findings"] == []
+    mismatch = run(source, "--expected-insunits", 2, "--expected-measurement", 0)
+    assert mismatch.returncode == 1, mismatch.stderr
+    findings = json.loads(mismatch.stdout)["findings"]
+    assert [(f["target"], f["severity"], f["code"], f["expected_code"]) for f in findings] == [
+        ("$INSUNITS", "error", 21, 2), ("$MEASUREMENT", "warning", 1, 0),
+    ]
+    assert source.read_bytes() == original
+
+
+def test_newer_dwg_unit_code_is_recognized_through_native_inventory(tmp_path, monkeypatch):
+    source = tmp_path / "survey.dwg"
+    source.write_bytes(b"AC1032fixture")
+    decoded = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14",
+               "HEADER": {"INSUNITS": 24}, "Template": {"MEASUREMENT": 0},
+               "OBJECTS": [{"object": "LAYER", "handle": [0, 1, 10], "name": "A-WALL"}]}
+    monkeypatch.setattr("cad_file_inventory.run_decoder", lambda *_: (json.dumps(decoded).encode(), b""))
+    output = tmp_path / "report.json"
+    assert audit_file(SimpleNamespace(input=str(source), dwgread=sys.executable, output=str(output),
+                                      summary=False, expected_insunits=24)) == 0
+    report = json.loads(output.read_text())
+    assert report["units"]["$INSUNITS"]["label"] == "US Survey Miles"
+    assert report["status"] == "audited"
+
+
+def xref_fixture(path, references):
+    drawing = ezdxf.new("R2018")
+    drawing.header["$INSUNITS"] = 4
+    drawing.header["$MEASUREMENT"] = 1
+    for name, target, overlay in references:
+        xref.define(drawing, name, target, overlay=overlay)
+        drawing.modelspace().add_blockref(name, (0, 0))
+    drawing.saveas(path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_nested_xrefs_find_cycle_and_missing_path_and_preserve_direct_mode(tmp_path):
+    root = tmp_path.resolve()
+    child = root / "nested"
+    child.mkdir()
+    source = root / "source.dxf"
+    xref_fixture(source, [("Child", "nested/child.dxf", False), ("Shared", "shared.dxf", True)])
+    xref_fixture(child / "child.dxf", [("Back", "../source.dxf", False), ("Sibling", "../shared.dxf", False),
+                                      ("Missing", "missing.dxf", False), ("Overlay", "ignored.dxf", True)])
+    xref_fixture(root / "shared.dxf", [])
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.rglob("*.dxf")}
+
+    result = run(source, "--xref-root", root)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert report["status"] == "audited" and report["total_xrefs"] == 2
+    assert report["inventory"]["coverage"]["xref_scope"] == "nested_saved_paths"
+    edges = {edge["name"]: edge for edge in report["inventory"]["xref_graph"]}
+    assert edges["Back"]["cycle"] == ["source.dxf", "nested/child.dxf", "source.dxf"]
+    assert edges["Sibling"]["target"] == "shared.dxf" and not edges["Sibling"]["isCircular"]
+    assert edges["Missing"]["status"] == "missing" and edges["Missing"]["host"] == "nested/child.dxf"
+    assert edges["Overlay"]["status"] == "overlay_excluded"
+    assert {(row["host"], row["target"]) for row in report["findings"] if row["ruleId"] == "CAD-XREF-01"} == {
+        ("nested/child.dxf", "Back"), ("nested/child.dxf", "Missing"),
+    }
+    summary = run(source, "--xref-root", root, "--summary")
+    assert summary.returncode == 1
+    assert json.loads(summary.stdout)["coverage"]["xref_scope"] == "nested_saved_paths"
+    direct = run(source)
+    assert direct.returncode == 3
+    assert "xref_graph" not in json.loads(direct.stdout)["inventory"]
+    assert before == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.rglob("*.dxf")}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_nested_xrefs_keep_cycle_findings_with_unchecked_edges(tmp_path):
+    root = tmp_path.resolve()
+    source = root / "source.dxf"
+    safe = root / "safe"
+    safe.mkdir()
+    (root / "alias").symlink_to(safe, target_is_directory=True)
+    xref_fixture(source, [("Self", "source.dxf", False), ("Unsafe", "alias/../source.dxf", False),
+                          ("Unqualified", "native.dwg", False)])
+    (root / "native.dwg").write_bytes(b"AC1015fixture")
+    result = run(source, "--xref-root", root)
+    assert result.returncode == 3, result.stderr
+    report = json.loads(result.stdout)
+    edges = {edge["name"]: edge for edge in report["inventory"]["xref_graph"]}
+    assert edges["Self"]["isCircular"]
+    assert edges["Unsafe"]["status"] == edges["Unqualified"]["status"] == "unchecked"
+    assert any(row["target"] == "Self" and row["severity"] == "error" for row in report["findings"])
+    assert run(root / "native.dwg", "--xref-root", root).returncode == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_nested_xrefs_distinguish_scope_escape_from_a_missing_in_scope_path(tmp_path):
+    root = tmp_path.resolve()
+    source = root / "source.dxf"
+    xref_fixture(source, [("Escape", "missing/../../outside.dxf", False),
+                          ("Inside", "missing/../inside.dxf", False)])
+    result = run(source, "--xref-root", root)
+    assert result.returncode == 3, result.stderr
+    report = json.loads(result.stdout)
+    edges = {edge["name"]: edge for edge in report["inventory"]["xref_graph"]}
+    assert edges["Escape"]["status"] == "unchecked"
+    assert edges["Escape"]["reason"] == "unsupported_or_unsafe_saved_path"
+    assert edges["Inside"]["status"] == "missing"
+    assert report["inventory"]["coverage"]["xref_scope"] == "nested_incomplete"
+    assert [finding["target"] for finding in report["findings"] if finding["ruleId"] == "CAD-XREF-01"] == ["Inside"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Process-group cleanup requires POSIX.")
+def test_decoder_deadline_includes_descendants_holding_output(tmp_path):
+    from time import monotonic
+
+    command = [sys.executable, "-c",
+               "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'])"]
+    start = monotonic()
+    with pytest.raises(ValueError, match="timed out"):
+        run_decoder(command, tmp_path, timeout=0.3, process_group=True)
+    assert monotonic() - start < 3
+
+
+def test_nested_xrefs_report_unsupported_descriptor_capability(monkeypatch):
+    from cad_xref_graph import inspect_nested_drawing
+
+    monkeypatch.setattr("cad_xref_graph.descriptor_support", lambda: False)
+    with pytest.raises(ValueError, match="Rerun without --xref-root"):
+        inspect_nested_drawing("ignored.dxf", "ignored", None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_nested_xrefs_use_shortest_path_and_honor_attempt_budget(tmp_path, monkeypatch):
+    import cad_xref_graph as graph
+
+    root = tmp_path.resolve()
+    source = root / "source.dxf"
+    xref_fixture(source, [("Long", "a.dxf", False), ("Short", "shared.dxf", False)])
+    xref_fixture(root / "a.dxf", [("Shared", "shared.dxf", False)])
+    xref_fixture(root / "shared.dxf", [("Leaf", "leaf.dxf", False)])
+    xref_fixture(root / "leaf.dxf", [("Missing", "missing.dxf", False)])
+    monkeypatch.setattr(graph, "MAX_DEPTH", 2)
+    scanned = graph.inspect_nested_drawing(str(source), str(root), None)
+    assert [(row["host"], row["status"]) for row in scanned["xref_graph"] if row["name"] == "Missing"] == [
+        ("leaf.dxf", "missing"),
+    ]
+    monkeypatch.setattr(graph, "MAX_DRAWINGS", 2)
+    limited = graph.inspect_nested_drawing(str(source), str(root), None)
+    assert limited["coverage"]["xref_scope"] == "nested_incomplete"
+    assert next(row for row in limited["xref_graph"] if row["name"] == "Short")["status"] == "unchecked"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Nested scans require POSIX descriptors.")
+def test_xref_stage_rejects_renamed_ancestor(tmp_path):
+    import cad_xref_graph as graph
+
+    root = tmp_path.resolve()
+    nested = root / "approved"
+    nested.mkdir()
+    source = nested / "drawing.dxf"
+    xref_fixture(source, [])
+    parts = ("approved", "drawing.dxf")
+    with graph.physical_root(root) as descriptor:
+        with graph.open_drawing(descriptor, parts) as (file, metadata, _, _):
+            nested.rename(root / "moved")
+            with pytest.raises(FileNotFoundError):
+                graph.stage_drawing(descriptor, root, parts, file, metadata, root / "stage.dxf")
+
+
+def r2000_linked_attributes():
+    def ref(value):
+        return [4, 1, value, value]
+
+    return {
+        "FILEHEADER": {"version": "AC1015"},
+        "created_by": "LibreDWG 0.14",
+        "HEADER": {"INSUNITS": 4},
+        "OBJECTS": [
+            {"object": "BLOCK_HEADER", "handle": [0, 1, 51], "name": "TITLE",
+             "first_entity": ref(53), "last_entity": ref(54)},
+            {"entity": "LINE", "handle": [0, 1, 53], "next_entity": ref(54)},
+            {"entity": "ATTDEF", "handle": [0, 1, 54], "tag": "SHEET",
+             "default_value": "seed", "flags": 0, "prev_entity": ref(53)},
+            {"entity": "INSERT", "handle": [0, 1, 55], "block_header": ref(51), "has_attribs": 1,
+             "first_attrib": ref(57), "last_attrib": ref(57), "seqend": ref(56)},
+            {"entity": "SEQEND", "handle": [0, 1, 56], "ownerhandle": ref(55)},
+            {"entity": "ATTRIB", "handle": [0, 1, 57], "tag": "SHEET", "text_value": "A101"},
+            {"entity": "INSERT", "handle": [0, 1, 58], "block_header": ref(51), "has_attribs": 1,
+             "first_attrib": ref(60), "last_attrib": ref(61), "seqend": ref(59)},
+            {"entity": "SEQEND", "handle": [0, 1, 59], "ownerhandle": ref(58)},
+            {"entity": "ATTRIB", "handle": [0, 1, 60], "tag": "SHEET", "text_value": "", "next_entity": ref(61)},
+            {"entity": "ATTRIB", "handle": [0, 1, 61], "tag": "DRAWN_BY", "text_value": "RD", "prev_entity": ref(60)},
+        ],
+    }
+
+
+def test_r2000_native_links_attach_values_to_exact_inserts_without_owner_fields():
+    from dwg_cad_audit import check_attribute_policy
+
+    inventory = dwg_inventory(r2000_linked_attributes(), "AC1015")
+    block, = inventory["blocks"]
+    assert block["definitions"] == [
+        {"handle": 54, "tag": "SHEET", "value": "seed", "constant": False, "insert_handle": None},
+    ]
+    assert [(row["insert_handle"], row["tag"], row["value"]) for row in block["attributes"]] == [
+        (55, "SHEET", "A101"), (58, "SHEET", ""), (58, "DRAWN_BY", "RD"),
+    ]
+    findings, coverage = check_attribute_policy(inventory, {"title": ("TITLE", ["SHEET"])})
+    assert [(row["insert_handle"], row["state"]) for row in findings] == [(58, "blank")]
+    assert coverage["checked_fields"] == 2 and coverage["unchecked_fields"] == []
+
+
+@pytest.mark.parametrize("failure", ["wrong_seqend", "broken_chain", "shared_attribute", "conflicting_direct_owner"])
+def test_r2000_attribute_links_keep_unverified_values_unassociated(failure):
+    from dwg_cad_audit import check_attribute_policy
+
+    data = r2000_linked_attributes()
+    if failure == "wrong_seqend":
+        data["OBJECTS"][7]["ownerhandle"] = [4, 1, 55, 55]
+    elif failure == "broken_chain":
+        data["OBJECTS"][9]["prev_entity"] = [4, 1, 55, 55]
+    elif failure == "conflicting_direct_owner":
+        data["OBJECTS"][8]["ownerhandle"] = [4, 1, 55, 55]
+    else:
+        data["OBJECTS"][3].update(first_attrib=[4, 1, 60, 60], last_attrib=[4, 1, 61, 61])
+    inventory = dwg_inventory(data, "AC1015")
+    assert {row["handle"] for row in inventory["unassociated_attributes"]} >= {60, 61}
+    findings, coverage = check_attribute_policy(inventory, {"title": ("TITLE", ["SHEET"])})
+    assert not findings
+    assert {"block": "TITLE", "insert_handle": 58, "tag": "SHEET"} in coverage["unchecked_fields"]

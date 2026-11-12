@@ -26,7 +26,7 @@ archi-magic currently interfaces with Revit and Rhino. Many architectural office
 - **Layer Standards Audit**: verify layer naming against office or project conventions (e.g. AIA CAD Layer Guidelines: `A-WALL`, `A-DOOR`), color, and linetype standards.
 - **Xref Inspector**: extract all external reference paths, detect broken/unresolved links, and report circular references.
 - **Block & Attribute Inventory**: count title block instances, verify attribute fill completeness, and detect unpurged anonymous blocks.
-- **Scale and Units Verification**: check `$INSUNITS` and `$MEASUREMENT` to detect unit mismatches before linking to Revit.
+- **Scale and Units Verification**: Check `$INSUNITS` against the project’s insertion unit and `$MEASUREMENT` against its hatch and linetype standard. [AutoCAD insertion units](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-Core/files/GUID-A58A87BB-482B-4042-A00A-EEF55A2B4FD8.htm) · [AutoCAD hatch and linetype standard](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-Core/files/GUID-1D074C55-0B63-482E-8A37-A52AC0C7C8FE.htm)
 
 ### Phase 2: Safe Edits with Explicit Approval
 - **Layer Mapping and Renaming**: compute old/new layer mapping with preview table.
