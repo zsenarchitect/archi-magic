@@ -353,3 +353,86 @@ def test_independent_verifier_rejects_inconsistent_evidence(audit_records, chang
     change(audit_records)
     with pytest.raises(ValueError, match=reason):
         audit_records.verify()
+
+
+@pytest.fixture
+def kept_reader(monkeypatch, audit_records):
+    source = snapshot()
+    from room_views_preview import compute, preflight_inputs
+    preview = compute(source)
+    args = preflight_inputs(source, preview)
+    rows = deepcopy(audit_records.receipt["views"])
+    kept = []
+    entities = {}
+    phase = NS(Id=NS(Value=3), UniqueId="fixture-3")
+    element_class = type("ViewSection", (), {})
+    marker_class = type("ElevationMarker", (), {})
+    for row in rows:
+        pair = {"name": row["name"], "view": row["view"]}
+        identities = [(row["view"], element_class)]
+        if "marker" in row:
+            pair.update(marker=row["marker"], slot=row["slot"])
+            identities.append((row["marker"], marker_class))
+        kept.append(pair)
+        for identity, kind in identities:
+            element = kind()
+            element.Id = NS(Value=int(identity["id"]))
+            element.UniqueId = identity["uid"]
+            entities[identity["id"]] = entities[identity["uid"]] = element
+    baseline = json.loads(audit_records.before["result"]["inventory_json"])
+    after_inventory = deepcopy(baseline)
+    after_inventory["views"].extend(dict(row["view"], name=row["name"]) for row in rows)
+    after_source = dict(source, view_names=sorted(source["view_names"] + [row["name"] for row in rows]))
+    from verify_room_view_trial import digest
+
+    baseline_text = json.dumps(baseline)
+    args.update(kept_views=kept, approved_proposal_sha256=preview["proposal_sha256"],
+                fixture_settings=audit_records.receipt["fixture_settings"], unrelated_control={},
+                baseline_inventory_json=baseline_text, baseline_inventory_sha256=digest(baseline_text))
+    document = NS(IsFamilyDocument=False, IsModifiable=False, IsWorkshared=False,
+                  GetElement=entities.get)
+
+    def resolve(_, identity):
+        return entities.get(identity["id"], phase)
+
+    def verify_view(view, marker, slot, spec, *_):
+        row = next(item for item in rows if item["name"] == spec["name"])
+        assert str(view.Id.Value) == row["view"]["id"]
+        if spec["kind"] == "elevation":
+            assert marker.UniqueId == row["marker"]["uid"] and slot == 0
+        else:
+            assert marker is None and slot is None
+        return row
+
+    monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=NS(ViewSection=element_class, ElevationMarker=marker_class)))
+    monkeypatch.setitem(sys.modules, "probe_room_views", NS(resolve=resolve, verify_view=verify_view))
+    monkeypatch.setitem(sys.modules, "read_room_finish_boundaries", NS(
+        MAX_BYTES=2 * 1024 * 1024, MAX_VIEWS=80, read_room_view_snapshot=lambda *_: (after_source, []),
+    ))
+    monkeypatch.setitem(sys.modules, "read_room_view_audit", NS(
+        digest=digest, encode=json.dumps, inventory=lambda *_: json.dumps(after_inventory),
+    ))
+    readback = runpy.run_path(str(SCRIPT.with_name("read_kept_room_views.py")))["read_kept"]
+    return NS(run=lambda: readback(document, args), rows=rows, args=args, inventory=after_inventory,
+              source=after_source, entities=entities)
+
+
+def test_kept_readback_verifies_views_and_markers_in_proposal_order(kept_reader):
+    result = kept_reader.run()
+    assert result["status"] == "kept_room_views_read"
+    receipt = json.loads(result["kept_json"])
+    assert receipt["views"] == kept_reader.rows
+    assert receipt["proposal_sha256"] == kept_reader.args["approved_proposal_sha256"]
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (lambda data: data.entities.pop(data.rows[0]["marker"]["uid"]), "expected native view or marker"),
+    (lambda data: data.inventory["views"][0].update(name="renamed"), "Existing native views changed"),
+    (lambda data: data.inventory["control"].update(value="changed"), "unrelated fixture control changed"),
+    (lambda data: data.source["view_names"].append("unreviewed"), "expected view names changed"),
+    (lambda data: data.args.update(approved_proposal_sha256="changed"), "does not match its digests"),
+])
+def test_kept_readback_blocks_changes_outside_reviewed_scope(kept_reader, change, reason):
+    change(kept_reader)
+    with pytest.raises(ValueError, match=reason):
+        kept_reader.run()
