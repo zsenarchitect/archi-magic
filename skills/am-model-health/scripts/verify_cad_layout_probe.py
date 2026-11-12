@@ -6,36 +6,14 @@ import json
 import math
 import sys
 
-from cad_layout_preview import INPUT_LIMIT, contour_area, contour_area_tolerance, edges, fields, label, read_input
+from cad_layout_preview import INPUT_LIMIT, contour_area, contour_area_tolerance, edges, fields, read_input
+from revit_probe_record import require_no_changes
 
 RECORD_LIMIT = 8 * INPUT_LIMIT
 
 
 def sha256(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def require_no_changes(record, mode):
-    record = record.get("response", record)
-    if (not isinstance(record, dict) or record.get("mode") != mode or record.get("status") != "ok"
-            or record.get("decision") != "no_changes" or type(record.get("exit_code")) is not int
-            or record["exit_code"] != 0 or record.get("result_truncated") is not False
-            or record.get("error") is not None or record.get("approval") is not None
-            or any(record.get(key) != [] for key in ("failures", "dialogs", "blocked", "warnings"))
-            or record.get("unclosed_documents", [])):
-        raise ValueError("Use a complete successful Revit record with no changes, warnings, or approval.")
-    if record.get("engine", {}).get("requested") != "cpython":
-        raise ValueError("Use the CPython Revit run records.")
-    label(record["run_id"])
-    changes = record["changes"]
-    if (any(type(changes.get(key)) is not int or changes[key] != 0
-            for key in ("added_count", "modified_count", "deleted_count"))
-            or any(changes.get(key) for key in ("added", "modified", "deleted", "added_ids", "modified_ids",
-                                                "deleted_ids", "by_category", "other_documents"))):
-        raise ValueError("The Revit record reports unexpected model changes.")
-    if not isinstance(record.get("result"), dict):
-        raise ValueError("The Revit script result is unavailable.")
-    return record
 
 
 def preview_payload(record):

@@ -699,7 +699,8 @@ def test_verify_cad_probe_uses_three_independent_complete_run_records(linked_dwg
     start, end = door["span_mm"]
 
     def run(run_id, mode, result):
-        return {"run_id": run_id, "mode": mode, "status": "ok", "decision": "no_changes",
+        decision = "rolled_back" if mode == "query" else "no_changes"
+        return {"run_id": run_id, "mode": mode, "status": "ok", "decision": decision,
                 "exit_code": 0, "result_truncated": False, "error": None, "warnings": [], "dialogs": [],
                 "failures": [], "blocked": [], "engine": {"requested": "cpython"},
                 "changes": {"added_count": 0, "modified_count": 0, "deleted_count": 0, "by_category": {}},
