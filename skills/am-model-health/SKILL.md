@@ -257,10 +257,14 @@ Use `python scripts/batch_family_type_table.py --table types.csv --manifest disc
 
 ### Review and trial the project batch load
 
-1. Run `batch_family_load_preview.py --lookup lookup.json --project-read project.json --staging staging.json`. Pass each verified workspace with `--export`. Review the exact export hashes, requested types, and skipped types.
-2. Call `get_context`. Confirm the same saved disposable project and loaded build. Obtain approval for the rollback-only trial.
-3. Run `probe_batch_family_load.py` in guarded CPython dry-run mode. Pass `disposable_fixture: true`, `lookup`, `staging`, `preview`, and its `preview_sha256`. Save the full bridge record.
-4. Check the exact new family and type IDs, preserved existing elements, and rollback result. Keep remains unavailable until the native trial and final approval path are qualified.
+1. Run the batch project query with `audit_inventory: true`. Save the full result as `before.json`.
+2. Run `batch_family_load_preview.py --lookup lookup.json --project-read before.json --staging staging.json`. Pass each verified workspace with `--export`. Review the exact export hashes, requested types, and skipped types.
+3. Call `get_context` and obtain approval for the rollback-only trial. Run `probe_batch_family_load.py` in guarded CPython dry-run mode. Pass `disposable_fixture: true`, `lookup`, `staging`, `preview`, `preview_sha256`, and the before query's `audit_token` as `baseline_audit_token`.
+4. Save the full trial record. Run the project query again with `audit_inventory: true`. Pass the trial's `transaction` and `effects.added` as `effect_ids`. Save it as `after.json`.
+5. Run `verify_batch_family_load.py lookup.json staging.json preview.json before.json trial.json after.json`. Review the exact effects and confirmed project restoration.
+6. Recheck the project and ask policy. Obtain approval for the real load. Run `apply_batch_family_load.py` in guarded CPython modify mode. Pass the same trial inputs as `load_run` and the full records as `before`, `trial`, and `after`.
+7. Use Revit's Keep or Discard prompt. Save the full modify record. Run the project query again with its transaction and effect IDs. Set `kept: true` only after Keep. Run the verifier with `--modify modify.json --fresh fresh.json`.
+8. Save the project after a verified Keep. Rerun the table and check that the preview skips the retained types. This workflow still requires native qualification with the loaded Revit bridge.
 
 ## Preview a CAD layout (issue #166)
 

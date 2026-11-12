@@ -2,9 +2,11 @@
 
 import json
 import math
+from uuid import uuid4
 
 from batch_family_type_preview import validate_record
-from read_family_placement import MAX_FAMILIES, MAX_SYMBOLS, eid, parameter_state, saved_project_identity
+from read_family_placement import MAX_FAMILIES, MAX_SYMBOLS, eid, inventory, inventory_record, parameter_state, saved_project_identity
+from batch_family_type_table import MAX_FAMILIES as MAX_BATCH_FAMILIES, MAX_ROWS
 
 
 def internal_size(DB, size):
@@ -103,6 +105,35 @@ def read_project(document, DB, lookup, *, require_unmodified=True):
             "revit_build": build, "rows": [classify_row(row, families, build, DB) for row in lookup["rows"]]}
 
 
+
+def project_query(document, DB, request):
+    kept = request.get("kept", False)
+    transaction = request.get("transaction")
+    if type(kept) is not bool or (kept and not transaction):
+        raise ValueError("A kept read needs the exact modify transaction.")
+    snapshot = read_project(document, DB, request["lookup"], require_unmodified=not kept)
+    result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
+    if request.get("audit_inventory") is not True:
+        return result
+    ids = request.get("effect_ids", [])
+    if (not isinstance(ids, list) or len(ids) > MAX_ROWS + MAX_BATCH_FAMILIES or len(set(ids)) != len(ids)
+            or bool(ids) != bool(transaction)):
+        raise ValueError("Use the exact transaction name with its provisional element IDs.")
+    elements = inventory(document, DB)
+    for key in ids:
+        number = int(key)
+        if number <= 0 or str(number) != key:
+            raise ValueError("Use canonical positive Revit effect IDs.")
+        element = document.GetElement(DB.ElementId(number))
+        if (element is not None) != kept or (key in elements) != kept:
+            raise ValueError("A provisional element's presence differs from the reviewed decision.")
+    preserved = {key: value for key, value in elements.items() if key not in ids}
+    result.update(audit_token=uuid4().hex, transaction=transaction, inventory=inventory_record(elements),
+                  preserved_inventory=inventory_record(preserved),
+                  present_ids=sorted(ids, key=int) if kept else [], absent_ids=[] if kept else sorted(ids, key=int))
+    return result
+
+
 try:
     active_project, query_inputs = doc, inputs
 except NameError:
@@ -110,7 +141,6 @@ except NameError:
 else:
     from pyrevit.api import DB
     try:
-        snapshot = read_project(active_project, DB, query_inputs["lookup"])
-        result = {"status": "ok", "snapshot_json": json.dumps(snapshot, ensure_ascii=True, allow_nan=False)}
+        result = project_query(active_project, DB, query_inputs)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         result = {"status": "blocked", "reason": str(error)}

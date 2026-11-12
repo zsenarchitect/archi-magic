@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import os
+import re
 from uuid import uuid4
 
 from batch_family_export import verified_export
@@ -70,8 +71,13 @@ def check_loaded_project(before, after, rows):
             raise ValueError("A skipped existing project type changed during the load.")
 
 
-def execute_trial(document, DB, args, before, bound):
+def execute_trial(document, DB, args, before, bound, *, handoff=None, expected_state=None):
     original = inventory(document, DB)
+    digest = manifest_digest(before)
+    baseline_inventory = inventory_record(original)
+    if expected_state and (digest != expected_state["baseline_sha256"]
+                           or baseline_inventory != expected_state["baseline_inventory"]):
+        raise ValueError("The project changed after the verified trial.")
     events = []
     closing = False
     invalid = False
@@ -97,6 +103,7 @@ def execute_trial(document, DB, args, before, bound):
     failure = None
     regeneration_failed = False
     restored = False
+    handed_off = False
     application.DocumentChanged += record
     try:
         if group.Start() != status.Started or transaction.Start() != status.Started:
@@ -112,13 +119,18 @@ def execute_trial(document, DB, args, before, bound):
                 or any(current.get(key) != value for key, value in original.items())):
             raise ValueError("The batch had effects outside its exact new families and types.")
         check_loaded_project(before, read_project(document, DB, args["lookup"], require_unmodified=False), rows)
+        if handoff is not None:
+            handoff()
+            if group.Assimilate() != status.Committed or group.GetStatus() != status.Committed:
+                raise ValueError("Revit did not transfer the batch to the guarded approval prompt.")
+            handed_off = True
     except Exception as error:
         regeneration_failed = type(error).__name__ == "RegenerationFailedException"
         failure = str(error) if isinstance(error, ValueError) else type(error).__name__
     finally:
         closing = True
         try:
-            restored = rollback(transaction, group, status)
+            restored = handed_off or rollback(transaction, group, status)
         except Exception:
             restored = False
         finally:
@@ -132,7 +144,12 @@ def execute_trial(document, DB, args, before, bound):
                 except Exception:
                     restored = False
     if not restored or regeneration_failed:
+        if handoff is not None:
+            raise RuntimeError("The batch did not close cleanly. The bridge must roll it back.")
         return {"status": "transaction_unresolved", "reason": failure or "Revit did not confirm rollback."}
+    if handed_off:
+        return load_record(args, name, digest, baseline_inventory, families, rows, added,
+                                status="awaiting_bridge_decision")
     try:
         if read_project(document, DB, args["lookup"], require_unmodified=False) != before or inventory(document, DB) != original:
             return {"status": "transaction_unresolved", "reason": "The project baseline changed after rollback."}
@@ -140,17 +157,24 @@ def execute_trial(document, DB, args, before, bound):
         return {"status": "transaction_unresolved", "reason": type(error).__name__}
     if failure:
         return {"status": "stopped", "reason": failure, "rollback_verified": True}
-    return {"status": "trial_rolled_back", "preview_sha256": args["preview_sha256"], "transaction": name,
-            "baseline_sha256": manifest_digest(before), "baseline_inventory": inventory_record(original),
+    return load_record(args, name, digest, baseline_inventory, families, rows, added,
+                            status="trial_rolled_back", rollback_verified=True)
+
+
+def load_record(args, name, digest, baseline_inventory, families, rows, added, **status):
+    return {"preview_sha256": args["preview_sha256"], "transaction": name,
+            "baseline_sha256": digest, "baseline_inventory": baseline_inventory,
+            "baseline_audit_token": args.get("baseline_audit_token"),
             "families": families, "rows": {str(key): value for key, value in rows.items()},
-            "effects": {"added": sorted(added, key=int), "modified": [], "deleted": []},
-            "rollback_verified": True}
+            "effects": {"added": sorted(added, key=int), "modified": [], "deleted": []}, **status}
 
 
-def run_trial(document, DB, args):
-    if (set(args) != {"disposable_fixture", "lookup", "preview", "preview_sha256", "staging"}
-            or args["disposable_fixture"] is not True or document.IsModifiable):
-        raise ValueError("Use a saved disposable standalone project and reviewed batch load.")
+def run_trial(document, DB, args, *, handoff=None, expected_state=None):
+    token = args.get("baseline_audit_token")
+    if (set(args) != {"disposable_fixture", "lookup", "preview", "preview_sha256", "staging", "baseline_audit_token"}
+            or args["disposable_fixture"] is not True or document.IsModifiable
+            or not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token)):
+        raise ValueError("Use a saved disposable project, original audit token, and reviewed batch load.")
     preview = args["preview"]
     if manifest_digest(preview) != args["preview_sha256"]:
         raise ValueError("The batch preview changed after review.")
@@ -168,7 +192,7 @@ def run_trial(document, DB, args):
             if receipt != group["receipt"]:
                 raise ValueError("A sealed export changed before the native load.")
             bound.append((path, group))
-        return execute_trial(document, DB, args, before, bound)
+        return execute_trial(document, DB, args, before, bound, handoff=handoff, expected_state=expected_state)
 
 
 try:
