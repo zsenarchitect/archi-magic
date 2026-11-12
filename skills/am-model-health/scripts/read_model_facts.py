@@ -254,7 +254,8 @@ def read_model_facts(doc, app, DB, inputs):
         actual_uid = facts.text(lambda: doc.ProjectInformation.UniqueId) if uid else None
         if actual_title != title or actual_path != path or (uid and uid != actual_uid):
             return {"status": "rejected", "error": "document_identity_mismatch"}
-        result = {"model": host_facts(doc, app, facts, actual_title, actual_path),
+        result = {"kind": "revit-model-facts",
+                  "model": host_facts(doc, app, facts, actual_title, actual_path),
                   "worksets": None, "links": None}
         facts.link_bytes = len(encode(result))
         for section, collect in (("worksets", workset_facts), ("links", link_facts)):
