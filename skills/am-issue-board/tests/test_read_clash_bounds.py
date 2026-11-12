@@ -227,6 +227,24 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
         assert confirmed_issue["findings"] == [
             "Navisworks clash UUID: " + guid, "Verified Revit section view " + view_name + ".",
         ]
+        board_run = tmp_path / "board-keep.json"
+        board_run.write_text(json.dumps({
+            "mode": "modify", "status": "ok", "decision": "committed", "approval": "user",
+            "run_id": "board-keep", "result": {"status": "ok", "note_id": 150,
+                                               "sha1_after": ib.text_sha1(board_plan["final_text"])},
+            "changes": dict(unchanged, modified_count=1, modified=[{"id": 150, "class": "TextNote"}]),
+        }))
+        board_readback = tmp_path / "board-fresh.json"
+        write_board(board_plan["final_text"])
+        board_readback.write_text(json.dumps({
+            "mode": "query", "status": "ok", "decision": "rolled_back", "run_id": "board-query",
+            "result": json.loads(note.read_text()), "changes": unchanged,
+        }))
+        write_board(board_body)
+        final = subprocess.run(handoff + ["--verify-board", "keep", "--board-run", str(board_run),
+                                         "--board-readback", str(board_readback)],
+                               check=True, capture_output=True, text=True)
+        assert json.loads(final.stdout)["board_verification"] == {"status": "verified_keep", "note_id": "150"}
         write_board(board_plan["final_text"])
         retry = proposal()
         assert retry["board_handoff"] == "already_recorded" and retry["plan"] is None
@@ -493,3 +511,44 @@ def test_board_apply_checks_kept_view_before_transaction(view_writer, change):
     }[change]
     with pytest.raises(expected, match=message):
         runpy.run_path(str(SCRIPTS / "apply_board.py"), init_globals=globals_)
+
+
+@pytest.mark.parametrize("outcome,mode,status,decision,approval", [
+    ("dry-run", "dry_run", "ok", "rolled_back", None),
+    ("discard", "modify", "rejected", "discarded", "user"),
+    ("keep", "modify", "ok", "committed", "user"),
+])
+def test_board_run_rejects_wrong_note_side_effects_and_stale_readback(outcome, mode, status, decision, approval):
+    import issue_board as ib
+    from navisworks_clash_cli import verify_board_run
+
+    host = {"project_uid": "fixture", "path_sha256": "a" * 64}
+    before = ib.plan_create("Fixture", [])["final_text"]
+    plan = ib.plan_add_issue(before, {"title": "Clash fixture"})
+    note = {"id": "150", "unique_id": "note-fixture", "sha1": ib.text_sha1(before)}
+    plan["structural_target"] = {"host_identity": host, "active": note}
+    after = plan["final_text"]
+    after_digest = ib.text_sha1(after)
+    observed = after if outcome == "keep" else before
+    fresh = {"host_identity": host, "note": dict(note, text=observed, sha1=ib.text_sha1(observed))}
+    unchanged = {"added_count": 0, "modified_count": 0, "deleted_count": 0,
+                 "added": [], "modified": [], "deleted": []}
+    edited = dict(unchanged, modified_count=1, modified=[{"id": 150, "class": "TextNote"}])
+    record = {"run_id": "board-run", "mode": mode, "status": status, "decision": decision,
+              "approval": approval, "changes": edited,
+              "result": {"status": "ok", "note_id": 150, "sha1_after": after_digest}}
+    readback = {"run_id": "board-readback", "mode": "query", "status": "ok", "decision": "rolled_back",
+                "changes": unchanged, "result": fresh}
+    assert verify_board_run(plan, outcome, record, readback) == {
+        "status": "verified_" + outcome.replace("-", "_"), "note_id": "150",
+    }
+    wrong_note = dict(fresh, note=dict(fresh["note"], unique_id="same-text-other-note"))
+    with pytest.raises(ValueError, match="text or identity"):
+        verify_board_run(plan, outcome, record, dict(readback, result=wrong_note))
+    wrong_text = before if outcome == "keep" else after
+    stale = dict(fresh, note=dict(fresh["note"], text=wrong_text, sha1=ib.text_sha1(wrong_text)))
+    with pytest.raises(ValueError, match="text or identity"):
+        verify_board_run(plan, outcome, record, dict(readback, result=stale))
+    with pytest.raises(ValueError, match="only the reviewed text note"):
+        verify_board_run(plan, outcome, dict(record, changes=dict(edited, added_count=1,
+                         added=[{"id": 300, "class": "TextNote"}])), readback)

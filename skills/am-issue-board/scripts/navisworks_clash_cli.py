@@ -540,6 +540,11 @@ def runtime_record(path):
     return data.get("response", data)
 
 
+RUNTIME_OUTCOMES = {"dry-run": ("dry_run", "ok", "rolled_back", None),
+                    "keep": ("modify", "ok", "committed", "user"),
+                    "discard": ("modify", "rejected", "discarded", "user")}
+
+
 def runtime_changes(record, mode, status, decision, approval=None):
     if (record["mode"] != mode or record["status"] != status or record["decision"] != decision
             or record.get("approval") != approval or not text(record["run_id"])
@@ -547,11 +552,24 @@ def runtime_changes(record, mode, status, decision, approval=None):
                 "error", "failures", "dialogs", "blocked", "warnings", "closed_documents", "unclosed_documents"))):
         raise ValueError("The guarded pyRevit record does not establish the requested outcome.")
     changes = record["changes"]
-    if (changes.get("other_documents") or changes["modified"] or changes["deleted"]
-            or any(type(changes[key]) is not int or changes[key] != 0
-                   for key in ("modified_count", "deleted_count"))):
+    if (changes.get("other_documents") or changes["deleted"] != []
+            or type(changes["deleted_count"]) is not int or changes["deleted_count"] != 0):
         raise ValueError("The run reports unexpected model changes.")
     return changes
+
+
+def matches_changes(changes, *, added=None, modified=None):
+    for field, expected in (("added", added), ("modified", modified)):
+        rows = changes[field]
+        count = changes[field + "_count"]
+        if type(count) is not int or not isinstance(rows, list) or count != len(rows):
+            return False
+        if expected is None:
+            if count:
+                return False
+        elif count != 1 or (str(rows[0]["id"]), rows[0]["class"]) != expected:
+            return False
+    return True
 
 
 def runtime_payload(record, field):
@@ -562,21 +580,16 @@ def runtime_payload(record, field):
 
 
 def verify_view_run(plan, outcome, run, readback):
-    decisions = {"dry-run": ("dry_run", "ok", "rolled_back", None),
-                 "keep": ("modify", "ok", "committed", "user"),
-                 "discard": ("modify", "rejected", "discarded", "user")}
     if plan["blocked"] or run["run_id"] == readback["run_id"]:
         raise ValueError("Use an unblocked plan and an independent readback.")
-    changes = runtime_changes(run, *decisions[outcome])
+    changes = runtime_changes(run, *RUNTIME_OUTCOMES[outcome])
     fresh_changes = runtime_changes(readback, "query", "ok", "rolled_back")
-    if type(fresh_changes["added_count"]) is not int or fresh_changes["added_count"] != 0 or fresh_changes["added"]:
+    if not matches_changes(fresh_changes):
         raise ValueError("The readback must leave the model unchanged.")
     receipt = runtime_payload(run, "receipt_json")
     view_id = receipt["view_id"]
     if (not re.fullmatch(r"[1-9][0-9]{0,18}", view_id) or int(view_id) >= 2**63
-            or type(changes["added_count"]) is not int or changes["added_count"] != 1
-            or len(changes["added"]) != 1 or str(changes["added"][0]["id"]) != view_id
-            or changes["added"][0]["class"] != "View3D"):
+            or not matches_changes(changes, added=(view_id, "View3D"))):
         raise ValueError("The guarded run must report only the exact added 3D view.")
     expected = {"clash_guid": plan["view"]["clash_guid"], "view_name": plan["view"]["name"],
                 "view_type_id": plan["view"]["view_type_id"], "basis_sha256": plan["basis_sha256"],
@@ -648,6 +661,28 @@ def kept_board_preview(source, archive, clash, view):
     return plan, skipped, "planned"
 
 
+def verify_board_run(plan, outcome, run, readback):
+    if plan is None or run["run_id"] == readback["run_id"]:
+        raise ValueError("Use a planned board handoff and an independent note readback.")
+    guard = plan["structural_target"]
+    note = guard["active"]
+    changes = runtime_changes(run, *RUNTIME_OUTCOMES[outcome])
+    if not matches_changes(changes, modified=(note["id"], "TextNote")):
+        raise ValueError("The guarded board run must change only the reviewed text note.")
+    fresh_changes = runtime_changes(readback, "query", "ok", "rolled_back")
+    if not matches_changes(fresh_changes):
+        raise ValueError("The independent board readback must leave the model unchanged.")
+    intended_sha1 = ib.text_sha1(plan["final_text"])
+    receipt = run["result"]
+    if (receipt["status"] != "ok" or str(receipt["note_id"]) != note["id"]
+            or receipt["sha1_after"] != intended_sha1):
+        raise ValueError("The board write receipt differs from the plan.")
+    expected = dict(note, sha1=intended_sha1) if outcome == "keep" else note
+    if board_identity(readback["result"], guard["host_identity"]) != expected:
+        raise ValueError("The independent note readback differs from the expected text or identity.")
+    return {"status": "verified_" + outcome.replace("-", "_"), "note_id": note["id"]}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
@@ -660,6 +695,9 @@ def main(argv=None):
     parser.add_argument("--view-run", help="Complete guarded pyRevit run record")
     parser.add_argument("--view-readback", help="Complete independent pyRevit query record")
     parser.add_argument("--confirm-visible", action="store_true", help="Both clash targets were visible in the kept view")
+    parser.add_argument("--verify-board", choices=tuple(RUNTIME_OUTCOMES))
+    parser.add_argument("--board-run", help="Complete guarded board write record")
+    parser.add_argument("--board-readback", help="Complete independent board query record")
     args = parser.parse_args(argv)
     suffix = Path(args.report).suffix.lower()
     is_html = suffix in (".html", ".htm")
@@ -678,6 +716,9 @@ def main(argv=None):
         kept_board = bool(args.board and args.view_clash and args.verify_view == "keep")
         if args.confirm_visible != kept_board or (args.board and args.view_clash and not kept_board):
             raise ValueError("Use a verified Keep and visual confirmation for a kept-view board preview.")
+        if any((args.verify_board, args.board_run, args.board_readback)) and not all(
+                (kept_board, args.verify_board, args.board_run, args.board_readback)):
+            raise ValueError("Supply a kept-view board handoff and both board run records.")
         raw = local_bytes(args.report)
         source_warnings = []
         if is_html:
@@ -728,6 +769,10 @@ def main(argv=None):
             clash = next(row for row in clashes if row["guid"] == args.view_clash)
             report["plan"], report["skipped_guids"], report["board_handoff"] = kept_board_preview(
                 board, archive, clash, report["view_verification"]["view"]
+            )
+        if args.verify_board:
+            report["board_verification"] = verify_board_run(
+                report["plan"], args.verify_board, runtime_record(args.board_run), runtime_record(args.board_readback)
             )
         if is_html:
             report["warnings"].append("HTML review has no mapped clash identity. Export XML for model mapping and board import.")
