@@ -353,9 +353,10 @@ def main(document, args):
     return {"status": "ok", "snapshot_json": encoded, "inventory_json": details}
 
 
-try:
-    result = main(doc, inputs)  # noqa: F821
-except ValueError as error:
-    result = {"status": "blocked", "reason": str(error)}
-except Exception as error:
-    result = {"status": "blocked", "reason": "The native split read could not be completed.", "error_type": type(error).__name__}
+if "inputs" in globals():
+    try:
+        result = main(doc, inputs)  # noqa: F821
+    except ValueError as error:
+        result = {"status": "blocked", "reason": str(error)}
+    except Exception as error:
+        result = {"status": "blocked", "reason": "The native split read could not be completed.", "error_type": type(error).__name__}
