@@ -213,13 +213,14 @@ def dwg_inventory(doc, version):
             if flagged or path:
                 xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
             elif not name.casefold().startswith(LAYOUT_PREFIXES):
-                blocks[key] = {"name": name, "count": 0, "attributes": [], "definitions": []}
+                blocks[key] = {"name": name, "count": 0, "insert_handles": [], "attributes": [], "definitions": []}
     for key, record in selected.items():
         kind = record.get("entity")
         if kind in {"INSERT", "MINSERT"}:
             ref = absolute_ref(record.get("block_header"))
             if ref in blocks:
                 blocks[ref]["count"] += 1
+                blocks[ref]["insert_handles"].append(key)
             elif selected.get(ref, {}).get("object") != "BLOCK_HEADER":
                 notes.append("Some inserts could not be assigned to a block definition.")
         if kind in {"ATTRIB", "ATTDEF"}:
@@ -227,8 +228,13 @@ def dwg_inventory(doc, version):
             owner_id = absolute_ref(record.get("ownerhandle"))
             owner = selected.get(owner_id, {})
             block_id = absolute_ref(owner.get("block_header")) if is_value else owner_id
-            row = {"handle": key, "tag": text_value(record["tag"]), "value": text_value(
-                record.get("text_value" if is_value else "default_value", ""))}
+            value = record.get("text_value" if is_value else "default_value")
+            multiline = record.get("mtext_type") in (2, 4)
+            row = {"handle": key, "tag": text_value(record["tag"]),
+                   "value": text_value(value) if isinstance(value, str) and not multiline else None}
+            if not is_value:
+                flags = record.get("flags")
+                row["constant"] = bool(flags & 2) if type(flags) is int else None
             if block_id in blocks and (not is_value or owner.get("entity") in {"INSERT", "MINSERT"}):
                 row["insert_handle"] = owner_id if is_value else None
                 blocks[block_id]["attributes" if is_value else "definitions"].append(row)
@@ -240,6 +246,11 @@ def dwg_inventory(doc, version):
               "$MEASUREMENT": doc.get("Template", {}).get("MEASUREMENT")}
     return {"layers": layers, "xrefs": xrefs, "blocks": list(blocks.values()), "header": header,
             "unassociated_attributes": values, "unassociated_definitions": definitions, "notes": notes}
+
+
+def dxf_attribute_text(attribute):
+    value = attribute.plain_mtext() if attribute.has_embedded_mtext_entity else attribute.dxf.text
+    return text_value(value)
 
 
 def dxf_worker(snapshot):
@@ -278,16 +289,18 @@ def dxf_worker(snapshot):
                 purge_candidates.append({"kind": "block", "name": name})
             instances = inserts.get(name.casefold(), [])
             attributes = [
-                {"tag": text_value(attribute.dxf.tag), "value": text_value(attribute.dxf.text),
+                {"tag": text_value(attribute.dxf.tag), "value": dxf_attribute_text(attribute),
                  "insert_handle": insert.dxf.handle}
                 for insert in instances for attribute in insert.attribs
             ]
             definitions = [
-                {"tag": text_value(attribute.dxf.tag), "value": text_value(attribute.dxf.text)}
+                {"tag": text_value(attribute.dxf.tag), "value": dxf_attribute_text(attribute),
+                 "constant": attribute.is_const}
                 for attribute in layout.query("ATTDEF")
             ]
-            blocks.append({"name": name, "count": len(instances), "attributes": attributes,
-                           "definitions": definitions})
+            blocks.append({"name": name, "count": len(instances),
+                           "insert_handles": [insert.dxf.handle for insert in instances],
+                           "attributes": attributes, "definitions": definitions})
     return {"layers": layers, "xrefs": xrefs, "blocks": blocks,
             "purge_candidates": sorted(purge_candidates, key=lambda row: row["name"].casefold()),
             "header": {key: doc.header.get(key) for key in ("$INSUNITS", "$MEASUREMENT")},

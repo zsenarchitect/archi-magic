@@ -50,7 +50,8 @@ def test_direct_dxf_reports_seeded_findings_and_inventory(tmp_path):
                                  "flags_consistent": True, "status": "missing", "isCircular": False}]
     title = next(b for b in drawing["blocks"] if b["name"] == "Title")
     assert title["count"] == 1
-    assert title["definitions"] == [{"tag": "MARK", "value": "Default"}]
+    assert title["insert_handles"] == [insert.dxf.handle]
+    assert title["definitions"] == [{"tag": "MARK", "value": "Default", "constant": False}]
     assert title["attributes"] == [{"tag": "MARK", "value": "Actual", "insert_handle": insert.dxf.handle}]
     assert source.read_bytes() == original
     refused = run(source, "--output", source)
@@ -95,9 +96,9 @@ def test_dwg_inventory_uses_absolute_handles_and_retains_orphans():
     assert result["layers"][0]["entityCount"] == 1
     assert result["xrefs"] == [{"name": "External", "path": "local.dwg", "flags_consistent": True}]
     assert result["blocks"] == [{
-        "name": "Title", "count": 1,
+        "name": "Title", "count": 1, "insert_handles": [20],
         "attributes": [{"handle": 22, "tag": "MARK", "value": "Actual", "insert_handle": 20}],
-        "definitions": [{"handle": 21, "tag": "MARK", "value": "Default", "insert_handle": None}],
+        "definitions": [{"handle": 21, "tag": "MARK", "value": "Default", "insert_handle": None, "constant": None}],
     }]
     assert result["unassociated_attributes"] == [{"handle": 23, "tag": "OTHER", "value": "Unassigned"}]
     assert result["notes"]
@@ -233,3 +234,59 @@ def test_layer_policy_rejects_duplicate_names_and_conflicting_color_modes(tmp_pa
         policy.write_text(raw)
         with pytest.raises(ValueError):
             read_layer_policy(str(policy))
+
+
+def test_dxf_required_attributes_are_checked_per_insert(tmp_path):
+    source, policy = tmp_path / "drawing.dxf", tmp_path / "title-tags.json"
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+    block = doc.blocks.new("Title")
+    block.add_attdef("SHEET", text="Generic default")
+    block.add_attdef("OFFICE", text="Filled constant", dxfattribs={"flags": 2})
+    model = doc.modelspace()
+    complete = model.add_blockref("Title", (0, 0))
+    complete.add_attrib("Sheet", "A101")
+    missing = doc.paperspace().add_blockref("Title", (1, 0))
+    blank = model.add_blockref("Title", (2, 0))
+    blank.add_attrib("SHEET", " ")
+    duplicate = model.add_blockref("Title", (3, 0))
+    duplicate.add_attrib("sheet", "A102")
+    duplicate.add_attrib("SHEET", "A103")
+    doc.saveas(source)
+    original = source.read_bytes()
+    policy.write_text('{"blocks":{"title":["SHEET","OFFICE"],"Unplaced":["TAG"]}}')
+
+    result = run(source, "--attribute-policy", policy)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    findings = [f for f in report["findings"] if f["ruleId"] == "CAD-BLK-02"]
+    assert {(f["insert_handle"], f["tag"], f["state"]) for f in findings} == {
+        (missing.dxf.handle, "SHEET", "missing"), (blank.dxf.handle, "SHEET", "blank"),
+        (duplicate.dxf.handle, "SHEET", "duplicate"),
+    }
+    assert report["inventory"]["attribute_policy"] == {
+        "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(), "checked_fields": 8,
+        "unchecked_fields": [], "unmatched_blocks": ["Unplaced"],
+    }
+    assert report["inventory"]["coverage"]["required_attribute_policy"] == "checked"
+    assert source.read_bytes() == original
+
+
+def test_dwg_policy_marks_unknown_attribute_values_unchecked():
+    from dwg_cad_audit import check_attribute_policy
+
+    data = {"FILEHEADER": {"version": "AC1032"}, "created_by": "LibreDWG 0.14",
+            "HEADER": {"INSUNITS": 4}, "Template": {"MEASUREMENT": 1}, "OBJECTS": [
+                {"object": "BLOCK_HEADER", "handle": [0, 1, 30], "name": "Title"},
+                {"entity": "MINSERT", "handle": [0, 1, 20], "block_header": [12, 1, 9, 30]},
+                {"entity": "ATTDEF", "handle": [0, 1, 21], "tag": "OFFICE", "default_value": "Value",
+                 "ownerhandle": [12, 1, 9, 30], "flags": 2},
+                {"entity": "ATTRIB", "handle": [0, 1, 22], "tag": "SHEET", "text_value": "uncertain fallback",
+                 "ownerhandle": [12, 1, 9, 20], "mtext_type": 2},
+            ]}
+    drawing = dwg_inventory(data, "AC1032")
+    findings, evidence = check_attribute_policy(drawing, {"title": ("Title", ["OFFICE", "SHEET", "DATE"])})
+    assert [(f["insert_handle"], f["tag"], f["state"]) for f in findings] == [(20, "DATE", "missing")]
+    assert evidence == {"checked_fields": 2, "unchecked_fields": [{"block": "Title", "insert_handle": 20,
+                                                                  "tag": "SHEET"}], "unmatched_blocks": []}

@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from collections import defaultdict
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -88,7 +89,7 @@ def check_layer_standards(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return findings
 
 
-def read_layer_policy(path):
+def read_cad_policy(path):
     from cad_file_inventory import local_path, snapshot_file, validate_json
 
     source = local_path(path)
@@ -96,8 +97,11 @@ def read_layer_policy(path):
     with TemporaryDirectory(prefix="archi-cad-policy-") as temporary:
         snapshot = Path(temporary) / "policy.json"
         digest = snapshot_file(source, snapshot, limit=256 * 1024)
-        policy = validate_json(snapshot.read_bytes())
+        return digest, validate_json(snapshot.read_bytes())
 
+
+def read_layer_policy(path):
+    digest, policy = read_cad_policy(path)
     if (not isinstance(policy, dict) or set(policy) != {"layers"} or not isinstance(policy["layers"], dict)
             or not 1 <= len(policy["layers"]) <= 512):
         raise ValueError("Supply a layer policy with one to 512 named layers.")
@@ -239,6 +243,79 @@ def check_blocks_and_attributes(blocks: List[Dict[str, Any]]) -> List[Dict[str, 
     return findings
 
 
+def read_attribute_policy(path):
+    digest, policy = read_cad_policy(path)
+    if (not isinstance(policy, dict) or set(policy) != {"blocks"} or not isinstance(policy["blocks"], dict)
+            or not 1 <= len(policy["blocks"]) <= 512):
+        raise ValueError("Supply an attribute policy with one to 512 named blocks.")
+    rules = {}
+    for name, tags in policy["blocks"].items():
+        if not name.strip() or name != name.strip() or len(name) > 255 or name.casefold() in rules:
+            raise ValueError("Use distinct, exact block names.")
+        if (not isinstance(tags, list) or not 1 <= len(tags) <= 64
+                or any(not isinstance(tag, str) or not tag.strip() or tag != tag.strip() or len(tag) > 255 for tag in tags)
+                or len({tag.casefold() for tag in tags}) != len(tags)):
+            raise ValueError("Use one to 64 distinct attribute tags per block.")
+        rules[name.casefold()] = (name, tags)
+    return digest, rules
+
+
+def attribute_state(attached, definitions, incomplete_links):
+    if len(attached) > 1:
+        return "duplicate"
+    if attached:
+        value = attached[0]["value"]
+    elif incomplete_links or len(definitions) > 1 or any(row["constant"] is None for row in definitions):
+        return "unchecked"
+    elif definitions and definitions[0]["constant"]:
+        value = definitions[0]["value"]
+    else:
+        return "missing"
+    if value is None:
+        return "unchecked"
+    return "filled" if value.strip() else "blank"
+
+
+def check_attribute_policy(drawing, rules):
+    by_name = defaultdict(list)
+    for block in drawing["blocks"]:
+        by_name[block["name"].casefold()].append(block)
+    uncertain = bool(drawing["unassociated_attributes"] or drawing["unassociated_definitions"])
+    findings, unchecked, unmatched = [], [], []
+    checked = total = 0
+    for key, (name, tags) in rules.items():
+        blocks = by_name.get(key, [])
+        if len(blocks) > 1:
+            unchecked.append({"block": name, "reason": "ambiguous_block_definition"})
+            continue
+        if not blocks or not blocks[0]["insert_handles"]:
+            unmatched.append(name)
+            continue
+        block = blocks[0]
+        total += len(block["insert_handles"]) * len(tags)
+        if total > 100000:
+            raise ValueError("The attribute policy exceeds 100,000 insert-tag checks.")
+        attached, definitions = defaultdict(list), defaultdict(list)
+        for attribute in block["attributes"]:
+            attached[attribute["insert_handle"], attribute["tag"].casefold()].append(attribute)
+        for definition in block["definitions"]:
+            definitions[definition["tag"].casefold()].append(definition)
+        for insert in block["insert_handles"]:
+            for tag in tags:
+                folded = tag.casefold()
+                status = attribute_state(attached.get((insert, folded), ()), definitions.get(folded, ()), uncertain)
+                target = {"block": block["name"], "insert_handle": insert, "tag": tag}
+                if status == "unchecked":
+                    unchecked.append(target)
+                    continue
+                checked += 1
+                if status != "filled":
+                    findings.append({"ruleId": "CAD-BLK-02", "severity": "warning", "category": "CAD Block Attribute",
+                                     "target": f"{block['name']}:{tag}", "state": status, **target,
+                                     "message": f"Block '{block['name']}' insert {insert}: required tag '{tag}' is {status}."})
+    return findings, {"checked_fields": checked, "unchecked_fields": unchecked, "unmatched_blocks": unmatched}
+
+
 def check_scale_and_units(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Audit $INSUNITS and $MEASUREMENT settings (CAD-UNIT-01)."""
     findings: List[Dict[str, Any]] = []
@@ -289,7 +366,7 @@ def check_scale_and_units(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     return findings
 
 
-def run_cad_audit(drawing_data: Dict[str, Any], layer_findings=()) -> Dict[str, Any]:
+def run_cad_audit(drawing_data: Dict[str, Any], policy_findings=()) -> Dict[str, Any]:
     """Execute all CAD audit rules on drawing data dictionary."""
     all_findings: List[Dict[str, Any]] = []
     finding_id = 1
@@ -299,7 +376,7 @@ def run_cad_audit(drawing_data: Dict[str, Any], layer_findings=()) -> Dict[str, 
     blocks = drawing_data.get("blocks", [])
     header = drawing_data.get("header", {})
 
-    for f in [*check_layer_standards(layers), *layer_findings]:
+    for f in check_layer_standards(layers):
         f["id"] = f"CAD-{finding_id:04d}"
         finding_id += 1
         all_findings.append(f)
@@ -309,7 +386,7 @@ def run_cad_audit(drawing_data: Dict[str, Any], layer_findings=()) -> Dict[str, 
         finding_id += 1
         all_findings.append(f)
 
-    for f in check_blocks_and_attributes(blocks):
+    for f in [*check_blocks_and_attributes(blocks), *policy_findings]:
         f["id"] = f"CAD-{finding_id:04d}"
         finding_id += 1
         all_findings.append(f)
@@ -342,19 +419,23 @@ def audit_file(args):
     from cad_file_inventory import FILE_LIMIT, inspect_drawing, local_path
 
     try:
-        policy_path = getattr(args, "layer_policy", None)
-        policy = read_layer_policy(policy_path) if policy_path else None
         drawing = inspect_drawing(args.input, args.dwgread)
-        layer_findings = []
-        if policy is not None:
-            digest, rules = policy
-            layer_findings, evidence = check_layer_policy(drawing, rules)
-            drawing["layer_policy"] = {"sha256": digest, **evidence}
+        policy_findings = []
+        for option, coverage, reader, check, label in (
+                ("layer_policy", "layer_style_policy", read_layer_policy, check_layer_policy, "layer style"),
+                ("attribute_policy", "required_attribute_policy", read_attribute_policy, check_attribute_policy, "attribute")):
+            path = getattr(args, option, None)
+            if not path:
+                continue
+            digest, rules = reader(path)
+            findings, evidence = check(drawing, rules)
+            policy_findings.extend(findings)
+            drawing[option] = {"sha256": digest, **evidence}
             complete = evidence["checked_fields"] > 0 and not evidence["unchecked_fields"]
-            drawing["coverage"]["layer_style_policy"] = "checked" if complete else "incomplete"
+            drawing["coverage"][coverage] = "checked" if complete else "incomplete"
             if not complete:
-                drawing["notes"].append("One or more requested layer style checks lack drawing evidence.")
-        result = run_cad_audit(drawing, layer_findings)
+                drawing["notes"].append(f"One or more requested {label} checks lack drawing evidence.")
+        result = run_cad_audit(drawing, policy_findings)
         result.update(status="incomplete" if drawing["notes"] else "audited",
                       inventory=drawing)
         report = result if args.output or not args.summary else {
@@ -384,12 +465,13 @@ def main() -> int:
 
     parser.add_argument("--dwgread", help="Absolute path to trusted LibreDWG 0.14 dwgread")
     parser.add_argument("--layer-policy", help="Local JSON layer color and linetype standard")
+    parser.add_argument("--attribute-policy", help="Local JSON standard for required block attribute tags")
     args = parser.parse_args()
 
     if Path(args.input).suffix.lower() in {".dxf", ".dwg"}:
         return audit_file(args)
-    if args.layer_policy:
-        parser.error("--layer-policy requires a direct DWG or DXF drawing.")
+    if args.layer_policy or args.attribute_policy:
+        parser.error("Policy options require a direct DWG or DXF drawing.")
 
     if not os.path.isfile(args.input):
         print(f"Error: input file '{args.input}' not found.", file=sys.stderr)
