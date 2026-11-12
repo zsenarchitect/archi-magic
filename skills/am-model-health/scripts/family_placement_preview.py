@@ -86,6 +86,8 @@ def build_preview(selection, read, point, rotation):
     ]
     activation = {"reuse": "Required" if ownership else "None", "load": "Depends on the loaded symbol",
                   "ambiguous": "Unresolved"}[action]
+    dependencies = {"reuse": "No new dependencies", "load": "New family and type only",
+                    "ambiguous": "Unresolved"}[action]
     payload = {
         "kind": "family-placement-review", "version": 1, "selection": selection,
         "project": snapshot["project"], "revit_build": snapshot["revit_build"], "level": level,
@@ -101,7 +103,7 @@ def build_preview(selection, read, point, rotation):
         "kind": "change-preview", "recipe": "family-library-placement", "title": "Review family placement",
         "keyColumn": "Change", "columns": columns, "changedColumns": columns[3:],
         "before": [[row, source, name, "No placement", "", "", "", "", ""]],
-        "after": [[row, source, name, action, activation, level["name"], coordinates, angle, "Unverified"]],
+        "after": [[row, source, name, action, activation, level["name"], coordinates, angle, dependencies]],
         "notes": parameter_notes, "warnings": [{"row": row, "text": text, "blocking": True} for text in blockers],
         "blocked": True, "ownership_ids": ownership, "parameter_differences": differences,
         "review": payload, "review_sha256": manifest_digest(payload),

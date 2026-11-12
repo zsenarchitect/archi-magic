@@ -101,10 +101,14 @@ def test_rejects_snapshot_for_different_selection(selection):
         build_preview(selection, read, [1, 2, 23], 0)
 
 
-@pytest.mark.parametrize("extra_effect", [False, True])
-def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch, extra_effect):
+@pytest.mark.parametrize(("action", "extra_effect"), [("reuse", False), ("reuse", True), ("load", False)])
+def test_trial_rolls_back_after_provisional_effect_check(selection, monkeypatch, action, extra_effect):
+    from contextlib import contextmanager
     import math
     import probe_family_placement as probe
+
+    loading = action == "load"
+    selection["source"]["rfa"] = {"basename": "Fixture.rfa", "sha256": "a" * 64, "bytes": 10}
 
     selection.update(generation="test-generation")
     selection.pop("selection_sha256")
@@ -115,11 +119,13 @@ def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkey
         "kind": "family-placement-project-snapshot", "version": 1, "revit_build": "fixture",
         "selection_sha256": selection["selection_sha256"], "project": {"project_uid": "fixture"},
         "level": {"id": "5", "uid": "level-5", "name": "Level A", "project_elevation": 20},
-        "same_name_families": [], "exact_symbols": [symbol_row],
+        "same_name_families": [], "exact_symbols": [] if loading else [symbol_row],
     }
     preview = build_preview(selection, baseline, [1, 2, 23], 90)
     args = {"index": "fixture-index", "disposable_fixture": True, "preview": preview,
             "preview_sha256": manifest_digest(preview)}
+    if loading:
+        args["staging"] = {"fixture": True}
 
     class XYZ:
         def __init__(self, x, y, z):
@@ -157,6 +163,9 @@ def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkey
         def RollBack(self):
             symbol.IsActive = False
             elements.pop(99, None)
+            if loading:
+                elements.pop(40, None)
+                elements.pop(41, None)
             self.state = "RolledBack"
             return self.state
 
@@ -166,8 +175,11 @@ def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkey
             event = SimpleNamespace(
                 Operation="TransactionCommitted", GetDocument=lambda: project,
                 GetTransactionNames=lambda: [probe.TRANSACTION_NAME],
-                GetAddedElementIds=lambda: [item_id(99)], GetDeletedElementIds=lambda: [],
-                GetModifiedElementIds=lambda: [item_id(41), item_id(5)] if extra_effect else [item_id(41)],
+                GetAddedElementIds=lambda: [item_id(key) for key in ([40, 41, 99] if loading else [99])],
+                GetDeletedElementIds=lambda: [],
+                GetModifiedElementIds=lambda: [] if loading else (
+                    [item_id(41), item_id(5)] if extra_effect else [item_id(41)]
+                ),
             )
             for handler in project.Application.DocumentChanged:
                 handler(None, event)
@@ -176,7 +188,16 @@ def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkey
     level = SimpleNamespace(Id=item_id(5), UniqueId="level-5")
     symbol = SimpleNamespace(Id=item_id(41), UniqueId="symbol-41", IsActive=False)
     symbol.Activate = lambda: setattr(symbol, "IsActive", True)
-    elements = {5: level, 41: symbol}
+    family = SimpleNamespace(Id=item_id(40), UniqueId="family-40", Name=selection["family"],
+                             FamilyCategory=SimpleNamespace(Id=item_id(-1000)), FamilyPlacementType="OneLevelBased")
+    symbol.Name = selection["type"]
+    symbol.Family = family
+    elements = {5: level} if loading else {5: level, 41: symbol}
+
+    def load(path, name, options):
+        assert loading and name == selection["type"] and str(path) == "pinned/Fixture.rfa"
+        elements.update({40: family, 41: symbol})
+        return True, symbol
 
     def place(insertion, chosen, base, structural):
         assert (insertion.X, insertion.Y, insertion.Z) == (1, 2, 3)
@@ -193,24 +214,61 @@ def test_reuse_trial_rolls_back_after_provisional_effect_check(selection, monkey
     project = SimpleNamespace(IsModifiable=False, Application=SimpleNamespace(DocumentChanged=EventHook()),
                               GetElement=elements.get, Regenerate=lambda: None,
                               Equals=lambda other: other is project,
-                              Create=SimpleNamespace(NewFamilyInstance=place))
+                              Create=SimpleNamespace(NewFamilyInstance=place), LoadFamilySymbol=load)
     statuses = SimpleNamespace(**{key: key for key in ("Uninitialized", "Started", "Committed", "RolledBack")})
     db = SimpleNamespace(TransactionStatus=statuses, Transaction=Transaction, TransactionGroup=Group,
                          ElementId=int, XYZ=XYZ, LocationPoint=SimpleNamespace,
                          Structure=SimpleNamespace(StructuralType=SimpleNamespace(NonStructural=0)),
                          Line=SimpleNamespace(CreateBound=lambda start, end: (start, end)),
-                         ElementTransformUtils=SimpleNamespace(RotateElement=rotate))
+                         ElementTransformUtils=SimpleNamespace(RotateElement=rotate), IFamilyLoadOptions=object)
+
+    @contextmanager
+    def verified_stage(receipt, relative):
+        assert receipt == args["staging"] and relative == selection["source"]["path"]
+        yield "pinned/Fixture.rfa", selection["source"]
+
+    def read_snapshot(*args, **kwargs):
+        if loading and 41 not in elements:
+            return baseline
+        row = dict(symbol_row, active=symbol.IsActive)
+        family_rows = []
+        if loading:
+            row.update(family_id="40", family_uid="family-40")
+            family_rows.append({"id": "40", "uid": "family-40", "name": selection["family"],
+                                "category_id": "-1000", "placement_type": "OneLevelBased"})
+        return dict(baseline, exact_symbols=[row], same_name_families=family_rows)
+
     monkeypatch.setattr(probe, "select_for_placement", lambda *args: selection)
-    monkeypatch.setattr(probe, "read_snapshot", lambda *args, **kwargs: dict(
-        baseline, exact_symbols=[dict(symbol_row, active=symbol.IsActive)]
-    ))
+    monkeypatch.setattr(probe, "read_snapshot", read_snapshot)
+    monkeypatch.setattr(probe, "staged_pair", verified_stage)
+    monkeypatch.setattr(probe, "parameter_state", lambda *args: {"state": "value", "value": 2.0})
     monkeypatch.setattr(probe, "inventory", lambda *args: {
         str(key): [value.UniqueId, "fingerprint"] for key, value in elements.items()
     })
     result = probe.trial(project, db, args)
     assert result["rollback_verified"] is True
     assert result["status"] == ("stopped" if extra_effect else "trial_rolled_back")
-    assert set(elements) == {5, 41} and symbol.IsActive is False
+    assert set(elements) == ({5} if loading else {5, 41}) and symbol.IsActive is False
     assert not project.Application.DocumentChanged
     if not extra_effect:
         assert result["placement"]["xyz_ft"] == [1, 2, 23]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_exact_load_rejects_both_conflict_callbacks(selection, shared):
+    from probe_family_placement import load_missing_symbol
+
+    callbacks = []
+    db = SimpleNamespace(IFamilyLoadOptions=object, FamilySource=SimpleNamespace(Project="Project"))
+
+    def load(path, name, options):
+        assert path == "pinned/Fixture.rfa" and name == "Exact type"
+        if shared:
+            assert options.OnSharedFamilyFound(None, True, None, True) == (False, "Project", False)
+        else:
+            assert options.OnFamilyFound(True, True) == (False, False)
+        return False, None
+
+    with pytest.raises(ValueError, match="conflicting family load"):
+        load_missing_symbol(SimpleNamespace(LoadFamilySymbol=load), db, "pinned/Fixture.rfa", selection, callbacks)
+    assert callbacks == ["existing_shared_family" if shared else "existing_family"]

@@ -201,14 +201,14 @@ Use this development workflow in a disposable Windows Revit 2026 host. Use ordin
 1. Select the exact path and type from the search results. Run `python scripts/family_library_index.py select <index> <token> --path "<path>" --type "<type>"`. Save the selection as JSON.
 2. Call `get_context` first. Open a saved standalone project in the same Revit build. Run `read_family_placement.py` in query mode. Pass the selection object as `selection` and the reviewed level ID string as `level_id`.
 3. Run `python scripts/family_placement_preview.py --index <index> --selection selection.json --project-read project.json --xyz 1 2 23 --rotation 90`. Supply absolute model coordinates in internal feet. Review type reuse, loading, parameter differences, and activation in the change preview.
-4. Review the preview and its ownership scope. Use the probe below only to qualify reuse in a disposable project.
+4. Review the preview and its ownership scope. Use the probe below only to qualify placement in a disposable project.
 
-### Test reuse placement with mandatory rollback
+### Test family placement with mandatory rollback
 
 1. Use a saved, standalone disposable project in Revit 2026. Use a reviewed nonzero level and rotation. Call `get_context` and check the active project, Revit build, CPython engine, and ask policy.
-2. Review the placement preview. Check ownership for its `ownership_ids`. Use the empty scope only when the chosen symbol is already active.
-3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`.
-4. Read the provisional element IDs, measured position, rotation, and rollback result. Stop on any unexpected effect or unresolved rollback. Loading a missing type and Keep/Discard still require separate native qualification.
+2. Review the placement preview. Check ownership for its `ownership_ids`. Use the empty scope for active reuse or a new family with no existing write targets.
+3. Obtain approval for the disposable trial. Run `probe_family_placement.py` in CPython with `dry_run: true`. Pass `disposable_fixture: true`, the `index` path, the reviewed `preview` object, and its `preview_sha256`. Compute the digest with `family_library_discovery.manifest_digest(preview)`. For a missing type, also pass the exact `staging` receipt.
+4. Read the provisional element IDs, measured position, rotation, and rollback result. Stop on any unexpected effect or unresolved rollback. The missing-type trial allows only one new family, one new type, and one new instance. Test catalogs, existing siblings, and Keep/Discard separately.
 
 ## Preview a CAD layout (issue #166)
 
