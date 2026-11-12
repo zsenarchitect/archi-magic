@@ -307,6 +307,25 @@ def test_flat_sequential_export_keeps_explicit_clash_group(tmp_path):
     assert rejected.returncode == 2 and not rejected.stdout
 
 
+def test_sequential_html_reports_coverage_per_test(tmp_path):
+    prefix, rest = sequential_report().split('<div class="animation">', 1)
+    animation, suffix = rest.rsplit("</div>", 1)
+    sections = [
+        '<div class="animation">' + sequential_pair("Total", str(total)) + animation + "</div>"
+        for total in (29, 1)
+    ]
+    source = tmp_path / "filtered.html"
+    source.write_text(prefix + "".join(sections) + suffix, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert len(data["clashes"]) == 2
+    coverage = [warning for warning in data["warnings"] if warning.startswith("Sequential test")]
+    assert coverage == [
+        "Sequential test 1 reports 29 total clashes and contains 1 individual row. Check the report filters.",
+    ]
+
+
 @pytest.mark.parametrize("html", [
     sequential_report(side="Item 1"),
     sequential_report().replace("</body>", ""),
