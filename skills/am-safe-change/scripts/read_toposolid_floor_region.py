@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read a selected Toposolid region and its proposed floor type and level."""
+"""Read a Toposolid conversion source or an existing floor for comparison."""
 
 import json
 import math
@@ -112,7 +112,7 @@ def read_surface(document, region, clock):
             triangles.append([a, b, c])
         faces.append({"reference": stable, "triangles_ft": sorted(triangles)})
     if not faces:
-        raise ValueError("No top faces were found on the selected Toposolid region.")
+        raise ValueError("No top faces were found on the selected terrain or floor.")
     return sorted(faces, key=lambda face: face["reference"])
 
 
@@ -153,19 +153,55 @@ def read_region(document, args):
         "level_project_elevation_ft": float(level.ProjectElevation),
         "profile_loops": read_profile(sketch, clock), "top_faces": read_surface(document, region, clock),
     }
+    return result_for(snapshot, clock)
+
+
+def read_floor(document, args):
+    project = project_identity(document)
+    clock = Stopwatch.StartNew()
+    floor = document.GetElement(element_id(args["floor_id"], "floor"))
+    if not isinstance(floor, DB.Floor):
+        raise ValueError("Select the candidate native floor.")
+    floor_type = document.GetElement(floor.GetTypeId())
+    level = document.GetElement(floor.LevelId)
+    sketch = document.GetElement(floor.SketchId) if floor.SketchId.Value != -1 else None
+    if not isinstance(floor_type, DB.FloorType) or floor_type.IsFoundationSlab:
+        raise ValueError("The candidate floor needs a non-foundation floor type.")
+    if not isinstance(level, DB.Level) or not finite_number(float(level.ProjectElevation)):
+        raise ValueError("The candidate floor needs a valid project level.")
+    if not isinstance(sketch, DB.Sketch) or sketch.OwnerId.Value != floor.Id.Value:
+        raise ValueError("The candidate floor has no verifiable sketch of its own.")
+    offset = floor.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM)
+    if offset is None or offset.StorageType != DB.StorageType.Double or not offset.HasValue:
+        raise ValueError("The candidate floor's level offset is unavailable.")
+    offset_ft = float(offset.AsDouble())
+    if not finite_number(offset_ft):
+        raise ValueError("The candidate floor's level offset is invalid.")
+    return result_for({
+        "document": project, "floor": identity(floor), "sketch": identity(sketch),
+        "floor_type": identity(floor_type), "level": identity(level),
+        "level_project_elevation_ft": float(level.ProjectElevation), "floor_offset_ft": offset_ft,
+        "profile_loops": read_profile(sketch, clock), "top_faces": read_surface(document, floor, clock),
+    }, clock)
+
+
+def result_for(snapshot, clock):
     payload = json.dumps(snapshot, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
     check_time(clock)
     if len(payload) > MAX_PAYLOAD_BYTES:
-        raise ValueError("Toposolid floor region is {} bytes, above the {} byte limit.".format(
+        raise ValueError("Surface snapshot is {} bytes, above the {} byte limit.".format(
             len(payload), MAX_PAYLOAD_BYTES))
     return {"status": "ok", "snapshot_json": payload}
 
 
 if "inputs" in globals():
     try:
-        result = read_region(doc, inputs)
+        if isinstance(inputs, dict) and set(inputs) == {"floor_id"}:
+            result = read_floor(doc, inputs)
+        else:
+            result = read_region(doc, inputs)
     except ValueError as error:
         result = {"status": "stopped", "message": str(error)}
     except Exception as error:
-        result = {"status": "stopped", "message": "Revit could not read the selected Toposolid floor region.",
+        result = {"status": "stopped", "message": "Revit could not read the selected terrain or floor surface.",
                   "error_type": type(error).__name__}

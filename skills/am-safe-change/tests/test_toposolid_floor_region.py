@@ -51,6 +51,10 @@ class PlanarFace(NS):
     pass
 
 
+class Floor(NS):
+    pass
+
+
 class FloorType(NS):
     pass
 
@@ -69,8 +73,8 @@ def closed_loop(corners):
     return [Line(start, end) for start, end in zip(corners, corners[1:] + corners[:1])]
 
 
-def run_query(monkeypatch, subdivision=False, fault=None, offset=-0.75):
-    region_id = 11 if subdivision else 10
+def run_query(monkeypatch, subdivision=False, fault=None, offset=-0.75, candidate_floor=False):
+    region_id = 80 if candidate_floor else (11 if subdivision else 10)
     host = element(Toposolid, 10, HostTopoId=element_id(-1))
     outer = [(0, 0, 5), (10, 0, 5), (10, 10, 5), (0, 10, 5)]
     inner = [(4, 4, 5), (4, 6, 5), (6, 6, 5), (6, 4, 5)]
@@ -87,7 +91,8 @@ def run_query(monkeypatch, subdivision=False, fault=None, offset=-0.75):
         "a": top_face([[(2, 0, 14), (0, 0, 12), (0, 2, 12)]]),
         "b": top_face([[(2, 0, 14), (3, 0, 14), (2, 2, 13)]]),
     }
-    region = element(Toposolid, region_id, HostTopoId=element_id(10 if subdivision else -1),
+    region = element(Floor if candidate_floor else Toposolid, region_id,
+                     GetTypeId=lambda: floor_type.Id, LevelId=level.Id, HostTopoId=element_id(10 if subdivision else -1),
                      SketchId=element_id(21), refs=refs,
                      GetGeometryObjectFromReference=lambda ref: faces[ref.label],
                      get_Parameter=lambda _: NS(StorageType="double", HasValue=True, AsDouble=lambda: offset))
@@ -114,15 +119,17 @@ def run_query(monkeypatch, subdivision=False, fault=None, offset=-0.75):
     monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(
         Stopwatch=NS(StartNew=lambda: NS(ElapsedMilliseconds=5000 if fault == "timeout" else 0))))
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=NS(
-        ElementId=element_id, Toposolid=Toposolid, FloorType=FloorType, Level=Level, Sketch=Sketch,
+        ElementId=element_id, Toposolid=Toposolid, Floor=Floor, FloorType=FloorType, Level=Level, Sketch=Sketch,
         Line=Line, Arc=Arc, PlanarFace=PlanarFace, HostObjectUtils=NS(GetTopFaces=lambda item: item.refs),
-        BuiltInParameter=NS(TOPOSOLID_SUBDIVIDE_HEIGHT=1), StorageType=NS(Double="double"))))
+        BuiltInParameter=NS(TOPOSOLID_SUBDIVIDE_HEIGHT=1, FLOOR_HEIGHTABOVELEVEL_PARAM=2),
+        StorageType=NS(Double="double"))))
     monkeypatch.syspath_prepend(str(SCRIPT.parent))
     monkeypatch.delitem(sys.modules, "read_toposolid_vertices", raising=False)
+    inputs = {"floor_id": str(region_id)} if candidate_floor else {
+        "region_id": str(region_id), "floor_type_id": "31", "level_id": "41",
+    }
     try:
-        return runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": {
-            "region_id": str(region_id), "floor_type_id": "31", "level_id": "41",
-        }})["result"]
+        return runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": inputs})["result"]
     finally:
         sys.modules.pop("read_toposolid_vertices", None)
 
@@ -163,3 +170,17 @@ def test_read_region_rejects_partial_or_unreliable_snapshots(monkeypatch, fault,
     assert set(result) == {"status", "message"}
     assert result["status"] == "stopped"
     assert message in result["message"]
+
+
+
+def test_independent_floor_query_reads_actual_floor_dependencies(monkeypatch):
+    result = run_query(monkeypatch, candidate_floor=True, offset=1.25)
+    assert result["status"] == "ok", result
+    snapshot = json.loads(result["snapshot_json"])
+    assert snapshot["floor"]["id"] == "80"
+    assert snapshot["floor_type"]["uid"] == "uid-31"
+    assert snapshot["level"]["uid"] == "uid-41"
+    assert snapshot["level_project_elevation_ft"] == 23
+    assert snapshot["floor_offset_ft"] == 1.25
+    assert len(snapshot["profile_loops"]) == 2
+    assert [face["reference"] for face in snapshot["top_faces"]] == ["face-a", "face-b"]
