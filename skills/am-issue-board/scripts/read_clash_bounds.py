@@ -10,7 +10,7 @@ from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 import issue_board as ib
-from clash_section import FRAME, section_view_preview
+from clash_section import FRAME, section_view_preview, snapshot_sha256
 
 LIMIT = 2 * 1024 * 1024
 TEXT = (str, type(u""))
@@ -252,6 +252,25 @@ def verify_kept(host, plan, receipt):
     return {"status": "ok", "verification_json": payload}
 
 
+def verify_rollback(host, plan, receipt):
+    if (plan["blocked"] is not False or receipt["host_identity"] != plan["host_identity"]
+            or receipt["clash_guid"] != plan["view"]["clash_guid"]
+            or receipt["basis_sha256"] != plan["basis_sha256"]
+            or not isinstance(receipt["view_uid"], TEXT) or not receipt["view_uid"].strip()):
+        raise ValueError("Use the exact clash plan and provisional view receipt.")
+    snapshot = json.loads(main(host, plan["request"])["snapshot_json"])
+    if snapshot_sha256(snapshot) != plan["basis_sha256"]:
+        raise ValueError("The original model readback changed after rollback.")
+    identity = {"id": receipt["view_id"], "uid": receipt["view_uid"]}
+    if host.GetElement(element_id(identity["id"])) is not None or host.GetElement(identity["uid"]) is not None:
+        raise ValueError("The provisional clash view still resolves by ID or UID.")
+    payload = json.dumps({"snapshot": snapshot, "confirmed_absent": identity},
+                         ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(payload) > LIMIT:
+        raise ValueError("The clash rollback evidence exceeds the read limit.")
+    return {"status": "ok", "rollback_json": payload}
+
+
 def rollback(transaction, group):
     try:
         state = transaction.GetStatus()
@@ -332,8 +351,10 @@ def run(host, args):
         return apply_view(host, args["plan"], args["preview"])
     if mode == "verify":
         return verify_kept(host, args["plan"], args["receipt"])
+    if mode == "verify-rollback":
+        return verify_rollback(host, args["plan"], args["receipt"])
     if mode != "read":
-        raise ValueError("Choose read, apply, or verify for the clash view.")
+        raise ValueError("Choose read, apply, verify, or verify-rollback for the clash view.")
     return main(host, args)
 
 

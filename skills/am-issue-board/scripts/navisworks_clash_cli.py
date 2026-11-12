@@ -630,6 +630,8 @@ RUNTIME_OUTCOMES = {"dry-run": ("dry_run", "ok", "rolled_back", None),
 def runtime_changes(record, mode, status, decision, approval=None):
     if (record["mode"] != mode or record["status"] != status or record["decision"] != decision
             or record.get("approval") != approval or not text(record["run_id"])
+            or record.get("result_truncated") is not False
+            or type(record.get("exit_code")) is not int or record["exit_code"] != 0
             or record.get("reckless") or any(record.get(key) for key in (
                 "error", "failures", "dialogs", "blocked", "warnings", "closed_documents", "unclosed_documents"))):
         raise ValueError("The guarded pyRevit record does not establish the requested outcome.")
@@ -686,9 +688,10 @@ def verify_view_run(plan, outcome, run, readback):
         if observed != {"view": receipt, "potentially_visible": plan["targets"]}:
             raise ValueError("The independent query did not verify the kept view and both mapped targets.")
         return {"status": "verified_keep", "view": receipt, "visual_inspection_required": True}
-    snapshot = runtime_payload(readback, "snapshot_json")
-    if snapshot_sha256(snapshot) != plan["basis_sha256"]:
-        raise ValueError("The original model readback changed after rollback.")
+    rollback = runtime_payload(readback, "rollback_json")
+    if (snapshot_sha256(rollback["snapshot"]) != plan["basis_sha256"]
+            or rollback["confirmed_absent"] != {"id": view_id, "uid": receipt["view_uid"]}):
+        raise ValueError("The original model readback changed or the exact view absence is unverified.")
     return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
 
 

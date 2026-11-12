@@ -196,11 +196,16 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
                      "added": [], "modified": [], "deleted": []}
         dry_run = tmp_path / "dry-run.json"
         dry_run.write_text(json.dumps({"mode": "dry_run", "status": "ok", "decision": "rolled_back",
+                                      "exit_code": 0, "result_truncated": False,
                                       "run_id": "dry-run", "result": {"status": "ok", "receipt_json": json.dumps(receipt)},
                                       "changes": dict(unchanged, added_count=1, added=[{"id": 100, "class": "View3D"}])}))
         fresh = tmp_path / "fresh.json"
+        rollback = {"snapshot": json.loads(native["snapshot_json"]),
+                    "confirmed_absent": {"id": receipt["view_id"], "uid": receipt["view_uid"]}}
         fresh.write_text(json.dumps({"response": {"mode": "query", "status": "ok", "decision": "rolled_back",
-                                                 "run_id": "readback", "result": native, "changes": unchanged}}))
+                                                 "exit_code": 0, "result_truncated": False, "run_id": "readback",
+                                                 "result": {"status": "ok", "rollback_json": json.dumps(rollback)},
+                                                 "changes": unchanged}}))
         verified = subprocess.run(command + ["--verify-view", "dry-run", "--view-run", str(dry_run),
                                              "--view-readback", str(fresh)],
                                   check=True, text=True, capture_output=True)
@@ -245,6 +250,7 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
         board_run = tmp_path / "board-keep.json"
         board_run.write_text(json.dumps({
             "mode": "modify", "status": "ok", "decision": "committed", "approval": "user",
+            "exit_code": 0, "result_truncated": False,
             "run_id": "board-keep", "result": {"status": "ok", "note_id": 150,
                                                "sha1_after": ib.text_sha1(board_plan["final_text"])},
             "changes": dict(unchanged, modified_count=1, modified=[{"id": 150, "class": "TextNote"}]),
@@ -253,6 +259,7 @@ def test_section_view_preview_links_two_exact_targets_to_new_view(runtime, tmp_p
         write_board(board_plan["final_text"])
         board_readback.write_text(json.dumps({
             "mode": "query", "status": "ok", "decision": "rolled_back", "run_id": "board-query",
+            "exit_code": 0, "result_truncated": False,
             "result": json.loads(note.read_text()), "changes": unchanged,
         }))
         write_board(board_body)
@@ -367,7 +374,10 @@ def view_writer(runtime):
     db.Transform.Identity.IsIdentity = True
     db.TransactionStatus = NS(Started="started", Pending="pending", Committed="committed", RolledBack="rolled_back")
     get_element = host.GetElement
-    host.GetElement = lambda item: next((view for view in host.views if view.Id.Value == item.Value), get_element(item))
+    host.GetElement = lambda item: (
+        next((view for view in host.views if view.UniqueId == item), None) if isinstance(item, str)
+        else next((view for view in host.views if view.Id.Value == item.Value), get_element(item))
+    )
     snapshot = json.loads(reader(host, request)["snapshot_json"])
     clash = {"guid": guid, "objects": [{"element_id": "42", "selection_path": ["Rotated", "Fixture"]},
                                       {"element_id": "42", "selection_path": ["Mirrored", "Fixture"]}]}
@@ -451,28 +461,32 @@ def test_verify_view_run_requires_matching_runtime_and_readback(view_writer, out
     from navisworks_clash_cli import verify_view_run
 
     run, host, plan, display = view_writer
-    baseline = run(host, plan["request"])
     applied = run(host, {"mode": "apply", "plan": plan, "preview": display})
     receipt = json.loads(applied["receipt_json"])
     unchanged = {"added_count": 0, "modified_count": 0, "deleted_count": 0,
                  "added": [], "modified": [], "deleted": []}
     created = dict(unchanged, added_count=1, added=[{"id": 100, "class": "View3D"}])
     record = {"mode": mode, "status": status, "decision": decision, "approval": approval,
-              "run_id": "create-run", "changes": created, "result": applied}
-    evidence = ({"status": "ok", "verification_json": json.dumps({
-        "view": receipt, "potentially_visible": plan["targets"],
-    })} if outcome == "keep" else baseline)
+              "run_id": "create-run", "changes": created, "result": applied,
+              "exit_code": 0, "result_truncated": False}
+    if outcome == "keep":
+        evidence = {"status": "ok", "verification_json": json.dumps({
+            "view": receipt, "potentially_visible": plan["targets"],
+        })}
+    else:
+        host.views.clear()
+        evidence = run(host, {"mode": "verify-rollback", "plan": plan, "receipt": receipt})
     readback = {"mode": "query", "status": "ok", "decision": "rolled_back", "run_id": "readback-run",
-                "changes": unchanged, "result": evidence}
+                "changes": unchanged, "result": evidence, "exit_code": 0, "result_truncated": False}
     result = verify_view_run(plan, outcome, record, readback)
     assert result["status"] == "verified_" + outcome.replace("-", "_")
     if outcome == "keep":
         assert result["view"] == receipt and result["visual_inspection_required"] is True
         evidence = dict(evidence, verification_json=json.dumps({"view": receipt, "potentially_visible": []}))
     else:
-        snapshot = json.loads(baseline["snapshot_json"])
-        snapshot["active_view_uid"] = "different"
-        evidence = dict(evidence, snapshot_json=json.dumps(snapshot))
+        rollback = json.loads(evidence["rollback_json"])
+        rollback["confirmed_absent"]["uid"] = "other"
+        evidence = dict(evidence, rollback_json=json.dumps(rollback))
     with pytest.raises(ValueError, match="readback changed|both mapped targets"):
         verify_view_run(plan, outcome, record, dict(readback, result=evidence))
     with pytest.raises(ValueError, match="only the exact added"):
@@ -480,6 +494,21 @@ def test_verify_view_run_requires_matching_runtime_and_readback(view_writer, out
                         readback)
     with pytest.raises(ValueError, match="independent readback"):
         verify_view_run(plan, outcome, record, dict(readback, run_id=record["run_id"]))
+    with pytest.raises(ValueError, match="does not establish"):
+        verify_view_run(plan, outcome, record, dict(readback, result_truncated=True))
+
+
+@pytest.mark.parametrize("identity", ["id", "uid"])
+def test_verify_rollback_refuses_a_renamed_view_by_either_identity(view_writer, identity):
+    run, host, plan, display = view_writer
+    receipt = json.loads(run(host, {"mode": "apply", "plan": plan, "preview": display})["receipt_json"])
+    host.views[0].Name = "Renamed view"
+    if identity == "uid":
+        host.views[0].Id = Id(101)
+    else:
+        host.views[0].UniqueId = "different"
+    with pytest.raises(ValueError, match="still resolves by ID or UID"):
+        run(host, {"mode": "verify-rollback", "plan": plan, "receipt": receipt})
 
 
 @pytest.mark.parametrize("change", ["valid", "view_replaced", "box_changed"])
@@ -550,10 +579,10 @@ def test_board_run_rejects_wrong_note_side_effects_and_stale_readback(outcome, m
                  "added": [], "modified": [], "deleted": []}
     edited = dict(unchanged, modified_count=1, modified=[{"id": 150, "class": "TextNote"}])
     record = {"run_id": "board-run", "mode": mode, "status": status, "decision": decision,
-              "approval": approval, "changes": edited,
+              "approval": approval, "changes": edited, "exit_code": 0, "result_truncated": False,
               "result": {"status": "ok", "note_id": 150, "sha1_after": after_digest}}
     readback = {"run_id": "board-readback", "mode": "query", "status": "ok", "decision": "rolled_back",
-                "changes": unchanged, "result": fresh}
+                "changes": unchanged, "result": fresh, "exit_code": 0, "result_truncated": False}
     assert verify_board_run(plan, outcome, record, readback) == {
         "status": "verified_" + outcome.replace("-", "_"), "note_id": "150",
     }
