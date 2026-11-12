@@ -59,9 +59,13 @@ def test_preview_lists_both_deletes_separately_from_twenty_one_edits(tmp_path, p
     assert [row[0] for row in preview["after"]] == [*range(100, 110), *range(200, 211)]
 
 
-@pytest.mark.parametrize("corruption", [None, "same_count_wrong_ids", "missing", "duplicated", "truncated", "another_model"])
+@pytest.mark.parametrize("corruption", [
+    None, "same_count_wrong_ids", "missing", "duplicated", "truncated", "another_model",
+    "missing_run_id", "failed_script", "approval", "warnings", "dialogs", "closed_documents",
+])
 def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corruption):
     run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
+           "run_id": "fixture-dry-run", "exit_code": 0,
            "changes": {"deleted_count": 2, "deleted": [300, "301"]}}
     changes = run["changes"]
     if corruption == "same_count_wrong_ids":
@@ -74,6 +78,14 @@ def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corrupt
         run["result_truncated"] = True
     elif corruption == "another_model":
         changes["other_documents"] = [{"deleted_count": 1}]
+    elif corruption == "missing_run_id":
+        del run["run_id"]
+    elif corruption == "failed_script":
+        run["exit_code"] = 1
+    elif corruption == "approval":
+        run["approval"] = "auto"
+    elif corruption in ("warnings", "dialogs", "closed_documents"):
+        run[corruption] = ["Unexpected activity"]
     completed = run_cli(tmp_path, preview, run)
     assert completed.returncode == (2 if corruption else 0)
     if corruption == "same_count_wrong_ids":
@@ -83,6 +95,7 @@ def test_dry_run_approval_requires_exact_deletion_ids(tmp_path, preview, corrupt
 @pytest.mark.parametrize("include_approval", [False, True])
 def test_dry_run_refuses_a_missing_or_changed_preview_approval(tmp_path, preview, include_approval):
     run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
+           "run_id": "fixture-dry-run", "exit_code": 0,
            "changes": {"deleted_count": 2, "deleted": [300, "301"]}}
     original = json.dumps(preview).encode("utf-8")
     approved_digest = hashlib.sha256(original).hexdigest() if include_approval else ""
@@ -97,6 +110,7 @@ def test_dry_run_refuses_a_missing_or_changed_preview_approval(tmp_path, preview
 
 def test_accepts_named_deletion_rows_in_saved_evidence(tmp_path, preview):
     run = {"mode": "dry_run", "status": "ok", "decision": "rolled_back", "result_truncated": False,
+           "run_id": "fixture-dry-run", "exit_code": 0,
            "changes": {"deleted_count": 2, "deleted": [{"id": 300}, {"id": "301"}]}}
     assert run_cli(tmp_path, preview, run).returncode == 0
 

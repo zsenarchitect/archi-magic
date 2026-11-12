@@ -48,9 +48,13 @@ def delete_list(by_id):
 
 def verify_dry_run(by_id, saved):
     run = saved.get("response", saved)
+    run_id = run.get("run_id")
+    exit_code = run.get("exit_code")
     if (run.get("mode") != "dry_run" or run.get("status") != "ok" or run.get("decision") != "rolled_back"
-            or run.get("result_truncated") is not False or run.get("error") is not None
-            or run.get("blocked") or run.get("failures") or run.get("unclosed_documents")):
+            or not isinstance(run_id, str) or not run_id.strip() or type(exit_code) is not int or exit_code != 0
+            or run.get("approval") is not None or run.get("result_truncated") is not False
+            or run.get("error") is not None or any(run.get(field) for field in (
+                "blocked", "failures", "dialogs", "warnings", "closed_documents", "unclosed_documents"))):
         raise ValueError("Save the complete successful rolled-back Revit dry run.")
     changes = run["changes"]
     count = changes["deleted_count"]
