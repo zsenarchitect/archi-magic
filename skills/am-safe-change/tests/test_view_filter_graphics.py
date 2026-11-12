@@ -371,3 +371,138 @@ def test_exact_filter_repeat_has_no_ownership_or_steps(reader):
     plan, display = compute(transfer(reader, document, "31", "41"))
     assert not plan["blocked"] and plan["ownership_ids"] == [] and plan["steps"] == []
     assert all(row[4] == "Already matches" for row in display["after"])
+
+
+def probe_fixture(reader, monkeypatch, fault=None):
+    from copy import copy
+    from view_filter_transfer_preview import compute
+
+    monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(**reader))
+    native = runpy.run_path(str(SCRIPTS / "probe_view_filter_transfer.py"))
+    document = transfer_fixture(reader)
+    document.elements[11] = SelectionFilter(11)
+    target = document.elements[41]
+    target.settings = dict(target.settings)
+    target.settings[11] = target.settings[10]
+    order = [10, 11, 20]
+    visible = {10: False, 11: False, 20: True}
+    enabled = {10: True, 11: False, 20: False}
+    changes = []
+    target.GetOrderedFilters = lambda: list(map(MockId, order))
+    target.GetFilterVisibility = lambda item: visible[item.Value]
+    target.GetIsFilterEnabled = lambda item: enabled[item.Value]
+    for view_id in (42, 43):
+        view = document.elements[view_id]
+        for method in ("GetOrderedFilters", "GetFilterOverrides", "GetFilterVisibility", "GetIsFilterEnabled"):
+            setattr(view, method, getattr(target, method))
+
+    def remove(item):
+        order.remove(item.Value)
+        target.settings.pop(item.Value)
+        changes.append(("remove", item.Value))
+
+    def add(item):
+        assert item.Value not in order
+        order.append(item.Value)
+        changes.append(("add", item.Value))
+
+    def overrides(item, settings):
+        assert item.Value in order
+        if fault == "setter" and item.Value == 10:
+            raise ValueError("Injected setter failure.")
+        target.settings[item.Value] = settings
+
+    target.RemoveFilter, target.AddFilter, target.SetFilterOverrides = remove, add, overrides
+    target.SetFilterVisibility = lambda item, value: visible.__setitem__(item.Value, value)
+    target.SetIsFilterEnabled = lambda item, value: enabled.__setitem__(item.Value, value)
+
+    class Handlers:
+        callback = None
+
+        def __iadd__(self, callback):
+            self.callback = callback
+            return self
+
+        def __isub__(self, callback):
+            assert self.callback is callback
+            self.callback = None
+            return self
+
+    class Collection(list):
+        @property
+        def Count(self):
+            return len(self)
+
+    class Group:
+        def __init__(self, _document, _name):
+            self.status = "Uninitialized"
+
+        def Start(self):
+            self.saved = (list(order), dict(target.settings), dict(visible), dict(enabled))
+            self.status = "Started"
+            return self.status
+
+        def RollBack(self):
+            order[:] = self.saved[0]
+            for live, baseline in zip((target.settings, visible, enabled), self.saved[1:]):
+                live.clear()
+                live.update(baseline)
+            self.status = "RolledBack"
+            return self.status
+
+        def GetStatus(self):
+            return self.status
+
+    class Transaction(Group):
+        def Commit(self):
+            if fault == "pending":
+                self.status = "Pending"
+                return self.status
+            self.status = "Committed"
+            modified = [MockId(41), MockId(999)] if fault == "telemetry" else [MockId(41)]
+            event_document = NS(Equals=lambda _document: False) if fault == "foreign" else document
+            event = NS(GetDocument=lambda: event_document, GetTransactionNames=lambda: [native["TRANSACTION_NAME"]],
+                       GetAddedElementIds=lambda: Collection(), GetDeletedElementIds=lambda: Collection(),
+                       GetModifiedElementIds=lambda: Collection(modified))
+            document.Application.DocumentChanged.callback(None, event)
+            return self.status
+
+    db = reader["DB"]
+    db.OverrideGraphicSettings = copy
+    db.TransactionGroup, db.Transaction = Group, Transaction
+    db.TransactionStatus = NS(Started="Started", Pending="Pending", RolledBack="RolledBack", Committed="Committed")
+    document.Application = NS(DocumentChanged=Handlers())
+    document.Equals = lambda other: document is other
+    document.Regenerate = lambda: None
+    request = {"source_id": "31", "target_ids": ["41"], "allow_placed": True}
+    baseline = native["read_snapshot"](document, request)
+    plan, display = compute(baseline)
+    args = {"disposable_fixture": True, "plan": plan, "preview": display}
+    return native, document, request, baseline, args, changes
+
+
+@pytest.mark.parametrize("fault,expected", [
+    (None, "trial_rolled_back"), ("setter", "stopped_and_rolled_back"),
+    ("telemetry", "stopped_and_rolled_back"), ("foreign", "transaction_unresolved"),
+    ("pending", "transaction_unresolved"),
+])
+def test_transfer_probe_qualifies_or_rolls_back_failures(reader, monkeypatch, fault, expected):
+    native, document, request, baseline, args, changes = probe_fixture(reader, monkeypatch, fault)
+    result = native["probe"](document, args)
+    assert result["status"] == expected
+    assert changes[:3] == [("remove", 10), ("remove", 11), ("remove", 20)]
+    assert document.Application.DocumentChanged.callback is None
+    if fault != "pending":
+        assert native["read_snapshot"](document, request) == baseline
+    if fault is None:
+        assert changes[3:] == [("add", 20), ("add", 10), ("add", 11)]
+        assert result["changes"] == {"added": [], "modified": ["41"], "deleted": []}
+        assert result["remaining_ownership_changes"] == []
+
+
+def test_transfer_probe_rejects_preview_tampering_before_transaction(reader, monkeypatch):
+    native, document, _, _, args, changes = probe_fixture(reader, monkeypatch)
+    args["preview"]["after"][0][5] = 99
+    with pytest.raises(ValueError, match="no longer matches"):
+        native["probe"](document, args)
+    assert changes == []
