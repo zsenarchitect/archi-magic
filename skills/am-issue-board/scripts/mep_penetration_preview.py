@@ -121,6 +121,9 @@ def tracked_status(rows, key, host, run, pair, complete, clearance, tolerance):
             return "out_of_date", "The linked run no longer crosses the measured gross host."
         if pair["status"] not in {"solid_crossing", "gross_crossing"} or pair.get("gross_verified") is not True:
             return "unresolved", "The current gross host crossing could not be verified."
+        if any(math.dist(vector(prior[field], 3), vector(pair[field], 3)) > tolerance
+               for field in ("entry_ft", "exit_ft")):
+            return "out_of_date", "The linked crossing moved from the reviewed opening."
         geometry = measured_geometry(host, run, pair, clearance, tolerance)
         if geometry_matches(prior, geometry, tolerance):
             if pair["status"] != "gross_crossing" or pair.get("existing_cut_verified") is not True:

@@ -66,6 +66,7 @@ def test_cli_sizes_reviewed_crossing_with_explicit_clearance(tmp_path, evidence,
     ("actual_void", "current"),
     ("small_measurement_noise", "current"),
     ("moved_within_host", "out_of_date"),
+    ("moved_near_edge", "out_of_date"),
     ("moved_away", "out_of_date"),
     ("changed_opening", "out_of_date"),
     ("missing_link", "unresolved"),
@@ -79,11 +80,13 @@ def test_tracking_distinguishes_motion_missing_evidence_and_existing_voids(evide
     key = track(evidence)
     pair = evidence["pairs"][0]
     pair.update(status="gross_crossing", existing_cut_verified=True)
-    if change in {"small_measurement_noise", "moved_within_host"}:
+    if change in {"small_measurement_noise", "moved_within_host", "moved_near_edge"}:
         shift = 0.0001 if change == "small_measurement_noise" else 1.0
         pair["entry_ft"][1] += shift
         pair["exit_ft"][1] += shift
         pair["center_uv_ft"][0] += shift
+        if change == "moved_near_edge":
+            pair["edge_distance_ft"] = 0.01
     elif change in {"moved_away", "unverified_miss"}:
         evidence["pairs"][0] = dict(pair, status="no_crossing", gross_verified=change == "moved_away")
     elif change == "changed_opening":
