@@ -223,3 +223,111 @@ def test_query_blocks_the_whole_snapshot_on_incomplete_source(model, change, rea
     result = invoke(document, args)
     assert result["status"] == "blocked" and reason in result["reason"]
     assert "snapshot_json" not in result and "inventory_json" not in result
+
+
+@pytest.fixture
+def split_readback(model, tmp_path):
+    document, elements, _ = model
+    args = request(document)
+    args["scope"] = [args["scope"][0]]
+    args["scope"][0]["cuts"] = args["scope"][0]["cuts"][:1]
+    wall = elements[10]
+    original_parameters = [*wall.Parameters, parameter(-1001105, "d", 20)]
+    wall.Parameters = original_parameters
+    source = invoke(document, args)
+    assert source["status"] == "ok", source
+    original_constraints = wall.get_Parameter
+    upper = native(Wall, 110, **{key: value for key, value in vars(wall).items() if key not in ("Id", "UniqueId")})
+    elements[110] = upper
+    for piece, low, high in ((wall, 0, 8), (upper, 8, 20)):
+        dimensions = {
+            "WALL_BASE_OFFSET": parameter(-1001108, "d", low),
+            "WALL_USER_HEIGHT_PARAM": parameter(-1001105, "d", high - low),
+        }
+        piece.get_Parameter = lambda key, dimensions=dimensions: dimensions.get(key) or original_constraints(key)
+        piece.Parameters = [*original_parameters[:-1], dimensions["WALL_USER_HEIGHT_PARAM"]]
+        piece.get_BoundingBox = lambda _, low=low, high=high: NS(
+            Min=point(0, 0, low), Max=point(1, 2, high), Transform=NS(OfPoint=lambda value: value, IsIdentity=True))
+
+    document.IsModified = True
+    result = invoke(document, {"host_identity": args["host_identity"], "readback": [
+        {"source_id": "10", "result": {"id": "110", "uid": "uid-110"}},
+        {"source_id": "10", "result": {"id": "10", "uid": "uid-10"}},
+    ]})
+    assert result["status"] == "ok", result
+    snapshot = tmp_path / "snapshot.json"
+    inventory = tmp_path / "inventory.json"
+    snapshot.write_text(source["snapshot_json"])
+    inventory.write_text(source["inventory_json"])
+    approval = {"kind": "element-split-readback-approval", "snapshot_sha256": sha256(snapshot.read_bytes()).hexdigest(),
+                "inventory_sha256": sha256(inventory.read_bytes()).hexdigest(),
+                "piece_adjustments": [
+                    {"source_id": "10", "piece": 1, "values": {"parameter:-1001105": 8}},
+                    {"source_id": "10", "piece": 2, "values": {"parameter:-1001105": 12}},
+                ]}
+    return snapshot, inventory, approval, json.loads(result["readback_json"])
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("none", None),
+    ("lost_parameter", "missing_parameter"),
+    ("new_parameter", "extra_parameter"),
+    ("changed_parameter", "parameter_changed"),
+    ("changed_type", "type_changed"),
+    ("wrong_geometry", "unmatched_or_ambiguous_geometry"),
+    ("moved_footprint", "footprint_changed"),
+    ("missing_piece", "missing_piece"),
+    ("unapproved_parameter", "adjustments"),
+    ("wrong_digest", "approval digest"),
+])
+def test_verifier_compares_fresh_pieces_against_exact_approved_source(tmp_path, split_readback, change, reason):
+    snapshot, inventory, approval, measured = split_readback
+    piece = measured["pieces"][0]
+    if change == "lost_parameter":
+        piece["parameters"].pop(0)
+    elif change == "new_parameter":
+        piece["parameters"].append({"identity": "parameter:99", "storage": "integer", "value": 2,
+                                    "has_value": True, "read_only": False})
+    elif change == "changed_parameter":
+        next(row for row in piece["parameters"] if row["identity"] == "shared:parameter-guid")["value"] = "lost"
+    elif change == "changed_type":
+        piece["type_uid"] = "different-type"
+    elif change == "wrong_geometry":
+        piece["geometry"]["base_ft"] = 9
+    elif change == "moved_footprint":
+        piece["footprint_xy_ft"] = [[10, 0], [11, 2]]
+    elif change == "missing_piece":
+        measured["pieces"].pop()
+    elif change == "unapproved_parameter":
+        approval["piece_adjustments"][0]["values"]["shared:parameter-guid"] = "overridden"
+
+    approved, readback = tmp_path / "approval.json", tmp_path / "readback.json"
+    approved.write_text(json.dumps(approval))
+    readback.write_text(json.dumps(measured))
+    digest = "f" * 64 if change == "wrong_digest" else sha256(approved.read_bytes()).hexdigest()
+    result = subprocess.run([sys.executable, str(SCRIPTS / "verify_element_split.py"),
+                             str(snapshot), str(inventory), str(approved), str(readback), "--approval-sha256", digest],
+                            capture_output=True, text=True)
+    if change in ("unapproved_parameter", "wrong_digest"):
+        assert result.returncode == 2 and result.stdout == "" and reason in result.stderr.lower()
+    else:
+        comparison = json.loads(result.stdout)
+        if change == "none":
+            assert result.returncode == 0 and comparison["status"] == "matched"
+            assert comparison["matches"] == [
+                {"source_id": "10", "piece": 2, "result_id": "110"},
+                {"source_id": "10", "piece": 1, "result_id": "10"},
+            ]
+        else:
+            assert result.returncode == 1 and comparison["status"] == "mismatch"
+            assert reason in {row["reason"] for row in comparison["differences"]}
+
+
+def test_floor_readback_checks_the_boundary_order_not_just_the_vertex_set(model):
+    from verify_element_split import matching_geometry
+
+    planned = {"elevation_ft": 0, "boundary_xy_ft": [(0, 0), (4, 0), (4, 2), (0, 2)]}
+    reversed_ring = {"elevation_ft": 0, "boundary_xy_ft": [[4, 2], [4, 0], [0, 0], [0, 2]]}
+    crossed = {"elevation_ft": 0, "boundary_xy_ft": [[4, 2], [0, 0], [4, 0], [0, 2]]}
+    assert matching_geometry("floor", planned, reversed_ring)
+    assert not matching_geometry("floor", planned, crossed)

@@ -227,6 +227,12 @@ The evidence object has `kind: element-split-evidence`, `frame: revit_host_inter
 - For `floor`, give `elevation_ft` and a simple convex `boundary_xy_ft` with the first vertex listed once. Each cut has `id`, `uid`, `kind` of `grid` or `line`, and `start_xy_ft` and `end_xy_ft`. A finite line must span each seam it intersects. Grid lines are extended through the supplied profile.
 - Exit 1 reports blocked rows. Exit 2 means the input or report exceeded a limit or had an invalid shape. Read the output as a geometry review. The query, dependency checks, result parameter comparison, and Keep/Discard workflow still require native qualification.
 
+For independent piece readback during qualification, send the query `host_identity` and `readback`, an array of objects with `source_id` and `result`. Each result has the exact `id` and `uid` from the native effect record. Save `readback_json` as a local file. The query permits unsaved model edits for this read so a kept change can still be undone. The document must be outside any active transaction.
+
+Run `python scripts/verify_element_split.py snapshot.json inventory.json approval.json readback.json --approval-sha256 <reviewed-digest>`. The approval file has `kind: element-split-readback-approval`, `snapshot_sha256`, `inventory_sha256`, and `piece_adjustments`. An adjustment has `source_id`, a one-based `piece` from the preview, and `values` keyed by parameter identity with exact expected typed values. Supply an empty adjustment array when every parameter is expected to stay the same. Only the documented geometry-derived and level-constraint parameters are adjustable. [Autodesk parameter identifiers](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/fb011c91-be7e-f737-28c7-3f1e1917a0e0.htm)
+
+A matched comparison covers piece extents or floor boundaries, vertical footprints, original type, and typed instance parameters. Verify the complete transaction effects, solid geometry, dependent elements, and native approval separately before accepting the split.
+
 ## House rules (all am-* skills)
 
 - Write all output to the user in ASD-STE100 Simplified Technical English. Use short sentences (max 20 words for instructions, 25 for descriptions). Use active voice. Put one instruction in each sentence, and start it with the verb. Use one word for one meaning. Explain any technical term the first time you use it, because many users are architects, not programmers.

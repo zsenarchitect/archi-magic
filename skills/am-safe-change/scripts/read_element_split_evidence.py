@@ -8,7 +8,8 @@ from time import monotonic
 from System import Int64
 from pyrevit.api import DB
 
-from element_split_preview import MAX_BYTES, MAX_CUTS, MAX_GEOMETRY, MAX_SOURCES, bounded_list, fields, identifier, uid
+from element_split_preview import (MAX_BYTES, MAX_CUTS, MAX_GEOMETRY, MAX_PIECES, MAX_SOURCES, bounded_list, fields,
+                                   identifier, uid)
 
 
 TOLERANCE_FT = 1e-6
@@ -29,9 +30,9 @@ class ReadBudget:
             raise ValueError("The native split read exceeded its evidence budget.")
 
 
-def project_identity(document):
+def project_identity(document, allow_modified=False):
     if (document is None or document.IsFamilyDocument or document.IsLinked or document.IsWorkshared
-            or document.IsModified or document.IsModifiable or not document.PathName):
+            or (document.IsModified and not allow_modified) or document.IsModifiable or not document.PathName):
         raise ValueError("Open a saved, unchanged, non-workshared host project.")
     return {"project_uid": uid(str(document.ProjectInformation.UniqueId)),
             "path_sha256": sha256(document.PathName.encode("utf-8")).hexdigest()}
@@ -136,20 +137,20 @@ def constraint_height(document, element, level_name, offset_name):
     return measure(measure(level.ProjectElevation) + measure(offset))
 
 
-def model_elevations(element, budget):
+def model_bounds(element, budget):
     box = element.get_BoundingBox(None)
     if box is None:
         raise ValueError("The element has no model bounds.")
     values = []
     for point in (box.Min, box.Max):
         budget.visit()
-        values.append(xyz(box.Transform.OfPoint(point))[2])
-    if not box.Transform.IsIdentity or not values[0] < values[1]:
+        values.append(xyz(box.Transform.OfPoint(point)))
+    if not box.Transform.IsIdentity or any(a >= b for a, b in zip(*values)):
         raise ValueError("Use nonempty axis-aligned model bounds.")
     return values
 
 
-def vertical_geometry(document, element, wall, budget):
+def vertical_geometry(document, element, wall, budget, require_split_eligible):
     if wall:
         if (element.WallType.Kind != DB.WallKind.Basic or element.CrossSection != DB.WallCrossSection.Vertical
                 or element.SketchId.Value > 0 or not isinstance(element.Location, DB.LocationCurve)):
@@ -170,7 +171,7 @@ def vertical_geometry(document, element, wall, budget):
         else:
             top = constraint_height(document, element, "WALL_HEIGHT_TYPE", "WALL_TOP_OFFSET")
     else:
-        if (not element.CanSplit or element.IsSlantedColumn or element.Symbol.Family.IsInPlace
+        if ((require_split_eligible and not element.CanSplit) or element.IsSlantedColumn or element.Symbol.Family.IsInPlace
                 or element.SuperComponent is not None or not isinstance(element.Location, (DB.LocationCurve, DB.LocationPoint))):
             raise ValueError("Use an eligible vertical, non-nested column.")
         base = constraint_height(document, element, "FAMILY_BASE_LEVEL_PARAM", "FAMILY_BASE_LEVEL_OFFSET_PARAM")
@@ -180,9 +181,10 @@ def vertical_geometry(document, element, wall, budget):
             if math.dist(a[:2], b[:2]) > TOLERANCE_FT or any(
                     abs(value - target) > TOLERANCE_FT for value, target in zip(sorted((a[2], b[2])), (base, top))):
                 raise ValueError("The column axis does not match its vertical constraints.")
-    if top <= base or any(abs(a - b) > TOLERANCE_FT for a, b in zip(model_elevations(element, budget), (base, top))):
+    bounds = model_bounds(element, budget)
+    if top <= base or any(abs(point[2] - height) > TOLERANCE_FT for point, height in zip(bounds, (base, top))):
         raise ValueError("The model bounds disagree with the candidate vertical constraints.")
-    return {"base_ft": base, "top_ft": top}
+    return {"base_ft": base, "top_ft": top}, [point[:2] for point in bounds]
 
 
 def horizontal_loop(loops, budget):
@@ -244,7 +246,7 @@ def read_cut(document, row, floor, budget):
     return dict(identity(element), kind="grid" if grid else "line", start_xy_ft=start[:2], end_xy_ft=end[:2])
 
 
-def read_source(document, row, budget):
+def read_source(document, row, budget, require_split_eligible=True):
     fields(row, {"source", "cuts"})
     element = selected(document, row["source"])
     if element.ViewSpecific or element.Pinned or element.GroupId.Value > 0 or element.DesignOption is not None:
@@ -272,18 +274,55 @@ def read_source(document, row, budget):
                                         budget)
             wall_ends.append({"end": end, "join_allowed": bool(DB.WallUtils.IsWallJoinAllowedAtEnd(element, end)),
                               "neighbors": neighbors})
-    cuts = [read_cut(document, cut, floor, budget) for cut in bounded_list(row["cuts"], 1, MAX_CUTS, "cuts per source")]
-    geometry = floor_geometry(document, element, budget) if floor else vertical_geometry(document, element, wall, budget)
+    cuts = [read_cut(document, cut, floor, budget)
+            for cut in bounded_list(row["cuts"], int(require_split_eligible), MAX_CUTS, "cuts per source")]
+    if floor:
+        geometry, footprint = floor_geometry(document, element, budget), None
+    else:
+        geometry, footprint = vertical_geometry(document, element, wall, budget, require_split_eligible)
     return dict(source, type_id=type_info["id"], type_uid=type_info["uid"], category=category, geometry=geometry,
                 cuts=cuts), dict(source, parameters=read_parameters(element, budget), dependencies=dependencies,
-                                 geometry_joins=joins, wall_end_joins=wall_ends)
+                                 geometry_joins=joins, wall_end_joins=wall_ends, footprint_xy_ft=footprint)
+
+
+def readback(document, args, project, version):
+    fields(args, {"host_identity", "readback"})
+    if args["host_identity"] != project:
+        raise ValueError("The open host is not the reviewed saved project.")
+    budget = ReadBudget()
+    started_modified = bool(document.IsModified)
+    pieces, seen = [], set()
+    for row in bounded_list(args["readback"], 1, MAX_PIECES, "result pieces"):
+        fields(row, {"source_id", "result"})
+        source = identifier(row["source_id"])
+        geometry, inventory = read_source(document, {"source": row["result"], "cuts": []},
+                                          budget, require_split_eligible=False)
+        if geometry["id"] in seen:
+            raise ValueError("The readback scope repeats a result element.")
+        seen.add(geometry["id"])
+        measured = {key: geometry[key] for key in ("id", "uid", "type_id", "type_uid", "geometry")}
+        measured.update(source_id=source, parameters=inventory["parameters"],
+                        footprint_xy_ft=inventory["footprint_xy_ft"])
+        pieces.append(measured)
+    if (project_identity(document, allow_modified=True) != project or bool(document.IsModified) != started_modified
+            or monotonic() >= budget.deadline):
+        raise ValueError("The saved project or native readback budget changed.")
+    encoded = json.dumps({"kind": "element-split-readback", "host_identity": project,
+                          "revit_version": version, "pieces": pieces},
+                         ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    if len(encoded) > MAX_BYTES:
+        raise ValueError("The result readback exceeds 2 MiB.")
+    return {"status": "ok", "readback_json": encoded}
 
 
 def main(document, args):
-    project = project_identity(document)
+    reading_results = isinstance(args, dict) and "readback" in args
+    project = project_identity(document, allow_modified=reading_results)
     version = str(document.Application.VersionNumber)
     if version != "2026":
         raise ValueError("Use Revit 2026 for the initial native split qualification.")
+    if reading_results:
+        return readback(document, args, project, version)
     if args == {"describe": True}:
         return {"status": "ok", "host_identity": project, "revit_version": version}
     fields(args, {"host_identity", "scope"})
