@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import runpy
@@ -556,6 +557,7 @@ def test_verify_fixture_rollback_through_cli(verified_fixture, tmp_path):
     ("replayed", "distinct"), ("auto", "clean dry_run rollback"), ("truncated", "missing or invalid metadata"),
     ("wrong_id", "disagrees"), ("short_samples", "disagrees"), ("foreign", "unreviewed additions"),
     ("model_drift", "differs from the original"), ("foreign_borrowing", "unreviewed ownership"),
+    ("wrong_trial_graphics", "trial filter stacks"), ("missing_trial_graphics", "trial filter stacks"),
 ])
 def test_verify_fixture_rollback_fails_closed(verified_fixture, fault, error):
     from view_filter_transfer_preview import verify_rollback
@@ -573,6 +575,13 @@ def test_verify_fixture_rollback_fails_closed(verified_fixture, fault, error):
         probe["changes"]["modified"] = []
     elif fault == "foreign":
         probe["changes"]["other_documents"] = [{"title": "Other project"}]
+    elif fault == "wrong_trial_graphics":
+        stacks = deepcopy(probe["result"]["trial_filter_stacks"])
+        first = next(iter(stacks.values()))[0]
+        first["graphics"]["ProjectionLineColor"] = [250, 1, 50]
+        probe["result"]["trial_filter_stacks"] = stacks
+    elif fault == "missing_trial_graphics":
+        probe["result"].pop("trial_filter_stacks", None)
     elif fault == "model_drift":
         inventory = json.loads(fresh["result"]["inventory_json"])
         inventory["views"]["43"]["filters"][0]["visible"] = not inventory["views"]["43"]["filters"][0]["visible"]
