@@ -276,11 +276,10 @@ def embedded_thumbnail(path):
             return thumbnail_png(stream.read(MAX_THUMBNAIL_STREAM + 1))
 
 
-def inspect_output(manifest_path, family):
-    root, work, output, rows = load_manifest(manifest_path, family)
-    row = rows[0]
+def inspect_saved_family(root, work, output_entries, row):
+    family = row["name"]
     source = root / family
-    saved = entries(output).get(name_key(family))
+    saved = output_entries.get(name_key(family))
     if saved is None or saved.name != family:
         raise ValueError("The reviewed output family was not found by its exact name.")
     check_file(source, row["source_identity"], row["sha256"])
@@ -301,6 +300,24 @@ def inspect_output(manifest_path, family):
                              "saved_file_sha256": output_sha}}
 
 
+def inspect_output(manifest_path, family=None):
+    root, work, output, rows = load_manifest(manifest_path, family)
+    output_entries = entries(output)
+    if family is not None:
+        return inspect_saved_family(root, work, output_entries, rows[0])
+
+    results = []
+    for row in rows:
+        try:
+            results.append(inspect_saved_family(root, work, output_entries, row))
+        except (OSError, ValueError) as error:
+            results.append({"name": row["name"], "status": "unavailable", "reason": str(error)})
+    complete = all(row.get("saved_thumbnail") is not None for row in results)
+    return {"kind": "family-preview-saved-batch",
+            "status": "thumbnail_review_pending" if complete else "incomplete",
+            "families": results}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -317,7 +334,7 @@ def main(argv=None):
     check.add_argument("--family")
     saved = commands.add_parser("inspect-output")
     saved.add_argument("manifest")
-    saved.add_argument("--family", required=True)
+    saved.add_argument("--family")
     args = parser.parse_args(argv)
     try:
         if args.command == "inventory":

@@ -106,3 +106,47 @@ def test_thumbnail_fingerprint_excludes_wrapper_and_checks_crc(monkeypatch):
         inspect(bytes(corrupt))
     with pytest.raises(ValueError, match="incomplete"):
         inspect(png[:-12])
+
+
+def test_batch_inspects_each_manifest_output_and_reports_incomplete_coverage(folders, monkeypatch, capsys):
+    source, _, output = folders
+    names = ("Desk.rfa", "Chair.rfa")
+    for name in names:
+        (source / name).write_bytes(name.encode("ascii"))
+    staged = stage(folders, *names)
+    assert staged.returncode == 0, staged.stderr
+    manifest = json.loads(staged.stdout)["manifest"]
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    main = runpy.run_path(str(SCRIPT))["main"]
+
+    def read_thumbnail(path):
+        if path.parent != output or path.read_bytes() == b"no thumbnail":
+            return None
+        return {"width": 1, "height": 1, "sha256": "a" * 64}
+
+    monkeypatch.setitem(main.__globals__, "embedded_thumbnail", read_thumbnail)
+    (output / "Desk.rfa").write_bytes(b"saved desk")
+    command = ["inspect-output", manifest]
+    assert main(command) == 1
+    partial = json.loads(capsys.readouterr().out)
+    assert partial["status"] == "incomplete"
+    by_name = {row["name"]: row for row in partial["families"]}
+    assert by_name["Chair.rfa"]["status"] == "unavailable"
+    assert by_name["Desk.rfa"]["thumbnail_status"] == "present"
+
+    (output / "Chair.rfa").write_bytes(b"no thumbnail")
+    assert main(command) == 1
+    partial = json.loads(capsys.readouterr().out)
+    by_name = {row["name"]: row for row in partial["families"]}
+    assert by_name["Chair.rfa"]["thumbnail_status"] == "missing"
+
+    (output / "Chair.rfa").write_bytes(b"saved chair")
+    assert main(command) == 0
+    ready = json.loads(capsys.readouterr().out)
+    assert ready["status"] == "thumbnail_review_pending"
+    assert [(row["name"], row["thumbnail_status"]) for row in ready["families"]] == [
+        ("Desk.rfa", "present"), ("Chair.rfa", "present"),
+    ]
+
+    assert main(command + ["--family", "Chair.rfa"]) == 0
+    assert json.loads(capsys.readouterr().out) == ready["families"][1]
