@@ -177,6 +177,8 @@ For native findings, read the board with `include_identity: true` from the audit
 
 For read-only parameter repair evidence, send the reviewed host `source` and `repair_parameters: {"guid": "<shared parameter GUID>", "elements": [{"id": "123", "uid": "<element UID>"}]}` to `read_mep.py`. Use a saved standalone project. Review the decoded `repair_parameters_json` for unset, empty, already-filled and ineligible parameters. Keep the returned values private. Save the complete response as `query.json`. Put the proposed text in a separate JSON file, for example `{"text": "Ventilation"}`. Run `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py query.json fill.json > preview.json` and open it in the change-preview renderer. The preview contains no model-write steps.
 
+For the disposable text-fill trial, run `am-safe-change/scripts/probe_mep_parameter_fill.py` with CPython and `run_modify` in dry-run mode. Pass `disposable_fixture: true` and the exact parsed `query`, `fill` and `preview` objects. The script checks the inner transaction and rolls back its group. Repeat the original query independently and compare the saved evidence. Native Revit qualification is pending.
+
 For routing review, use the separate [connector endpoint query](../../docs/rfcs/003-mep-support.md#read-reviewed-route-endpoints).
 
 ## Rules

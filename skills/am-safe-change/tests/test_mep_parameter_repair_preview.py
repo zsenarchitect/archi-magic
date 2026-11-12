@@ -104,3 +104,102 @@ def test_preview_rejects_unverified_query_receipts(inputs, override):
     result = run(**override)
     assert result.returncode == 2 and not result.stdout
     assert "clean query rollback" in result.stderr
+
+
+@pytest.mark.parametrize("fault, outcome", [
+    (None, "mep_text_fill_trial_rolled_back"),
+    ("extra", "stopped_and_rolled_back"),
+    ("setter_failed", "stopped_and_rolled_back"),
+    ("foreign", "transaction_unresolved"),
+    ("pending", "transaction_unresolved"),
+    ("survives", "transaction_unresolved"),
+])
+def test_native_fill_trial_measures_effects_and_always_rolls_back(inputs, tmp_path, monkeypatch, fault, outcome):
+    import runpy
+    from types import SimpleNamespace as NS
+
+    from test_probe_mep_route import Collection, Handler, RegenerationFailure
+
+    evidence, run = inputs
+    display = json.loads(run().stdout)
+    args = {"disposable_fixture": True, "query": json.loads((tmp_path / "query.json").read_text()),
+            "fill": json.loads((tmp_path / "fill.json").read_text()), "preview": display}
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    db = NS(TransactionStatus=NS(Started="Started", Committed="Committed", Pending="Pending",
+                                 RolledBack="RolledBack", Uninitialized="Uninitialized"))
+    monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
+    monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
+    monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(Stopwatch=NS(StartNew=object)))
+    monkeypatch.setitem(sys.modules, "Autodesk.Revit.Exceptions", NS(RegenerationFailedException=RegenerationFailure))
+    monkeypatch.delitem(sys.modules, "duplicate_views", raising=False)
+    module = runpy.run_path(str(SCRIPT.with_name("probe_mep_parameter_fill.py")))
+    document = NS(PathName="C:/Fixtures/MEP.rvt", IsModifiable=False,
+                  Application=NS(VersionNumber="2026", DocumentChanged=Handler()))
+    document.Equals = lambda other: other is document
+    calls = []
+    original = evidence["elements"]
+    current = [dict(row) for row in original]
+
+    def read(_doc, request, _clock):
+        selected = {item["id"] for item in request["elements"]}
+        return {"guid": GUID, "elements": [dict(row) for row in current if row["id"] in selected]}
+
+    def set_value(value):
+        if fault == "setter_failed":
+            return False
+        current[0].update(value=value, has_value=True, state="already_filled")
+        return True
+
+    reader = NS(resolve_source=lambda *_: (document, None, evidence["source"]),
+                read_repair_parameters=read, element_id=str, Guid=str)
+    document.GetElement = lambda identifier: NS(get_Parameter=lambda guid: NS(Set=set_value))
+
+    class Group:
+        def __init__(self, *_):
+            self.state = "Uninitialized"
+
+        def Start(self):
+            self.state = "Started"
+            return self.state
+
+        def GetStatus(self):
+            return self.state
+
+        def RollBack(self):
+            calls.append("group_rollback")
+            if fault != "survives":
+                current[:] = [dict(row) for row in original]
+            self.state = "RolledBack"
+            return self.state
+
+    class Transaction(Group):
+        def RollBack(self):
+            calls.append("transaction_rollback")
+            self.state = "RolledBack"
+            return self.state
+
+        def Commit(self):
+            if fault == "pending":
+                self.state = "Pending"
+                return self.state
+            identifier = 23 if fault == "extra" else int(LARGE_ID)
+            event = NS(Operation="TransactionCommitted", GetTransactionNames=lambda: [module["TRANSACTION_NAME"]],
+                       GetDocument=lambda: object() if fault == "foreign" else document,
+                       GetAddedElementIds=Collection, GetDeletedElementIds=Collection,
+                       GetModifiedElementIds=lambda: Collection([NS(Value=identifier)]))
+            document.Application.DocumentChanged.callback(None, event)
+            self.state = "Committed"
+            return self.state
+
+    db.TransactionGroup, db.Transaction = Group, Transaction
+    result = module["trial"](document, args, reader)
+    assert result["status"] == outcome, result
+    assert not hasattr(document.Application.DocumentChanged, "callback")
+    if fault == "pending":
+        assert not calls
+    else:
+        assert calls[-1] == "group_rollback"
+    if fault not in ("pending", "survives"):
+        assert current == original
+    if fault is None:
+        assert result["trial_changes"] == {"added": [], "modified": [LARGE_ID], "deleted": []}
