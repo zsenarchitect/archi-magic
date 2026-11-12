@@ -105,7 +105,7 @@ class Workspace:
                     not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None
                     or not isinstance(slot, dict) or slot.get("kind") not in ARTIFACT_KINDS
                     for name, slot in slots.items()):
-                raise ValueError("Configure named audit, preview, board, model or document artifact slots.")
+                raise ValueError("Configure named workspace artifact slots with supported kinds.")
             paths = [slot_path(slot) for slot in slots.values()]
             if len(set(paths)) != len(paths):
                 raise ValueError("Each artifact slot requires a different file.")
@@ -445,7 +445,7 @@ class Workspace:
         except (OSError, ValueError) as error:
             LOG.warning("Workspace artifact could not be read (%s)", type(error).__name__)
             raise web.HTTPServiceUnavailable(text="Project artifact is unavailable.") from error
-        if data.get("kind") in ("model", "document"):
+        if data.get("kind") in ("model", "document", "recipe"):
             data = describe_artifact(data)
         return web.json_response(data, status=503 if data["freshness"] == "unavailable" else 200)
 

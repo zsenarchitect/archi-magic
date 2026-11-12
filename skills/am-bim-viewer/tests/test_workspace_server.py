@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
+import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from threading import Event
 
@@ -627,5 +629,72 @@ def test_document_worker_admission_survives_a_client_disconnect(tmp_path, monkey
                 assert saved.status == 200
             finally:
                 finish.set()
+
+    asyncio.run(exercise())
+
+
+def test_saved_recipe_catalog_uses_a_private_exact_source_binding(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "am-safe-change" / "scripts"))
+    from recipe_library import save_recipe
+    from workspace_artifacts import read_published
+    from workspace_review_state import canonical
+
+    accounts, projects = settings(tmp_path)
+    project = projects["sample"]
+    slot = {"kind": "recipe", "path": "catalog.json"}
+    project["artifacts"] = {"placement": slot}
+    source = tmp_path / "operator"
+    code = "raise RuntimeError('private source sentinel')"
+    description = "Review <img src=x onerror=alert(1)> placement"
+    _, filename = save_recipe(str(source), "Place Views", description, code,
+                              inputs_schema={"private_schema_sentinel": r"Z:\private\config"}, author="Coordinator",
+                              tested_years=["2026"])
+    recipe = Path(filename)
+    config = tmp_path / "workspace.json"
+    config.write_text(json.dumps({"projects": {"sample": {**project, "root": str(project["root"])}}}))
+    publisher = Path(server.__file__).with_name("workspace_artifacts.py")
+    command = [sys.executable, str(publisher), str(config), "sample", "placement", "1", str(recipe)]
+    publish_result = subprocess.run(command, capture_output=True, text=True)
+    assert publish_result.returncode == 0, publish_result.stderr
+    artifact = read_published(project["root"], slot)
+    source_digest = hashlib.sha256(recipe.read_bytes()).hexdigest()
+    assert artifact["data"]["recipe_sha256"] == source_digest
+    assert code not in str(artifact) and "private_schema_sentinel" not in str(artifact)
+    output_path = project["root"] / slot["path"]
+    previous = output_path.read_bytes()
+    recipe.write_bytes(recipe.read_bytes() + b"\n")
+    assert subprocess.run(command, capture_output=True).returncode == 2
+    assert output_path.read_bytes() == previous
+
+    async def exercise():
+        async with TestClient(TestServer(create_app(ORIGIN, accounts, projects))) as client:
+            async def login(actor):
+                response = await client.post("/session", headers=HEADERS, json={"token": TOKENS[actor]})
+                return {COOKIE: response.cookies[COOKIE].value}
+
+            viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+            project_path = "/projects/sample"
+            legacy = project_path + "/artifacts/placement"
+            assert (await client.get(legacy, headers=HEADERS)).status == 401
+            for method in (client.get, client.head):
+                assert (await method(legacy, headers=HEADERS, cookies=outsider)).status == 404
+            expected = {"kind": "recipe", "generation": 1, "freshness": "ready", "rows": [], "recipe": {
+                "name": "Place Views", "slug": "place_views", "description": description,
+                "author": "Coordinator", "version": "1.0.0", "tested_years": ["2026"],
+            }}
+            current = await client.get(legacy, headers=HEADERS, cookies=viewer)
+            assert await current.json() == expected
+            assert (await client.head(legacy, headers=HEADERS, cookies=viewer)).status == 200
+            snapshot = await client.get(project_path + "/workspace", headers=HEADERS, cookies=viewer)
+            assert (await snapshot.json())["artifacts"]["placement"] == expected
+            assert source_digest not in await snapshot.text() and "private_schema_sentinel" not in await snapshot.text()
+
+            artifact["data"]["metadata"]["script"] = code
+            content = {key: artifact[key] for key in ("kind", "data", "board")}
+            artifact["generation"] = 2
+            artifact["digest"] = hashlib.sha256(canonical(content)).hexdigest()
+            output_path.write_bytes(canonical(artifact))
+            response = await client.get(legacy, headers=HEADERS, cookies=viewer)
+            assert await response.json() == dict(expected, freshness="stale")
 
     asyncio.run(exercise())

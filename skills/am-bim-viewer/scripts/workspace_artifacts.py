@@ -14,11 +14,12 @@ from uuid import uuid4
 from project_page import collect_findings, pair_preview_rows, read_change_preview, read_saved_result, render_board
 from workspace_documents import MAX_DOCUMENT_INPUT, MAX_DOCUMENT_PUBLICATION, normalize_document, validate_document
 from workspace_model import MAX_MODEL_BYTES, validate_model
+from workspace_recipes import make_recipe, validate_recipe
 from workspace_review_state import canonical, unique_object
 
 
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
-ARTIFACT_KINDS = ("audit", "preview", "board", "model", "document")
+ARTIFACT_KINDS = ("audit", "preview", "board", "model", "document", "recipe")
 
 
 def slot_limit(slot):
@@ -37,11 +38,15 @@ def open_json_file(name, limit, directory=None):
         yield stream, metadata
 
 
-def read_json_stream(stream, limit):
+def read_bounded(stream, limit):
     raw = stream.read(limit + 1)
     if len(raw) > limit:
         raise ValueError("The workspace JSON exceeds its byte limit.")
-    return json.loads(raw, object_pairs_hook=unique_object)
+    return raw
+
+
+def read_json_stream(stream, limit):
+    return json.loads(read_bounded(stream, limit), object_pairs_hook=unique_object)
 
 
 def read_json_file(name, limit, directory=None):
@@ -123,8 +128,10 @@ def validate_data(kind, data):
         validate_model(data)
     elif kind == "document":
         validate_document(data)
+    elif kind == "recipe":
+        validate_recipe(data)
     else:
-        raise ValueError("Use a configured audit, preview, board, model or document artifact slot.")
+        raise ValueError("Use a configured workspace artifact kind.")
 
 
 def make_artifact(slot, generation, raw):
@@ -149,8 +156,10 @@ def make_artifact(slot, generation, raw):
         data = raw
     elif kind == "document":
         data = normalize_document(raw)
+    elif kind == "recipe":
+        data = make_recipe(raw)
     else:
-        raise ValueError("Use a configured audit, preview, board, model or document artifact slot.")
+        raise ValueError("Use a configured workspace artifact kind.")
     validate_data(kind, data)
     content = {"kind": kind, "data": data, "board": board_binding(slot) if kind == "board" else None}
     return {**content, "generation": generation, "digest": hashlib.sha256(canonical(content)).hexdigest()}
@@ -180,7 +189,7 @@ def read_published(root, slot):
 
 def review_targets(slot_name, artifact):
     kind, data = artifact["kind"], artifact["data"]
-    if kind in ("model", "document"):
+    if kind in ("model", "document", "recipe"):
         return []
     if kind == "board":
         lineage = artifact["board"]["lineage"]
@@ -245,7 +254,11 @@ def main():
         project = config["projects"][args.project]
         slot = project["artifacts"][args.slot]
         limit = {"model": MAX_MODEL_BYTES, "document": MAX_DOCUMENT_INPUT}.get(slot["kind"], 3 * MAX_ARTIFACT_BYTES)
-        raw = read_json_file(args.input, limit)
+        if slot["kind"] == "recipe":
+            with open_json_file(args.input, MAX_ARTIFACT_BYTES) as (stream, _):
+                raw = read_bounded(stream, MAX_ARTIFACT_BYTES)
+        else:
+            raw = read_json_file(args.input, limit)
         print(json.dumps(publish(project["root"], slot, args.generation, raw)))
     except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
         parser.exit(2, "Workspace publication stopped ({}). Check the configured slot, source and generation.\n"

@@ -31,6 +31,9 @@ def describe_artifact(artifact):
     if kind == "document":
         return {"kind": kind, "freshness": freshness, "generation": artifact["generation"],
                 "digest": artifact["digest"], "document": data.summary, "rows": []}
+    if kind == "recipe":
+        return {"kind": kind, "freshness": freshness, "generation": artifact["generation"],
+                "recipe": data["metadata"], "rows": []}
     notices = []
     if kind == "audit":
         rows = [

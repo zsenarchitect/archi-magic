@@ -216,6 +216,16 @@ function documentSection(name, artifact) {
     return node;
 }
 
+function recipeSection(artifact) {
+    const recipe = artifact.recipe;
+    const node = section(recipe.name, [], artifact.freshness, availability[artifact.freshness]);
+    node.append(element("p", "Saved recipe · Reference"));
+    node.append(element("p", recipe.author + " · Version " + recipe.version));
+    if (recipe.description) node.append(element("p", recipe.description));
+    if (recipe.tested_years.length) node.append(element("p", "Declared Revit years · " + recipe.tested_years.join(", ")));
+    return node;
+}
+
 function render(data) {
     snapshot = data;
     const visible = new Set();
@@ -225,6 +235,7 @@ function render(data) {
         artifact.rows.forEach(row => visible.add(row.target));
         if (artifact.kind === "document") return documentSection(name, artifact);
         documentSections.delete(name);
+        if (artifact.kind === "recipe") return recipeSection(artifact);
         const wrapper = section(artifact.kind ? labels[artifact.kind] + " · " + name : name, artifact.rows,
                                 artifact.freshness, availability[artifact.freshness], artifact.notices);
         if (artifact.viewer_digest) {

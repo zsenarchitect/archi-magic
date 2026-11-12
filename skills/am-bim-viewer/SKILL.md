@@ -201,6 +201,10 @@ Use the local `project_document_cli.py extract` or `compare` workflow in am-mark
 
 The workspace shows the original sheet, page, table and row references when present. Reviewers can page through the table or browse mismatches, missing schedule entries and schedule-only entries separately. Original documents stay with the extraction operator. DWG references show their recorded revision and unverified availability.
 
+### Saved recipes
+
+Configure an artifact slot with `"kind": "recipe"` and publish an explicitly selected `.recipe.json` saved by the team recipe library. Use the same publisher and a new generation when the saved file changes. The workspace shows the recipe name, version, owner, description and declared Revit years. Catalog entries are references. Use the existing native preview and approval workflow to run the recipe.
+
 ### Audit reports
 
 Open **Audit reports** in the office workspace to print the current report or download self-contained HTML. Use the browser’s Print dialog and select Save as PDF for a PDF copy. The report includes accepted audit generations, freshness, model-health totals and rule IDs. Its descriptions come from installed checks. Set `audit_reports` to `false` in a project’s configuration to disable its report route and links.
