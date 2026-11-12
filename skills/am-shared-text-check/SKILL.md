@@ -23,6 +23,17 @@ Pass `workspace` = the absolute path of this skill's `scripts/` folder on every 
 2. Call `get_skill("revit-scripting")` before you submit any script.
 3. Check `agent.policy` before any change. This skill makes no change, so all policies allow the read. Changes go through am-safe-change later.
 
+
+## Export all drafting-view notes
+
+Use this read-only mode to export full notes for a BIM execution plan. Confirm the project and selected Revit PID with `get_context`, then load `get_skill("revit-scripting")`. Read the project identity through the model-facts query. Resolve the drafting view in that same project. If its UniqueId is unknown, send the script below with `identify_view: true`, the exact view ID and project identity, and confirm the returned view before exporting.
+
+Send the complete `scripts/read_shared_text.py` as a `run_query` script with `export_view: true`, `expected_title`, `expected_path`, `expected_project_uid`, `view_id` as a decimal string and `expected_view_uid`. Pass `heading_ids` as a list of reviewed decimal ID strings. Optional `row_tolerance_mm` defaults to 0.5 paper millimetres. Optional `column_boundaries_mm` splits the view by increasing paper X coordinates measured from the view origin. Notes on a boundary belong to the column to its right.
+
+Parse the returned JSON string once. For each column, a heading starts a section at its position in reading order. Notes before the first heading have a null section ID. An inventory marked complete includes notes owned by the view even when hidden or cropped. When the result marks visual order unverified, use the inventory for review and avoid treating it as a correctly ordered BEP. This mode verifies order for left-aligned, top-aligned notes whose text axes match the view axes.
+
+Save the JSON to the user's private working folder. If the immediate response is truncated, recover the full response from the same run with `get_run` and check `inventory_complete` and `visual_order` before using it.
+
 ## Pick the scope
 
 1. Ask which views to check if the user did not say. Offer these scopes: the standards view, the reference views, the start or sync view, the issue board notes, or every text note.
