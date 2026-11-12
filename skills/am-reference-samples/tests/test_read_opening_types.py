@@ -134,6 +134,7 @@ def fixture_project(monkeypatch):
         return runpy.run_path(str(SCRIPT), init_globals={"doc": document, "inputs": inputs})["result"]
 
     query.document = document
+    query.db = db
 
     return query, large_id, instances, resolved, disposed, clock
 
@@ -193,3 +194,96 @@ def test_legend_classifies_missing_duplicate_and_unplaced_elevations(fixture_pro
         (-7, None), (-6, None), (-7, None),
     ]
     assert query(legend_id="26")["status"] == "stopped"
+
+
+def test_layout_reads_seed_target_graphics_and_both_sheet_placements(fixture_project, monkeypatch):
+    query, _, instances, _, _, _ = fixture_project
+    db, doc = query.db, query.document
+    original_lookup = doc.GetElement
+    original_collector = db.FilteredElementCollector
+    target = original_lookup(NS(Value=25))
+    xyz = lambda x, y, z=0: NS(X=x, Y=y, Z=z)
+
+    def graphic(item, owner, category, kind):
+        item.OwnerViewId = owner.Id
+        item.Category = NS(Id=NS(Value=category))
+        item.GroupId = NS(Value=-1)
+        item.Pinned = False
+        item.GetType = lambda: NS(Name=kind)
+        item.get_BoundingBox = lambda _view: NS(Min=xyz(0, 0), Max=xyz(3, 4), Dispose=lambda: None)
+        return item
+
+    source = db.View()
+    source.Id, source.UniqueId = NS(Value=26), "fixture-source-legend"
+    seed = graphic(Element(dict(instances[-3][0].parameters)), source, -3, "Element")
+    seed.Id, seed.UniqueId = NS(Value=60), "fixture-seed"
+
+    class TextType:
+        UniqueId = "fixture-text-type"
+        Name = "Fixture text type"
+
+    class Sheet:
+        def __init__(self, key):
+            self.Id, self.UniqueId, self.SheetNumber = NS(Value=key), "fixture-sheet-" + str(key), "A" + str(key)
+            self.Outline = NS(Min=NS(U=0, V=0), Max=NS(U=3, V=2), Dispose=lambda: None)
+
+    class Viewport:
+        def __init__(self, key, sheet, view, width):
+            self.Id, self.UniqueId = NS(Value=key), "fixture-viewport-" + str(key)
+            self.SheetId, self.ViewId = sheet.Id, view.Id
+            self.Rotation = "None"
+            self.width = width
+            graphic(self, sheet, -5, "Viewport")
+
+        def GetBoxOutline(self):
+            return NS(IsEmpty=False, MinimumPoint=xyz(0, 0), MaximumPoint=xyz(self.width, 1), Dispose=lambda: None)
+
+        def GetLabelOutline(self):
+            return NS(IsEmpty=False, MinimumPoint=xyz(0, -0.2), MaximumPoint=xyz(1, 0), Dispose=lambda: None)
+
+    a, b = Sheet(81), Sheet(82)
+    vp_a, vp_b, adjacent = Viewport(71, a, target, 1), Viewport(72, b, target, 2), Viewport(73, b, source, 1)
+    items = {26: source, 60: seed, 70: TextType(), 81: a, 82: b}
+    for item in instances[-3] + instances[-4]:
+        category = -3 if item in instances[-3] else -4
+        graphic(item, target, category, "Element" if category == -3 else "TextNote")
+    manual = graphic(NS(Id=NS(Value=36), UniqueId="fixture-line"), target, -6, "DetailLine")
+    owned = {25: instances[-3] + instances[-4] + [manual], 26: [seed], 81: [vp_a], 82: [vp_b, adjacent]}
+    doc.GetElement = lambda identifier: items.get(identifier.Value) or original_lookup(identifier)
+    db.Viewport, db.ViewSheet, db.TextNoteType, db.XYZ = Viewport, Sheet, TextType, xyz
+
+    class Collector(original_collector):
+        owner = category = kind = None
+
+        def OwnedByView(self, identifier):
+            self.owner = identifier.Value
+            return self
+
+        def OfClass(self, kind):
+            self.kind = kind
+            return self
+
+        def WhereElementIsNotElementType(self):
+            if self.owner is not None:
+                return [row for row in owned[self.owner] if self.category is None or row.Category.Id.Value == self.category]
+            if self.kind is Viewport:
+                return [vp_a, vp_b, adjacent]
+            return super().WhereElementIsNotElementType()
+
+    monkeypatch.setattr(db, "FilteredElementCollector", Collector)
+    result = query(legend_id="25", source_legend_id="26", seed_component_id="60", text_type_id="70")
+    assert result["status"] == "ok", result
+    layout = json.loads(result["snapshot_json"])["legend"]["layout"]
+    assert layout["seed"]["id"] == "60" and layout["seed"]["direction"] == "front_elevation"
+    assert layout["text_type"]["uid"] == "fixture-text-type"
+    assert layout["front_elevation_coverage"]["duplicate_elevation_type_ids"] == []
+    assert [item["id"] for item in layout["target_graphics"]] == ["31", "32", "33", "34", "36"]
+    assert [(sheet["id"], sheet["legend_viewport_ids"]) for sheet in layout["sheet_placements"]] == [
+        ("81", ["71"]), ("82", ["72"]),
+    ]
+    second = layout["sheet_placements"][1]
+    assert [item["view_id"] for item in second["graphics"]] == ["25", "26"]
+    assert second["graphics"][0]["label_bounds_ft"] == {"min": [0, -0.2, 0], "max": [1, 0, 0]}
+    owned[82].remove(vp_b)
+    rejected = query(legend_id="25", source_legend_id="26", seed_component_id="60", text_type_id="70")
+    assert rejected == {"status": "stopped", "message": "The legend's sheet viewport evidence could not be reconciled."}

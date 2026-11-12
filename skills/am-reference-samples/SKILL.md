@@ -25,6 +25,9 @@ Review missing nominal sizes and any measured variation before choosing a label.
 
 Pass `{"legend_id":"123"}` to compare the inventory with an existing legend. The query reads components and text notes owned by that view. In Revit 2026, `coverage` lists missing and duplicate elevations, elevations of unplaced types, and unresolved directions. For other versions, the report gives raw direction values. Check the direction in Revit before drawing conclusions about coverage.
 
+In Revit 2026, add `source_legend_id`, `seed_component_id`, and `text_type_id` to read the layout for a proposed update. Use a separate source legend with a measured door or window front elevation. The query records target graphics, front-elevation coverage, and every sheet placement. Check the viewport box and label bounds separately.
+
+
 
 
 ### 2. Run the coverage check first (read only)
