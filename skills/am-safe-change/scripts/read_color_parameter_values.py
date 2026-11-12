@@ -10,7 +10,7 @@ from System.Diagnostics import Stopwatch
 from pyrevit.api import DB
 
 from duplicate_views import bounded, document_identity, identifier, key
-from read_view_filter_graphics import native_number, rule_signature
+from read_view_filter_graphics import filter_definition, graphics, native_number, rule_signature
 from view_duplicate_preview import MAX_BYTES, TEXT, snapshot_digest
 
 SIGNED_ID = re.compile(r"^-?[1-9][0-9]{0,18}\Z")
@@ -107,10 +107,11 @@ def value_groups(rows, types, epsilon):
             value = 0.0
         typed = {"storage": state["storage"], "has_value": row["source"] != "unset", "value": value}
         group_id = snapshot_digest(typed)
-        group = groups.setdefault(group_id, dict(typed, key=group_id, count=0, labels=set()))
+        group = groups.setdefault(group_id, dict(typed, key=group_id, count=0, labels=set(), member_ids=[]))
         if typed["storage"] == "Double" and typed["has_value"]:
             group["epsilon"] = epsilon
         group["count"] += 1
+        group["member_ids"].append(row["id"])
         if state["label"] is not None:
             group["labels"].add(state["label"])
         expected[row["id"]] = group_id
@@ -210,11 +211,103 @@ def qualify_rules(document, parameter_id, category_ids, rows, types, missing, ep
             "mismatch_count": mismatch_count, "mismatches": mismatches}
 
 
+def normalized_rule(expression):
+    # A non-inverted one-child logical node does not change the predicate.
+    while (expression and expression["type"] in ("LogicalAndFilter", "LogicalOrFilter")
+           and not expression["inverted"] and len(expression["children"]) == 1):
+        expression = expression["children"][0]
+    return expression
+
+
+def existing_filter_matches(document, view, inventory, clock):
+    groups = inventory["native_rules"]["groups"]
+    categories = set(inventory["category_ids"])
+    signatures = {snapshot_digest(normalized_rule(group["expression"])): group["key"] for group in groups}
+    groups_by_members = {frozenset(group["member_ids"]): group["key"] for group in groups}
+    applied = {key(item) for item in bounded(view.GetOrderedFilters(), 100, "applied filter", clock)}
+    solid = key(DB.LinePatternElement.GetSolidPatternId())
+    rows = inventory["rows"]
+    observed = []
+    for row in rows:
+        element = document.GetElement(identifier(row["id"]))
+        if element is None or str(element.UniqueId) != row["uid"]:
+            raise ValueError("An observed element changed during filter reuse verification.")
+        observed.append((row["id"], element))
+
+    exact = {group["key"]: [] for group in groups}
+    possible = {group["key"]: [] for group in groups}
+    definition_budget, evaluation_budget = [4096], 120000 - len(groups) * len(rows)
+    names = []
+    collector = DB.FilteredElementCollector(document)
+    try:
+        for item in bounded(collector.OfClass(DB.ParameterFilterElement), 5000, "existing filter", clock):
+            item_id = key(item.Id)
+            name = str(item.Name)
+            names.append({"id": item_id, "name": name})
+            if {key(category) for category in bounded(item.GetCategories(), 256, "existing filter category", clock)} != categories:
+                continue
+            try:
+                definition = filter_definition(item, definition_budget, clock)
+                signature = snapshot_digest(normalized_rule(definition["tree"]))
+            except ValueError:
+                # A definition we cannot serialize may still be comparable on the observed elements.
+                signature = None
+            match = signatures.get(signature)
+            if match is not None:
+                entry = {"id": item_id, "uid": str(item.UniqueId), "name": name, "applied": item_id in applied}
+                if entry["applied"]:
+                    settings = view.GetFilterOverrides(item.Id)
+                    try:
+                        entry.update(visible=bool(view.GetFilterVisibility(item.Id)),
+                                     enabled=bool(view.GetIsFilterEnabled(item.Id)),
+                                     graphics=graphics(settings, solid))
+                    finally:
+                        settings.Dispose()
+                exact[match].append(entry)
+                continue
+
+            expression = item.GetElementFilter()
+            if expression is None:
+                continue
+            try:
+                evaluation_budget -= len(observed)
+                if evaluation_budget < 0:
+                    raise ValueError("The existing filter comparison exceeds 120,000 native evaluations.")
+                matching = frozenset(item_id for item_id, element in bounded(
+                    observed, 5000, "existing filter candidate", clock) if expression.PassesFilter(element))
+                match = groups_by_members.get(matching)
+                if match is not None:
+                    possible[match].append(item_id)
+            finally:
+                expression.Dispose()
+    finally:
+        collector.Dispose()
+
+    results = {}
+    for group in groups:
+        group_id = group["key"]
+        exact_rows = sorted(exact[group_id], key=lambda row: int(row["id"]))
+        choices = [row for row in exact_rows if row["applied"]] or exact_rows
+        uncertain = sorted(possible[group_id], key=int)
+        selected = choices[0] if len(choices) == 1 else None
+        if len(choices) > 1 or (not choices and uncertain):
+            status, reason = "blocked", "ambiguous_filter_match"
+        elif selected and selected["applied"] and not (selected["visible"] and selected["enabled"]):
+            status, reason = "blocked", "existing_filter_hidden_or_disabled"
+        else:
+            status, reason = ("reuse" if selected else "create"), None
+        results[group_id] = {"status": status, "reason": reason, "exact": exact_rows,
+                             "uncertain_filter_ids": uncertain,
+                             "selected_id": selected["id"] if status == "reuse" else None}
+    return {"groups": results, "existing_parameter_filter_names": sorted(names, key=lambda row: int(row["id"]))}
+
+
 def main(document, args):
     project = document_identity(document)
     check_rules = args.get("check_rules", False)
-    if type(check_rules) is not bool:
-        raise ValueError("The native rule check flag must be true or false.")
+    check_reuse = args.get("check_reuse", False)
+    if type(check_rules) is not bool or type(check_reuse) is not bool or (check_reuse and not check_rules):
+        raise ValueError("Use boolean rule and reuse flags. Reuse checking requires native rule checking.")
     epsilon = args.get("double_epsilon", 1e-9)
     if type(epsilon) not in (int, float) or not 0 < epsilon <= 1e-4:
         raise ValueError("Use a positive numeric double tolerance up to 0.0001 in Revit internal units.")
@@ -259,6 +352,8 @@ def main(document, args):
     if check_rules:
         data["native_rules"] = qualify_rules(document, parameter_id, category_ids, data["rows"], types, missing,
                                              float(epsilon), clock)
+    if check_reuse and data["native_rules"]["status"] == "verified_host_partition":
+        data["existing_filters"] = existing_filter_matches(document, view, data, clock)
     payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(payload) > MAX_BYTES or clock.ElapsedMilliseconds > 10000:
         raise ValueError("The parameter inventory exceeds its size or time budget.")

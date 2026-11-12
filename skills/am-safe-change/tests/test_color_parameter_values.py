@@ -33,6 +33,21 @@ class View:
     UniqueId = "view-31"
     IsTemplate = False
 
+    def __init__(self, applied=()):
+        self.applied = dict(applied)
+
+    def GetOrderedFilters(self):
+        return [ElementId(value) for value in self.applied]
+
+    def GetFilterOverrides(self, identifier):
+        return NS(values={"sample": identifier.Value}, Dispose=lambda: None)
+
+    def GetFilterVisibility(self, identifier):
+        return self.applied[identifier.Value][0]
+
+    def GetIsFilterEnabled(self, identifier):
+        return self.applied[identifier.Value][1]
+
     def AreGraphicsOverridesAllowed(self):
         return True
 
@@ -45,8 +60,8 @@ class Link:
 
 
 class Collector:
-    def __init__(self, document, view_id):
-        assert view_id.Value == 31
+    def __init__(self, document, view_id=None):
+        assert view_id is None or view_id.Value == 31
         self.document = document
 
     @staticmethod
@@ -61,8 +76,7 @@ class Collector:
         return self.document.candidates
 
     def OfClass(self, kind):
-        assert kind is Link
-        return [Link()]
+        return [Link()] if kind is Link else self.document.existing_filters
 
     def Dispose(self):
         self.document.collectors_closed += 1
@@ -82,12 +96,15 @@ def reader(monkeypatch):
     monkeypatch.setitem(sys.modules, "System.Diagnostics", NS(Stopwatch=NS(StartNew=lambda: NS(ElapsedMilliseconds=1))))
     db = NS(ElementId=ElementId, View=View, RevitLinkInstance=Link, FilteredElementCollector=Collector,
             ElementMulticategoryFilter=lambda ids: NS(ids=ids.values, Dispose=lambda: None),
-            ParameterFilterUtilities=NS(GetFilterableParametersInCommon=lambda _doc, _cats: [ElementId(-55)]))
+            ParameterFilterUtilities=NS(GetFilterableParametersInCommon=lambda _doc, _cats: [ElementId(-55)]),
+            LinePatternElement=NS(GetSolidPatternId=lambda: ElementId(-3000001)))
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=db))
     monkeypatch.setitem(sys.modules, "duplicate_views", NS(
         bounded=bounded, document_identity=lambda _doc: {"project_uid": "project-1"},
         identifier=ElementId, key=lambda value: str(value.Value)))
-    monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(native_number=float, rule_signature=lambda rule, *_: dict(rule.signature)))
+    monkeypatch.setitem(sys.modules, "read_view_filter_graphics", NS(native_number=float, rule_signature=lambda rule, *_: dict(rule.signature),
+                                                      graphics=lambda settings, _solid: settings.values,
+                                                      filter_definition=lambda item, *_: {"tree": item.tree}))
     return runpy.run_path(str(SCRIPTS / "read_color_parameter_values.py"))
 
 
@@ -196,13 +213,13 @@ def mock_rules(reader, *, direct_unset=False, inverse_unset=True, applicable=Tru
     return checked, released
 
 
-def qualifying_inventory(reader, candidates, types=(), epsilon=1e-9):
-    values = {31: View()}
+def qualifying_inventory(reader, candidates, types=(), epsilon=1e-9, existing=(), applied=(), reuse=False):
+    values = {31: View(applied)}
     values.update({row.Id.Value: row for row in [*candidates, *types]})
     document = NS(GetElement=lambda identifier: values.get(identifier.Value), collectors_closed=0,
-                  candidates=candidates)
+                  candidates=candidates, existing_filters=existing)
     result = reader["main"](document, {"view_id": "31", "parameter_id": "-55", "category_ids": ["-200"],
-                                       "check_rules": True, "double_epsilon": epsilon})
+                                       "check_rules": True, "check_reuse": reuse, "double_epsilon": epsilon})
     return json.loads(result["inventory_json"])
 
 
@@ -245,3 +262,57 @@ def test_native_applicability_and_missing_values_block_rule_qualification(reader
     assert checked == released == ["equals"]
     result = qualifying_inventory(reader, [candidate(101, None, None)])["native_rules"]
     assert result["reason"] == "missing_parameter" and checked == ["equals"]
+
+
+def existing_filter(identifier, value, *, category=-200, wrapped=False):
+    rule = {"type": "ElementParameterFilter", "inverted": False,
+            "rules": [{"strategy": "equals", "value": value, "epsilon": None}]}
+    tree = {"type": "LogicalAndFilter", "inverted": False, "children": [rule]} if wrapped else rule
+
+    def matches(element):
+        return element.native_value.lower() == value.lower()
+
+    return NS(Id=ElementId(identifier), UniqueId="filter-%d" % identifier, Name="Filter %d" % identifier,
+              tree=tree, GetCategories=lambda: [ElementId(category)],
+              GetElementFilter=lambda: NS(PassesFilter=matches, Dispose=lambda: None))
+
+
+def reuse_by_value(inventory):
+    matches = inventory["existing_filters"]["groups"]
+    return {group["value"]: matches[group["key"]] for group in inventory["native_rules"]["groups"]}
+
+
+def test_reuse_prefers_applied_exact_match_and_checks_all_categories(reader):
+    mock_rules(reader)
+    rows = [candidate(101, parameter("String", "North"), "North"),
+            candidate(102, parameter("String", "South"), "South")]
+    result = qualifying_inventory(reader, rows, existing=[
+        existing_filter(201, "North", wrapped=True), existing_filter(202, "North"),
+        existing_filter(203, "South", category=-201),
+    ], applied=[(201, (True, True))], reuse=True)
+    matches = reuse_by_value(result)
+    assert matches["North"]["status"] == "reuse" and matches["North"]["selected_id"] == "201"
+    assert matches["North"]["exact"][0]["graphics"] == {"sample": 201}
+    assert [row["id"] for row in matches["North"]["exact"]] == ["201", "202"]
+    assert matches["South"]["status"] == "create"
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("duplicate", "ambiguous_filter_match"), ("hidden", "existing_filter_hidden_or_disabled"),
+    ("disabled", "existing_filter_hidden_or_disabled"), ("observed_only", "ambiguous_filter_match"),
+])
+def test_reuse_blocks_ambiguous_hidden_or_unverified_matches(reader, scenario, expected):
+    mock_rules(reader)
+    rows = [candidate(101, parameter("String", "North"), "North")]
+    existing, applied = [existing_filter(201, "North")], []
+    if scenario == "duplicate":
+        existing.append(existing_filter(202, "North"))
+    elif scenario == "observed_only":
+        existing = [existing_filter(201, "NORTH")]
+    else:
+        applied = [(201, (scenario != "hidden", scenario != "disabled"))]
+    match = reuse_by_value(qualifying_inventory(reader, rows, existing=existing, applied=applied,
+                                                reuse=True))["North"]
+    assert match["status"] == "blocked" and match["reason"] == expected and match["selected_id"] is None
+    if scenario == "observed_only":
+        assert match["exact"] == [] and match["uncertain_filter_ids"] == ["201"]
