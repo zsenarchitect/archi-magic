@@ -98,6 +98,15 @@ def test_refresh_retires_only_receipted_pairs_and_reuses_a_freed_cell():
         ("retire", "door", ["31", "32"], 0), ("add", "new", [], 0), ("refresh", "window", ["33", "34"], 1),
     ]
     assert preview["ownership_ids"] == ["25", "31", "32", "33", "34"]
+    assert preview["deletions"] == [
+        {"id": "31", "category": "Legend Components", "name": "Front elevation for type ID 9007199254740993"},
+        {"id": "32", "category": "Text Notes", "name": "Label: A01 | 3 ft × 7 ft"},
+    ]
+    assert PLANNER["approved_plan"](preview, state) == preview
+    incomplete = deepcopy(preview)
+    incomplete["deletions"].pop()
+    with pytest.raises(ValueError, match="approved legend preview"):
+        PLANNER["approved_plan"](incomplete, state)
     with pytest.raises(ValueError, match="verified prior receipt"):
         build(state, {"grid": GRID})
     state["legend"]["text_notes"][1]["text"] = "Edited by hand"
@@ -420,11 +429,16 @@ def test_writer_builds_retires_and_restarts_legend_from_separate_seed(monkeypatc
         added, deleted = set(items) - old_ids, old_ids - set(items)
         changes = {"added": [{"id": value} for value in sorted(added)], "added_count": len(added),
                    "modified": [], "modified_count": 0,
-                   "deleted": [{"id": value} for value in sorted(deleted)], "deleted_count": len(deleted)}
+                   "deleted": sorted(map(int, deleted)), "deleted_count": len(deleted)}
         envelope = {"mode": "modify", "status": "ok", "decision": "committed", "approval": "user",
                     "run_id": "keep-" + tag, "changes": changes, "result": run}
         fresh = {"mode": "query", "status": "ok", "run_id": "read-" + tag,
                  "result": {"status": "ok", "snapshot_json": json.dumps(read(doc, None))}}
+        if deleted:
+            wrong = deepcopy(envelope)
+            wrong["changes"]["deleted"][0] = 987654321
+            with pytest.raises(ValueError, match="differ from the reviewed legend scope"):
+                PLANNER["verify_run"](plan, wrong, fresh, "keep")
         return PLANNER["verify_run"](plan, envelope, fresh, "keep")
 
     receipt = apply_and_verify({"grid": GRID}, "add")

@@ -217,7 +217,7 @@ def build_rows(snapshot, intent, legend, types, pairs, graphics, manual_rects, c
     grid, overrides = intent["grid"], intent.get("labels", {})
     occupied = {pair["slot"] for uid, pair in pairs.items() if uid in types}
     slots = [slot for slot in range(MAX_ROWS) if slot not in occupied]
-    warnings, steps, before, after, ownership = [], [], [], [], set()
+    warnings, steps, before, after, deletions, ownership = [], [], [], [], [], set()
     marks = {}
     for row in types.values():
         if row["type_mark"]:
@@ -232,6 +232,11 @@ def build_rows(snapshot, intent, legend, types, pairs, graphics, manual_rects, c
             existing_ids, old = [], [uid, None, None, None, None]
         if row is None:
             operation, slot, proposed = "retire", prior["slot"], None
+            deletions.extend((
+                {"id": existing_ids[0], "category": "Legend Components",
+                 "name": "Front elevation for type ID %s" % prior["component"]["type_id"]},
+                {"id": existing_ids[1], "category": "Text Notes", "name": u"Label: %s" % prior["note"]["text"]},
+            ))
             new = [uid, None, None, None, None]
         else:
             if prior:
@@ -274,7 +279,7 @@ def build_rows(snapshot, intent, legend, types, pairs, graphics, manual_rects, c
     fields = ["Type UID", "Type ID", "Label", "Cell", "Legend elements", "Action"]
     return {"kind": "change-preview", "recipe": "opening-elevation-legend", "title": "Update door and window legend",
             "columns": fields, "keyColumn": fields[0], "changedColumns": fields[1:], "before": before, "after": after,
-            "steps": steps, "ownership_ids": sorted(ownership, key=int), "warnings": warnings,
+            "steps": steps, "ownership_ids": sorted(ownership, key=int), "warnings": warnings, "deletions": deletions,
             "blocked": any(warning["blocking"] for warning in warnings), "basis": snapshot, "intent": intent,
             "notes": ["Revit must verify the component, note and sheet bounds after regeneration.",
                       "Sheet placements to check: %d." % len(legend["layout"]["sheet_placements"])]}
@@ -340,7 +345,8 @@ def approved_plan(plan, current):
     if plan["basis"] != current:
         raise ValueError("The opening types or legend changed after preview. Read and preview again.")
     checked = build_preview(current, plan["intent"])
-    keys = ("kind", "recipe", "keyColumn", "columns", "changedColumns", "before", "after", "steps", "ownership_ids")
+    keys = ("kind", "recipe", "keyColumn", "columns", "changedColumns", "before", "after",
+            "steps", "ownership_ids", "deletions")
     if checked["blocked"] or not checked["steps"] or any(plan.get(key) != checked[key] for key in keys):
         raise ValueError("Use the approved legend preview with a real change.")
     return checked
@@ -457,7 +463,7 @@ def evidence_ids(changes, field):
     count = changes.get(field + "_count")
     if type(count) is not int or not isinstance(rows, list) or count != len(rows):
         raise ValueError("The runtime element change list is incomplete.")
-    ids = [str(row["id"]) for row in rows]
+    ids = [str(row if field == "deleted" and not isinstance(row, dict) else row["id"]) for row in rows]
     if not all(valid_id(key) for key in ids) or len(set(ids)) != len(ids):
         raise ValueError("The runtime change list contains invalid or repeated IDs.")
     return set(ids)
@@ -474,7 +480,7 @@ def evidence_changes(plan, envelope, receipt):
     steps = plan["steps"]
     expected_added = {expected_pairs[step["type_uid"]][kind]["id"] for step in steps
                       if step["operation"] == "add" for kind in ("component", "note")}
-    expected_deleted = {value for step in steps if step["operation"] == "retire" for value in step["existing_ids"]}
+    expected_deleted = {row["id"] for row in plan["deletions"]}
     approved_modified = {value for step in steps if step["operation"] == "refresh" for value in step["existing_ids"]}
     modified_pairs = set(receipt["modified_pair_ids"])
     viewports = set(receipt["changed_viewport_ids"])
