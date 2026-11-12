@@ -56,6 +56,14 @@ def open_drawing(root, parts):
     if (not parts or parts[-1] in (".", "..") or len(parts) > MAX_PARTS
             or len("/".join(parts)) > MAX_PATH or Path(parts[-1]).suffix.lower() not in SUPPORTED_SUFFIXES):
         raise ValueError("Unsupported drawing path.")
+    depth = 0
+    for part in parts[:-1]:
+        if part == "..":
+            depth -= 1
+        elif part != ".":
+            depth += 1
+        if depth < 0:
+            raise ValueError("The reference is outside the approved root.")
     device = os.fstat(root).st_dev
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     with ExitStack() as handles:
@@ -64,8 +72,6 @@ def open_drawing(root, parts):
             if part == ".":
                 continue
             if part == "..":
-                if len(stack) == 1:
-                    raise ValueError("The reference is outside the approved root.")
                 stack.pop()
                 resolved.pop()
                 continue
