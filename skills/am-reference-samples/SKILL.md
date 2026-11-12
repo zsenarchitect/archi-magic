@@ -23,6 +23,9 @@ Use `scripts/read_opening_types.py` with `run_query` in a saved host project. De
 
 Review missing nominal sizes and any measured variation before choosing a label. A repeated type mark does not combine two types. This query prepares the type list for a legend.
 
+Pass `{"legend_id":"123"}` to compare the inventory with an existing legend. The query reads components and text notes owned by that view. In Revit 2026, `coverage` lists missing and duplicate elevations, elevations of unplaced types, and unresolved directions. For other versions, the report gives raw direction values. Check the direction in Revit before drawing conclusions about coverage.
+
+
 
 ### 2. Run the coverage check first (read only)
 
