@@ -203,6 +203,64 @@ def text_value(value):
     return value
 
 
+def r2000_attribute_owners(records, selected):
+    """Recover owners from native R2000 links when entity owner handles are omitted."""
+    entities = {}
+    for record in records:
+        if "entity" not in record:
+            continue
+        identifier = handle(record["handle"])
+        entities[identifier] = None if identifier in entities else record
+
+    claims = {}
+    budget = 2 * len(records)
+
+    def chain(first, last, owner, entity_kind):
+        nonlocal budget
+        found, seen, previous = [], set(), None
+        current = first
+        while current and current not in seen:
+            budget -= 1
+            if budget < 0:
+                return []
+            record = entities.get(current)
+            if record is None or (previous is not None and absolute_ref(record.get("prev_entity")) != previous):
+                return []
+            if entity_kind == "ATTRIB" and record["entity"] != entity_kind:
+                return []
+            if record["entity"] == entity_kind:
+                direct = absolute_ref(record.get("ownerhandle"))
+                if direct not in (None, 0, owner):
+                    return []
+                found.append(current)
+            if current == last:
+                return found
+            seen.add(current)
+            previous, current = current, absolute_ref(record.get("next_entity"))
+        return []
+
+    for identifier, record in selected.items():
+        if budget < 0:
+            return {}
+        if record.get("object") == "BLOCK_HEADER":
+            first, last = (absolute_ref(record.get(field)) for field in ("first_entity", "last_entity"))
+            kind = "ATTDEF"
+        elif record.get("entity") in {"INSERT", "MINSERT"} and record.get("has_attribs") == 1:
+            ending = entities.get(absolute_ref(record.get("seqend")))
+            if (ending is None or ending.get("entity") != "SEQEND"
+                    or absolute_ref(ending.get("ownerhandle")) != identifier):
+                continue
+            first, last = (absolute_ref(record.get(field)) for field in ("first_attrib", "last_attrib"))
+            kind = "ATTRIB"
+        else:
+            continue
+        if not first or not last:
+            continue
+        for target in chain(first, last, identifier, kind):
+            claims.setdefault(target, set()).add(identifier)
+    return claims if budget >= 0 else {}
+
+
 def dwg_inventory(doc, version, *, graph=False):
     if doc["FILEHEADER"]["version"] != version or doc["created_by"] != "LibreDWG 0.14":
         raise ValueError("Unexpected DWG decoder version or source signature.")
@@ -219,6 +277,7 @@ def dwg_inventory(doc, version, *, graph=False):
                 raise ValueError("Relevant drawing records have duplicate handles.")
             selected[key] = record
 
+    inferred_owners = r2000_attribute_owners(records, selected) if version == "AC1015" else {}
     # DWG stores structural delimiters as entities with layers. DXF iteration
     # omits them, and they do not represent drawn or placed content.
     layer_counts = Counter(
@@ -261,6 +320,11 @@ def dwg_inventory(doc, version, *, graph=False):
         if kind in {"ATTRIB", "ATTDEF"}:
             is_value = kind == "ATTRIB"
             owner_id = absolute_ref(record.get("ownerhandle"))
+            inferred = inferred_owners.get(key, set())
+            if len(inferred) > 1:
+                owner_id = None
+            elif not owner_id and inferred:
+                owner_id = next(iter(inferred))
             owner = selected.get(owner_id, {})
             block_id = absolute_ref(owner.get("block_header")) if is_value else owner_id
             value = record.get("text_value" if is_value else "default_value")
