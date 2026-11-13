@@ -1,8 +1,8 @@
 # Autodesk Marketplace listing decision for Archi Magic
 
-**Proposed decision** · No-go for the current package
+**Decision** · Defer the Autodesk Marketplace listing for the current package
 **Decision owner** · `zsenarchitect`, repository owner
-**Decision status** · Owner confirmation pending
+**Decision status** · Confirmed by the repository owner on 2026-11-13
 **Repository baseline** · `921f04327f9a4fb0f2c71f605066edaa7059f1a0`
 
 Keep the current GitHub and Claude Code distribution. Revisit an Autodesk listing after an accountable publisher, a supported Revit package, and real Revit acceptance evidence are available. This decision covers whether to submit the current package. [Issue #177 and owner direction](https://github.com/zsenarchitect/archi-magic/issues/177)
