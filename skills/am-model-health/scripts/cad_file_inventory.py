@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -17,6 +18,15 @@ FILE_LIMIT = 32 * 1024 * 1024
 LOG_LIMIT = 128 * 1024
 RECORD_LIMIT = 150000
 VERSIONS = {"AC1015", "AC1032"}
+# AutoCAD INSUNITS codes are drawing metadata. The receiving application determines support.
+INSERTION_UNITS = (
+    "Unspecified", "Inches", "Feet", "Miles", "Millimeters", "Centimeters", "Meters", "Kilometers",
+    "Microinches", "Mils", "Yards", "Angstroms", "Nanometers", "Microns", "Decimeters",
+    "Dekameters", "Hectometers", "Gigameters", "Astronomical Units", "Light Years", "Parsecs",
+    "US Survey Feet", "US Survey Inches", "US Survey Yards", "US Survey Miles",
+)
+PATTERN_STANDARDS = ("Imperial", "Metric")
+DRAWING_SETTINGS = {"$INSUNITS": INSERTION_UNITS, "$MEASUREMENT": PATTERN_STANDARDS}
 LAYOUT_PREFIXES = ("*model_space", "*paper_space")
 RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", re.I)
 
@@ -38,7 +48,7 @@ def link_or_reparse(info):
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
 
 
-def snapshot_file(source, snapshot):
+def snapshot_file(source, snapshot, *, limit=FILE_LIMIT):
     info = source.lstat()
     if link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
         raise ValueError("Select an original regular drawing file.")
@@ -47,12 +57,12 @@ def snapshot_file(source, snapshot):
     copied = 0
     with os.fdopen(os.open(source, flags), "rb") as origin, snapshot.open("xb") as target:
         before = os.fstat(origin.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > FILE_LIMIT:
-            raise ValueError("Drawing must be a regular file up to 32 MiB.")
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"The source must be a regular file up to {limit} bytes.")
         while chunk := origin.read(1024 * 1024):
             copied += len(chunk)
-            if copied > FILE_LIMIT:
-                raise ValueError("Drawing exceeds 32 MiB.")
+            if copied > limit:
+                raise ValueError(f"The source exceeds {limit} bytes.")
             digest.update(chunk)
             target.write(chunk)
         after = os.fstat(origin.fileno())
@@ -66,7 +76,7 @@ def snapshot_file(source, snapshot):
     return digest.hexdigest()
 
 
-def run_decoder(args, directory, *, timeout=35):
+def run_decoder(args, directory, *, timeout=35, process_group=False):
     buffers = [bytearray(), bytearray()]
     exceeded = Event()
 
@@ -79,7 +89,8 @@ def run_decoder(args, directory, *, timeout=35):
                 buffer.extend(chunk)
 
     with subprocess.Popen(
-        args, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        args, cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=process_group,
     ) as process:
         threads = [
             Thread(target=drain, args=(pipe, buffer, limit), daemon=True)
@@ -90,12 +101,23 @@ def run_decoder(args, directory, *, timeout=35):
         for thread in threads:
             thread.start()
         deadline = monotonic() + timeout
+        timed_out = False
         try:
-            while process.poll() is None and not exceeded.wait(0.02):
-                if monotonic() >= deadline:
+            while process.poll() is None or (process_group and any(thread.is_alive() for thread in threads)):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
                     raise ValueError("Drawing decoder timed out.")
+                if exceeded.wait(min(remaining, 0.02)):
+                    break
         finally:
-            if process.poll() is None:
+            if process_group and (timed_out or exceeded.is_set() or process.poll() is None
+                                  or any(thread.is_alive() for thread in threads)):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif process.poll() is None:
                 process.kill()
             process.wait()
             for thread in threads:
@@ -181,7 +203,66 @@ def text_value(value):
     return value
 
 
-def dwg_inventory(doc, version):
+def r2000_attribute_owners(records, selected):
+    """Recover owners from native R2000 links when entity owner handles are omitted."""
+    entities = {}
+    for record in records:
+        if "entity" not in record:
+            continue
+        identifier = handle(record["handle"])
+        entities[identifier] = None if identifier in entities else record
+
+    claims = {}
+    conflicts = set()
+    budget = 2 * len(records)
+
+    def chain(first, last, owner, entity_kind):
+        nonlocal budget
+        found, seen, previous = [], set(), None
+        current = first
+        while current and current not in seen:
+            budget -= 1
+            if budget < 0:
+                return []
+            record = entities.get(current)
+            if record is None or (previous is not None and absolute_ref(record.get("prev_entity")) != previous):
+                return []
+            if entity_kind == "ATTRIB" and record["entity"] != entity_kind:
+                return []
+            if record["entity"] == entity_kind:
+                found.append(current)
+            if current == last:
+                if any(absolute_ref(entities[key].get("ownerhandle")) not in (None, 0, owner) for key in found):
+                    conflicts.update(found)
+                    return []
+                return found
+            seen.add(current)
+            previous, current = current, absolute_ref(record.get("next_entity"))
+        return []
+
+    for identifier, record in selected.items():
+        if budget < 0:
+            return {}, conflicts
+        if record.get("object") == "BLOCK_HEADER":
+            first, last = (absolute_ref(record.get(field)) for field in ("first_entity", "last_entity"))
+            kind = "ATTDEF"
+        elif record.get("entity") in {"INSERT", "MINSERT"} and record.get("has_attribs") == 1:
+            ending = entities.get(absolute_ref(record.get("seqend")))
+            if (ending is None or ending.get("entity") != "SEQEND"
+                    or absolute_ref(ending.get("ownerhandle")) != identifier):
+                continue
+            first, last = (absolute_ref(record.get(field)) for field in ("first_attrib", "last_attrib"))
+            kind = "ATTRIB"
+        else:
+            continue
+        if not first or not last:
+            continue
+        for target in chain(first, last, identifier, kind):
+            claims.setdefault(target, set()).add(identifier)
+    return (claims if budget >= 0 else {}), conflicts
+
+
+def dwg_inventory(doc, version, *, graph=False):
     if doc["FILEHEADER"]["version"] != version or doc["created_by"] != "LibreDWG 0.14":
         raise ValueError("Unexpected DWG decoder version or source signature.")
     records = doc["OBJECTS"]
@@ -197,6 +278,7 @@ def dwg_inventory(doc, version):
                 raise ValueError("Relevant drawing records have duplicate handles.")
             selected[key] = record
 
+    inferred_owners, conflicts = r2000_attribute_owners(records, selected) if version == "AC1015" else ({}, set())
     # DWG stores structural delimiters as entities with layers. DXF iteration
     # omits them, and they do not represent drawn or placed content.
     layer_counts = Counter(
@@ -216,24 +298,43 @@ def dwg_inventory(doc, version):
             flagged = bool(record.get("blkisxref") or record.get("xrefoverlaid"))
             path = text_value(record.get("xref_pname", ""))
             if flagged or path:
-                xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
+                row = {"name": name, "path": path, "flags_consistent": bool(path) == flagged}
+                if graph:
+                    attach, overlay = record.get("blkisxref", 0), record.get("xrefoverlaid", 0)
+                    if (type(attach) not in (bool, int) or type(overlay) not in (bool, int)
+                            or attach not in (0, 1) or overlay not in (0, 1)):
+                        row["mode"] = "unknown"
+                    else:
+                        row["mode"] = "overlay" if overlay else "attach" if attach else "unknown"
+                xrefs.append(row)
             elif not name.casefold().startswith(LAYOUT_PREFIXES):
-                blocks[key] = {"name": name, "count": 0, "attributes": [], "definitions": []}
+                blocks[key] = {"name": name, "count": 0, "insert_handles": [], "attributes": [], "definitions": []}
     for key, record in selected.items():
         kind = record.get("entity")
         if kind in {"INSERT", "MINSERT"}:
             ref = absolute_ref(record.get("block_header"))
             if ref in blocks:
                 blocks[ref]["count"] += 1
+                blocks[ref]["insert_handles"].append(key)
             elif selected.get(ref, {}).get("object") != "BLOCK_HEADER":
                 notes.append("Some inserts could not be assigned to a block definition.")
         if kind in {"ATTRIB", "ATTDEF"}:
             is_value = kind == "ATTRIB"
             owner_id = absolute_ref(record.get("ownerhandle"))
+            inferred = inferred_owners.get(key, set())
+            if key in conflicts or len(inferred) > 1:
+                owner_id = None
+            elif not owner_id and inferred:
+                owner_id = next(iter(inferred))
             owner = selected.get(owner_id, {})
             block_id = absolute_ref(owner.get("block_header")) if is_value else owner_id
-            row = {"handle": key, "tag": text_value(record["tag"]), "value": text_value(
-                record.get("text_value" if is_value else "default_value", ""))}
+            value = record.get("text_value" if is_value else "default_value")
+            multiline = record.get("mtext_type") in (2, 4)
+            row = {"handle": key, "tag": text_value(record["tag"]),
+                   "value": text_value(value) if isinstance(value, str) and not multiline else None}
+            if not is_value:
+                flags = record.get("flags")
+                row["constant"] = bool(flags & 2) if type(flags) is int else None
             if block_id in blocks and (not is_value or owner.get("entity") in {"INSERT", "MINSERT"}):
                 row["insert_handle"] = owner_id if is_value else None
                 blocks[block_id]["attributes" if is_value else "definitions"].append(row)
@@ -247,8 +348,14 @@ def dwg_inventory(doc, version):
             "unassociated_attributes": values, "unassociated_definitions": definitions, "notes": notes}
 
 
-def dxf_worker(snapshot):
+def dxf_attribute_text(attribute):
+    value = attribute.plain_mtext() if attribute.has_embedded_mtext_entity else attribute.dxf.text
+    return text_value(value)
+
+
+def dxf_worker(snapshot, *, graph=False):
     import ezdxf
+    from ezdxf.blkrefs import find_unreferenced_blocks
     if ezdxf.__version__ != "1.4.5":
         raise ValueError("Install the qualified ezdxf 1.4.5 reader.")
     doc = ezdxf.readfile(snapshot)
@@ -256,7 +363,8 @@ def dxf_worker(snapshot):
     inserts = defaultdict(list)
     if len(doc.entitydb) > RECORD_LIMIT:
         raise ValueError("Drawing exceeds the supported object limits.")
-    layers, xrefs, blocks = [], [], []
+    layers, xrefs, blocks, purge_candidates = [], [], [], []
+    unreferenced = find_unreferenced_blocks(doc)
     for layout in doc.blocks:
         for entity in layout:
             if entity.dxf.hasattr("layer"):
@@ -266,62 +374,92 @@ def dxf_worker(snapshot):
     for layer in doc.layers:
         name = text_value(layer.dxf.name)
         layers.append({"name": name, "entityCount": counts[name.casefold()],
-                       "color": layer.dxf.color, "linetype": layer.dxf.linetype})
+                       "color": layer.dxf.color, "linetype": layer.dxf.linetype,
+                       "true_color": layer.dxf.get("true_color", None)})
     for layout in doc.blocks:
         entity = layout.block
         name = text_value(layout.name)
         path = text_value(entity.dxf.xref_path)
         flagged = entity.is_xref or entity.is_xref_overlay
         if flagged or path:
-            xrefs.append({"name": name, "path": path, "flags_consistent": bool(path) == flagged})
+            row = {"name": name, "path": path, "flags_consistent": bool(path) == flagged}
+            if graph:
+                row["mode"] = "overlay" if entity.is_xref_overlay else "attach" if entity.is_xref else "unknown"
+            xrefs.append(row)
         elif not entity.is_layout_block:
+            if (layout.name in unreferenced and not name.startswith(("*", "_")) and "|" not in name
+                    and not entity.is_anonymous and not entity.dxf.flags & (entity.EXTERNAL | entity.RESOLVED)):
+                purge_candidates.append({"kind": "block", "name": name})
             instances = inserts.get(name.casefold(), [])
             attributes = [
-                {"tag": text_value(attribute.dxf.tag), "value": text_value(attribute.dxf.text),
+                {"tag": text_value(attribute.dxf.tag), "value": dxf_attribute_text(attribute),
                  "insert_handle": insert.dxf.handle}
                 for insert in instances for attribute in insert.attribs
             ]
             definitions = [
-                {"tag": text_value(attribute.dxf.tag), "value": text_value(attribute.dxf.text)}
+                {"tag": text_value(attribute.dxf.tag), "value": dxf_attribute_text(attribute),
+                 "constant": attribute.is_const}
                 for attribute in layout.query("ATTDEF")
             ]
-            blocks.append({"name": name, "count": len(instances), "attributes": attributes,
-                           "definitions": definitions})
+            blocks.append({"name": name, "count": len(instances),
+                           "insert_handles": [insert.dxf.handle for insert in instances],
+                           "attributes": attributes, "definitions": definitions})
     return {"layers": layers, "xrefs": xrefs, "blocks": blocks,
+            "purge_candidates": sorted(purge_candidates, key=lambda row: row["name"].casefold()),
             "header": {key: doc.header.get(key) for key in ("$INSUNITS", "$MEASUREMENT")},
             "unassociated_attributes": [], "unassociated_definitions": [], "notes": []}
+
+
+def decode_snapshot(snapshot, decoder, *, timeout=None):
+    graph = timeout is not None
+    options = {"timeout": timeout, "process_group": True} if graph else {}
+    if snapshot.suffix == ".dwg":
+        if not decoder or not Path(decoder).is_absolute():
+            raise ValueError("Give the absolute path to the trusted LibreDWG 0.14 dwgread executable.")
+        exe = local_path(decoder)
+        if not exe.is_file():
+            raise ValueError("The selected DWG decoder does not exist.")
+        with snapshot.open("rb") as stream:
+            version = stream.read(6).decode("ascii")
+        if version not in VERSIONS:
+            raise ValueError("The qualified DWG versions are AC1015 and AC1032.")
+        raw, log = run_decoder([str(exe), "-O", "JSON", str(snapshot)], snapshot.parent, **options)
+        result = dwg_inventory(validate_json(raw, dwg=True), version, graph=graph)
+        tool = "LibreDWG 0.14"
+    else:
+        args = [sys.executable, str(Path(__file__).resolve()), "_dxf_worker", str(snapshot)]
+        if graph:
+            args.append("--graph")
+        raw, log = run_decoder(args, snapshot.parent, **options)
+        result = validate_json(raw)
+        tool = "ezdxf 1.4.5"
+    if re.search(rb"^\s*WARN(?:ING)?\b", log, re.M | re.I):
+        result["notes"].append("The drawing decoder reported warnings.")
+    return result, tool
+
+
+def finish_inventory(result, source, digest, tool, *, xref_scope):
+    if any(type(result["header"][field]) is not int or not 0 <= result["header"][field] < len(labels)
+           for field, labels in DRAWING_SETTINGS.items()):
+        result["notes"].append("One or more drawing unit settings were absent or unrecognized.")
+    result["notes"] = list(dict.fromkeys(result["notes"]))
+    result.update(filename=source.name, sha256=digest, decoder=tool, coverage={
+        "xref_scope": xref_scope,
+        "layer_style_policy": "not_assessed",
+        "required_attribute_policy": "not_assessed",
+        "purge_eligibility": "not_assessed",
+        "block_purge_review": "known_dxf_references" if source.suffix.lower() == ".dxf" else "not_assessed",
+    })
+    return result
 
 
 def inspect_drawing(raw_source, decoder):
     source = local_path(raw_source)
     source = source.parent.resolve(strict=True) / source.name
-    suffix = source.suffix.lower()
     with TemporaryDirectory(prefix="archi-cad-") as temporary:
-        work = Path(temporary)
-        snapshot = work / ("drawing" + suffix)
+        snapshot = Path(temporary) / ("drawing" + source.suffix.lower())
         digest = snapshot_file(source, snapshot)
-        if suffix == ".dwg":
-            if not decoder or not Path(decoder).is_absolute():
-                raise ValueError("Give the absolute path to the trusted LibreDWG 0.14 dwgread executable.")
-            exe = local_path(decoder)
-            if not exe.is_file():
-                raise ValueError("The selected DWG decoder does not exist.")
-            with snapshot.open("rb") as stream:
-                version = stream.read(6).decode("ascii")
-            if version not in VERSIONS:
-                raise ValueError("The qualified DWG versions are AC1015 and AC1032.")
-            raw, log = run_decoder([str(exe), "-O", "JSON", str(snapshot)], work)
-            result = dwg_inventory(validate_json(raw, dwg=True), version)
-            tool = "LibreDWG 0.14"
-        else:
-            raw, log = run_decoder([
-                sys.executable, str(Path(__file__).resolve()), "_dxf_worker", str(snapshot),
-            ], work)
-            result = validate_json(raw)
-            tool = "ezdxf 1.4.5"
-        if re.search(rb"^\s*WARN(?:ING)?\b", log, re.M | re.I):
-            result["notes"].append("The drawing decoder reported warnings.")
-
+        result, tool = decode_snapshot(snapshot, decoder)
     for xref in result["xrefs"]:
         status, circular = read_xref_path(xref["path"], source) if xref["flags_consistent"] else (
             "unchecked", False,
@@ -331,22 +469,12 @@ def inspect_drawing(raw_source, decoder):
         result["notes"].append("Nested Xrefs and cycles were not inspected.")
     if any(xref["status"] == "unchecked" for xref in result["xrefs"]):
         result["notes"].append("Some Xref paths were outside the supported local path scope.")
-    if (type(result["header"]["$INSUNITS"]) is not int or not 0 <= result["header"]["$INSUNITS"] <= 7
-            or type(result["header"]["$MEASUREMENT"]) is not int or result["header"]["$MEASUREMENT"] not in (0, 1)):
-        result["notes"].append("One or more drawing unit settings were absent or outside the supported range.")
-    result["notes"] = list(dict.fromkeys(result["notes"]))
-    result.update(filename=source.name, sha256=digest, decoder=tool, coverage={
-        "xref_scope": "drawing_directory_only",
-        "layer_style_policy": "not_assessed",
-        "required_attribute_policy": "not_assessed",
-        "purge_eligibility": "not_assessed",
-    })
-    return result
+    return finish_inventory(result, source, digest, tool, xref_scope="drawing_directory_only")
 
 
-if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "_dxf_worker":
+if __name__ == "__main__" and sys.argv[1:2] == ["_dxf_worker"] and len(sys.argv) in (3, 4):
     try:
-        print(json.dumps(dxf_worker(sys.argv[2]), ensure_ascii=True))
+        print(json.dumps(dxf_worker(sys.argv[2], graph=sys.argv[3:] == ["--graph"]), ensure_ascii=True))
     except ImportError:
         print("Optional ezdxf 1.4.5 not available", file=sys.stderr)
         sys.exit(2)

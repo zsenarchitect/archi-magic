@@ -113,3 +113,12 @@ def test_cli_execution_with_output(tmp_path, non_compliant_cad_drawing):
         data = json.load(f)
     assert data["total_findings"] > 0
     assert data["summary"]["errors"] > 0
+
+
+@pytest.mark.parametrize("raw", [None, True, 2.9, "2.9", 25])
+def test_invalid_insertion_unit_is_unverifiable_against_expectation(raw):
+    findings = check_scale_and_units({"$INSUNITS": raw}, {"$INSUNITS": 2})
+    assert len(findings) == 1
+    assert findings[0]["target"] == "$INSUNITS"
+    assert findings[0]["code"] is None and findings[0]["expected_code"] == 2
+    assert "could not be verified" in findings[0]["message"]
