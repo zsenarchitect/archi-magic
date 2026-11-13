@@ -153,6 +153,8 @@ def test_geometry_pipeline_and_board_retry(case, tmp_path):
     issues = ib.parse_board(plan["final_text"])["issues"]
     assert issues[0] == ib.parse_board(original)["issues"][0]
     assert issues[1]["findings"][1] == "Sampled envelope center shift 50.000 mm."
+    assert issues[1]["findings"][2] == "Host element 1. Linked element 10."
+    assert issues[2]["findings"][2] == "Host element 3. Linked element missing."
     assert all(not item["element_ids"] for item in issues)
     save_board(board, plan["final_text"], ib.saved_document_identity(host))
     repeated = json.loads(invoke(snapshot, review, "--board", board).stdout)
