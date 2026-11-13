@@ -187,8 +187,12 @@ def read_receipt(work, plan, models):
     rows = receipt["rows"]
     if not isinstance(rows, list) or len(rows) != len(models):
         raise ValueError("Receipt does not account for every model.")
+    stopped = False
     for row, model in zip(rows, models):
         status = row["status"]
+        if (status == "not_run") != stopped:
+            raise ValueError("Receipt rows disagree with the host stop after a close failure.")
+        stopped = stopped or status == "close_failed"
         expected_keys = {"id", "sha256", "status"}
         if status in ("audited", "incomplete"):
             expected_keys.add("summary")
