@@ -197,7 +197,12 @@ def dwg_inventory(doc, version):
                 raise ValueError("Relevant drawing records have duplicate handles.")
             selected[key] = record
 
-    layer_counts = Counter(absolute_ref(record.get("layer")) for record in records if "layer" in record)
+    # DWG stores structural delimiters as entities with layers. DXF iteration
+    # omits them, and they do not represent drawn or placed content.
+    layer_counts = Counter(
+        absolute_ref(record["layer"]) for record in records
+        if "layer" in record and record.get("entity") not in {"BLOCK", "ENDBLK", "SEQEND"}
+    )
     layers, xrefs, blocks, notes = [], [], {}, []
     values, definitions = [], []
     for key, record in selected.items():

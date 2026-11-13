@@ -78,6 +78,9 @@ def test_dwg_inventory_uses_absolute_handles_and_retains_orphans():
         "HEADER": {"INSUNITS": 4}, "Template": {"MEASUREMENT": 1},
         "OBJECTS": [
             {"object": "LAYER", "handle": [0, 1, 10], "name": "A-WALL", "color": 3},
+            {"entity": "BLOCK", "handle": [0, 1, 32], "layer": [5, 1, 10, 10]},
+            {"entity": "ENDBLK", "handle": [0, 1, 33], "layer": [5, 1, 10, 10]},
+            {"entity": "SEQEND", "handle": [0, 1, 34], "layer": [5, 1, 10, 10]},
             {"object": "BLOCK_HEADER", "handle": [0, 1, 30], "name": "Title", "is_xref_ref": 1},
             {"object": "BLOCK_HEADER", "handle": [0, 1, 31], "name": "External", "blkisxref": 1,
              "xref_pname": "local.dwg"},
