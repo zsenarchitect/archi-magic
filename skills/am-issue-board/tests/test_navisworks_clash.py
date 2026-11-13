@@ -142,3 +142,198 @@ def test_archive_dedup_is_distinct_from_active_board(inputs, tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
     assert data["skipped_guids"] == [FIRST] and len(data["plan"]["operations"]) == 1
+
+
+def tabular_report(left="ID d'élément: 42", right="9007199254740993", row_class="contentRow"):
+    return f"""<!doctype html><html><body>
+<table class="mainTable">
+<tr class="headerRow">
+<td class="generalHeader" colspan="3"></td><td class="item1HeaderGroup">Elément 1</td>
+<td class="item2HeaderGroup">Elément 2</td></tr>
+<tr class="headerRow">
+<td class="generalHeader" colspan="2">Nom de conflit</td><td class="generalHeader">Etat</td>
+<td class="item1Header">ID d'élément</td><td class="item2Header">ID d'élément</td></tr>
+<tr class="{row_class}">
+<td class="contentCell" colspan="2">Fixture clash</td><td class="contentCell">Nouveau</td>
+<td class="élément1Contenu">{left}</td><td class="élément2Contenu">{right}</td></tr>
+</table></body></html>"""
+
+
+def test_html_tabular_reads_both_explicit_ids_without_guessing_model_or_clash_identity(inputs, tmp_path):
+    _, snapshot, board = inputs
+    source = tmp_path / "tabular.html"
+    source.write_text(tabular_report(), encoding="utf-8")
+    original = board.read_bytes()
+    result = invoke(source, "--snapshot", snapshot, "--board", board)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    row, = data["clashes"]
+    assert data["source_format"] == "html_tabular"
+    assert row["name"] == "Fixture clash" and row["source_status"] == "nouveau"
+    assert row["objects"] == [
+        {"element_id": "42", "selection_path": []},
+        {"element_id": "9007199254740993", "selection_path": []},
+    ]
+    assert row["guid"] is None and row["section_box"] is None and data["plan"] is None
+    assert "Export XML" in data["warnings"][-1]
+    assert board.read_bytes() == original
+
+
+def test_html_ids_require_an_exact_numeric_value_in_the_element_column(tmp_path):
+    source = tmp_path / "invalid-ids.html"
+    source.write_text(tabular_report(left="Element ID: 42, 43", right="Item ID: 42"), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    assert [side["element_id"] for side in json.loads(result.stdout)["clashes"][0]["objects"]] == [None, None]
+
+
+def grouped_tabular_report(rows):
+    return """<html><body><table class="mainTable">
+<tr class="headerRow"><td class="generalHeader" colspan="3"></td>
+<td class="item1HeaderGroup">Item 1</td><td class="item2HeaderGroup">Item 2</td>
+<td class="generalHeader"></td></tr>
+<tr class="headerRow"><td class="generalHeader">Clash Group</td>
+<td class="generalHeader">Clash Name</td><td class="generalHeader">Status</td>
+<td class="item1Header">Item ID</td><td class="item2Header">Item ID</td>
+<td class="generalHeader">Comments</td></tr>
+""" + "".join(rows) + "</table></body></html>"
+
+
+def grouped_tabular_row(kind, name, group="", left="Element ID: 42", right="42"):
+    css = "clashGroupCell" if kind == "clashGroupRow" else "contentCell"
+    second = f'<td class="item2Content">{right}</td>' if right is not None else ""
+    return (f'<tr class="{kind}"><td class="{css}">{group}</td><td class="{css}">{name}</td>'
+            f'<td class="{css}">Active</td><td class="item1Content">{left}</td>'
+            f'{second}<td class="{css}">Fixture comment</td></tr>')
+
+
+def test_grouped_tabular_reads_children_and_preserves_missing_item_scope(tmp_path):
+    source = tmp_path / "grouped.html"
+    source.write_text(grouped_tabular_report([
+        grouped_tabular_row("clashGroupRow", "Group A"),
+        grouped_tabular_row("childRow", "First", "Group A"),
+        grouped_tabular_row("childRowLast", "Second", "Group A", right="Element ID: 43"),
+        grouped_tabular_row("contentRow", "Standalone", right=None),
+        grouped_tabular_row("clashGroupRow", "Group B"),
+    ]), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert [(row["name"], [item["element_id"] for item in row["objects"]]) for row in data["clashes"]] == [
+        ("First", ["42", None]), ("Second", ["42", "43"]), ("Standalone", ["42", None]),
+    ]
+    assert [row.get("source_group") for row in data["clashes"]] == ["Group A", "Group A", None]
+    assert data["warnings"][:2] == [
+        "Skipped 2 group summary rows.",
+        "Some groups have no individual rows. Export Everything to review all clashes.",
+    ]
+    assert data["plan"] is None
+
+
+@pytest.mark.parametrize("rows", [
+    [grouped_tabular_row("childRowLast", "Orphan", "Group A")],
+    [grouped_tabular_row("clashGroupRow", "Group A"), grouped_tabular_row("childRow", "Truncated", "Group A")],
+    [grouped_tabular_row("clashGroupRow", "Group A"), grouped_tabular_row("childRowLast", "Wrong group", "Group B")],
+])
+def test_grouped_tabular_rejects_orphaned_or_incomplete_children(tmp_path, rows):
+    source = tmp_path / "grouped.html"
+    source.write_text(grouped_tabular_report(rows), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout
+
+
+@pytest.mark.parametrize("bad_layout", ["grouped", "wrong_side", "extra_header", "script"])
+def test_unsupported_html_layout_does_not_return_partial_results(tmp_path, bad_layout):
+    source = tmp_path / "unrecognized.html"
+    html = tabular_report()
+    if bad_layout == "grouped":
+        html = tabular_report(row_class="clashGroupRow")
+    elif bad_layout == "wrong_side":
+        html = html.replace('class="élément1Contenu"', 'class="élément2Contenu"')
+    elif bad_layout == "extra_header":
+        html = html.replace('class="item2Header"', 'class="item1Header"')
+    else:
+        html = html.replace("<body>", "<body><script>untrusted()</script>")
+    source.write_text(html, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout
+
+
+def sequential_pair(name, value):
+    return (f'<span class="namevaluepair"><span class="name">{name}</span>'
+            f'<span class="value">{value}</span></span>')
+
+
+def sequential_report(left=None, right=None, side="Item 2", group=""):
+    left = sequential_pair("Element ID", "42") if left is None else left
+    right = sequential_pair("Element ID", "9007199254740993") if right is None else right
+    return ('<html><head><meta charset="utf-8"></head><body><div class="animation">'
+            f'{sequential_pair("Status", "OK")}<div class="viewpoint"><a href="ignored"><img src="ignored"></a>'
+            f'{sequential_pair("Name", "Wall &amp; pipe")}{sequential_pair("Status", "New")}'
+            f'{group}<h4 class="clashobject">Item 1</h4>{left}'
+            f'<h4 class="clashobject">{side}</h4>{right}</div></div></body></html>')
+
+
+def test_sequential_html_reads_item_scoped_ids_without_creating_a_board_plan(inputs, tmp_path):
+    _, snapshot, board = inputs
+    source = tmp_path / "sequential.html"
+    source.write_text(sequential_report(), encoding="utf-8")
+    result = invoke(source, "--snapshot", snapshot, "--board", board)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    row, = data["clashes"]
+    assert data["source_format"] == "html_sequential"
+    assert row["name"] == "Wall & pipe" and row["source_status"] == "new"
+    assert row["objects"] == [{"element_id": "42", "selection_path": []},
+                              {"element_id": "9007199254740993", "selection_path": []}]
+    assert row["guid"] is None and row["section_box"] is None and data["plan"] is None
+    source.write_text(sequential_report(left="", right=sequential_pair("Item ID", "42")), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    row, = json.loads(result.stdout)["clashes"]
+    assert [item["element_id"] for item in row["objects"]] == [None, None]
+
+
+def test_flat_sequential_export_keeps_explicit_clash_group(tmp_path):
+    group = sequential_pair("Clash Group", "Group &amp; A")
+    source = tmp_path / "individual.html"
+    source.write_text(sequential_report(group=group), encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    row, = json.loads(result.stdout)["clashes"]
+    assert row["source_group"] == "Group & A"
+    source.write_text(sequential_report(group=group + group), encoding="utf-8")
+    rejected = invoke(source)
+    assert rejected.returncode == 2 and not rejected.stdout
+
+
+def test_sequential_html_reports_coverage_per_test(tmp_path):
+    prefix, rest = sequential_report().split('<div class="animation">', 1)
+    animation, suffix = rest.rsplit("</div>", 1)
+    sections = [
+        '<div class="animation">' + sequential_pair("Total", str(total)) + animation + "</div>"
+        for total in (29, 1)
+    ]
+    source = tmp_path / "filtered.html"
+    source.write_text(prefix + "".join(sections) + suffix, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert len(data["clashes"]) == 2
+    coverage = [warning for warning in data["warnings"] if warning.startswith("Sequential test")]
+    assert coverage == [
+        "Sequential test 1 reports 29 total clashes and contains 1 individual row. Check the report filters.",
+    ]
+
+
+@pytest.mark.parametrize("html", [
+    sequential_report(side="Item 1"),
+    sequential_report().replace("</body>", ""),
+    sequential_report().replace('<div class="viewpoint">', '<div class="group"><div class="viewpoint">'),
+    sequential_report().replace("</body>", tabular_report() + "</body>"),
+])
+def test_sequential_html_refuses_unsupported_or_incomplete_markup(tmp_path, html):
+    source = tmp_path / "unrecognized.html"
+    source.write_text(html, encoding="utf-8")
+    result = invoke(source)
+    assert result.returncode == 2 and not result.stdout

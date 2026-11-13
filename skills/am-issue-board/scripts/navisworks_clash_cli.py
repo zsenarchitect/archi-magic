@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+from html.parser import HTMLParser
 import io
 import json
 import math
@@ -136,6 +137,355 @@ def parse_report(data):
     if not tests:
         raise ValueError("No Clash Detective test found in this exchange file.")
     return units, report
+
+
+TABULAR_ROWS = {"headerRow", "contentRow", "clashGroupRow", "childRow", "childRowLast"}
+
+
+class TabularReport(HTMLParser):
+    """Read the default Navisworks tabular table as inert text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self.table = None
+        self.row = None
+        self.cell = None
+        self.nodes = 0
+        self.sequential = False
+
+    def handle_decl(self, declaration):
+        if declaration.lower().strip() != "doctype html":
+            raise ValueError("Unexpected HTML declaration.")
+
+    def handle_starttag(self, tag, attrs):
+        self.nodes += 1
+        if self.nodes > 20000 or tag in ("script", "iframe", "object", "embed"):
+            raise ValueError("Unsupported HTML content or structure limit.")
+        fields = dict(attrs)
+        css = fields.get("class", "")
+        if tag == "div" and css == "animation":
+            self.sequential = True
+        if tag == "table":
+            if self.table is not None:
+                raise ValueError("Unexpected nested Navisworks table.")
+            if css == "mainTable":
+                if len(self.tables) >= 100:
+                    raise ValueError("Too many Navisworks tables.")
+                self.table = []
+        elif self.table is not None and tag == "tr":
+            if self.row is not None or css not in TABULAR_ROWS:
+                raise ValueError("Unexpected Navisworks row layout.")
+            if len(self.table) >= 302:
+                raise ValueError("Too many Navisworks table rows.")
+            self.row = (css, [])
+        elif self.table is not None and tag in ("td", "th"):
+            if self.row is None or self.cell is not None or len(self.row[1]) >= 50:
+                raise ValueError("Unexpected Navisworks cell layout.")
+            if fields.get("rowspan", "1") != "1":
+                raise ValueError("Unexpected Navisworks cell span.")
+            raw_span = fields.get("colspan", "1")
+            if not re.fullmatch(r"[1-9][0-9]?", raw_span) or int(raw_span) > 50:
+                raise ValueError("Unexpected Navisworks cell span.")
+            self.cell = (css, int(raw_span), [])
+        elif self.cell is not None and tag == "br":
+            self.cell[2].append(" ")
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell[2].append(data)
+
+    def handle_endtag(self, tag):
+        if self.table is None:
+            return
+        if tag in ("td", "th"):
+            if self.cell is None:
+                raise ValueError("Unexpected Navisworks cell closing tag.")
+            css, span, parts = self.cell
+            self.row[1].append((css, span, " ".join("".join(parts).split())))
+            self.cell = None
+        elif tag == "tr":
+            if self.cell is not None or self.row is None:
+                raise ValueError("Incomplete Navisworks row.")
+            self.table.append(self.row)
+            self.row = None
+        elif tag == "table":
+            if self.row is not None:
+                raise ValueError("Incomplete Navisworks table.")
+            self.tables.append(self.table)
+            self.table = None
+
+
+HTML_LABELS = {
+    "name": {"clash name", "nom de conflit"},
+    "status": {"status", "etat", "état"},
+    "element": {"element id", "id d'élément"},
+}
+HTML_ITEM_CLASSES = ({"item1Content", "élément1Contenu"}, {"item2Content", "élément2Contenu"})
+
+
+def html_element_id(value, *, labelled=False):
+    # An explicitly labelled Element ID column may repeat the label before the value.
+    candidate, labels = re.subn(r"^(?:element id|id d'élément)\s*:\s*", "", value, flags=re.I)
+    if labelled and not labels:
+        return None
+    return candidate if re.fullmatch(r"[1-9][0-9]{0,18}", candidate) and int(candidate) <= 2**63 - 1 else None
+
+
+def tabular_columns(rows):
+    if len(rows) < 2 or [row[0] for row in rows[:2]] != ["headerRow", "headerRow"]:
+        raise ValueError("Expected the default two-level Navisworks table header.")
+    group, columns = rows[0][1], rows[1][1]
+    if sum(cell[1] for cell in group) != sum(cell[1] for cell in columns):
+        raise ValueError("Navisworks header spans disagree.")
+    group_width = {css: span for css, span, _ in group if css in ("item1HeaderGroup", "item2HeaderGroup")}
+    if len(group_width) != 2 or len([cell for cell in group if cell[0] in group_width]) != 2:
+        raise ValueError("The report must identify both Navisworks item groups.")
+    keys = {}
+    expected_cells = []
+    position = 0
+    group_slots = [css for css, span, _ in group for _ in range(span)]
+    for index, (css, span, heading) in enumerate(columns):
+        field = None
+        if css == "generalHeader":
+            if any(slot in group_width for slot in group_slots[position:position + span]):
+                raise ValueError("General and item columns overlap.")
+            expected_cells.append(({"contentCell"}, span))
+            field = next((name for name in ("name", "status") if heading.casefold() in HTML_LABELS[name]), None)
+            if heading.casefold() == "clash group":
+                field = "group"
+        elif css in ("item1Header", "item2Header"):
+            side = int(css[4]) - 1
+            if group_slots[position:position + span] != [css + "Group"] * span:
+                raise ValueError("A Navisworks item column is outside its group.")
+            expected_cells.append((HTML_ITEM_CLASSES[side], span))
+            if heading.casefold() in HTML_LABELS["element"]:
+                field = "element%d" % side
+            elif heading.casefold() == "item id":
+                field = "item%d" % side
+        else:
+            raise ValueError("Unknown Navisworks table column.")
+        if field is not None:
+            if field in keys:
+                raise ValueError("The report repeats a Navisworks field.")
+            keys[field] = index
+        position += span
+    if "name" not in keys:
+        raise ValueError("The report does not identify individual clash rows.")
+    return keys, expected_cells
+
+
+def tabular_cells(cells, expected, row_class):
+    summary = row_class == "clashGroupRow"
+    layout = [({"clashGroupCell"} if summary and classes == {"contentCell"} else classes, span)
+              for classes, span in expected]
+    missing = [set()]
+    if row_class == "contentRow" and len(cells) < len(layout):
+        # A default report can omit an entire unavailable item, while retaining later columns.
+        missing = [{index for index, (allowed, _) in enumerate(layout) if allowed == classes}
+                   for classes in HTML_ITEM_CLASSES]
+    matches = []
+    for omitted in missing:
+        present = [index for index in range(len(layout)) if index not in omitted]
+        if len(cells) == len(present) and all(
+                cell[0] in layout[index][0] and cell[1] == layout[index][1]
+                for cell, index in zip(cells, present)):
+            matches.append(dict(zip(present, cells)))
+    if len(matches) != 1:
+        raise ValueError("Clash row does not match its Navisworks headers.")
+    return matches[0]
+
+
+def tabular_clashes(reader):
+    if reader.table is not None or not reader.tables:
+        raise ValueError("The report is not a complete default Navisworks tabular export.")
+    report = []
+    summaries = 0
+    incomplete_groups = 0
+    for rows in reader.tables:
+        keys, expected = tabular_columns(rows)
+        group_name = None
+        child_started = False
+        for css, cells in rows[2:]:
+            if css == "headerRow":
+                raise ValueError("Unsupported tabular clash row or report size.")
+            summary = css == "clashGroupRow"
+            aligned = tabular_cells(cells, expected, css)
+            selected = {field: text(aligned[index][2]) for field, index in keys.items() if index in aligned}
+            if not selected["name"]:
+                raise ValueError("A clash row does not have a name.")
+            row_group = selected.get("group")
+            if css in ("childRow", "childRowLast"):
+                if group_name is None or ("group" in keys and selected["group"] != group_name):
+                    raise ValueError("A child clash is outside its reported group.")
+                row_group = group_name
+                child_started = css == "childRow"
+                if not child_started:
+                    group_name = None
+            else:
+                if child_started:
+                    raise ValueError("A clash group is missing its final child row.")
+                incomplete_groups += int(group_name is not None)
+                group_name = selected["name"] if summary else None
+            if summary:
+                summaries += 1
+                continue
+            if len(report) >= 300:
+                raise ValueError("Too many individual clashes.")
+            objects = []
+            for side in (0, 1):
+                element_key = "element%d" % side
+                value = (html_element_id(selected[element_key]) if element_key in selected
+                         else html_element_id(selected.get("item%d" % side, ""), labelled=True))
+                objects.append({"element_id": value, "selection_path": []})
+            report.append({"guid": None, "name": selected["name"],
+                           "source_status": selected.get("status", "").casefold(), "source_point": None,
+                           "objects": objects})
+            if row_group:
+                report[-1]["source_group"] = row_group
+        if child_started:
+            raise ValueError("A clash group is missing its final child row.")
+        incomplete_groups += int(group_name is not None)
+    warnings = []
+    if summaries:
+        warnings.append("Skipped %d group summary rows." % summaries)
+    if incomplete_groups:
+        warnings.append("Some groups have no individual rows. Export Everything to review all clashes.")
+    return report, warnings
+
+
+class SequentialReport(HTMLParser):
+    """Read one viewpoint at a time from the default sequential layout."""
+
+    CONTAINER = (("html", ""), ("body", ""), ("div", "animation"))
+    VIEWPOINT = ("div", "viewpoint")
+    PAIR = ("span", "namevaluepair")
+    SIDE = ("h4", "clashobject")
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                 "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.clashes = []
+        self.fields = None
+        self.items = []
+        self.pair = None
+        self.parts = None
+        self.warnings = []
+        self.test_number = 0
+        self.test_start = 0
+        self.test_totals = []
+
+    def handle_starttag(self, tag, attrs):
+        css = dict(attrs).get("class", "")
+        node = (tag, css)
+        parent = tuple(self.stack)
+        viewpoint = self.CONTAINER + (self.VIEWPOINT,)
+        if len(parent) >= 24 or self.parts is not None:
+            raise ValueError("Unsupported nested sequential clash field.")
+        if parent + (node,) == self.CONTAINER:
+            self.test_number += 1
+            self.test_start = len(self.clashes)
+            self.test_totals = []
+        if node == self.VIEWPOINT:
+            if parent != self.CONTAINER:
+                raise ValueError("Unsupported nested sequential report. Export Individual Clashes Only or HTML (Tabular).")
+            if len(self.clashes) >= 300:
+                raise ValueError("Too many individual clashes.")
+            self.fields, self.items = {}, []
+        if parent == viewpoint and node == self.SIDE:
+            self.parts = []
+        if parent in (self.CONTAINER, viewpoint) and node == self.PAIR:
+            self.pair = []
+        if parent in (self.CONTAINER + (self.PAIR,), viewpoint + (self.PAIR,)):
+            if len(self.pair) >= 2 or node != ("span", ("name", "value")[len(self.pair)]):
+                raise ValueError("Unexpected sequential property field.")
+            self.parts = []
+        if tag not in self.VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in self.VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_data(self, data):
+        if self.parts is not None:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1][0] != tag:
+            raise ValueError("Incomplete sequential clash markup.")
+        node = self.stack.pop()
+        parent = tuple(self.stack)
+        viewpoint = self.CONTAINER + (self.VIEWPOINT,)
+        if parent in (self.CONTAINER + (self.PAIR,), viewpoint + (self.PAIR,)):
+            self.pair.append(" ".join("".join(self.parts).split()))
+            self.parts = None
+        elif parent in (self.CONTAINER, viewpoint) and node == self.PAIR:
+            if len(self.pair) != 2:
+                raise ValueError("Incomplete sequential clash property.")
+            label, value = self.pair
+            label = label.casefold()
+            if parent == self.CONTAINER:
+                if label == "total":
+                    self.test_totals.append(value)
+            elif not self.items and label in ("name", "status", "clash group"):
+                if label in self.fields:
+                    raise ValueError("The viewpoint repeats a clash field.")
+                self.fields[label] = text(value)
+            if parent == viewpoint and self.items and label in HTML_LABELS["element"]:
+                if "element_id" in self.items[-1]:
+                    raise ValueError("The item repeats an Element ID.")
+                self.items[-1]["element_id"] = html_element_id(text(value))
+            self.pair = None
+        elif parent == viewpoint and node == self.SIDE:
+            label = " ".join("".join(self.parts).split()).casefold()
+            if len(self.items) >= 2 or label != "item %d" % (len(self.items) + 1):
+                raise ValueError("Expected ordered Item 1 and Item 2 sections.")
+            self.items.append({"selection_path": []})
+            self.parts = None
+        elif parent == self.CONTAINER and node == self.VIEWPOINT:
+            if len(self.items) != 2 or not self.fields.get("name"):
+                raise ValueError("A sequential entry lacks a name or two items. Export Individual Clashes Only with item data.")
+            for item in self.items:
+                item.setdefault("element_id", None)
+            self.clashes.append({"guid": None, "name": self.fields["name"],
+                                 "source_status": self.fields.get("status", "").casefold(),
+                                 "source_point": None, "objects": self.items})
+            if self.fields.get("clash group"):
+                self.clashes[-1]["source_group"] = self.fields["clash group"]
+        elif parent + (node,) == self.CONTAINER and self.test_totals:
+            if len(self.test_totals) != 1 or not re.fullmatch(r"[0-9]{1,9}", self.test_totals[0]):
+                self.warnings.append(f"Sequential test {self.test_number} has an unreadable clash total.")
+            else:
+                declared = int(self.test_totals[0])
+                present = len(self.clashes) - self.test_start
+                if declared != present:
+                    suffix = "" if present == 1 else "s"
+                    self.warnings.append(f"Sequential test {self.test_number} reports {declared} total clashes "
+                                         f"and contains {present} individual row{suffix}. Check the report filters.")
+
+
+def parse_html_report(data):
+    decoded = data.decode("utf-8-sig")
+    if "\0" in decoded or re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", decoded, re.I):
+        raise ValueError("Unexpected HTML declaration.")
+    layout = TabularReport()
+    layout.feed(decoded)
+    layout.close()
+    if not layout.sequential:
+        clashes, warnings = tabular_clashes(layout)
+        return "html_tabular", clashes, warnings
+    if layout.tables or layout.table is not None:
+        raise ValueError("The HTML mixes tabular and sequential layouts.")
+    reader = SequentialReport()
+    reader.feed(decoded)
+    reader.close()
+    if reader.stack or not reader.clashes:
+        raise ValueError("The report is not a complete default sequential Navisworks export.")
+    return "html_sequential", reader.clashes, reader.warnings
 
 
 def point(value):
@@ -277,15 +627,23 @@ def main(argv=None):
     parser.add_argument("--board")
     parser.add_argument("--archive")
     args = parser.parse_args(argv)
+    suffix = Path(args.report).suffix.lower()
+    is_html = suffix in (".html", ".htm")
     try:
-        if Path(args.report).suffix.lower() != ".xml":
-            raise ValueError("Export a Navisworks XML report. HTML requires a separately verified layout.")
+        if suffix != ".xml" and not is_html:
+            raise ValueError("Use a Navisworks XML or default HTML report.")
         if not math.isfinite(args.padding_ft) or not 0.1 <= args.padding_ft <= 20:
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
         raw = local_bytes(args.report)
-        units, clashes = parse_report(raw)
+        source_warnings = []
+        if is_html:
+            source_format, clashes, source_warnings = parse_html_report(raw)
+            units = ""
+        else:
+            source_format = "xml"
+            units, clashes = parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
         host, index = element_snapshot(snapshot) if snapshot is not None else (None, {})
         for row in clashes:
@@ -300,12 +658,16 @@ def main(argv=None):
         plan, skipped = board_preview(args.board, args.archive, clashes) if args.board else (None, [])
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
+            "source_format": source_format,
             "report_sha256": hashlib.sha256(raw).hexdigest(), "source_units": units,
             "snapshot_sha256": hashlib.sha256(snapshot).hexdigest() if snapshot is not None else None,
             "host_id": host, "coordinate_frame": FRAME if host else None,
             "clashes": clashes, "plan": plan, "skipped_guids": skipped,
-            "warnings": ["Archive note not checked for duplicates."] if args.board and not args.archive else [],
+            "warnings": source_warnings + (
+                ["Archive note not checked for duplicates."] if args.board and not args.archive else []),
         }
+        if is_html:
+            report["warnings"].append("HTML review has no mapped clash identity. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)
         if len(encoded) > LIMIT:
             raise ValueError("Preview exceeds the supported size.")
@@ -316,8 +678,8 @@ def main(argv=None):
     except (ValueError, KeyError, TypeError, AttributeError, RecursionError, ET.ParseError, ib.BoardError):
         # Parser and board exceptions may include raw report or model content.
         print("Navisworks intake failed: invalid input, format, identity or limit.", file=sys.stderr)
-        if Path(args.report).suffix.lower() != ".xml":
-            print("Export a Navisworks XML report. HTML is not supported here.", file=sys.stderr)
+        if suffix != ".xml":
+            print("Use a Navisworks XML or a supported default HTML report.", file=sys.stderr)
         return 2
     return 0
 
