@@ -78,13 +78,15 @@ function Read-SavedNote([string]$Path) {
         'revit_context' { 'The session checked Revit availability or context.' }
         default { 'The saved note does not identify the operation.' }
     }
+    $incidentLine = $null
+    if ($incident) { $incidentLine = 'Archi Magic incident: ' + $signals[0] + ' at ' + $incident }
     return [ordered]@{
         activity = $activity
         title = $titles[$signals[0]]
         signals = $signals
         ended_at = $date.ToUniversalTime().ToString('o')
         occurred_at = $incident
-        incident_line = if ($incident) { 'Archi Magic incident: ' + $signals[0] + ' at ' + $incident }
+        incident_line = $incidentLine
         note_sha256 = Get-FeedbackDigest $bytes
     }
 }

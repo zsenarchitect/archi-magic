@@ -585,16 +585,29 @@ def test_document_pages_hold_provenance_and_reject_changed_cursor(tmp_path):
                 return {COOKIE: response.cookies[COOKIE].value}
 
             viewer, outsider = [await login(actor) for actor in ("viewer", "outsider")]
+
+            async def read_page(**kwargs):
+                # Artifact refresh shares the document worker. Retry only its
+                # explicit busy response, never publication failures.
+                for _ in range(20):
+                    response = await client.get(url, headers=HEADERS, cookies=viewer, **kwargs)
+                    if response.status != 503 or response.headers.get("Retry-After") != "2":
+                        return response
+                    await response.read()
+                    await asyncio.sleep(0.05)
+                pytest.fail("The document worker did not become available.")
+
             assert (await client.get(url, headers=HEADERS)).status == 401
             for method in (client.get, client.head):
                 assert (await method(url, headers=HEADERS, cookies=outsider)).status == 404
-            response = await client.get(url, headers=HEADERS, cookies=viewer)
+            response = await read_page()
             assert response.status == 200
             first = await response.json()
             assert first["columns"] == raw["columns"]
             assert first["rows"] == raw["rows"][:50]
             cursor = {"digest": first["digest"], "generation": first["generation"], "index": first["next_index"]}
-            response = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            response = await read_page(params=cursor)
+            assert response.status == 200
             second = await response.json()
             assert second["rows"] == raw["rows"][50:] and second["next_index"] is None
 
@@ -608,14 +621,16 @@ def test_document_pages_hold_provenance_and_reject_changed_cursor(tmp_path):
             original = path.read_bytes()
             path.unlink()
             path.symlink_to("elsewhere.json")
-            stale = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            stale = await read_page(params=cursor)
+            assert stale.status == 200
             assert (await stale.json())["freshness"] == "stale"
             path.unlink()
             path.write_bytes(original)
             publish(project["root"], slot, 2, {**raw, "rows": raw["rows"][1:]})
-            response = await client.get(url, headers=HEADERS, cookies=viewer, params=cursor)
+            response = await read_page(params=cursor)
             assert response.status == 409
-            current = await client.get(url, headers=HEADERS, cookies=viewer)
+            current = await read_page()
+            assert current.status == 200
             assert (await current.json())["rows"] == raw["rows"][1:51]
 
     asyncio.run(exercise())
