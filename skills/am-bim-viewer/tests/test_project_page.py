@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(HERE, "..", "scripts")
 sys.path.insert(0, SCRIPTS)
@@ -52,15 +54,21 @@ def test_preview_shows_change_and_gate():
     assert "Keep/Discard" in out
 
 
-def test_page_has_no_network_and_cli_works(tmp_path):
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
+def test_page_has_no_network_and_cli_works(tmp_path, encoding):
     a = tmp_path / "a.json"
-    a.write_text(json.dumps(AUDIT), encoding="utf-8")
+    a.write_text(json.dumps(AUDIT), encoding=encoding)
+    preview = tmp_path / "preview.json"
+    preview.write_text(json.dumps(PREVIEW), encoding=encoding)
     out = tmp_path / "p.html"
     r = subprocess.run(
-        [sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", str(a), "--out", str(out)],
+        [sys.executable, os.path.join(SCRIPTS, "project_page.py"), "--audit", str(a),
+         "--preview", str(preview), "--out", str(out)],
         capture_output=True, text=True,
     )
     assert r.returncode == 0, r.stderr
     page = out.read_text(encoding="utf-8")
     assert "http://" not in page and "https://" not in page
     assert "default-src 'none'" in page
+    assert "<td>R2</td>" in page
+    assert "<del>A1</del>" in page
