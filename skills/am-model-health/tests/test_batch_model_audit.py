@@ -33,9 +33,11 @@ def batch(tmp_path):
     return root, workspace, plan_path, json.loads(result.stdout)
 
 
-def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False):
+def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False,
+              extra_document_at=None):
     events = []
     documents = []
+    extra_document = object()
 
     class Document:
         IsFamilyDocument = IsWorkshared = IsModelInCloud = IsModified = False
@@ -54,6 +56,8 @@ def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False
         events.append(("open", Path(path).name))
         doc = Document(path)
         documents.append(doc)
+        if extra_document_at == "open":
+            documents.append(extra_document)
         return doc
 
     app = SimpleNamespace(Documents=documents, VersionNumber="2026", VersionBuild="26.3.0.37",
@@ -71,6 +75,8 @@ def fake_host(monkeypatch, *, close_fails=False, workshared=False, partial=False
         assert doc in documents and running_app is app and inputs["max_ids"] == 1
         if b"am-model-health:" in script:
             events.append(("audit", "health"))
+            if extra_document_at == "health":
+                documents.append(extra_document)
             return {"metrics": [{"id": "warnings", "status": "warn"}],
                     "cad_view_count": {"partial": partial}}
         assert b"am-param-qa:" in script
@@ -160,6 +166,23 @@ def test_close_failure_stops_other_models(batch, monkeypatch):
         "close_failed", "not_run", "not_run", "not_run", "not_run",
     ]
     assert events.count(("close", False)) == 1
+
+
+@pytest.mark.parametrize("extra_document_at", ["open", "health"])
+def test_extra_document_stops_audits_and_leaves_other_document_open(batch, monkeypatch, extra_document_at):
+    _, work, plan, _ = batch
+    ui, db, events = fake_host(monkeypatch, extra_document_at=extra_document_at)
+    host.host_run(ui, db, "7.0.0.26278+2233", str(work))
+
+    result = collect(plan)
+    assert result.returncode == 1
+    assert [row["status"] for row in json.loads(result.stdout)["models"]] == [
+        "close_failed", "not_run", "not_run", "not_run", "not_run",
+    ]
+    expected_audits = [("audit", "health")] if extra_document_at == "health" else []
+    assert [event for event in events if event[0] == "audit"] == expected_audits
+    assert events.count(("close", False)) == 1
+    assert len(ui.Application.Documents) == 1
 
 
 def test_workshared_preflight_never_opens_a_model(batch, monkeypatch):
