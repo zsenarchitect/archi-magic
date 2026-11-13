@@ -106,6 +106,45 @@ def test_real_pdf_preview_confirmation_and_stale_input(spec):
     assert stale.returncode == 2 and not stale.stdout and "exact preview bytes" in stale.stderr
 
 
+def test_confirms_fractional_dimensions_from_pdf_cells(spec):
+    pdf, mapping, preview, decisions = spec
+    def write_specification(width):
+        writer = PdfWriter()
+        draw_table(writer, [("Dimension", "Value"), ("Width", width), ("Depth", "3/4 ft"),
+                            ("Height", "1 1/8 in")])
+        draw_table(writer, [("Property", "Value"), ("Service connection", "DN25"), ("Product code", "Demo-1")])
+        writer.write(pdf)
+
+    write_specification('24-1/2"')
+    mapping_data = json.loads(mapping.read_text())
+    mapping_data["fields"][1]["unit"] = "ft"
+    write_json(mapping, mapping_data)
+
+    result = run("preview", pdf, "--mapping", mapping)
+    assert result.returncode == 0, result.stderr
+    preview.write_text(result.stdout)
+    assert [row["extracted_text"] for row in json.loads(result.stdout)["rows"][:3]] == [
+        '24-1/2"', "3/4 ft", "1 1/8 in",
+    ]
+    draft = run("template", "--preview", preview)
+    assert draft.returncode == 0, draft.stderr
+    reviewed = json.loads(draft.stdout)
+    for choice in reviewed["decisions"]:
+        choice["action"] = "accept"
+    write_json(decisions, reviewed)
+
+    result = run("confirm", pdf, "--mapping", mapping, "--preview", preview, "--decisions", decisions)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["dimensions_mm"] == {
+        "width": "622.3", "depth": "228.6", "height": "28.575",
+    }
+
+    for invalid_width in ('24--1/2"', "1/0 in", "24 3/2 in"):
+        write_specification(invalid_width)
+        failed = run("preview", pdf, "--mapping", mapping)
+        assert failed.returncode == 2 and not failed.stdout and "width:" in failed.stderr
+
+
 @pytest.mark.parametrize("change,message", [
     ("missing_unit", "explicit source unit"),
     ("conflict", "conflicts"),

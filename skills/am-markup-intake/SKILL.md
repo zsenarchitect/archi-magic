@@ -178,7 +178,7 @@ Exit code 0 means extraction worked or the inputs match. Exit code 1 means the c
 
 Run this workflow on your own computer. Keep the PDF and output files private. Use the same local document requirements as the schedule comparison. The PDF must have a selectable-text table. Choose one product variant. Find the exact table cells that describe it.
 
-1. Make a mapping JSON file. Give each field a one-based page, table, row and column. Count the header as a row. Supply the source unit for a number whose label has the unit. Length units are mm, cm, m, in and ft. Use one decimal number per cell.
+1. Make a mapping JSON file. Give each field a one-based page, table, row and column. Count the header as a row. Supply the source unit for a number whose label has the unit. Length units are mm, cm, m, in and ft. Use one decimal or fractional length per cell. The parser accepts inch and foot marks.
 2. Map width, depth and height. Also map a connector field, such as connector_service, or all six clearance sides. The sides are clearance_left, clearance_right, clearance_front, clearance_back, clearance_below and clearance_above. Enter each side as its own nonnegative offset from the equipment face. A zero offset must come from the mapped source. Additional product fields start with parameter_.
 3. Generate and inspect the preview and decision template. Show the numbered rows as a table with field, PDF cell, extracted text and confirmed units. Compare each row with the original PDF. To correct a field, fix its mapping and generate a new preview. Set each decision action to "accept" only after checking that row. Keep the decision order.
 
