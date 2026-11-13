@@ -8,15 +8,15 @@ Demand rating reflects cumulative user reviews from similar commercial and free 
 
 ## 1. Executive Summary & Delivery Status
 
-GitHub issue states checked on 2026-11-12. Open issues may already have components on main. The totals cover the 60 marketplace and platform entries below.
+GitHub issue states checked on 2026-11-13. Open issues may already have components on main. The totals cover the 60 marketplace and platform entries below.
 
 | Wave or tier | Tracked | Closed on GitHub | Open on GitHub |
 |---|---:|---:|---:|
 | Platform epics (#179–#188) | 10 | 6 | 4 |
 | P1 (#128–#137) | 10 | 9 | 1 |
 | P2 (#138–#157) | 20 | 1 | 19 |
-| P3 (#158–#177) | 20 | 5 | 15 |
-| **Total** | **60** | **21** | **39** |
+| P3 (#158–#177) | 20 | 6 | 14 |
+| **Total** | **60** | **22** | **38** |
 
 
 ---
@@ -105,4 +105,4 @@ GitHub issue states checked on 2026-11-12. Open issues may already have componen
 | #174 | Batch process many models | 40 | `am-doctor` | Open | Batch audit merged in PR #215. Five-model native run pending. |
 | #175 | Modelling effort log from journals | 50 | `am-doctor` | Closed | Journal parser |
 | #176 | Revit backup file cleanup | 17 | `am-doctor` | Closed | `scripts/cleanup_backups.py`, scan, archive, delete, test suite |
-| #177 | Positioning: list archi-magic as MCP app on Autodesk store | 54 | Docs / Distribution | Open | Owner decision pending. See the [decision proposal](../decisions/2026-11-09-autodesk-marketplace.md). |
+| #177 | Positioning: list archi-magic as MCP app on Autodesk store | 54 | Docs / Distribution | Closed | Owner deferred listing the current package. See the [decision record](../decisions/2026-11-09-autodesk-marketplace.md). |
