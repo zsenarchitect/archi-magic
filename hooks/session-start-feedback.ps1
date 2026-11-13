@@ -1,33 +1,20 @@
 <#
 .SYNOPSIS
-  archi-magic SessionStart hook: show a saved session-end feedback note, once.
+  Expose pending feedback privately at SessionStart. Leave unrelated sessions quiet.
 
 .DESCRIPTION
-  The SessionEnd hook (hooks/session-end-feedback.ps1) saves one small JSON
-  note to %LOCALAPPDATA%\archi-magic\session-feedback.json when a session ends
-  with trouble (Revit connection errors, failed tool calls, the user saying
-  something is broken). This hook reads that note at the next session start
-  and shows it once, then deletes it.
-
-  Why a second hook: Claude Code discards a SessionEnd hook's JSON output
-  (systemMessage included), so the SessionEnd hook cannot tell the user
-  anything itself. A SessionStart hook can: its systemMessage is shown to the
-  user, and its additionalContext reaches the agent, which is alive again and
-  can file the issue if the user says yes.
-
-  Output: nothing when there is no note. With a note, one JSON object:
-  systemMessage (shown to the user: what went wrong, the offer to file it)
-  and additionalContext (for the agent: the signals, the suggested title and
-  body draft, the rule to file only if the user says yes).
-
-  Never blocks a session: always exit 0. Every failure goes to the shared
-  archi-magic log. Opt out: set ARCHI_MAGIC_NO_FEEDBACK_NUDGE=1 (a saved
-  note is deleted).
-
-  Test parameters: -FeedbackFile.
+  With no switch, give the agent a static notice. Do not show a user message or
+  consume the note. The am-feedback skill reads it only for relevant feedback.
+  -Read prints the sanitized note and its digest. -Claim consumes only the
+  matching note, after the GitHub duplicate check and before the one offer.
+  Claim uses a same-directory rename so two sessions cannot offer the same note.
+  A local receipt keeps the same timed incident or identical legacy note quiet.
+  The SessionStart path never contacts GitHub and always exits 0.
 #>
 param(
-    [string]$FeedbackFile = ''
+    [string]$FeedbackFile = '',
+    [switch]$Read,
+    [string]$Claim = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -39,48 +26,132 @@ function Write-Log([string]$Level, [string]$Message, [hashtable]$Data) {
     } catch { }
 }
 
+function Get-FeedbackDigest([byte[]]$Bytes) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($hash.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+}
+
+function Get-ReceiptPath([string]$Path, $Note) {
+    $key = $Note.note_sha256
+    if ($Note.incident_line) {
+        $key = Get-FeedbackDigest ([Text.Encoding]::UTF8.GetBytes($Note.incident_line))
+    }
+    return "$Path.seen-$key"
+}
+
+function Register-Incident([string]$ReceiptPath) {
+    try {
+        $stream = [IO.File]::Open($ReceiptPath, [IO.FileMode]::CreateNew)
+    } catch [IO.IOException] {
+        if ([IO.File]::Exists($ReceiptPath)) { return $false }
+        throw
+    }
+    $stream.Dispose()
+    return $true
+}
+
+function Read-SavedNote([string]$Path) {
+    if ((Get-Item -LiteralPath $Path).Length -gt 65536) { throw 'Feedback note exceeds 64 KiB.' }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -gt 65536) { throw 'Feedback note exceeds 64 KiB.' }
+    $raw = [Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xfeff)
+    $note = $raw | ConvertFrom-Json
+    $titles = [ordered]@{
+        pipe_error = 'Revit connection dropped (pipe_error)'
+        revit_busy = 'Revit was busy (revit_busy) and blocked the session'
+        no_instances_found = 'No Revit instances found'
+        tool_failed = 'A tool call failed'
+        user_reported_broken = 'Something felt broken in the session'
+    }
+    $signals = @($titles.Keys | Where-Object { @($note.signals) -ccontains $_ })
+    if ($signals.Count -eq 0 -or -not $note.ended_at) { throw 'Feedback signal or date is missing.' }
+    $date = [DateTimeOffset]$note.ended_at
+    $incident = $null
+    if ($note.occurred_at) {
+        $occurred = [DateTimeOffset]$note.occurred_at
+        $incident = $occurred.ToUniversalTime().ToString('o')
+    }
+    $activity = switch -CaseSensitive ([string]$note.activity) {
+        'revit_query' { 'The session tried a read-only Revit query.' }
+        'revit_modify' { 'The session tried a Revit modification.' }
+        'revit_context' { 'The session checked Revit availability or context.' }
+        default { 'The saved note does not identify the operation.' }
+    }
+    $incidentLine = $null
+    if ($incident) { $incidentLine = 'Archi Magic incident: ' + $signals[0] + ' at ' + $incident }
+    return [ordered]@{
+        activity = $activity
+        title = $titles[$signals[0]]
+        signals = $signals
+        ended_at = $date.ToUniversalTime().ToString('o')
+        occurred_at = $incident
+        incident_line = $incidentLine
+        note_sha256 = Get-FeedbackDigest $bytes
+    }
+}
+
+function Write-Json($Record) {
+    [Console]::Out.Write(($Record | ConvertTo-Json -Compress -Depth 4))
+}
+
 try {
+    if ($Read -and $Claim) { throw 'Use either Read or Claim.' }
+    if ($Claim -and $Claim -cnotmatch '^[0-9a-f]{64}$') { throw 'Use the exact SHA-256 returned by Read.' }
     if (-not $FeedbackFile) {
         $base = $env:LOCALAPPDATA
-        if (-not $base) { $base = Join-Path $env:USERPROFILE 'AppData\Local' }
+        if (-not $base -and $env:USERPROFILE) { $base = Join-Path $env:USERPROFILE 'AppData\Local' }
         if (-not $base) { exit 0 }
         $FeedbackFile = Join-Path $base 'archi-magic\session-feedback.json'
     }
-    if (-not (Test-Path -LiteralPath $FeedbackFile)) { exit 0 }
+    if (-not (Test-Path -LiteralPath $FeedbackFile -PathType Leaf)) { exit 0 }
     if ($env:ARCHI_MAGIC_NO_FEEDBACK_NUDGE -eq '1') {
-        try { Remove-Item -Force -LiteralPath $FeedbackFile } catch { }
+        Remove-Item -Force -LiteralPath $FeedbackFile
         exit 0
     }
 
-    $note = $null
-    try { $note = [IO.File]::ReadAllText($FeedbackFile) | ConvertFrom-Json } catch { }
-    # Consume once: delete even when the note is unreadable, so a bad file
-    # cannot nag at every session start.
-    try { Remove-Item -Force -LiteralPath $FeedbackFile } catch { Write-Log 'warn' 'Feedback note not deleted' $null }
-    if ($null -eq $note -or -not $note.title) {
-        Write-Log 'warn' 'Feedback note unreadable; deleted' $null
+    if ($Claim) {
+        $claimed = $FeedbackFile + '.claim-' + [Guid]::NewGuid().ToString('N')
+        [IO.File]::Move($FeedbackFile, $claimed)
+        $consumed = $false
+        $offer = $false
+        try {
+            $note = Read-SavedNote $claimed
+            if ($note.note_sha256 -ceq $Claim) {
+                $receipt = Get-ReceiptPath $FeedbackFile $note
+                $offer = Register-Incident $receipt
+                $consumed = $true
+            }
+        } finally {
+            if ($consumed) {
+                [IO.File]::Delete($claimed)
+            } else {
+                try { [IO.File]::Move($claimed, $FeedbackFile) }
+                catch { Write-Log 'warn' 'Feedback claim could not be restored; retained a local recovery file' $null }
+            }
+        }
+        if ($offer) {
+            Write-Json @{ status = 'claimed'; note_sha256 = $Claim }
+            Write-Log 'info' 'Feedback note claimed' $null
+        }
         exit 0
     }
 
-    $signals = ''
-    if ($note.signals) { $signals = (@($note.signals) -join ', ') }
-    $user = "Last session hit a problem: $($note.title). " +
-            'Want to file it as a GitHub issue on archi-magic? ' +
-            "Suggested title: $($note.title). Say yes and I will draft it with you."
-    $ctx = "A previous archi-magic session ended with trouble. Signals: $signals. " +
-           "Suggested issue title: $($note.title). " +
-           "Suggested body draft: $($note.body) " +
-           "Session ended (UTC): $($note.ended_at). Transcript: $($note.transcript) " +
-           'Offer once: ask the user if they want to file it as a GitHub issue on zsenarchitect/archi-magic. ' +
-           'File it only if the user says yes. Route: gh issue create --repo zsenarchitect/archi-magic --title "<title>" --body "<body>". ' +
-           'Never file it without the user saying yes. If the user says no, drop it.'
-    $out = [ordered]@{
-        systemMessage      = $user
-        hookSpecificOutput = [ordered]@{ hookEventName = 'SessionStart'; additionalContext = $ctx }
+    $note = Read-SavedNote $FeedbackFile
+    $receipt = Get-ReceiptPath $FeedbackFile $note
+    if ([IO.File]::Exists($receipt)) { exit 0 }
+    if ($Read) {
+        Write-Json $note
+        exit 0
     }
-    [Console]::Out.Write((New-Object PSObject -Property $out | ConvertTo-Json -Compress -Depth 3))
-    Write-Log 'info' 'Feedback note shown' @{ signals = $signals }
+
+    Write-Json @{
+        hookSpecificOutput = @{
+            hookEventName = 'SessionStart'
+            additionalContext = 'A local archi-magic feedback note is pending. Leave it alone in unrelated sessions. If the user brings up that same incident or asks for feedback about it, follow the Saved session feedback section of am-feedback. Do not ask a filing question at session start.'
+        }
+    }
 } catch {
-    Write-Log 'error' ('Feedback note not shown: ' + $_.Exception.Message) $null
+    Write-Log 'warn' ('Feedback note not used: ' + $_.Exception.Message) $null
 }
 exit 0

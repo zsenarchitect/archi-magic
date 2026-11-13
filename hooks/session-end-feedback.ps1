@@ -7,7 +7,7 @@
   transcript (transcript_path from the hook input JSON on stdin) and looks for
   a small explicit list of failure signals only:
     - Revit connection errors: revit_busy, pipe_error, no instances found.
-    - Tool failures: a tool result with is_error true, or invalid_params.
+    - Tool failures: is_error true or invalid_params, excluding known unrelated tools.
     - The user saying something is broken or wrong.
   A retry is covered by the failure signal: a retry always follows a failure.
 
@@ -18,8 +18,8 @@
   %LOCALAPPDATA%\archi-magic\session-feedback.json (override with
   -FeedbackFile; test use only). It prints nothing: Claude Code discards a
   SessionEnd hook's JSON output (systemMessage included), so the note is shown
-  by the SessionStart hook (hooks/session-start-feedback.ps1) at the next
-  session start, once, and then it is deleted. Nothing is ever filed
+  privately by the SessionStart hook (hooks/session-start-feedback.ps1).
+  The feedback workflow claims it only when relevant. Nothing is ever filed
   automatically.
 
   Speed: a SessionEnd hook from a plugin gets about 1.5 seconds (the plugin
@@ -81,7 +81,71 @@ try {
 
     # One pass over the tail lines. -match is case-insensitive by default.
     $found = New-Object System.Collections.Generic.List[string]
+    $toolActivities = @{}
+    $failureActivities = @{}
+    $failureTimes = @{}
     foreach ($line in ($tail -split "`r?`n")) {
+        if ($line -match 'note_sha256.{0,12}[0-9a-f]{64}') { continue }
+        if ($line -match '"type"\s*:\s*"tool_(use|result)"') {
+            $hasToolBlocks = $false
+            $event = $null
+            try { $event = $line | ConvertFrom-Json } catch { }
+            foreach ($block in @($event.message.content)) {
+                if ($block.type -eq 'tool_use' -and $block.id) {
+                    $hasToolBlocks = $true
+                    switch -Regex ([string]$block.name) {
+                        '^(mcp__pyrevit__)?run_query$' { $toolActivities[$block.id] = 'revit_query' }
+                        '^(mcp__pyrevit__)?run_modify$' { $toolActivities[$block.id] = 'revit_modify' }
+                        '^(mcp__pyrevit__)?(get_context|list_revit_instances)$' { $toolActivities[$block.id] = 'revit_context' }
+                        default {
+                            if ([string]$block.name -notmatch '^mcp__pyrevit__') {
+                                $toolActivities[$block.id] = 'unrelated'
+                            }
+                        }
+                    }
+                } elseif ($block.type -eq 'tool_result') {
+                    $hasToolBlocks = $true
+                    $activity = if ($block.tool_use_id) { $toolActivities[$block.tool_use_id] }
+                    if ($activity -eq 'unrelated') { continue }
+                    $content = $block.content | ConvertTo-Json -Compress -Depth 4
+                    $stamp = [DateTimeOffset]::MinValue
+                    $timestamp = $event.timestamp
+                    if ($timestamp -is [DateTime] -and $timestamp.Kind -ne [DateTimeKind]::Unspecified) {
+                        $stamp = [DateTimeOffset]$timestamp
+                    } elseif ($timestamp -is [DateTimeOffset]) {
+                        $stamp = $timestamp
+                    } elseif ($timestamp -is [string] -and $timestamp -match '(Z|[+-][0-9]{2}:[0-9]{2})$') {
+                        [void][DateTimeOffset]::TryParse($timestamp, [ref]$stamp)
+                    }
+                    $matched = @(
+                        if ($content -match 'pipe_error') { 'pipe_error' }
+                        if ($content -match 'revit_busy') { 'revit_busy' }
+                        if ($content -match 'no instances found') { 'no_instances_found' }
+                        if ($block.is_error -eq $true -or $content -match 'invalid_params') { 'tool_failed' }
+                    )
+                    foreach ($signal in $matched) {
+                        if (-not $found.Contains($signal)) { $found.Add($signal) }
+                        if ($stamp -ne [DateTimeOffset]::MinValue -and
+                            (-not $failureTimes.ContainsKey($signal) -or $stamp -gt $failureTimes[$signal])) {
+                            $failureTimes[$signal] = $stamp
+                            $failureActivities[$signal] = $activity
+                        } elseif (-not $failureTimes.ContainsKey($signal) -and $activity) {
+                            $failureActivities[$signal] = $activity
+                        }
+                    }
+                }
+            }
+            if ($hasToolBlocks) {
+                $userText = @($event.message.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text })
+                if ($event.message.role -eq 'user' -and
+                    ($userText -match '\bbroken\b|\bwrong\b|\bbug\b|crash|doesn''t work|does not work|not working') -and
+                    -not $found.Contains('user_reported_broken')) { $found.Add('user_reported_broken') }
+                continue
+            }
+        }
+        # Assistant prose can recap a previously filed error. Only tool results
+        # above can identify a new incident in a structured assistant message.
+        if ($line -match '"role"\s*:\s*"assistant"') { continue }
         if (($line -match 'revit_busy') -and -not $found.Contains('revit_busy')) { $found.Add('revit_busy') }
         if (($line -match 'pipe_error') -and -not $found.Contains('pipe_error')) { $found.Add('pipe_error') }
         if (($line -match 'no instances found') -and -not $found.Contains('no_instances_found')) { $found.Add('no_instances_found') }
@@ -90,18 +154,22 @@ try {
     }
     if ($found.Count -eq 0) { exit 0 }
 
-    # Suggested title: the strongest signal first.
-    $title = ''
-    if ($found.Contains('pipe_error')) { $title = 'Revit connection dropped (pipe_error)' }
-    elseif ($found.Contains('revit_busy')) { $title = 'Revit was busy (revit_busy) and blocked the session' }
-    elseif ($found.Contains('no_instances_found')) { $title = 'No Revit instances found' }
-    elseif ($found.Contains('tool_failed')) { $title = 'A tool call failed' }
-    else { $title = 'Something felt broken in the session' }
+    $titles = [ordered]@{
+        pipe_error = 'Revit connection dropped (pipe_error)'
+        revit_busy = 'Revit was busy (revit_busy) and blocked the session'
+        no_instances_found = 'No Revit instances found'
+        tool_failed = 'A tool call failed'
+        user_reported_broken = 'Something felt broken in the session'
+    }
+    $primary = @($titles.Keys | Where-Object { $found.Contains($_) })[0]
+    $title = $titles[$primary]
+    $activity = $failureActivities[$primary]
+    if (-not $activity) { $activity = 'unknown' }
 
     $when = (Get-Date).ToUniversalTime().ToString('o')
+    $incident = if ($failureTimes.ContainsKey($primary)) { $failureTimes[$primary].ToUniversalTime().ToString('o') }
     $body = "Signals seen at the end of the session: " + ($found -join ', ') + ".`n" +
             "Session ended (UTC): $when.`n" +
-            "What were you doing when it happened? Add one line before you file.`n" +
             "File it at https://github.com/zsenarchitect/archi-magic/issues/new or with: gh issue create --repo zsenarchitect/archi-magic --title `"$title`""
 
     if (-not $FeedbackFile) {
@@ -112,10 +180,12 @@ try {
     }
     $note = [ordered]@{
         signals    = @($found)
+        activity   = $activity
         title      = $title
         body       = $body
         session_id = $sessionId
         ended_at   = $when
+        occurred_at = $incident
         transcript = $TranscriptPath
     }
     try {
