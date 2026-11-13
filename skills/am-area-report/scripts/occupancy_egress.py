@@ -150,6 +150,8 @@ def review_widths(criteria, rooms, floors):
     segments = {}
     for item in rows(criteria["segments"], 1000):
         segment_id = identifier(item["id"])
+        if segment_id in rooms:
+            raise ReviewError("An egress segment ID belongs to a room in the reviewed snapshot.")
         if segment_id in segments or item["kind"] not in ("door", "stair"):
             raise ReviewError("Duplicate segment ID or unsupported segment kind.")
         measurement = item["measurement"]
