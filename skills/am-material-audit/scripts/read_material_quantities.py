@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Read material quantities for explicitly selected Revit elements via run_query."""
 
+import hashlib
 import json
 import math
+import time
 
 from pyrevit.api import DB
 from System import Int32, Int64
@@ -30,7 +32,16 @@ def selected_ids(values):
 def takeoff(document, ids):
     rows = {}
     issues = []
+    started = time.time()
+    pairs = 0
+    limit_hit = False
     for element_id in ids:
+        if limit_hit:
+            break
+        if time.time() - started > 10:
+            issues.append({"element_id": element_id, "reason": "quantity_read_budget_exceeded"})
+            limit_hit = True
+            break
         try:
             id_type = Int64 if hasattr(DB.ElementId, "Value") else Int32
             element = document.GetElement(DB.ElementId(id_type(element_id)))
@@ -41,13 +52,18 @@ def takeoff(document, ids):
             if category is None or not category.HasMaterialQuantities:
                 issues.append({"element_id": element_id, "reason": "category_has_no_material_quantities"})
                 continue
-            level = document.GetElement(element.LevelId)
+            level = document.GetElement(element.LevelId) if eid(element.LevelId) > 0 else None
             if level is None:
                 issues.append({"element_id": element_id, "reason": "level_unknown"})
             material_ids = list(element.GetMaterialIds(False))
             if not material_ids:
                 issues.append({"element_id": element_id, "reason": "no_geometry_materials"})
             for material_id in material_ids:
+                if pairs >= 5000 or time.time() - started > 10:
+                    issues.append({"element_id": element_id, "reason": "quantity_read_budget_exceeded"})
+                    limit_hit = True
+                    break
+                pairs += 1
                 try:
                     material = document.GetElement(material_id)
                     if material is None:
@@ -76,12 +92,36 @@ def takeoff(document, ids):
         except Exception as exc:
             issues.append({"element_id": element_id, "reason": "element_read_failed",
                            "error_type": type(exc).__name__})
-    return {"requested_elements": len(ids), "status": "incomplete" if issues else "reported",
-            "rows": [rows[key] for key in sorted(rows)], "issues": issues,
+    if not limit_hit and time.time() - started > 10:
+        issues.append({"reason": "quantity_read_budget_exceeded"})
+    ordered = [rows[key] for key in sorted(rows)]
+    by_level = {}
+    for row in ordered:
+        by_level.setdefault(row["level_id"], []).append(row)
+    totals = []
+    for level_id, group in sorted(by_level.items()):
+        totals.append({"level_id": level_id, "level": group[0]["level"],
+                       "area_m2": math.fsum(row["area_m2"] for row in group),
+                       "volume_m3": math.fsum(row["volume_m3"] for row in group)})
+    path = getattr(document, "PathName", "")
+    project_info = getattr(document, "ProjectInformation", None)
+    project = None
+    if path and project_info is not None:
+        project = {"uid": str(project_info.UniqueId),
+                   "path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest()}
+    return {"requested_elements": len(ids), "requested_element_ids": [str(i) for i in ids],
+            "project": project, "status": "incomplete" if issues else "reported",
+            "rows": ordered, "totals_by_level": totals, "issues": issues,
             "scope": "selected host elements, geometry and compound layers only"}
 
 
 if doc is None or doc.IsFamilyDocument:
     result = {"error": "Open a Revit project first."}
 else:
-    result = {"payload": json.dumps(takeoff(doc, selected_ids(inputs.get("element_ids"))), ensure_ascii=True)}
+    report = takeoff(doc, selected_ids(inputs.get("element_ids")))
+    payload = json.dumps(report, ensure_ascii=True, allow_nan=False)
+    if len(payload) > 1024 * 1024:
+        report.update(status="incomplete", rows=[], totals_by_level=[],
+                      issues=[{"reason": "quantity_payload_budget_exceeded"}])
+        payload = json.dumps(report, ensure_ascii=True, allow_nan=False)
+    result = {"payload": payload}

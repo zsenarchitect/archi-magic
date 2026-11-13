@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import runpy
@@ -38,12 +39,20 @@ def test_query_groups_geometry_and_reports_missing_elements(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "pyrevit.api", NS(DB=fake_db))
     monkeypatch.setitem(sys.modules, "System", NS(Int32=int, Int64=int))
-    document = NS(IsFamilyDocument=False, GetElement=lambda id_: elements.get(id_.Value))
+    document = NS(IsFamilyDocument=False, GetElement=lambda id_: elements.get(id_.Value),
+                  PathName="Synthetic.rvt", ProjectInformation=NS(UniqueId="synthetic-project"))
     execution = runpy.run_path(
         str(SCRIPT), init_globals={"doc": document, "inputs": {"element_ids": [1, 2, 3, 999, 1]}},
     )
     report = json.loads(execution["result"]["payload"])
+    assert report["project"] == {"uid": "synthetic-project",
+                                 "path_sha256": hashlib.sha256(b"Synthetic.rvt").hexdigest()}
     assert report["requested_elements"] == 4
+    assert report["requested_element_ids"] == ["1", "2", "3", "999"]
+    assert report["totals_by_level"] == [
+        {"level_id": 8, "level": "Level 2", "area_m2": 5.0, "volume_m3": 1.0},
+        {"level_id": 10, "level": "Level 1", "area_m2": 30.0, "volume_m3": 5.0},
+    ]
     assert report["status"] == "incomplete"
     assert report["issues"] == [{"element_id": 999, "reason": "element_not_found"}]
     assert report["rows"] == [
@@ -52,3 +61,9 @@ def test_query_groups_geometry_and_reports_missing_elements(monkeypatch):
         {"category": "Walls", "category_id": 30, "level": "Level 1", "level_id": 10,
          "material": "Material A", "material_id": 100, "area_m2": 30.0, "volume_m3": 5.0},
     ]
+
+    elements[1].GetMaterialIds = lambda paint: [ElementId(100)] * 5001
+    limited = execution["takeoff"](document, [1, 2])
+    assert limited["status"] == "incomplete"
+    assert limited["issues"] == [{"element_id": 1, "reason": "quantity_read_budget_exceeded"}]
+    assert limited["rows"][0]["area_m2"] == 50000.0
