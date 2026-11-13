@@ -36,6 +36,7 @@ REFERENCES = re.compile(
     re.IGNORECASE,
 )
 FIELD_REFERENCE = re.compile(r'[^"<>|;\r\n]{1,1000}' + RV, re.IGNORECASE)
+FIELD_LABEL = re.compile(r"^[^:\r\n\\/]{2,80}:\s+(.+)$")
 UNSCANNED = {
     "txbxContent": "text_box", "ins": "tracked_revision", "del": "tracked_revision",
     "moveFrom": "tracked_revision", "moveTo": "tracked_revision", "sdt": "content_control",
@@ -302,18 +303,18 @@ def compare_reference(reference, host_roles, link_paths, former_paths, reviewed_
 
 
 def paragraph_references(text, reviewed, known_names):
+    value = text.strip().strip('"“”')
+    labeled = FIELD_LABEL.match(value)
+    if labeled:
+        value = labeled[1].strip().strip('"“”')
     if reviewed:
         # The caller identified this physical paragraph as a specific host field.
         # Accept one entire reference or a label followed by that reference.
-        value = text.strip().strip('"“”')
-        labeled = re.match(r"^[^:\r\n\\/]{2,80}:\s+(.+)$", value)
-        if labeled:
-            value = labeled[1].strip().strip('"“”')
         if FIELD_REFERENCE.fullmatch(value) and len(re.findall(RV, value, re.I)) == 1:
             return [value]
         return []
-    if len(text) <= MAX_VALUE and normalize(text) in known_names:
-        return [text]
+    if len(value) <= MAX_VALUE and normalize(value) in known_names:
+        return [value]
     matches = islice(REFERENCES.finditer(text), MAX_REFERENCES + 1)
     return [match.group(match.lastgroup) for match in matches]
 

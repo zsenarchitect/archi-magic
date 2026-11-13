@@ -194,3 +194,20 @@ def test_reviewed_field_requires_the_whole_reference(tmp_path, facts):
     assert [(row["location"], row["reference"], row["status"]) for row in result["references"]] == [
         ("body/block:3", "Old Tower.rvt", "mismatch"),
     ]
+
+
+def test_labeled_known_multiword_basename_matches_without_review(tmp_path, facts):
+    path = tmp_path / "coordination.docx"
+    doc = Document()
+    doc.add_paragraph("Coordination model: Coordination Tower.rvt")
+    doc.save(path)
+    model_facts = json.loads(facts.read_text())
+    model_facts["model"]["current_path"] = r"C:\Working\Coordination Tower.rvt"
+    facts.write_text(json.dumps(model_facts))
+
+    code, result = invoke(path, "--facts", facts)
+    assert code == 0
+    assert [(row["reference"], row["status"], row["host_roles"])
+            for row in result["references"]] == [
+        ("Coordination Tower.rvt", "current_host", ["current"]),
+    ]
