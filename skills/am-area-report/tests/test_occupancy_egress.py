@@ -63,6 +63,19 @@ def test_hand_calculation_and_exact_width_boundary(tmp_path, example):
     ]
 
 
+def test_room_element_id_cannot_be_used_as_an_egress_segment(tmp_path, example):
+    snapshot, criteria = example
+    room_id = snapshot["rooms"][0]["id"]
+    criteria["segments"][0]["id"] = room_id
+    for route in criteria["routes"]:
+        route["segment_ids"] = [room_id if value == "51" else value for value in route["segment_ids"]]
+
+    result = execute(tmp_path, snapshot, criteria)
+
+    assert result.returncode == 2 and not result.stdout
+    assert "belongs to a room" in result.stderr
+
+
 def test_ceiling_uses_exact_ratio_before_rounding(tmp_path, example):
     snapshot, criteria = example
     snapshot["rooms"][0]["area_ft2"] = "400.00000000000000000000000000001"
