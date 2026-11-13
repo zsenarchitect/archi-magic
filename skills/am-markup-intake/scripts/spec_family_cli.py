@@ -15,7 +15,11 @@ SIDES = (("left", "right"), ("front", "back"), ("below", "above"))
 CLEARANCES = tuple("clearance_" + side for pair in SIDES for side in pair)
 FACTORS = {"mm": Decimal(1), "cm": Decimal(10), "m": Decimal(1000),
            "in": Decimal("25.4"), "ft": Decimal("304.8")}
-LENGTH = re.compile(r"([0-9]{1,8}(?:\.[0-9]{1,6})?)\s*(mm|cm|m|in|ft)?\Z", re.ASCII)
+LENGTH = re.compile(
+    r"""(?:([0-9]{1,8}(?:\.[0-9]{1,6})?)|(?:([0-9]{1,8})(?: +|-))?([0-9]{1,3})/([0-9]{1,3}))"""
+    r"""\s*(mm|cm|m|in|ft|["'′″])?\Z""", re.ASCII,
+)
+UNIT_MARKS = {'"': "in", "″": "in", "'": "ft", "′": "ft"}
 TEXT_FIELD = re.compile(r"(?:connector|parameter)_[a-z][a-z0-9_]{0,39}\Z")
 PREVIEW = "spec-family-preview"
 DECISIONS = "spec-family-decisions"
@@ -62,16 +66,25 @@ def positive_index(value, maximum):
 def length_mm(raw, unit, *, clearance):
     match = LENGTH.fullmatch(raw)
     if not match:
-        raise ValueError("Use a decimal length with mm, cm, m, in or ft.")
-    number, cell_unit = match.groups()
+        raise ValueError("Use a decimal or fractional length with mm, cm, m, in or ft.")
+    number, whole, numerator, denominator, cell_unit = match.groups()
+    cell_unit = UNIT_MARKS.get(cell_unit, cell_unit)
     if cell_unit is not None and unit is not None and cell_unit != unit:
         raise ValueError("The mapped unit conflicts with the PDF cell.")
     chosen = cell_unit or unit
     if chosen not in FACTORS:
         raise ValueError("Map an explicit source unit for this numeric cell.")
-    value = Decimal(number) * FACTORS[chosen]
+    if numerator is None:
+        value = Decimal(number) * FACTORS[chosen]
+    else:
+        top, bottom = int(numerator), int(denominator)
+        if bottom == 0 or (whole is not None and top >= bottom):
+            raise ValueError("Use a nonzero denominator and a proper fraction after a whole number.")
+        value = (Decimal(whole or 0) + Decimal(top) / bottom) * FACTORS[chosen]
     if not (0 if clearance else 1) <= value <= 30000:
         raise ValueError("A physical length is outside its supported range.")
+    if numerator is not None:
+        value = value.quantize(Decimal("0.000000000001"))
     return format(value.normalize(), "f")
 
 
