@@ -13,6 +13,7 @@ Optional inputs (dict): {"max_ids": 300, "top_warnings": 15}
 """
 import datetime
 import math
+import ntpath
 import re
 import sys
 import time
@@ -240,6 +241,21 @@ _USER_PATH = re.compile(r"^[A-Za-z]:\\+Users\\+([^\\]+)\\+([^\\]*)", re.IGNORECA
 _PROFILE_FOLDERS = ("desktop", "documents", "downloads", "appdata", "pictures", "videos", "music", "")
 
 
+def windows_classification_path(path):
+    """Recognize ordinary Windows drives and UNC, including their long-path spellings."""
+    value = path.replace("/", "\\")
+    if value.startswith("\\\\.\\"):
+        return None
+    if value.startswith("\\\\?\\"):
+        tail = value[4:]
+        if tail.lower().startswith("unc\\"):
+            return "\\\\" + tail[4:]
+        if re.match(r"^[A-Za-z]:\\", tail):
+            return tail
+        return None
+    return ntpath.normpath(value) if re.match(r"^[A-Za-z]:\\", value) else value
+
+
 def personal_path_kind(path):
     """Classify a CAD path that lives in one person's Windows profile.
 
@@ -250,7 +266,8 @@ def personal_path_kind(path):
     """
     if not path:
         return None, None
-    m = _USER_PATH.match(path.replace("/", "\\"))
+    normalized = windows_classification_path(path)
+    m = _USER_PATH.match(normalized) if normalized else None
     if not m:
         return None, None
     user, first = m.group(1), m.group(2)
@@ -282,13 +299,25 @@ def link_path_kind(path, local=None):
         return "revit_server"
     if lower.startswith(("bim 360://", "autodesk docs://", "acc://")):
         return "cloud"
-    if lower.startswith(("//", "\\\\")):
+    normalized = windows_classification_path(path)
+    if normalized is None:
+        return None
+    if normalized.startswith("\\\\"):
         return "network"
-    if local is True:
-        return "local"
-    if re.match(r"^[a-zA-Z]:[/\\]", path):
-        return "drive_letter"
+    if re.match(r"^[a-zA-Z]:\\", normalized):
+        return "local" if local is True else "drive_letter"
     return None
+
+
+def standalone_relative_link_kind(path, local):
+    if (not path or path.startswith(("\\", "/")) or ntpath.isabs(path) or ":" in path
+            or link_read(lambda: bool(doc.IsWorkshared or doc.IsModelInCloud)) is not False):
+        return None
+    host = link_read(lambda: windows_classification_path(doc.PathName))
+    if not host or not ntpath.isabs(host) or not ntpath.splitdrive(host)[0]:
+        return None
+    resolved = ntpath.normpath(ntpath.join(ntpath.dirname(host), path))
+    return link_path_kind(resolved, local)
 
 
 def link_enum(value, accepted):
@@ -302,6 +331,12 @@ def link_type_details(link_type):
     saved = link_read(lambda: ref.GetPath())
     model_path = absolute if absolute is not None else saved
     path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(model_path))
+    if (not path and absolute is not None and saved is not None
+            and not link_read(lambda: bool(absolute.CloudPath))
+            and not link_read(lambda: bool(absolute.ServerPath))):
+        model_path = saved
+        path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
+    saved_relative_path = path if model_path is saved else None
     if not path:
         path = link_read(lambda: link_type.GetExternalResourceReference(
             DB.ExternalResourceTypes.BuiltInExternalResourceTypes.RevitLink).InSessionPath)
@@ -316,6 +351,8 @@ def link_type_details(link_type):
     path_type = link_read(lambda: link_type.PathType)
     if path_type is None:
         path_type = link_read(lambda: ref.PathType)
+    if model_kind is None and str(path_type) == "Relative":
+        model_kind = standalone_relative_link_kind(saved_relative_path, local)
 
     ifc_ref = link_read(lambda: link_type.GetExternalResourceReference(
         DB.ExternalResourceTypes.BuiltInExternalResourceTypes.IFCLink))
@@ -331,7 +368,14 @@ def link_type_details(link_type):
             locations.update([model_kind] if model_kind else [])
         source_kind = next(iter(locations)) if len(locations) == 1 else None
     else:
-        source_kind = None if cache_hint else model_kind
+        locations = {model_kind} if model_kind and not cache_hint else set()
+        if (kind == "RVT" and (path_type is None or str(path_type) == "Absolute")
+                and model_kind not in ("cloud", "revit_server")):
+            saved_path = link_read(lambda: DB.ModelPathUtils.ConvertModelPathToUserVisiblePath(saved))
+            if personal_path_kind(saved_path)[0]:
+                locations.add("personal")
+        source_kind = next(iter(locations)) if len(locations) == 1 else None
+    path_risk = next((risk for risk in ("personal", "local", "drive_letter") if risk in locations), None)
 
     status = link_read(lambda: link_type.GetLinkedFileStatus())
     if status is None:
@@ -344,7 +388,8 @@ def link_type_details(link_type):
         "saved_model_path_type": link_enum(path_type, ("Absolute", "Relative", "Server")),
         "model_path_kind": model_kind,
         "source_path_kind": source_kind,
-        "path_risk": source_kind if source_kind in ("personal", "local", "drive_letter") else None,
+        "source_path_kind_candidates": sorted(locations),
+        "path_risk": path_risk,
         "status": link_enum(status, ("Loaded", "Unloaded", "LocallyUnloaded", "NotFound",
                                      "Invalid", "InClosedWorkset", "Imported", "CanBeUpgraded")),
         "loaded": link_read(lambda: bool(DB.RevitLinkType.IsLoaded(doc, link_type.Id))),
