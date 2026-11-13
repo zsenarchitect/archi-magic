@@ -64,6 +64,35 @@ function Test-Field($o, [string]$name) {
     return [bool]$o.PSObject.Properties[$name]
 }
 
+function Get-DeletionJson($preview) {
+    if (-not (Test-Field $preview 'deletions')) { return '[]' }
+    $items = Get-Field $preview 'deletions'
+    if ($items -isnot [System.Collections.IList]) { throw 'Use an array for planned deletions.' }
+    $seen = @{}
+    $deletions = @(
+        foreach ($item in $items) {
+            $value = Get-Field $item 'id'
+            $id = [string]$value
+            $number = [long]0
+            if (($value -isnot [string] -and $value -isnot [int] -and $value -isnot [long]) -or
+                $id -cnotmatch '\A[1-9][0-9]{0,18}\z' -or -not [long]::TryParse($id, [ref]$number) -or
+                $seen.ContainsKey($id)) {
+                throw 'Give each deletion one distinct positive Revit ElementId.'
+            }
+            $category = Get-Field $item 'category'
+            $name = Get-Field $item 'name'
+            if ($category -isnot [string] -or $name -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($category) -or [string]::IsNullOrWhiteSpace($name)) {
+                throw 'Name the category and exact element for each deletion.'
+            }
+            $seen[$id] = $true
+            [ordered]@{ id = $id; category = $category; name = $name }
+        }
+    )
+    # Convert only deletion IDs to decimal strings before the browser sees them.
+    return (ConvertTo-Json -InputObject $deletions -Compress -Depth 3).Replace('<', '\u003c')
+}
+
 function Read-Payload([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { Write-Host "FAIL: JSON file not found: $path"; exit 1 }
     $raw = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $path).ProviderPath, $utf8)
@@ -131,6 +160,13 @@ if ($p1.Kind -eq 'change-preview' -and $reviewOnly -is [bool] -and $reviewOnly) 
 $html = $html.Replace('__PAGE_TITLE__', $title)
 $html = $html.Replace('__DATA2_JSON__', $(if ($p2) { $p2.Raw } else { 'null' }))
 $html = $html.Replace('__DATA_JSON__', $p1.Raw)
+$deleteJson = '[]'
+if ($p1.Kind -eq 'change-preview') {
+    try { $deleteJson = Get-DeletionJson $p1.Obj }
+    catch { Write-Host "FAIL: $($_.Exception.Message)"; exit 1 }
+}
+$html = $html.Replace('<script type="application/json" id="deletions">__DELETIONS_JSON__</script>',
+                      '<script type="application/json" id="deletions">' + $deleteJson + '</script>')
 
 $outFull = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($Out)) { $Out } else { Join-Path (Get-Location).ProviderPath $Out }))
 $outDir = Split-Path -Parent $outFull
