@@ -72,7 +72,17 @@ Use this report for Revit links, IFC links, or a Manage Links path and visibilit
 - Read `revit_links.views` for per-view observations. Report explicit hiding, an unloaded link, potential visibility, or unknown. The host collector gives potential visibility only. An instance absent from the collector can need more inspection.
 - Report the coverage totals and reasons before drawing conclusions from missing rows. This report has a soft ten-second budget, 200 rows per inventory, and 1,000 view observations. If the transport truncates the result, call `get_run`. Report incomplete coverage if the full result is unavailable.
 
-Use the focused report in chat. Keep it out of the dashboard snapshot flow. It classifies link paths without returning the path strings. Compare the flagged link in Manage Links before proposing a repath or reload.
+Use the focused report in chat. Keep it out of the dashboard snapshot flow. It classifies link paths without returning the path strings.
+
+### Review a reload plan
+
+In Manage Links, match the flagged type to the reviewed project and check its status, saved path type and source. For IFC, use the source on the IFC tab. Revit maintains a separate intermediate model. [Autodesk IFC linking guide](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-Model/files/GUID-BAA2ED9C-5107-4F21-ABE1-1ACF609AEEE3.htm)
+
+- For a missing link or a personal path, identify the project-approved source and confirm the model identity before proposing Reload From. Resolve conflicting source evidence before choosing a path.
+- For an unloaded link, confirm that the unload was intentional and check the workset. For a nested link, identify the top-level parent before proposing any reload.
+- Record the affected instances, pinned state, Shared Site, origin and reviewed views for comparison after any approved operation. For IFC, include affected dimensions, tags and hosted elements in the readback.
+
+Present the plan for review. The focused audit is read-only. Revit's API reload requires completed transaction phases, clears Undo history and can discard unsaved shared-coordinate changes. A transaction dry run cannot qualify that API call. [Autodesk Revit reload API](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/86830eb9-5ddb-c342-fddd-6963e5c03564.htm)
 
 ### CAD link audit
 
