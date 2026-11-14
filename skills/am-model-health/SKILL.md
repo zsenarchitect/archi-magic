@@ -25,6 +25,16 @@ It drives the `pyrevit` MCP tools (the pyRevit Agent Runtime). If those tools ar
 - `get_run` returns the full record when the immediate response is truncated.
 - Anything the script reads is sent to the AI provider. Use it only on projects where that is allowed.
 
+## Model facts for a BIM execution plan
+
+Use this opt-in query when the user needs the actual file name, current and central paths, worksharing state, Revit year and build, workset counts, and linked models. It returns raw model paths and names. Use it only where the project allows sending those details to the AI provider.
+
+1. Call `get_context` for the selected Revit PID and confirm the active project. Then call `get_skill("revit-scripting")`. Use the same PID for every query.
+2. Run the full `scripts/read_model_facts.py` as a read-only `run_query` with `expected_title` and the exact `expected_path`. If the path is unknown or empty, first run the same script with `identify: true` and `expected_title`. Check the returned identity against the selected model and pass its `path` and `project_uid` as `expected_path` and `expected_project_uid` in the facts query.
+3. Parse the returned ASCII-safe JSON string once. If the response was truncated, retrieve the same run with `get_run` and verify the complete response before reporting the facts. A rejected or incomplete response cannot verify the whole model. Nulls and `issues` identify unavailable evidence. Keep the exact paths and names in the private working context.
+
+The current file name comes from the current path. Central and cloud paths have separate fields. The build describes the running Revit application. Workset counts distinguish total and user worksets. The link list covers top-level link types and includes unloaded and unplaced types. Stored, resolved and provider paths are separate. A loaded document title is available only when a placed instance exposes its document.
+
 ## What the script returns
 
 `result` is JSON: `model`, `revit_year`, `timestamp`, `path`, `workshared`, and `metrics[]`. Each metric has `id`, `label`, `value`, `unit`, `threshold {warn, bad}`, `status` (`ok`, `warn`, `bad` or `info`), `hint`, and `details[]` (`label`, `count`, `ids` = element IDs).

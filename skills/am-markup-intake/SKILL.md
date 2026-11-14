@@ -174,6 +174,18 @@ The CLI compares trimmed display text. Enter leading-zero room IDs as text. Norm
 
 Exit code 0 means extraction worked or the inputs match. Exit code 1 means the comparison found differences. Exit code 2 means the inputs could not be checked.
 
+## Compare a local BIM execution plan with Revit model facts
+
+Save the complete JSON from `am-model-health`'s model-facts query to a private local folder. Run this check locally against the selected DOCX with the document dependencies installed.
+
+```powershell
+python scripts/bep_document_cli.py "BEP.docx" --facts "model-facts.json"
+```
+
+Review reported document locations against Word. Add `--field "body/block:3=central"` when that exact paragraph is the central model field. Use `current`, `central`, or `cloud` to select the corresponding observed host path. Use `--former-host "Old Project.rvt"` for a confirmed former host alias. An unfamiliar reference stays unresolved until its role or former alias is confirmed. Quote a filename containing spaces when it appears inside prose.
+
+The JSON identifies filename and folder mismatches and includes the document location and a short excerpt. It reports incomplete coverage for unsupported content such as text boxes, tracked revisions, and merged or nested table cells. Keep both input and output files private. Without a DOCX, the check reports that it did not run.
+
 ## Confirm dimensions from a local product PDF
 
 Run this workflow on your own computer. Keep the PDF and output files private. Use the same local document requirements as the schedule comparison. The PDF must have a selectable-text table. Choose one product variant. Find the exact table cells that describe it.
