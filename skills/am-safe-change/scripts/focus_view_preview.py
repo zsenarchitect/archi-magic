@@ -119,6 +119,8 @@ def check_result(plan, actual):
     if (actual["document"] != basis["document"] or actual["selection_ids"] != [row["id"] for row in basis["selection"]]
             or actual["active_view_uid"] != basis["active_view_uid"]):
         raise ValueError("The document, active view, or selection changed.")
+    if json.loads(actual.get("selection_json", "null")) != basis["selection"]:
+        raise ValueError("The selected element identity or bounds changed. Read and review the selection again.")
     if basis["request"]["action"] != "create_3d":
         if actual["view_id"] != basis["target"]["id"] or actual["view_uid"] != basis["target"]["uid"]:
             raise ValueError("The readback targets another view.")

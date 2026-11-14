@@ -205,10 +205,13 @@ def test_extent_change_and_deferral_are_distinct(case):
     assert report["elements"][2]["findings"] == []
 
 
+@pytest.mark.parametrize("guard_key", ["structural_target", "mep_penetration_target"])
 @pytest.mark.parametrize("change", ["valid", "wrong_note", "save_as", "archive_changed"])
-def test_board_guard_runs_before_transaction(case, monkeypatch, change):
+def test_board_guard_runs_before_transaction(case, monkeypatch, change, guard_key):
     snapshot, review, board, host, original = case
     plan = json.loads(invoke(snapshot, review, "--board", board).stdout)["plan"]
+
+    plan[guard_key] = plan.pop("structural_target")
 
     class TextNote:
         UniqueId = "board-note"
@@ -217,7 +220,7 @@ def test_board_guard_runs_before_transaction(case, monkeypatch, change):
             return NS(GetPlainText=lambda: original)
 
     if change == "archive_changed":
-        plan["structural_target"]["archive"] = {"id": "41", "unique_id": "archive-note", "sha1": "f" * 40}
+        plan[guard_key]["archive"] = {"id": "41", "unique_id": "archive-note", "sha1": "f" * 40}
     actual_note = TextNote()
     if change == "wrong_note":
         actual_note.UniqueId = "same-text-different-note"

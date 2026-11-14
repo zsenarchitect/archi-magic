@@ -158,13 +158,16 @@ def read_snapshot(raw):
 def inspect_view(view, action):
     check_view(view, action)
     box, active, view_range = target_box(view, action)
+    ids = current_selection()
     return {"status": "ok", "document": project_identity(), "view_id": get_id(view),
             "view_uid": str(view.UniqueId), "name_json": json.dumps(view.Name, ensure_ascii=True),
             "category_json": json.dumps(view.Category.Name if view.Category is not None else "(no category)",
                                         ensure_ascii=True),
             "box": box, "box_active": active, "view_range": view_range,
             "active_view_uid": str(doc.ActiveView.UniqueId),  # noqa: F821
-            "selection_ids": [str(i.Value) for i in current_selection()]}
+            "selection_ids": [str(i.Value) for i in ids],
+            "selection_json": json.dumps(read_selection(ids), ensure_ascii=True, allow_nan=False,
+                                         separators=(",", ":"))}
 
 
 def apply(plan):

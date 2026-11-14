@@ -1,6 +1,7 @@
 """Preview Navisworks clash intake and optional Revit section bounds."""
 
 import argparse
+from collections import Counter
 import hashlib
 from html.parser import HTMLParser
 import io
@@ -16,12 +17,14 @@ import xml.etree.ElementTree as ET
 
 import bcf_cli
 import board_cli
+from clash_section import FRAME, element_snapshot, point, section_box, section_view_preview, snapshot_sha256, text
 import issue_board as ib
 
 LIMIT = 2 * 1024 * 1024
 MARKER = "Navisworks clash UUID: "
+BOUNDS_PENDING = "Section bounds proposed for review."
+MAPPING_PENDING = "Element mapping requires review."
 STATUSES = {"new", "active", "reviewed", "approved", "resolved"}
-FRAME = "revit_host_internal_feet"
 RESULT = ("exchange", "batchtest", "clashtests", "clashtest", "clashresults")
 
 
@@ -62,12 +65,6 @@ def json_input(data):
     return json.loads(data.decode("utf-8-sig"), object_pairs_hook=unique)
 
 
-def text(value):
-    if not isinstance(value, str) or len(value) > 500:
-        raise ValueError("Report text exceeds the supported limit.")
-    return value.strip()
-
-
 def object_side(node):
     candidates = set()
     for attr in node.findall("objectattribute") + node.findall("smarttags/smarttag"):
@@ -95,6 +92,7 @@ def parse_report(data):
     path = []
     report = []
     seen = set()
+    group_names = []
     nodes = 0
     tests = 0
     units = ""
@@ -110,6 +108,8 @@ def parse_report(data):
                 units = text(node.get("units", ""))
             if tuple(path) == RESULT[:-1]:
                 tests += 1
+            if node.tag == "clashgroup":
+                group_names.append(text(node.get("name", "")))
             continue
         if node.tag == "clashresult":
             if not valid_result_path(path) or len(report) >= 300:
@@ -133,6 +133,10 @@ def parse_report(data):
                 "source_point": coordinates,
                 "objects": [object_side(item) for item in objects] if len(objects) == 2 else [],
             })
+            if group_names and group_names[-1]:
+                report[-1]["source_group"] = group_names[-1]
+        if node.tag == "clashgroup":
+            group_names.pop()
         path.pop()
     if not tests:
         raise ValueError("No Clash Detective test found in this exchange file.")
@@ -488,76 +492,73 @@ def parse_html_report(data):
     return "html_sequential", reader.clashes, reader.warnings
 
 
-def point(value):
-    if (not isinstance(value, list) or len(value) != 3
-            or any(type(n) not in (int, float) or not -1e6 <= n <= 1e6 for n in value)):
-        raise ValueError("Bounds must contain three finite host coordinates.")
-    return value
+def paired_clashes(html_rows, xml_rows):
+    translated = {"nouveau": "new", "activé": "active", "vérifié": "reviewed",
+                  "approuvé": "approved", "résolu": "resolved"}
+
+    def key(row):
+        sides = tuple(item["element_id"] for item in row["objects"])
+        status = translated.get(row["source_status"], row["source_status"])
+        if row["name"] and status in STATUSES and len(sides) == 2 and all(sides):
+            return row["name"], status, sides
+        return None
+
+    counts = Counter(key(row) for row in html_rows)
+    indexed = {}
+    for row in xml_rows:
+        match_key = key(row)
+        if match_key is not None:
+            indexed.setdefault(match_key, []).append(row)
+    result = []
+    for row in html_rows:
+        match_key = key(row)
+        candidates = indexed.get(match_key, [])
+        status = "unmatched"
+        paired = dict(row)
+        if match_key is None:
+            status = "incomplete_html_identity"
+        elif counts[match_key] != 1 or len(candidates) > 1:
+            status = "ambiguous"
+        elif candidates:
+            match = candidates[0]
+            html_group, xml_group = row.get("source_group"), match.get("source_group")
+            if xml_group and not html_group:
+                status = "incomplete_html_identity"
+            elif html_group != xml_group:
+                status = "different_group"
+            elif not match["guid"] or not all(
+                item["selection_path"] and all(item["selection_path"]) for item in match["objects"]
+            ):
+                status = "incomplete_xml_identity"
+            else:
+                paired.update(guid=match["guid"], objects=match["objects"], source_point=match["source_point"],
+                              source_status=match_key[1])
+                if row["source_status"] != match_key[1]:
+                    paired["html_source_status"] = row["source_status"]
+                status = "matched"
+        result.append(dict(paired, xml_identity=status))
+    return result
 
 
-def element_snapshot(raw):
+def snapshot_document(raw):
     doc = json_input(raw)
-    if doc["coordinate_frame"] != FRAME or not text(doc["host_id"]):
-        raise ValueError("Use a named Revit host snapshot in internal feet.")
-    sources = doc["sources"]
-    if not isinstance(sources, list) or not 1 <= len(sources) <= 32:
-        raise ValueError("Use 1 to 32 source model instances.")
-    index = {}
-    ids = set()
-    total = 0
-    for source in sources:
-        model = text(source["model_id"])
-        prefix = source["path_prefix"]
-        if not isinstance(prefix, list) or not 1 <= len(prefix) <= 20:
-            raise ValueError("A source needs an exact selection-tree path prefix.")
-        prefix = tuple(text(node) for node in prefix)
-        if not model or not all(prefix) or prefix in index or model in ids:
-            raise ValueError("Duplicate or empty source model mapping.")
-        ids.add(model)
-        entries = source["elements"]
-        if not isinstance(entries, dict):
-            raise ValueError("Use an element ID dictionary.")
-        total += len(entries)
-        if total > 10000:
-            raise ValueError("Element snapshot exceeds the supported count.")
-        elements = {}
-        unique = set()
-        for key, item in entries.items():
-            low, high = point(item["min"]), point(item["max"])
-            uid = text(item["unique_id"])
-            if (not re.fullmatch(r"[1-9][0-9]{0,18}", key) or int(key) > 2**63 - 1
-                    or not uid or uid in unique or not all(0 <= b - a <= 1000 for a, b in zip(low, high))
-                    or low == high):
-                raise ValueError("Invalid or duplicate element identity or bounds.")
-            unique.add(uid)
-            elements[key] = {"model_id": model, "unique_id": uid, "min": low, "max": high}
-        index[prefix] = elements
-    return doc["host_id"], index
+    doc = doc.get("response", doc)
+    if "result" in doc:
+        if doc.get("status", "ok") != "ok" or doc.get("error"):
+            raise ValueError("The Revit clash snapshot did not complete.")
+        doc = doc["result"]
+    if "snapshot_json" in doc:
+        if doc.get("status") != "ok":
+            raise ValueError("The Revit clash snapshot did not complete.")
+        encoded = doc["snapshot_json"]
+        if not isinstance(encoded, str) or not encoded.isascii() or len(encoded) > LIMIT:
+            raise ValueError("The Revit clash snapshot is unavailable or exceeds its limit.")
+        doc = json_input(encoded.encode("ascii"))
+    return doc
 
 
-def section_box(objects, index, padding):
-    if len(objects) != 2:
-        return None
-    targets = []
-    for item in objects:
-        path = tuple(item["selection_path"])
-        matched = [elements for prefix, elements in index.items() if path[:len(prefix)] == prefix]
-        if len(matched) != 1 or item["element_id"] not in matched[0]:
-            return None
-        targets.append(matched[0][item["element_id"]])
-    if (targets[0]["model_id"], targets[0]["unique_id"]) == (targets[1]["model_id"], targets[1]["unique_id"]):
-        return None
-    low = [min(a, b) - padding for a, b in zip(targets[0]["min"], targets[1]["min"])]
-    high = [max(a, b) + padding for a, b in zip(targets[0]["max"], targets[1]["max"])]
-    if not all(-1e6 <= a < b <= 1e6 and b - a <= 1000 for a, b in zip(low, high)):
-        return None
-    return {"min": low, "max": high, "targets": [
-        {key: item[key] for key in ("model_id", "unique_id")} for item in targets
-    ]}
-
-
-def board_rows(path, *, archive=False):
-    body, formats = board_cli.decode_note(json_input(local_bytes(path)))
+def board_rows(source, *, archive=False):
+    body, formats = board_cli.decode_note(source)
     board = ib.parse_board(body)
     issues = board["issues"]
     numbers = {row["number"] for row in issues}
@@ -576,9 +577,9 @@ def board_rows(path, *, archive=False):
     return body, formats, issues, markers
 
 
-def board_preview(path, archive, clashes):
-    body, formats, existing_rows, seen = board_rows(path)
-    if archive:
+def board_preview(source, archive, clashes, *, verified_finding=None):
+    body, formats, existing_rows, seen = board_rows(source)
+    if archive is not None:
         _, _, _, archived = board_rows(archive, archive=True)
         if seen & archived:
             raise ValueError("Clash provenance exists on both active and archive notes.")
@@ -597,7 +598,7 @@ def board_preview(path, archive, clashes):
         title = "Clash: " + (title or guid)
         issue = {"title": title, "status": "OPEN", "findings": [
             MARKER + guid,
-            "Section bounds proposed for review." if row["section_box"] else "Element mapping requires review.",
+            verified_finding or (BOUNDS_PENDING if row["section_box"] else MAPPING_PENDING),
         ]}
         proposals.append({"op": "add", "issue": issue})
     if not proposals:
@@ -619,13 +620,181 @@ def board_preview(path, archive, clashes):
     return plan, skipped
 
 
+def runtime_record(path):
+    data = json_input(local_bytes(path))
+    return data.get("response", data)
+
+
+RUNTIME_OUTCOMES = {"dry-run": ("dry_run", "ok", "rolled_back", None),
+                    "keep": ("modify", "ok", "committed", "user"),
+                    "discard": ("modify", "rejected", "discarded", "user")}
+
+
+def runtime_changes(record, mode, status, decision, approval=None):
+    if (record["mode"] != mode or record["status"] != status or record["decision"] != decision
+            or record.get("approval") != approval or not text(record["run_id"])
+            or record.get("result_truncated") is not False
+            or type(record.get("exit_code")) is not int or record["exit_code"] != 0
+            or record.get("reckless") or any(record.get(key) for key in (
+                "error", "failures", "dialogs", "blocked", "warnings", "closed_documents", "unclosed_documents"))):
+        raise ValueError("The guarded pyRevit record does not establish the requested outcome.")
+    changes = record["changes"]
+    if (changes.get("other_documents") or changes["deleted"] != []
+            or type(changes["deleted_count"]) is not int or changes["deleted_count"] != 0):
+        raise ValueError("The run reports unexpected model changes.")
+    return changes
+
+
+def matches_changes(changes, *, added=None, modified=None):
+    for field, expected in (("added", added), ("modified", modified)):
+        rows = changes[field]
+        count = changes[field + "_count"]
+        if type(count) is not int or not isinstance(rows, list) or count != len(rows):
+            return False
+        if expected is None:
+            if count:
+                return False
+        elif count != 1 or (str(rows[0]["id"]), rows[0]["class"]) != expected:
+            return False
+    return True
+
+
+def runtime_payload(record, field):
+    result = record["result"]
+    if result["status"] != "ok":
+        raise ValueError("The clash script stopped before producing evidence.")
+    return json_input(result[field].encode("ascii"))
+
+
+def verify_view_run(plan, outcome, run, readback):
+    if plan["blocked"] or run["run_id"] == readback["run_id"]:
+        raise ValueError("Use an unblocked plan and an independent readback.")
+    changes = runtime_changes(run, *RUNTIME_OUTCOMES[outcome])
+    fresh_changes = runtime_changes(readback, "query", "ok", "rolled_back")
+    if not matches_changes(fresh_changes):
+        raise ValueError("The readback must leave the model unchanged.")
+    receipt = runtime_payload(run, "receipt_json")
+    view_id = receipt["view_id"]
+    if (not re.fullmatch(r"[1-9][0-9]{0,18}", view_id) or int(view_id) >= 2**63
+            or not matches_changes(changes, added=(view_id, "View3D"))):
+        raise ValueError("The guarded run must report only the exact added 3D view.")
+    expected = {"clash_guid": plan["view"]["clash_guid"], "view_name": plan["view"]["name"],
+                "view_type_id": plan["view"]["view_type_id"], "basis_sha256": plan["basis_sha256"],
+                "host_identity": plan["host_identity"]}
+    if (not text(receipt["view_uid"]) or any(receipt[key] != value for key, value in expected.items())
+            or any(not abs(actual - approved) <= 1e-7
+                   for field, bound in (("box_min", "min"), ("box_max", "max"))
+                   for actual, approved in zip(point(receipt[field]), plan["box"][bound]))):
+        raise ValueError("The created view differs from the reviewed plan.")
+    if outcome == "keep":
+        observed = runtime_payload(readback, "verification_json")
+        if observed != {"view": receipt, "potentially_visible": plan["targets"]}:
+            raise ValueError("The independent query did not verify the kept view and both mapped targets.")
+        return {"status": "verified_keep", "view": receipt, "visual_inspection_required": True}
+    rollback = runtime_payload(readback, "rollback_json")
+    if (snapshot_sha256(rollback["snapshot"]) != plan["basis_sha256"]
+            or rollback["confirmed_absent"] != {"id": view_id, "uid": receipt["view_uid"]}):
+        raise ValueError("The original model readback changed or the exact view absence is unverified.")
+    return {"status": "verified_dry_run" if outcome == "dry-run" else "verified_discard"}
+
+
+def kept_board_source(record):
+    if "result" not in record and "mode" not in record:
+        return record
+    changes = runtime_changes(record, "query", "ok", "rolled_back")
+    if not matches_changes(changes):
+        raise ValueError("The board baseline must come from a query that left the model unchanged.")
+    return record["result"]
+
+
+def board_identity(source, host):
+    if source["host_identity"] != host:
+        raise ValueError("The board is not in the verified project.")
+    note = source["note"]
+    note_id = note["id"]
+    body, _ = board_cli.decode_note(source)
+    if (not re.fullmatch(r"[1-9][0-9]{0,18}", note_id) or int(note_id) >= 2**63
+            or not text(note["unique_id"]) or note["sha1"] != ib.text_sha1(body)):
+        raise ValueError("Read the board again with its saved project and note identities.")
+    return {key: note[key] for key in ("id", "unique_id", "sha1")}
+
+
+def kept_board_preview(source, archive, clash, view):
+    host = view["host_identity"]
+    active = board_identity(source, host)
+    archived = board_identity(archive, host) if archive is not None else None
+    if archived and (active["id"] == archived["id"] or active["unique_id"] == archived["unique_id"]):
+        raise ValueError("Choose distinct active and archive notes.")
+    guid = clash["guid"]
+    marker = MARKER + guid
+    finding = "Verified Revit section view " + view["view_name"] + "."
+    body, formats, issues, seen = board_rows(source)
+    plan, skipped = board_preview(source, archive, [clash], verified_finding=finding)
+    if guid in seen:
+        issue = next(row for row in issues if marker in row["findings"])
+        if finding in issue["findings"]:
+            return None, skipped, "already_recorded"
+        if issue["findings"] not in ([marker, BOUNDS_PENDING], [marker, MAPPING_PENDING]):
+            raise ValueError("The existing clash findings were edited. Review the issue before updating it.")
+        plan = ib.plan_replace_field(body, issue["number"], "finding", [marker, finding], formats)
+        old_paragraph = "Finding: " + issue["findings"][1]
+        new_paragraph = "Finding: " + finding
+        original = ib.split_paragraphs(body)
+        changed = ib.split_paragraphs(plan["final_text"])
+        expected = [line for _, line in original]
+        status_rows = [row["index"] for row in issue["lines"] if row["text"] == old_paragraph]
+        if len(status_rows) != 1:
+            raise ValueError("Cannot identify one original clash status paragraph.")
+        expected[status_rows[0]] = new_paragraph
+        if [line for _, line in changed] != expected:
+            raise ValueError("The board preview changed more than the clash status paragraph.")
+        skipped = []
+    if plan is None:
+        return None, skipped, "archived"
+    plan["structural_target"] = {"host_identity": host, "active": active, "archive": archived,
+                                 "view": {key: view[key] for key in (
+                                     "view_id", "view_uid", "view_name", "box_min", "box_max")}}
+    return plan, skipped, "planned"
+
+
+def verify_board_run(plan, outcome, run, readback):
+    if plan is None or run["run_id"] == readback["run_id"]:
+        raise ValueError("Use a planned board handoff and an independent note readback.")
+    guard = plan["structural_target"]
+    note = guard["active"]
+    changes = runtime_changes(run, *RUNTIME_OUTCOMES[outcome])
+    if not matches_changes(changes, modified=(note["id"], "TextNote")):
+        raise ValueError("The guarded board run must change only the reviewed text note.")
+    fresh_changes = runtime_changes(readback, "query", "ok", "rolled_back")
+    if not matches_changes(fresh_changes):
+        raise ValueError("The independent board readback must leave the model unchanged.")
+    intended_sha1 = ib.text_sha1(plan["final_text"])
+    receipt = run["result"]
+    if (receipt["status"] != "ok" or str(receipt["note_id"]) != note["id"]
+            or receipt["sha1_after"] != intended_sha1):
+        raise ValueError("The board write receipt differs from the plan.")
+    expected = dict(note, sha1=intended_sha1) if outcome == "keep" else note
+    if board_identity(readback["result"], guard["host_identity"]) != expected:
+        raise ValueError("The independent note readback differs from the expected text or identity.")
+    return {"status": "verified_" + outcome.replace("-", "_"), "note_id": note["id"]}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
+    parser.add_argument("--matching-xml", help="XML export from the same test as the HTML report")
     parser.add_argument("--snapshot")
     parser.add_argument("--padding-ft", type=float, default=1.0)
     parser.add_argument("--board")
     parser.add_argument("--archive")
+    parser.add_argument("--view-clash", help="Preview one section view for a verified Navisworks clash GUID")
+    parser.add_argument("--verify-view", choices=("dry-run", "keep", "discard"))
+    parser.add_argument("--view-run", help="Complete guarded pyRevit run record")
+    parser.add_argument("--view-readback", help="Complete independent pyRevit query record")
+    parser.add_argument("--confirm-visible", action="store_true", help="Both clash targets were visible in the kept view")
+    parser.add_argument("--verify-board", choices=tuple(RUNTIME_OUTCOMES))
+    parser.add_argument("--board-run", help="Complete guarded board write record")
+    parser.add_argument("--board-readback", help="Complete independent board query record")
     args = parser.parse_args(argv)
     suffix = Path(args.report).suffix.lower()
     is_html = suffix in (".html", ".htm")
@@ -636,16 +805,40 @@ def main(argv=None):
             raise ValueError("Use padding from 0.1 to 20 feet.")
         if args.archive and not args.board:
             raise ValueError("Supply an active board with the archive.")
+        if args.matching_xml and (not is_html or Path(args.matching_xml).suffix.lower() != ".xml"):
+            raise ValueError("Pair one HTML report with an XML export of the same test.")
+        if args.view_clash and ((is_html and not args.matching_xml) or not args.snapshot):
+            raise ValueError("Use verified XML clash identity and a Revit snapshot for a section-view preview.")
+        if any((args.verify_view, args.view_run, args.view_readback)) and not all(
+                (args.verify_view, args.view_run, args.view_readback, args.view_clash)):
+            raise ValueError("Supply the view GUID, outcome, full run record and independent readback together.")
+        kept_board = bool(args.board and args.view_clash and args.verify_view == "keep")
+        if args.confirm_visible != kept_board or (args.board and args.view_clash and not kept_board):
+            raise ValueError("Use a verified Keep and visual confirmation for a kept-view board preview.")
+        if any((args.verify_board, args.board_run, args.board_readback)) and not all(
+                (kept_board, args.verify_board, args.board_run, args.board_readback)):
+            raise ValueError("Supply a kept-view board handoff and both board run records.")
         raw = local_bytes(args.report)
+        report_digest = hashlib.sha256(raw).hexdigest()
+        identity_digest = None
         source_warnings = []
         if is_html:
             source_format, clashes, source_warnings = parse_html_report(raw)
             units = ""
+            if args.matching_xml:
+                identity_raw = local_bytes(args.matching_xml)
+                identity_digest = hashlib.sha256(identity_raw).hexdigest()
+                units, xml_rows = parse_report(identity_raw)
+                clashes = paired_clashes(clashes, xml_rows)
+                unresolved = sum(row["xml_identity"] != "matched" for row in clashes)
+                if unresolved:
+                    source_warnings.append(f"{unresolved} HTML clash rows could not be bound uniquely to XML identity.")
         else:
             source_format = "xml"
             units, clashes = parse_report(raw)
         snapshot = local_bytes(args.snapshot) if args.snapshot else None
-        host, index = element_snapshot(snapshot) if snapshot is not None else (None, {})
+        snapshot_data = snapshot_document(snapshot) if snapshot is not None else None
+        host, index = element_snapshot(snapshot_data) if snapshot_data is not None else (None, {})
         for row in clashes:
             row["section_box"] = section_box(row["objects"], index, args.padding_ft)
             row["warnings"] = []
@@ -655,18 +848,47 @@ def main(argv=None):
                 row["warnings"].append("Unknown Navisworks status.")
             if row["section_box"] is None:
                 row["warnings"].append("Both distinct elements must match one scoped Revit snapshot.")
-        plan, skipped = board_preview(args.board, args.archive, clashes) if args.board else (None, [])
+        board = runtime_record(args.board) if args.board else None
+        archive = runtime_record(args.archive) if args.archive else None
+        if kept_board:
+            board = kept_board_source(board)
+            archive = kept_board_source(archive) if archive is not None else None
+            if args.archive and not isinstance(archive, dict):
+                raise ValueError("The archive query did not return a note.")
+        plan, skipped = board_preview(board, archive, clashes) if args.board and not kept_board else (None, [])
         report = {
             "kind": "navisworks-clash-preview", "model_write_approved": False,
             "source_format": source_format,
-            "report_sha256": hashlib.sha256(raw).hexdigest(), "source_units": units,
+            "report_sha256": report_digest, "source_units": units,
             "snapshot_sha256": hashlib.sha256(snapshot).hexdigest() if snapshot is not None else None,
             "host_id": host, "coordinate_frame": FRAME if host else None,
             "clashes": clashes, "plan": plan, "skipped_guids": skipped,
             "warnings": source_warnings + (
                 ["Archive note not checked for duplicates."] if args.board and not args.archive else []),
         }
-        if is_html:
+        if identity_digest is not None:
+            report["identity_report_sha256"] = identity_digest
+        if args.view_clash:
+            plan_report_digest = report_digest if identity_digest is None else hashlib.sha256(
+                ("navisworks-html+xml:" + report_digest + ":" + identity_digest).encode("ascii")
+            ).hexdigest()
+            report["view_plan"], report["view_preview"] = section_view_preview(
+                args.view_clash, clashes, snapshot_data, args.padding_ft, plan_report_digest
+            )
+        if args.verify_view:
+            report["view_verification"] = verify_view_run(
+                report["view_plan"], args.verify_view, runtime_record(args.view_run), runtime_record(args.view_readback)
+            )
+        if kept_board:
+            clash = next(row for row in clashes if row["guid"] == args.view_clash)
+            report["plan"], report["skipped_guids"], report["board_handoff"] = kept_board_preview(
+                board, archive, clash, report["view_verification"]["view"]
+            )
+        if args.verify_board:
+            report["board_verification"] = verify_board_run(
+                report["plan"], args.verify_board, runtime_record(args.board_run), runtime_record(args.board_readback)
+            )
+        if is_html and not args.matching_xml:
             report["warnings"].append("HTML review has no mapped clash identity. Export XML for model mapping and board import.")
         encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2)
         if len(encoded) > LIMIT:

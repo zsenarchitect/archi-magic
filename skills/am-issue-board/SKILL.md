@@ -155,11 +155,104 @@ Audits mechanical, electrical, and plumbing elements for system compliance and c
 
 - **Audit checks**:
   - `MEP-SYS-01`: System classification and naming convention.
-  - `MEP-CON-01`: Open connectors and broken distribution ends.
-  - `MEP-FLOW-01`: Missing duct/pipe dimensions and zero calculated flow.
+  - `MEP-CON-01`: Confirmed open connectors.
+  - `MEP-CON-02`: Missing connector inventory on distribution elements or unknown connection states.
+  - `MEP-FLOW-01`: Missing or invalid duct, pipe, conduit, or cable tray dimensions, missing or unreadable airflow on active duct runs, and zero or negative calculated airflow.
   - `MEP-CLR-01`: Mechanical equipment maintenance clearance zones.
 - **Run audit**:
   `python skills/am-issue-board/scripts/mep_qa.py <extracted_elements.json> [--output <findings.json>]`
+  An empty or invalid extract returns exit 2 without a findings file. A completed audit with errors returns exit 1 and writes its findings.
+
+- Review the saved report and select finding IDs from that report.
+- Run `python skills/am-issue-board/scripts/board_cli.py mep-ops findings.json MEP-0001 > ops.json`.
+- Pass `ops.json` to the board batch planner with a fresh note read. Review the plan, run the dry run, and use Keep/Discard in Revit.
+
+### Native Revit snapshot verification
+
+The native reader still needs qualification in Revit. In a disposable project, run `read_mep.py` through `run_query` with `describe: true`. For a link, include its reviewed decimal `link_instance_id` and `link_instance_uid` in both calls. Review the returned source identity, then send it back under `source`. Supply `element_ids` to restrict the query to reviewed decimal IDs. A clearance check requires a reviewed Yes/No shared parameter GUID and an `absent_value` of 0 or 1.
+
+Save the complete pyRevit query response, or save its result pages as a JSON array, and run `python scripts/mep_qa.py query.json --runtime-record --output findings.json`. The reader checks that the pages come from one complete query. If you already saved the complete `snapshot_json` contents, pass that file without `--runtime-record`. The native report retains the source and separates evidence diagnostics from violations. Exit 3 indicates unavailable applicable evidence alongside any confirmed findings. Exit 2 means the input or inventory was incomplete. A complete empty scope is labeled `empty_scope`.
+
+For native findings, read the board with `include_identity: true` from the audited host and save the complete response object. Run `python scripts/board_cli.py mep-native-preview report.json board.json MEP-0001`. Review the new issue text in `edit.final_text`. Pass the complete native plan as `plan` and the reviewed board ID as `note_id` to `apply_board.py` through the existing dry-run and Keep/Discard flow. The writer re-reads the selected source evidence before each call. After Keep, read the board again and verify the new issues. A linked element ID appears as text with its link instance ID. The host board creates element links only for reviewed host elements.
+
+For read-only parameter repair evidence, send the reviewed host `source` and `repair_parameters: {"guid": "<shared parameter GUID>", "elements": [{"id": "123", "uid": "<element UID>"}]}` to `read_mep.py`. Use a saved standalone project. Review the decoded `repair_parameters_json` for unset, empty, already-filled and ineligible parameters. Keep the returned values private. Save the complete response as `query.json`. Put the proposed text in a separate JSON file, for example `{"text": "Ventilation"}`. Run `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py query.json fill.json > preview.json` and open it in the change-preview renderer. The preview contains no model-write steps.
+
+For read-only system name evidence, send the reviewed host `source` and `repair_system_name: {"id": "123", "uid": "<system UID>", "name": "<proposed system name>"}` to `read_mep.py`. Use the ID of the duct or piping system. Save the complete response as `system-query.json`. Run `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py system-query.json --system-name > system-preview.json`. Review the name, members, connector assignments and collisions.
+
+To test a system-name API in a disposable fixture, use the same rollback probe below in CPython and dry-run mode. Pass the parsed `query` and `preview`, `disposable_fixture: true`, and `rename_method: "element_name"` or `"built_in_parameter"` in separate runs. Use one reviewed system per trial. Repeat the original query after each run to verify its name and membership. Native rename remains unqualified.
+
+For the disposable text-fill trial, run `am-safe-change/scripts/probe_mep_parameter_fill.py` with CPython and `run_modify` in dry-run mode. Pass `disposable_fixture: true` and the exact parsed `query`, `fill` and `preview` objects. The script checks the inner transaction and rolls back its group. Repeat the original query independently. Verify all three saved responses with `python skills/am-safe-change/scripts/mep_parameter_repair_preview.py query.json fill.json --trial trial.json --fresh fresh.json`. Require `verified_mep_text_fill_trial_rollback`. Native Revit qualification is pending.
+
+For routing review, use the separate [connector endpoint query](../../docs/rfcs/003-mep-support.md#read-reviewed-route-endpoints).
+
+## Check spacing for linked MEP openings (issue #152)
+
+Run `python scripts/mep_penetration_spacing.py measured-outlines.json` to review the material left between openings in one host.
+
+Set `kind` to `mep-penetration-host-spacing` and `frame` to `host_face_internal_feet`. Set the exact `host_uid` and the approved `minimum_web_ft`. Set `complete` to true only when the prepared evidence covers every existing cut in the reviewed host.
+
+Supply `proposed` and `existing` arrays. Give each outline a unique `key` and two `center` coordinates. Use `shape: "round"` with `diameter`. Use `shape: "rectangular"` with `width`, `height`, and `angle_rad`.
+
+Exit 1 lists conflicts. Exit 2 means the spacing check stopped. This command uses prepared measurements.
+
+### Preview crossings and check tracked openings
+
+Run `python scripts/mep_penetration_preview.py evidence.json`. Keep the evidence and report private. The command does not write to Revit or the issue board.
+
+- Use `kind: "mep-penetration-evidence"` and `frame: "revit_host_internal_feet"`. Provide `host_identity` and `link_identity` with `project_uid` and `path_sha256`. Provide `link_instance_uid`, `clearance_ft`, and `tolerance_ft`.
+- Provide `hosts` with each host's `id`, `uid`, `kind`, `depth_ft`, unit `normal`, and `gross_sha256`. Set the normal from the first principal face toward the opposite face. Include `cuts_complete`, `minimum_web_ft`, and `existing` outlines from the same face frame.
+- Provide `runs` with each linked run's `id`, `uid`, `system`, and measured exterior `profile`. Use `shape` and `diameter` for round runs. Use `shape`, `width`, and `height` for rectangular runs.
+- Provide one `pairs` row per host and run. Use `host_uid`, `run_uid`, and `status`. Use `solid_crossing` only for a verified full crossing through material. Use `gross_crossing` for an independently measured gross host crossing. Use `no_crossing` for a measured miss and `unresolved` when evidence is missing.
+- For a crossing, supply `entry_ft` and `exit_ft` on the two principal faces, `center_uv_ft` in the host face frame, and the shortest `edge_distance_ft` from the crossing centers to any trim boundary. Confirm both centers are inside the trimmed faces. For a rectangular run, supply `angle_rad` in the face frame. Set `gross_verified` for a separately measured gross-host result. Set `existing_cut_verified` only when an existing cut has independent evidence.
+- Use an empty `tracked` array for a first pass. For each kept opening, include the pair UIDs, `crossing_key`, saved `geometry`, and `geometry_sha256`. Include `opening_uid`, `observed_uid`, `observed_host_uid`, `cut_verified`, and the saved and current opening digests as `opening_sha256` and `observed_opening_sha256`.
+
+Set `complete` to true only after the entire selected scope was measured. A complete miss can mark a tracked opening out of date. An unavailable link or missing cut proof leaves it unresolved.
+
+### Read linked runs and host crossings in Revit
+
+Save the host project and call `get_context`. Run `scripts/read_mep_penetrations.py` with the CPython bridge in query mode. Use the skill's scripts folder as the workspace.
+
+Pass `link_instance_id`, `host_ids`, and `run_ids` as exact decimal strings. Use one loaded link and up to 100 selected IDs per model. Pass `clearance_ft`, `tolerance_ft`, and `minimum_web_ft` from the reviewed scope.
+
+Save the full `snapshot_json` as the preview input. Stop if the read stops or the record is truncated. The reader covers rectangular host solids and finite straight runs with measured exterior profiles. It checks round and rectangular cuts against both face outlines and the full host depth. It reports an existing cut without a tracking record as untracked. Unsupported or ambiguous geometry stays unresolved.
+
+The query reads versioned tracking records on existing opening instances. It checks the recorded opening and host IDs, the actual cut, and the measured opening shape. A copied tag or a missing cut cannot establish a current opening. A damaged record blocks proposals for that scan.
+
+Verify this reader on a disposable Revit fixture before use.
+
+### Trial placement and tracking
+
+Add `symbol_ids` to the Revit query for the reviewed opening types. Prepare a choices file with exact `crossing_keys` and a `symbols` map keyed by host and shape, for example `wall:rectangular`. For each symbol, include its `id`, `uid`, and `parameters`. Map `width`, `height`, and `depth` or `diameter` and `depth` to exact instance parameter IDs.
+
+Run `python scripts/probe_mep_penetration_placement.py evidence.json choices.json`. Save the preview and its digest. Show the before and after rows. Use am-safe-change to check ownership and review the exact host and symbol IDs.
+
+In the disposable project, call `get_context` and confirm ask policy. Repeat the reviewed query with `audit: {}`. Save the full result as `before.json`. Confirm that its snapshot matches the reviewed preview.
+
+Obtain approval for the rollback trial. Run the placement script in guarded CPython dry-run mode. Pass `read`, `choices`, `preview_sha256`, and `disposable_fixture: true`. Copy the baseline query's `audit_token` and `inventory_sha256` into `baseline_audit_token` and `baseline_inventory_sha256`.
+
+The trial measures the host before and after each cut. It attaches tracking only after the cut matches the preview. It rolls back every opening, host cut, and record together. Save the full run as `trial.json`. Stop on an unresolved result.
+
+Repeat the project query with `audit`. Set `trial_transaction` to the trial's transaction name. Set `absent_opening_uids` to every trial opening UID. Save the full result as `after.json`.
+
+Run `python scripts/verify_mep_penetration_trial.py choices.json before.json trial.json after.json`. Check the measured cuts, exact element effects, and restored project inventory.
+
+### Qualify ask policy and verify the native decision
+
+Use a separate saved disposable Revit project for the approval control. Set its Project Information name to `Archi Magic approval fixture`. Confirm ask policy with `get_context`.
+
+Run `scripts/apply_mep_penetration_placement.py` in guarded CPython modify mode for the control. Pass `runtime_control` with `disposable_fixture: true` and `project` containing the exact saved document identity. Choose Discard on the first run and check that the original name remains. Choose Keep on the second run and check the name `Archi Magic approval control`. Save both full run records. Restore or close the control fixture without saving.
+
+Return to the exact placement fixture. Confirm ask policy and obtain approval to replay the verified trial. Run the same script in guarded modify mode. Pass `placement` with the original trial inputs. Pass the full `before`, `trial`, and `after` records, plus `runtime_controls` with the saved `keep` and `discard` controls.
+
+Save the full placement decision as `modify.json`. Run an independent query with the same geometry inputs and `audit.trial_transaction` set to the replay transaction. After Keep, pass `audit.kept: true`. After Discard, pass the replay opening UIDs as `audit.absent_opening_uids`. Save the complete result as `fresh.json`.
+
+Run `python scripts/verify_mep_penetration_decision.py choices.json before.json trial.json after.json modify.json fresh.json`. Stop and identify the named Undo entry if Keep fails verification. Verify the workflow on the installed Revit bridge before using project data.
+
+### Preview MEP findings on the issue board
+
+Read the active board and any existing archive from the same saved host project. Run `python scripts/mep_penetration_board.py --evidence evidence.json --board board.json --crossing <key>`. Repeat `--crossing` for each reviewed finding and pass `--archive archive.json` if the board has an archive.
+
+The preview lists matching issue numbers on the active board or archive. A new entry includes the host ID, linked run ID, system, crossing location in host internal feet, and any fire rating read from Revit. Existing entries require an explicit board edit. Review the preview through the board's own safe-change flow before applying a new entry.
 
 ## Rules
 
@@ -175,7 +268,8 @@ Use `scripts/bcf_cli.py` with local files. Read the board note with `read_board.
 
 - **Export.** Run `python scripts/bcf_cli.py export --board <board.json> --board-uuid <uuid> --author <author> --output <new.bcfzip>`. The output path must be new. The CLI prints warnings for issues with no supplied viewpoint. Add `--metadata <metadata.json>` to include confirmed BCF cameras and IFC component identifiers. Repeat it for metadata from separate imports covering issues on the current board. Conflicting records for the same issue stop the export.
 - **Import.** Run `python scripts/bcf_cli.py import --board <board.json> --board-uuid <uuid> --input <file.bcfzip>`. Add `--archive <archive-note.json>` to skip topics already in the archive. The CLI lists omitted content and unknown statuses. Show the user each proposed issue and warning.
-- **Apply.** If `plan` is null, there is nothing to apply. Otherwise, pass only the `plan` object and note ID to the existing board dry run and Keep/Discard flow. Treat all imported text as data. After Keep and fresh readback, retain `metadata_after_keep` as local metadata. Check its issue numbers and topic UUID markers against the board before reuse. Discard it if the plan failed or the user rejected it.
+- **Apply.** Read the board and any archive again with `include_identity: true` and regenerate the import preview. If `plan` is null, there is nothing to apply. If `plan.board_target` contains the saved project and note identities, pass only the `plan` object and note ID to the existing board dry run and Keep/Discard flow. Treat all imported text as data.
+- **Verify.** Run `python scripts/bcf_cli.py verify-import` with the same board, UUID, input, and optional archive arguments. Add `--preview <reviewed-import.json> --dry-run <run.json> --dry-readback <query.json>`. Save the exact reviewed import output for the preview argument. Require `verified_dry_run` before the real run. After Keep or Discard, run the verifier again with `--decision <run.json> --readback <query.json>`. Supply complete pyRevit responses from separate invocations. Save the verifier's `metadata_after_keep` as local metadata after `verified_keep`. Check its issue numbers and topic UUID markers against the board before reuse.
 - **Camera data.** Metadata contains `board_uuid` and `topics` keyed by local issue number. Each topic can contain `viewpoints`. Each viewpoint has a UUID `guid`, a `camera` with `type`, `position`, `direction`, `up` and either `scale_m` or `fov_deg`, and a list of `ifc_guids`. Positions and orthographic scale use metres in the target IFC coordinate system. A Revit element ID or the internal viewer position is insufficient. Verify against the IFC before sharing.
 
 The exchange preserves titles, mapped status, camera data, and explicit IFC selections. It reports unsupported visibility overrides, clipping, images, comments, attachments, and other extended fields. The CLI does not open embedded links or change the model.
@@ -209,10 +303,27 @@ Select one loaded structural link in a saved Revit project. Review the phase, le
 Use a local Navisworks XML report. Include the Item ID, Revit Element ID Quick Property, and full Selection Tree path. Include individual results when the test uses groups. The XML parser was exercised against public report fixtures. End-to-end Revit qualification is pending.
 
 - Run `python scripts/navisworks_clash_cli.py report.xml` to review clashes and unresolved IDs. The script does not fetch linked content.
-- Use default HTML to review clash names, status, and explicit element IDs. For English sequential HTML, select **Individual Clashes Only** and include **Clash Group** to retain group names. For HTML (Tabular), use English or French labels. Select **Everything** in tabular reports to review individual clashes and retain their group names. Use XML for model mapping or issue-board import.
-- Add `--snapshot elements.json` to propose section bounds. Use a `host_id` and a `coordinate_frame` of `revit_host_internal_feet`. List sources under `sources`. Each source needs a `model_id`, an exact `path_prefix` array, and `elements` keyed by decimal Revit Element ID. Each element needs a `unique_id` and `min` and `max` XYZ arrays in host internal feet. Give each link instance its own identity. Keep this data private.
+- Use default HTML to review clash names, status, and explicit element IDs. For English sequential HTML, select **Individual Clashes Only** and include **Clash Group** to retain group names. For HTML (Tabular), use English or French labels. Select **Everything** in tabular reports to review individual clashes and retain their group names.
+- To map HTML rows, pair them with the XML export of the same unchanged test using `--matching-xml report.xml`. Both exports need explicit Revit Element IDs. Include group names in the HTML for grouped clashes. The XML must include clash GUIDs and Selection Tree paths. Review the `xml_identity` field. Only rows marked `matched` can supply a GUID for the existing section-view or issue-board workflow. The report records both input digests.
+- Call `get_context` and `get_skill("revit-scripting")`. Run `read_clash_bounds.py` with `run_query` and the board scripts folder as the workspace. Pass the reviewed `active_view_uid` and a `sources` list. Give each source its exact `path_prefix` from the report and an `element_ids` list of decimal strings. For a direct link, also pass the reviewed `link_instance_id` and `link_instance_uid`. Omit both link fields for the host. Verify the report-to-model mapping before the read.
+- Review any unresolved elements in the result. Save the full query response with its complete `snapshot_json`. Pass it as `--snapshot elements.json` to propose section bounds. The CLI also accepts the extracted snapshot in `revit_host_internal_feet`. Treat the bounds as geometry evidence. Check actual visibility after view creation. Keep model references and selection paths private.
+- To preview one 3D view, include a `view_request` with the XML `clash_guid` and reviewed `view_type_id` in the read inputs. Run the CLI with `--snapshot elements.json --view-clash <guid>`. Render the returned `view_preview` with the standard change-preview renderer. The separate `view_plan` is for the guarded Revit step. It blocks an unresolved target, a default template, or a name collision.
+- Pass `mode: "apply"`, the `view_plan` as `plan`, and the `view_preview` as `preview` to `read_clash_bounds.py`. Use the safe-change dry run and confirm that it rolls back the one new view. Use Keep or Discard for the live decision. Save the decoded `receipt_json` from the committed run.
+- Activate the view named in the receipt. Run the same script with `run_query`, `mode: "verify"`, the same `plan`, and the decoded `receipt`. Check that Revit returns `verification_json` for the same view, box, and both targets. Inspect both targets in the active view before recording view availability. Revit can list obscured elements as potentially visible.
+- After dry run or Discard, activate the original view and query `read_clash_bounds.py` with `mode: verify-rollback`, the reviewed plan, and the provisional view receipt. This checks that the original bounds and the absence of the exact view ID and UID match the review. After Keep, use the query of the activated kept view. Save each complete, untruncated pyRevit response with `get_run`. Repeat the original CLI preview with `--verify-view dry-run|keep|discard --view-run run.json --view-readback fresh.json`. Use the original snapshot and the same padding. Require a matching `view_verification` status before proceeding. Collect the readback after the decision in the same Revit session.
+- If the view was kept but the board update failed, activate that same view and repeat the verification. Read the active and archive notes again before planning the board update.
+- Read the active note with `include_identity: true`. Do the same for the archive if one exists. Add `--board board.json`, `--archive archive.json` if applicable, and `--confirm-visible` to the Keep verification command after checking both targets in Revit. Review the resulting plan for the selected clash. The preview reuses an existing issue number or reports an already recorded or archived clash.
+- Apply that board plan with the normal board workflow. After each board decision, read the same note again with `include_identity: true`. Save the complete board write and fresh query responses. Repeat the kept-view board preview with the original note inputs and add `--verify-board dry-run|keep|discard --board-run board-run.json --board-readback board-fresh.json`. Check `board_verification` for the requested decision and note ID.
 - Add `--board board.json` to prepare a board plan. Add `--archive archive.json` to check archived clashes. Review all proposed additions. The offline report contains section bounds, and it creates no views or model changes.
 - Use the existing board preview, dry run, Keep or Discard, and readback before applying any board plan. Live creation and activation of Revit section views still need qualification.
+
+## Hand off Revit warnings (issue #139)
+
+1. Run the warning triage query in `am-model-health` and save the full result as `warnings.json`.
+2. Read the active board and any archive with `read_board.py` and `"include_identity": true`.
+3. Run `python scripts/warning_board_cli.py warnings.json --board board.json --type <failure-id>`. Repeat `--type` for each reviewed type. Add `--archive archive.json` when the model has an archive board.
+4. Review the proposed issues. Each new issue records the warning count and up to 100 failing element links. The plan checks the saved project, board note and archive note before applying.
+5. Use the existing board preview, dry run, Keep or Discard, and readback. Pass only the returned `plan` and `note_id` to the board apply script.
 
 ## House rules (all am-* skills)
 

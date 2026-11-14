@@ -16,7 +16,7 @@ INPUT_LIMIT = 1024 * 1024
 FRAME = "revit_internal_axes_mm"
 
 
-def read_input(path):
+def read_input(path, limit=INPUT_LIMIT):
     source = local_path(path)
     original = source.lstat()
     if link_or_reparse(original) or not stat.S_ISREG(original.st_mode):
@@ -25,9 +25,9 @@ def read_input(path):
              | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(os.open(source, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > INPUT_LIMIT:
-            raise ValueError("Use a regular JSON file up to 1 MiB.")
-        raw = stream.read(INPUT_LIMIT + 1)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"Use a regular JSON file up to {limit // (1024 * 1024)} MiB.")
+        raw = stream.read(limit + 1)
         after = os.fstat(stream.fileno())
         current = source.lstat()
         if not (
@@ -199,6 +199,15 @@ def edges(loop):
     return list(zip(loop, loop[1:] + loop[:1]))
 
 
+def contour_area(sides):
+    origin = sides[0][0]
+    return abs(sum(cross(sub(a, origin), sub(b, origin)) for a, b in sides)) / 2
+
+
+def contour_area_tolerance(sides, tolerance):
+    return sum(math.dist(a, b) for a, b in sides) * tolerance + math.pi * tolerance ** 2
+
+
 def inside(p, sides):
     x, y = p
     return sum(
@@ -211,9 +220,7 @@ def valid_room(loop, seed, tolerance):
     sides = edges(loop)
     if len(set(loop)) != len(loop) or min(math.dist(*edge) for edge in sides) <= tolerance:
         return False
-    base = loop[0]
-    area = abs(sum(cross(sub(a, base), sub(b, base)) for a, b in sides)) / 2
-    if area < 10000:
+    if contour_area(sides) < 10000:
         return False
     for i, (a, b) in enumerate(sides):
         c = sides[(i + 1) % len(sides)][1]
@@ -235,13 +242,88 @@ def rooms_conflict(a, b, tolerance):
     )
 
 
-def propose(snapshot, mapping):
-    fields(snapshot, "coordinate_frame link_id level_id level_mm segments room_loops")
+def fraction_in_box(edge, x_range, y_range):
+    start, end = edge
+    first, last = 0.0, 1.0
+    for origin, delta, (low, high) in zip(start, sub(end, start), (x_range, y_range)):
+        if abs(delta) <= 1e-9:
+            if not low < origin < high:
+                return 0.0
+            continue
+        near, far = sorted(((low - origin) / delta, (high - origin) / delta))
+        first, last = max(first, near), min(last, far)
+    return max(0.0, last - first)
+
+
+def room_edge_support(side, winding, wall_frames, tolerance):
+    """Use the left face as +1 along the proposed wall axis."""
+    supports, conflicts = [], []
+    for wall_id, origin, axis, length, half_width, room_bounding in wall_frames:
+        edge = [(dot(axis, delta), cross(axis, delta)) for delta in (sub(p, origin) for p in side)]
+        clearance = min(tolerance, half_width / 2, length / 4)
+        if fraction_in_box(edge, (clearance, length - clearance),
+                           (-half_width + clearance, half_width - clearance)) > 1e-9:
+            conflicts.append(wall_id)
+            continue
+        x0, x1 = sorted(p[0] for p in edge)
+        for sign in (-1, 1):
+            face = sign * half_width
+            covered = fraction_in_box(edge, (0, length), (face - tolerance - 1e-8, face + tolerance + 1e-8))
+            if covered * (x1 - x0) <= tolerance + 1e-8:
+                continue
+            whole = (x0 >= -tolerance and x1 <= length + tolerance
+                     and all(abs(p[1] - face) <= tolerance + 1e-8 for p in edge)
+                     and abs(dot(direction(*side), axis)) >= math.cos(math.radians(0.5)))
+            wall_is_outside = (edge[1][0] - edge[0][0]) * winding * sign > 0
+            if whole and wall_is_outside and room_bounding:
+                supports.append({"wall_id": wall_id, "face_sign": sign})
+            elif (whole and not wall_is_outside) or (room_bounding and not whole):
+                conflicts.append(wall_id)
+    if conflicts or len(supports) > 1:
+        return {"kind": "unresolved", "wall_ids": sorted(set(conflicts) | {row["wall_id"] for row in supports})}
+    if supports:
+        return {"kind": "wall_face", **supports[0]}
+    return {"kind": "separator"}
+
+
+def classify_room_boundaries(proposal, wall_room_bounding):
+    """Plan boundary edges using explicit room-bounding choices for proposed walls."""
+    walls = proposal["walls"]
+    if (not isinstance(wall_room_bounding, dict)
+            or set(wall_room_bounding) != {wall["id"] for wall in walls}
+            or any(type(value) is not bool for value in wall_room_bounding.values())):
+        raise ValueError("Supply a room-bounding choice for each proposed wall.")
+    tolerance = proposal["tolerance_mm"]
+    frames = []
+    for wall in walls:
+        a, b = wall["axis"]
+        wall_id = wall["id"]
+        frames.append((wall_id, a, direction(a, b), math.dist(a, b), wall["width_mm"] / 2,
+                       wall_room_bounding[wall_id]))
+    rooms, unresolved = [], list(proposal["unresolved"])
+    for room in proposal["rooms"]:
+        contour = edges(room["boundary"])
+        base = room["boundary"][0]
+        winding = sum(cross(sub(a, base), sub(b, base)) for a, b in contour)
+        boundary_edges = []
+        for side in contour:
+            choice = room_edge_support(side, winding, frames, tolerance)
+            boundary_edges.append({"edge": side, **choice})
+            if choice["kind"] == "unresolved":
+                unresolved.append({"source_ids": room["source_ids"], "edge": side, "wall_ids": choice["wall_ids"],
+                                   "reason": "A proposed wall crosses the room edge or its face support is uncertain."})
+        for wall_id, a, axis, length, _, _ in frames:
+            dx, dy = scale(axis, length / 2)
+            if inside((a[0] + dx, a[1] + dy), contour):
+                unresolved.append({"source_ids": room["source_ids"], "wall_ids": [wall_id],
+                                   "reason": "A proposed wall extends into the room interior."})
+        rooms.append({**room, "boundary_edges": boundary_edges})
+    return {**proposal, "wall_room_bounding": wall_room_bounding, "rooms": rooms,
+            "unresolved": unresolved, "status": "unresolved" if unresolved else proposal["status"]}
+
+
+def validate_mapping(mapping):
     fields(mapping, "tolerance_mm minimum_overlap_mm door_setback_mm walls doors room_layers")
-    if snapshot["coordinate_frame"] != FRAME:
-        raise ValueError("Use Revit internal axes expressed in millimetres.")
-    link_id, level_id = (label(snapshot[key]) for key in ("link_id", "level_id"))
-    level = number(snapshot["level_mm"], -1e7, 1e7)
     tolerance = number(mapping["tolerance_mm"], 0.1, 25)
     minimum = number(mapping["minimum_overlap_mm"], 100, 1e6)
     setback = number(mapping["door_setback_mm"], tolerance, 1e5)
@@ -255,7 +337,17 @@ def propose(snapshot, mapping):
         fields(entry, "type_id width_mm")
         label(entry["type_id"])
         number(entry["width_mm"], 30, 10000)
+    return tolerance, minimum, setback
 
+
+def propose(snapshot, mapping):
+    fields(snapshot, "coordinate_frame link_id level_id level_mm segments room_loops")
+    if snapshot["coordinate_frame"] != FRAME:
+        raise ValueError("Use Revit internal axes expressed in millimetres.")
+    link_id, level_id = (label(snapshot[key]) for key in ("link_id", "level_id"))
+    level = number(snapshot["level_mm"], -1e7, 1e7)
+    tolerance, minimum, setback = validate_mapping(mapping)
+    wall_map, door_map, room_layers = (mapping[key] for key in ("walls", "doors", "room_layers"))
     segments, loops = snapshot["segments"], snapshot["room_loops"]
     if not isinstance(segments, list) or not isinstance(loops, list) or len(segments) > 400 or len(loops) > 32:
         raise ValueError("Use at most 400 segments and 32 room loops.")
@@ -387,11 +479,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot")
     parser.add_argument("--mapping", required=True)
+    parser.add_argument("--room-bounding", choices=("all", "none"),
+                        help="Classify room edges with all or no proposed walls set to room-bounding.")
     args = parser.parse_args(argv)
     try:
         snapshot, source_sha = read_input(args.snapshot)
         mapping, mapping_sha = read_input(args.mapping)
         result = propose(snapshot, mapping)
+        if args.room_bounding is not None:
+            result = classify_room_boundaries(result, {wall["id"]: args.room_bounding == "all"
+                                                       for wall in result["walls"]})
         result.update(snapshot_sha256=source_sha, mapping_sha256=mapping_sha)
         encoded = json.dumps(result, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
         if len(encoded) > 2 * INPUT_LIMIT:

@@ -37,6 +37,16 @@ def report(snapshot):
             "note": "Configured hide evidence only. Other visibility mechanisms and rendered visibility are not assessed."}
 
 
+def expected_after(snapshot, kind, ids):
+    expected = copy.deepcopy(snapshot)
+    collection, flag = {"element": ("elements", "direct"), "category": ("categories", "hidden"),
+                        "filter": ("filters", "hidden")}[kind]
+    for row in expected[collection]:
+        if row["id"] in ids:
+            row[flag] = False
+    return expected
+
+
 def compute(snapshot, intent):
     if snapshot["kind"] != "hidden-elements-snapshot" or not snapshot["view"]["writable"]:
         raise ValueError("The reviewed active view cannot be changed.")
@@ -68,6 +78,15 @@ def compute(snapshot, intent):
     else:
         raise ValueError("Choose element, category, or filter.")
     ids = sorted(ids, key=int)
+    affected = set(ids if kind == "element" else snapshot["impact"])
+    for row in report(expected_after(snapshot, kind, ids))["rows"]:
+        if row["id"] not in affected:
+            continue
+        reasons = ["%s %s (%s)" % (reason["kind"], reason["id"], reason["origin"])
+                   if "id" in reason else "a direct element hide" for reason in row["reasons"]]
+        if reasons:
+            warnings.append({"row": row["id"], "blocking": False,
+                             "text": "Other configured hides remain for %s." % ", ".join(reasons)})
     return {"kind": "change-preview", "recipe": "hidden-elements", "title": "Clear Revit visibility hides",
             "keyColumn": "ID", "columns": ["ID", "Source", "Hide flag"], "changedColumns": ["Hide flag"],
             "before": [[key, kind, True] for key in ids], "after": [[key, kind, False] for key in ids],
@@ -79,14 +98,9 @@ def compute(snapshot, intent):
 
 
 def check_after(plan, actual):
-    expected = copy.deepcopy(plan["basis"])
+    intent = plan["intent"]
+    expected = expected_after(plan["basis"], intent["kind"], intent["ids"])
     observed = copy.deepcopy(actual)
-    kind = plan["intent"]["kind"]
-    collection, flag = {"element": ("elements", "direct"), "category": ("categories", "hidden"),
-                        "filter": ("filters", "hidden")}[kind]
-    for row in expected[collection]:
-        if row["id"] in plan["intent"]["ids"]:
-            row[flag] = False
     for state in (expected, observed):
         state["view"].pop("ownership", None)
         state["view"].pop("writable", None)

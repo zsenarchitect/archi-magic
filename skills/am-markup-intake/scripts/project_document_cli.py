@@ -136,13 +136,15 @@ def main(argv=None):
         mode.add_argument("--page", type=positive_int)
         mode.add_argument("--table", type=positive_int)
         mode.add_argument("--header-row", type=positive_int, default=1)
+    read.add_argument("--literal-text-column", help="Require literal text in the named XLSX column")
     check.add_argument("--schedule-json", required=True)
     check.add_argument("--schedule", required=True)
     check.add_argument("--key", type=mapping, action="append", required=True)
     check.add_argument("--field", type=mapping, action="append", required=True)
     args = parser.parse_args(argv)
     try:
-        document = extract(args.document, args.sheet, args.page, args.table, args.header_row)
+        document = extract(args.document, args.sheet, args.page, args.table, args.header_row,
+                           literal_text_column=getattr(args, "literal_text_column", None))
         result = document if args.mode == "extract" else compare(
             document, read_schedule(args.schedule_json, args.schedule), args.key, args.field)
         encoded = json.dumps(result, ensure_ascii=True, indent=2)
