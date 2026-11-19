@@ -1,0 +1,15 @@
+# Built-in patterns for scan_private.py and scan-private.ps1 (issue #273).
+# Both scripts read this file, so an agent never copies a backslash through a shell.
+# One pattern per line, four fields separated by one TAB:
+#   kind <TAB> name <TAB> regular expression (case-insensitive) <TAB> canary
+# kind "deny": a match is a hit. Its canary must give a hit with this name (self-test).
+# kind "allow": known safe text. Deny patterns skip it. Its canary must scan clean.
+# Use only regex syntax that Python "re" and .NET "Regex" read the same way.
+deny	user-profile-path	[a-z]:[\\/]+users[\\/]	see D:\Users\jdoe\notes.txt
+deny	home-path	/(users|home)/	see /Users/jdoe/notes.txt
+deny	at-sign	@	write to jdoe@example.com
+deny	long-number	\d{7,}	id 1234567
+deny	guid	[0-9a-f]{8}-[0-9a-f]{4}-	run 0123abcd-4567-89ab
+deny	link	https?://(?!github\.com/zsenarchitect(/|$|[^\w.-]))	see https://example.com/page
+allow	plugin-id	[\w-]+@archi-magic(?![\w-]|\.\w)	run claude plugin update archi-magic@archi-magic now
+allow	repo-link	https?://github\.com/zsenarchitect(?![\w.-])[^\s)>\]]*	see https://github.com/zsenarchitect/archi-magic/issues/new

@@ -24,12 +24,20 @@ function Assert-True([string]$name, [bool]$ok, [string]$detail) {
     $script:Asserts++
     if ($ok) { Write-Host "PASS $name" } else { $script:Fail++; Write-Host "FAIL $name : $detail" }
 }
-function Write-State([string]$name, [string]$lastNudge) {
+function Write-State([string]$name, [string]$lastNudge, [string]$lastPost = '') {
     $p = Join-Path $Root $name
-    [IO.File]::WriteAllText($p, ('{"last_nudge":"' + $lastNudge + '"}'))
+    $json = '{"last_nudge":"' + $lastNudge + '"'
+    if ($lastPost) { $json += ',"last_feedback_post":"' + $lastPost + '"' }
+    [IO.File]::WriteAllText($p, ($json + '}'))
     return $p
 }
 function Get-Last([string]$p) { ([IO.File]::ReadAllText($p) | ConvertFrom-Json).last_nudge }
+function Get-Post([string]$p) { ([IO.File]::ReadAllText($p) | ConvertFrom-Json).last_feedback_post }
+function Invoke-MarkPost([string]$state, [string]$now) {
+    # The am-feedback skill runs: powershell -NoProfile -ExecutionPolicy Bypass -File <hook> -MarkPost
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Hook -MarkPost -StateFile $state -NowUtc $now 2>&1 | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+}
 function Plus([int]$minutes) { ([datetime]::Parse($T0, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)).AddMinutes($minutes).ToString('o') }
 
 try {
@@ -107,6 +115,46 @@ try {
     $r = Invoke-Hook $s (Plus 600) 'UserPromptSubmit'
     Assert-True 'bad state: exit 0, quiet' ($r.Code -eq 0 -and $r.Out -eq '') "exit $($r.Code) out '$($r.Out)'"
     Assert-True 'bad state: rewritten' ((Get-Last $s) -like '2026-11-02T20:00:00*') ([IO.File]::ReadAllText($s))
+
+    # 11. A manual am-feedback post inside the interval delays the nudge (#274).
+    $s = Write-State 'post-inside.json' $T0 (Plus 100)
+    $r = Invoke-Hook $s (Plus 150) 'UserPromptSubmit'
+    Assert-True 'post inside interval: quiet' ($r.Code -eq 0 -and $r.Out -eq '') "out '$($r.Out)'"
+    Assert-True 'post inside interval: state unchanged' ((Get-Last $s) -eq $T0 -and (Get-Post $s) -eq (Plus 100)) ([IO.File]::ReadAllText($s))
+
+    # 12. Due after the post: since = the post time, and the post time is kept.
+    $r = Invoke-Hook $s (Plus 220) 'UserPromptSubmit'
+    $j = $null; try { $j = $r.Out | ConvertFrom-Json } catch { }
+    Assert-True 'after post: nudges' ($null -ne $j) $r.Out
+    Assert-True 'after post: since = post time' ($j -and $j.hookSpecificOutput.additionalContext -match 'since=2026-11-02T11:40:00') $r.Out
+    Assert-True 'after post: names the post as the anchor' ($j -and $j.hookSpecificOutput.additionalContext -match 'last am-feedback post') $r.Out
+    Assert-True 'after post: nudge time moved, post time kept' ((Get-Last $s) -like '2026-11-02T13:40:00*' -and (Get-Post $s) -like '2026-11-02T11:40:00*') ([IO.File]::ReadAllText($s))
+
+    # 13. A post older than the last nudge: since = the last nudge.
+    $s = Write-State 'post-old.json' (Plus 60) $T0
+    $r = Invoke-Hook $s (Plus 180) 'UserPromptSubmit'
+    Assert-True 'old post: since = previous nudge' ($r.Out -match 'since=2026-11-02T11:00:00' -and $r.Out -match 'previous nudge') $r.Out
+
+    # 14. An unreadable post time is ignored.
+    $s = Write-State 'post-bad.json' $T0 'not a time'
+    $r = Invoke-Hook $s (Plus 120) 'UserPromptSubmit'
+    Assert-True 'bad post time: ignored, nudges at 120 min' ($r.Out -match 'since=2026-11-02T10:00:00') $r.Out
+
+    # 15. -MarkPost keeps last_nudge and writes the post time, UTF-8 without BOM.
+    $s = Write-State 'mark.json' $T0
+    $r = Invoke-MarkPost $s (Plus 30)
+    Assert-True 'mark post: exit 0, says saved' ($r.Code -eq 0 -and $r.Out -match '^feedback post time saved: 2026-11-02T10:30:00') "exit $($r.Code) out '$($r.Out)'"
+    Assert-True 'mark post: last_nudge kept' ((Get-Last $s) -like '2026-11-02T10:00:00*') ([IO.File]::ReadAllText($s))
+    Assert-True 'mark post: post time written' ((Get-Post $s) -like '2026-11-02T10:30:00*') ([IO.File]::ReadAllText($s))
+    $bytes = [IO.File]::ReadAllBytes($s)
+    Assert-True 'mark post: no BOM' ($bytes[0] -eq [byte][char]'{') ("first byte $($bytes[0])")
+
+    # 16. -MarkPost with no state file, and with all nudges turned off.
+    $env:ARCHI_MAGIC_NO_FEEDBACK_NUDGE = '1'
+    $s = Join-Path $Root 'mark-new.json'
+    $r = Invoke-MarkPost $s (Plus 45)
+    $env:ARCHI_MAGIC_NO_FEEDBACK_NUDGE = $null
+    Assert-True 'mark post, no state: file written' ((Test-Path -LiteralPath $s) -and (Get-Post $s) -like '2026-11-02T10:45:00*' -and (Get-Last $s) -like '2026-11-02T10:45:00*') "out '$($r.Out)'"
 } finally {
     $env:ARCHI_MAGIC_LOG_DIR = $null
     $env:ARCHI_MAGIC_NO_FEEDBACK_NUDGE = $null
