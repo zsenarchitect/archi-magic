@@ -27,7 +27,7 @@ Diagnose archi-magic problems with the tested script `scripts/doctor.ps1` in thi
    - Exit 2: no problem found, but some part was not checked. Say which part, and say what the user can do so it can be checked.
    - If Revit answered earlier in this session and is gone now, run it again with `-RevitWasRunning`. The doctor then points to `am-revit-crash-doctor`.
 2. Explain each `error`, `warn` and `unchecked` line in plain words. Say what is wrong, why it matters, and what the fix does. Mention `info` lines only when they help.
-3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: CONFIG_BOM, DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, ADDIN_NAME_CLASH / ADDIN_DUPLICATE / ADDIN_OTHER_ID, YEAR_NOT_ATTACHED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option. If the user set `auto` on purpose, report POLICY_AUTO only: do not offer its fix, and never mark it "(Recommended)". For CONFIG_BAD_JSON, SKILL_SHADOW, GIT_MISSING, PYTHON_MISSING, GH_MISSING and GH_SIGNED_OUT, give the manual step from the `fix` column. Move a personal skill copy only after the user agrees.
+3. Ask which fix to run. Use AskUserQuestion. Put the fix for the most basic problem first, with "(Recommended)", in this order: CONFIG_BOM, DEPS_MISSING, PY7_MISSING, INSTALL_CRASH, REPOINT_NEEDED, ADDIN_NAME_CLASH / ADDIN_DUPLICATE / ADDIN_OTHER_ID, YEAR_NOT_ATTACHED, AGENT_DISABLED, MCP_MISSING / MCP_WRONG_PATH, POLICY_AUTO. Add a "Not now" option. If the user set `auto` on purpose, report POLICY_AUTO only: do not offer its fix, and never mark it "(Recommended)". For CONFIG_BAD_JSON, SKILL_SHADOW, GIT_MISSING, PYTHON_MISSING, PYTHON_PYREVIT_ONLY, PYTEST_MISSING, GH_MISSING and GH_SIGNED_OUT, give the manual step from the `fix` column. Move a personal skill copy only after the user agrees.
 4. Run only the fix that the user picked:
    `powershell -NoProfile -ExecutionPolicy Bypass -File "<this skill dir>\scripts\doctor.ps1" -Fix <CODE>`
    - Exit 4 means there is no automatic fix. Give the user the manual step from the `fix` column.
@@ -68,7 +68,11 @@ Diagnose archi-magic problems with the tested script `scripts/doctor.ps1` in thi
 | GIT_MISSING | git is not found, or not on PATH in this session. Claude Code needs git to add and update the archi-magic marketplace (`Command 'git' not found`). | Manual: `winget install --id Git.Git --exact --scope user` (no admin), then restart the Claude app. |
 | GH_MISSING / GH_SIGNED_OUT (info) | The GitHub CLI (`gh`) is missing or not signed in. Only `am-feedback` and `-Report -OpenIssue` need it. Without it they give the text to paste. The doctor never shows the account name. | Manual: install gh, then the user runs `gh auth login`. In PowerShell with a full path, put `&` first: `& "<path>\gh.exe" auth login`. Never type a token for the user. |
 | PYTHON_MISSING | No working Python 3. Often `python` is only the Microsoft Store alias, which prints "Python was not found; run without arguments to install from the Microsoft Store". Skill scripts that run `python` then fail. The doctor reports the alias as "no Python". | Manual: `winget install --id Python.Python.3.12 --exact --scope user` (no admin). If the Store message stays, the user turns off the `python.exe` App execution aliases in Windows Settings. Until then, use the no-Python path of a skill (for example in `am-feedback`). |
-| PYTHON (info) | `python` does not work, but `py -3` or `python3` runs Python 3. | Use that command where a skill says `python`. |
+| PYTHON (info) | `python` does not work (often the Store alias), but `py -3` (the Python Launcher of a per-user install) or `python3` runs Python 3. The evidence names the command. | Where a skill says `python scripts/...`, run `py -3 scripts/...` (or the command in the evidence). Do not report "no Python". |
+| PYTHON_PYREVIT_ONLY | The only Python that runs is the CPython inside the pyRevit folder (`bin\cengines\CPY*\python.exe`). It has no pip and no pytest. You cannot add packages to it, so the skill tests cannot run. | Manual: `winget install --id Python.Python.3.12 --exact --scope user` (no admin). Do not use the pyRevit CPython for skill scripts or tests. |
+| PYTEST_MISSING (info) | Python works, but pytest (or pip) is missing. Only contributors who run the skill tests need it. | Manual: `<python> -m pip install --user pytest` (for example `py -3 -m pip install --user pytest`). A warning that the Scripts folder is not on PATH is fine: run `<python> -m pytest`. |
+
+The doctor tests these commands in this order: `python`, `python3`, `py -3`, then pyRevit's CPython. When `python` is only the Store alias, use the command that the PYTHON line names for every helper script in this session.
 
 If Revit stays busy, the agent check names the dialog when the busy line lists the open windows. The finding is `AGENT_BLOCKED_DIALOG | warn`. Ask the user to close the dialog, then run the doctor again. If the busy line names no windows, the finding is `AGENT_BUSY_SESSION | warn`. Tell the user that another agent session probably holds Revit. Ask the user to wait for the other session, then run the doctor again.
 
@@ -106,6 +110,10 @@ If a dependency is missing, or a Claude Code JSON file has a byte-order mark, ar
 ## Shared log
 
 archi-magic scripts write one JSON line per key step to `%LOCALAPPDATA%\archi-magic\logs\<yyyy-MM>.jsonl` (6 months kept). The log contains no model data, no file contents and no tokens. Paths are written as `%APPDATA%`, `%TEMP%` and similar.
+
+## Python helper scripts
+
+The commands in the next three sections start with `python`. If `python` is only the Microsoft Store alias, write `py -3` instead (or the command that the PYTHON line names). These scripts use only the Python standard library.
 
 ## Time-saved log and ROI report (issue #184)
 

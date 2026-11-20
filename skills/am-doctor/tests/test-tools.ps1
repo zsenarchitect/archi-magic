@@ -14,7 +14,14 @@
        message ("Python was not found; run without arguments to install from the Microsoft Store")
        -> PYTHON_MISSING warn "only the Microsoft Store alias". A Python 2 -> PYTHON_MISSING warn.
        None -> PYTHON_MISSING warn "not found".
-    4. -Fix PYTHON_MISSING / GIT_MISSING / GH_SIGNED_OUT -> exit 4 with the manual step.
+    5. Python Launcher (issue #254 comment 2): 'python' is the Store alias, 'py -3' works ->
+       PYTHON info that names 'py -3' (no PYTHON_MISSING, exit 0). 'py' gets '-3' first.
+    6. pyRevit's own CPython (bin\cengines\CPY*\python, issue #254 comment 1): it is the only
+       working Python -> PYTHON_PYREVIT_ONLY warn, exit 1. With a real Python too -> that one wins.
+    7. pip and pytest: pip but no pytest -> PYTEST_MISSING info with 'pip install --user pytest'.
+       No pip -> PYTEST_MISSING info "has no pip". Both present -> no PYTEST_MISSING line.
+    4. (runs last) -Fix PYTHON_MISSING / GIT_MISSING / GH_SIGNED_OUT / PYTHON_PYREVIT_ONLY /
+       PYTEST_MISSING -> exit 4 with the manual step.
 
   powershell -NoProfile -ExecutionPolicy Bypass -File skills\am-doctor\tests\test-tools.ps1
   Exit 0 = all cases pass.
@@ -50,6 +57,14 @@ try {
     $pyOk = New-Stub 'python-ok' @('echo AMPY3.12')
     $pyAlias = New-Stub 'python-alias' @('echo Python was not found; run without arguments to install from the Microsoft Store, or disable this shortcut from Settings ^> Apps ^> Advanced app settings ^> App execution aliases.', 'exit /b 9009')
     $py2 = New-Stub 'python2' @('echo AMPY2.7')
+    # The launcher stub answers only when '-3' comes first, like 'py -3'.
+    $pyLauncher = New-Stub 'py-launcher' @('if not "%1"=="-3" (echo wrong launcher args 1>&2 & exit /b 2)', 'echo AMPY3.12', 'echo AMMOD pip=1 pytest=1')
+    $pyNoPytest = New-Stub 'python-nopytest' @('echo AMPY3.12', 'echo AMMOD pip=1 pytest=0')
+    $pyNoPip = New-Stub 'python-nopip' @('echo AMPY3.12', 'echo AMMOD pip=0 pytest=0')
+    $pyFull = New-Stub 'python-full' @('echo AMPY3.12', 'echo AMMOD pip=1 pytest=1')
+    $pyRevitPy = Join-Path $Root 'stubs\pyRevit-Master\bin\cengines\CPY3123\python.cmd'
+    New-Item -ItemType Directory -Force (Split-Path -Parent $pyRevitPy) | Out-Null
+    (@('@echo off', 'echo AMPY3.12', 'echo AMMOD pip=0 pytest=0') -join "`r`n") | Set-Content -LiteralPath $pyRevitPy -Encoding Ascii
 
     # 1. git.
     $r = Invoke-Doctor 'none' $ghIn $pyOk
@@ -78,8 +93,32 @@ try {
     $r = Invoke-Doctor $gitOk $ghIn 'none'
     Assert-True '3: no Python -> PYTHON_MISSING warn "not found"' ($r.Code -eq 1 -and (Get-Lines $r.Out '^PYTHON_MISSING \| warn \|.*not found').Count -eq 1) "exit $($r.Code)`n$($r.Out)"
 
+    # 5. Python Launcher: python is the Store alias, py -3 works.
+    $r = Invoke-Doctor $gitOk $ghIn $pyAlias @('-Only', 'tools', '-PyExe', $pyLauncher)
+    Assert-True "5: Store alias + py launcher -> PYTHON info names 'py -3', exit 0" ($r.Code -eq 0 -and (Get-Lines $r.Out "^PYTHON \| info \|.*'python' is only the Microsoft Store alias, but 'py -3' runs Python 3\.12").Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+    Assert-True '5: py launcher works -> no PYTHON_MISSING line' ((Get-Lines $r.Out '^PYTHON_MISSING').Count -eq 0) $r.Out
+    $r = Invoke-Doctor $gitOk $ghIn 'none' @('-Only', 'tools', '-PyExe', $pyLauncher)
+    Assert-True "5: no python, py launcher only -> PYTHON info 'py -3'" ($r.Code -eq 0 -and (Get-Lines $r.Out "^PYTHON \| info \|.*'python' is not found, but 'py -3' runs").Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+    $r = Invoke-Doctor $gitOk $ghIn $pyAlias @('-Only', 'tools', '-PyExe', 'none')
+    Assert-True '5: Store alias, py none -> PYTHON_MISSING warn' ($r.Code -eq 1 -and (Get-Lines $r.Out '^PYTHON_MISSING \| warn \|').Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+
+    # 6. pyRevit's own CPython.
+    $r = Invoke-Doctor $gitOk $ghIn $pyRevitPy
+    Assert-True '6: only pyRevit CPython -> PYTHON_PYREVIT_ONLY warn, exit 1' ($r.Code -eq 1 -and (Get-Lines $r.Out "^PYTHON_PYREVIT_ONLY \| warn \|.*Only pyRevit's own CPython 3\.12 runs.*no pip and no pytest").Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+    Assert-True '6: pyRevit CPython is not reported as PYTHON ok' ((Get-Lines $r.Out '^PYTHON \| ok').Count -eq 0) $r.Out
+    $r = Invoke-Doctor $gitOk $ghIn $pyRevitPy @('-Only', 'tools', '-PyExe', $pyLauncher)
+    Assert-True "6: pyRevit CPython + py launcher -> PYTHON info 'py -3', no PYTHON_PYREVIT_ONLY" ($r.Code -eq 0 -and (Get-Lines $r.Out "^PYTHON \| info \|.*'py -3' runs").Count -eq 1 -and (Get-Lines $r.Out '^PYTHON_PYREVIT_ONLY').Count -eq 0) "exit $($r.Code)`n$($r.Out)"
+
+    # 7. pip and pytest.
+    $r = Invoke-Doctor $gitOk $ghIn $pyNoPytest
+    Assert-True '7: pip, no pytest -> PYTEST_MISSING info with pip install --user pytest, exit 0' ($r.Code -eq 0 -and (Get-Lines $r.Out '^PYTEST_MISSING \| info \|.*has pip but no pytest.*python -m pip install --user pytest').Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+    $r = Invoke-Doctor $gitOk $ghIn $pyNoPip
+    Assert-True '7: no pip -> PYTEST_MISSING info "has no pip"' ($r.Code -eq 0 -and (Get-Lines $r.Out '^PYTEST_MISSING \| info \|.*has no pip').Count -eq 1) "exit $($r.Code)`n$($r.Out)"
+    $r = Invoke-Doctor $gitOk $ghIn $pyFull
+    Assert-True '7: pip and pytest -> PYTHON ok, no PYTEST_MISSING' ((Get-Lines $r.Out '^PYTHON \| ok').Count -eq 1 -and (Get-Lines $r.Out '^PYTEST_MISSING').Count -eq 0) $r.Out
+
     # 4. Manual fixes.
-    foreach ($c in @(@{ Code = 'PYTHON_MISSING'; Want = 'winget install --id Python\.Python' }, @{ Code = 'GIT_MISSING'; Want = 'winget install --id Git\.Git' }, @{ Code = 'GH_SIGNED_OUT'; Want = '& "<path>\\gh\.exe" auth login' })) {
+    foreach ($c in @(@{ Code = 'PYTHON_MISSING'; Want = 'winget install --id Python\.Python' }, @{ Code = 'GIT_MISSING'; Want = 'winget install --id Git\.Git' }, @{ Code = 'GH_SIGNED_OUT'; Want = '& "<path>\\gh\.exe" auth login' }, @{ Code = 'PYTHON_PYREVIT_ONLY'; Want = 'no pip and no pytest' }, @{ Code = 'PYTEST_MISSING'; Want = 'pip install --user pytest' })) {
         $r = Invoke-Doctor $gitOk $ghIn $pyOk @('-Fix', $c.Code)
         Assert-True "4: -Fix $($c.Code) -> exit 4 with the manual step" ($r.Code -eq 4 -and $r.Out -match $c.Want) "exit $($r.Code)`n$($r.Out)"
     }

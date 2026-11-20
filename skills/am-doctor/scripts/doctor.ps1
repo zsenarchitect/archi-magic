@@ -23,7 +23,7 @@
 
   Test parameters (-AddinsRoot, -UserAddinsRoot, -RevitInstallRoot, -Py7Root, -Py7Exe, -LogDir,
   -SetupLogRoot, -McpName, -InstalledPluginsJson, -ClaudeSettingsJson, -KnownMarketplacesJson,
-  -PersonalSkillsDir, -DoctorBackupRoot, -GitExe, -GhExe, -PythonExe, -Only) point the checks
+  -PersonalSkillsDir, -DoctorBackupRoot, -GitExe, -GhExe, -PythonExe, -PyExe, -Only) point the checks
   at other folders or programs.
   -Py7Exe replaces <Py7Root>\bin\pyrevit.exe (for example with a test stub), as in pyrevit7-setup.ps1.
   Defaults are the real locations. The deps check only reads those two JSON files (no network).
@@ -33,7 +33,9 @@
     config (Claude Code JSON files with a byte-order mark or bad JSON, personal skill copies that
             shadow a plugin skill; issue #253),
     tools  (git, gh sign-in, a real Python and not only the Microsoft Store alias; issue #254).
-  -GitExe / -GhExe / -PythonExe: a path to use instead of the PATH search; 'none' = not installed.
+  -GitExe / -GhExe / -PythonExe / -PyExe: a path to use instead of the PATH search; 'none' = not
+    installed. -PyExe is the Python Launcher (run as 'py -3'). With -PythonExe or -PyExe, the doctor
+    tests only those two and does not look for pyRevit's own CPython.
   -Fix CONFIG_BOM copies each Claude Code JSON file that starts with a byte-order mark to
     %LOCALAPPDATA%\archi-magic\backups\am-doctor\<timestamp>\ (-DoctorBackupRoot), then writes it
     again as UTF-8 without a byte-order mark. Ask the user first.
@@ -48,7 +50,7 @@ param(
     [ValidateSet('', 'PY7_MISSING', 'REPOINT_NEEDED', 'YEAR_NOT_ATTACHED', 'INSTALL_CRASH', 'AGENT_DISABLED', 'AGENT_NOT_RESPONDING',
         'AGENT_BLOCKED_DIALOG', 'AGENT_BUSY_SESSION', 'NO_MODEL_OPEN', 'MCP_MISSING', 'MCP_WRONG_PATH', 'POLICY_AUTO', 'DOCS_OFFLINE', 'DEPS_MISSING', 'HEADLESS_OLD_PYREVIT',
         'ADDIN_NAME_CLASH', 'ADDIN_DUPLICATE', 'ADDIN_OTHER_ID', 'ADDIN_SHARED_ID',
-        'CONFIG_BOM', 'CONFIG_BAD_JSON', 'SKILL_SHADOW', 'GIT_MISSING', 'GH_MISSING', 'GH_SIGNED_OUT', 'PYTHON_MISSING')]
+        'CONFIG_BOM', 'CONFIG_BAD_JSON', 'SKILL_SHADOW', 'GIT_MISSING', 'GH_MISSING', 'GH_SIGNED_OUT', 'PYTHON_MISSING', 'PYTHON_PYREVIT_ONLY', 'PYTEST_MISSING')]
     [string]$Fix = '',
     [switch]$Report,
     [switch]$OpenIssue,
@@ -74,6 +76,8 @@ param(
     [string]$GitExe = '',
     [string]$GhExe = '',
     [string]$PythonExe = '',
+    # The Python Launcher (py.exe). With -PythonExe or -PyExe, the doctor uses only these two (no PATH search).
+    [string]$PyExe = '',
     [int]$BusyWaitSec = 25,
     # Pass -RevitWasRunning when Revit answered earlier in this session (a get_context or run
     # succeeded) or the user says Revit just closed. Without it, "no Revit process" is only an
@@ -308,6 +312,19 @@ function Test-PythonCandidate([string]$exe, [string[]]$pre) {
     $alias = (-not $ver) -and (($out -match 'Microsoft Store|App execution aliases') -or ($exe -match '\\Microsoft\\WindowsApps\\'))
     return @{ Version = $ver; StoreAlias = $alias; Out = $out }
 }
+# pyRevit ships its own CPython in <pyRevit>\bin\cengines\CPY*\. It has no pip and no pytest, so it
+# cannot run the skill tests or install a package (issue #254 comment 1).
+function Test-PyRevitPython([string]$exe) { return ([string]$exe -match '(?i)[\\/]bin[\\/]cengines[\\/]') }
+# Checks pip and pytest for a working Python. -I would hide a 'pip install --user' pytest, so this
+# run keeps the user site folder, ignores PYTHON* variables (-E) and drops the current folder from
+# sys.path before it imports anything. Returns @{ Known; Pip; Pytest }.
+function Test-PythonModules([string]$exe, [string[]]$pre) {
+    $code = "import sys;sys.path[:]=[p for p in sys.path if p not in ('','.')];import importlib.util as u;print('AMMOD pip=%d pytest=%d' % tuple(int(u.find_spec(m) is not None) for m in ('pip','pytest')))"
+    $r = Invoke-Native $exe (@($pre) + @('-E', '-c', $code)) 60
+    $m = [regex]::Match([string]$r.Out, 'AMMOD pip=([01]) pytest=([01])')
+    if (-not ($r.Ok -and $m.Success)) { return @{ Known = $false; Pip = $false; Pytest = $false } }
+    return @{ Known = $true; Pip = ($m.Groups[1].Value -eq '1'); Pytest = ($m.Groups[2].Value -eq '1') }
+}
 
 $FixMap = @{
     PY7_MISSING          = @{ Kind = 'setup'; Args = @('-Install', '-Repoint', '-EnableAgent', '-Verify'); Text = 'am-pyrevit7-setup: run setup (Install, Repoint, EnableAgent, Verify).' }
@@ -339,6 +356,8 @@ $FixMap = @{
     GH_MISSING           = @{ Kind = 'manual'; Text = 'Optional: only am-feedback and doctor -Report -OpenIssue post to GitHub, and without gh they show the text to paste. Install: winget install --id GitHub.cli --exact. Then sign in (GH_SIGNED_OUT).' }
     GH_SIGNED_OUT        = @{ Kind = 'manual'; Text = 'The user signs in: gh auth login. In PowerShell with a full path, put & first: & "<path>\gh.exe" auth login. Never type a token for the user.' }
     PYTHON_MISSING       = @{ Kind = 'manual'; Text = 'Install Python 3 for your user (no admin): winget install --id Python.Python.3.12 --exact --scope user. If python still prints the Microsoft Store message, the user turns off the python.exe and python3.exe App execution aliases (Windows Settings > Apps > Advanced app settings). Until then, use the no-Python path of a skill, or skip its Python step.' }
+    PYTHON_PYREVIT_ONLY  = @{ Kind = 'manual'; Text = 'Install Python 3 for your user (no admin): winget install --id Python.Python.3.12 --exact --scope user. Then call it by its full path (for example %LOCALAPPDATA%\Programs\Python\Python312\python.exe) or start a new session. Do not use the CPython in the pyRevit folder for skill scripts or tests: it has no pip and no pytest, and you cannot add packages to it.' }
+    PYTEST_MISSING       = @{ Kind = 'manual'; Text = 'Only for contributors who run the skill tests. Install pytest for your user: <python> -m pip install --user pytest (for example py -3 -m pip install --user pytest). Then run <python> -m pytest -q tests in the skill folder. A warning that the Scripts folder is not on PATH is fine.' }
 }
 
 # ------------------------------------------------------------------ -Fix CONFIG_BOM
@@ -755,32 +774,59 @@ if (Test-Want 'tools') {
 
     # Python: many skill scripts run 'python'. The Microsoft Store alias is not a Python (issue #254).
     try {
+        # Candidates in order: python, python3, the Python Launcher 'py -3' (per-user installs often
+        # have only py on PATH; issue #254 comment 2), then pyRevit's own CPython (not on PATH).
         $cands = @()
-        if ($PythonExe -eq 'none') { }
-        elseif ($PythonExe) { if (Test-Path -LiteralPath $PythonExe) { $cands += @{ Cmd = 'python'; Path = $PythonExe; Pre = @() } } }
-        else {
+        if ($PythonExe -or $PyExe) {
+            foreach ($c in @(@{ Cmd = 'python'; Path = $PythonExe; Pre = @() }, @{ Cmd = 'py'; Path = $PyExe; Pre = @('-3') })) {
+                if ($c.Path -and $c.Path -ne 'none' -and (Test-Path -LiteralPath $c.Path)) { $cands += $c }
+            }
+        } else {
             foreach ($c in @(@{ Cmd = 'python'; Pre = @() }, @{ Cmd = 'python3'; Pre = @() }, @{ Cmd = 'py'; Pre = @('-3') })) {
                 $gc = Get-Command $c.Cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($gc) { $cands += @{ Cmd = $c.Cmd; Path = $gc.Source; Pre = $c.Pre } }
             }
+            $cengines = Join-Path $Py7Root 'bin\cengines'
+            if (Test-Path -LiteralPath $cengines) {
+                foreach ($f in @(Get-ChildItem -Path (Join-Path $cengines 'CPY*\python.exe') -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+                    $cands += @{ Cmd = $f.FullName; Path = $f.FullName; Pre = @() }
+                }
+            }
         }
-        $first = $null; $works = $null
+        $first = $null; $works = $null; $pyrevitPy = $null
         foreach ($c in $cands) {
             $t = Test-PythonCandidate $c.Path $c.Pre
             $c.Result = $t
-            if (-not $first) { $first = $c }
+            if (Test-PyRevitPython $c.Path) {
+                if ($t.Version -and -not $pyrevitPy) { $pyrevitPy = $c }
+                continue
+            }
             if ($t.Version) { $works = $c; break }
+            if (-not $first) { $first = $c }   # the first host command that does not run Python 3
         }
         $pyState = if (-not $first) { 'not found' } elseif ($first.Result.StoreAlias) { 'only the Microsoft Store alias' } else { 'not a working Python 3' }
+        $cmdText = ''
         if ($works -and $works.Cmd -eq 'python') {
+            $cmdText = 'python'
             Add-Finding 'PYTHON' 'ok' "python runs Python $($works.Result.Version) ($(Redact $works.Path))" '-'
         } elseif ($works) {
             $cmdText = (@($works.Cmd) + @($works.Pre)) -join ' '
-            Add-Finding 'PYTHON' 'info' "'python' is $pyState, but '$cmdText' runs Python $($works.Result.Version) ($(Redact $works.Path)). Use '$cmdText' where a skill says python" '-'
+            Add-Finding 'PYTHON' 'info' "'python' is $pyState, but '$cmdText' runs Python $($works.Result.Version) ($(Redact $works.Path)). Where a skill says 'python scripts/...', run '$cmdText scripts/...'" '-'
+        } elseif ($pyrevitPy) {
+            Add-Finding 'PYTHON_PYREVIT_ONLY' 'warn' "no Python for skill scripts: 'python' is $pyState. Only pyRevit's own CPython $($pyrevitPy.Result.Version) runs ($(Redact $pyrevitPy.Path)). It has no pip and no pytest, so it cannot run the skill tests or install a package" $FixMap.PYTHON_PYREVIT_ONLY.Text
         } elseif ($first -and $first.Result.StoreAlias) {
             Add-Finding 'PYTHON_MISSING' 'warn' "no Python: 'python' is only the Microsoft Store alias ($(Redact $first.Path)). Skill scripts that run python cannot run" $FixMap.PYTHON_MISSING.Text
         } else {
             Add-Finding 'PYTHON_MISSING' 'warn' "no Python: $(if ($first) { "'$($first.Cmd)' at $(Redact $first.Path) is not a working Python 3" } else { 'python, python3 and py not found' }). Skill scripts that run python cannot run" $FixMap.PYTHON_MISSING.Text
+        }
+        # pip and pytest: only the skill tests need pytest, so this is info (issue #254 comment 1).
+        if ($works) {
+            $mods = Test-PythonModules $works.Path $works.Pre
+            if ($mods.Known -and -not $mods.Pip) {
+                Add-Finding 'PYTEST_MISSING' 'info' "'$cmdText' has no pip, so it cannot install pytest for the skill tests. Skill scripts that use only the standard library still run" 'Only for contributors who run the skill tests: install Python per user with winget (it includes pip): winget install --id Python.Python.3.12 --exact --scope user'
+            } elseif ($mods.Known -and -not $mods.Pytest) {
+                Add-Finding 'PYTEST_MISSING' 'info' "'$cmdText' has pip but no pytest. Only the skill tests need pytest" "Only for contributors who run the skill tests: $cmdText -m pip install --user pytest, then $cmdText -m pytest -q tests in the skill folder"
+            }
         }
     } catch { Add-Finding 'PYTHON' 'unchecked' "could not check Python: $($_.Exception.Message)" 'Run: python --version' }
 }

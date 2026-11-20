@@ -1,0 +1,10 @@
+# Packages for the Python skill tests (skills/*/tests). Install them for your user, no admin:
+#   py -3 -m pip install --user -r requirements-dev.txt
+# Then run every test folder: scripts/run-python-tests.ps1 (see CONTRIBUTING.md, "Python skill tests").
+# Keep this list in step with the install line of the Python test step in
+# .github/workflows/check-skills.yml. The Windows test job installs from this file.
+pytest
+pypdf
+ezdxf==1.4.5
+-r skills/am-markup-intake/requirements-documents.txt
+-r skills/am-bim-viewer/requirements-workspace.txt

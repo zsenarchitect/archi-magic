@@ -12,6 +12,7 @@ A "markup" is one reviewer mark: a cloud, a callout, a text box, a strike-out, a
 | Script | Where it runs | What it does |
 |---|---|---|
 | `scripts/inventory.ps1` | User's computer | Lists the markup files: type, size, PDF page count, files to convert first. Converts TIFF pages to PNG. |
+| `scripts/render-pdf-pages.ps1` | User's computer (Windows PowerShell 5.1) | Renders PDF pages to PNG with the PDF engine in Windows. Needs no Python and no poppler. |
 | `scripts/pdf_annots.py` | User's computer (Python) | Reads the PDF annotation layer: author, date, page, type, verbatim text, region. |
 | `scripts/consolidate.py` | User's computer (Python) | Merges records: removes duplicates, finds conflicts, sets priority and next step, writes the tracker. |
 | `scripts/read_model_index.py` | Inside Revit, `run_query` only | Lists sheets (with placed views), rooms, door marks and window marks. |
@@ -55,6 +56,7 @@ Use this section for a narrated screen recording. Run the commands in a terminal
    - If it exits 3 (no PDF library), ask with AskUserQuestion: **Install PyMuPDF for this user (Recommended)** runs `python -m pip install --user pymupdf` (no admin rights) / **Continue without it** reads the pages visually only. Never install without a yes.
    - If there is no Python, continue without the scripts. See "No Python" below.
 4. **Extract.**
+   - Test the Read tool on page 1 of one PDF. If it says `pdftoppm is not installed` (no poppler), render the pages to PNG first. See "PDF pages without poppler" below. Then give each subagent its PNG files, not the PDF pages.
    - First read the annotation layer of every PDF, in the main thread. It is fast and needs no AI reading:
      `python "<skill dir>\scripts\pdf_annots.py" "<file>" --json "<work>\annots-<n>.json"`
      Exit 3 means no PDF library: continue with the visual read only.
@@ -134,7 +136,7 @@ A flattened PDF has the reviewer's marks burned into the page. `pdf_annots.py` t
 3. Read each page at full size, in parts when the sheet is large. Find every mark of that color: clouds, lines, arrows, text. Count them per page.
 4. Write one record per mark, with `textSource: "visual"` and a `region`. A mark with no words gets `text: ""` and a plain `interpreted`.
 5. Tell the user the count per page, and ask them to confirm it before the hand-off. A mark found by color alone can be part of the base drawing.
-6. If the computer has no PDF tools, ask the user to export the pages as PNG and read the images.
+6. If the Read tool cannot show the pages, render them with `render-pdf-pages.ps1` (see "PDF pages without poppler"). Use a higher `-Dpi` to read small marks. If the script exits 3, ask the user to export the pages as PNG and read the images.
 
 ## Section marks on plans
 
@@ -154,10 +156,24 @@ A reviewer can draw new section cuts on a plan as a line with a thick bar (the h
 - **Next step.** Question: "Check in model (read-only)" when the question names a room, door, window, grid, detail or sheet ("Verify door swing at Room 205"); else answer the reviewer; an RFI for a consultant discipline. FYI: no action. Change: "Model change -> am-safe-change" for model elements, "Drawing edit" for notes, dimensions and details, or the consultant for other disciplines.
 - The script never changes or "cleans" the verbatim text. Interpretations always show as "[interpretation] ...".
 
+## PDF pages without poppler
+
+The Read tool needs poppler (`pdftoppm`) to show PDF pages. Many office computers do not have it. Do not install poppler. Do not write your own PDF renderer. Use the script in this skill. It uses the PDF engine in Windows 10 and 11 and needs no Python and no admin rights.
+
+1. Run it with Windows PowerShell 5.1 (`powershell`, not `pwsh`):
+   `powershell -NoProfile -ExecutionPolicy Bypass -File "<skill dir>\scripts\render-pdf-pages.ps1" -Pdf "<file>" -OutDir "<work>\pages-<n>" -Pages "1-10" -Dpi 150`
+2. It prints one line for each page: `PAGE <page> <width>x<height> <png path>`. Read the PNG files with the Read tool.
+   - Leave out `-Pages` to render all pages. The first output line gives the page count (`PDF <n> page(s)`).
+   - A large sheet at 150 dpi is a large image. Use `-Dpi 100` for a first look. Use `-Dpi 200` or more to read small text.
+   - The PNG shows the annotations that have a drawn appearance. Read the annotation layer with `pdf_annots.py` as usual when Python is available.
+3. Exit codes: 1 means the PDF is not found, damaged or has a password. Tell the user. 2 means a bad `-Pages` or `-Dpi` value. 3 means the Windows PDF engine is not available. Then ask the user to export the pages as PNG.
+4. The PNG files are copies of the markup pages. Keep them in the work folder.
+
 ## No Python
 
 If the user's computer has no Python, do the same work in chat:
 - Skip `pdf_annots.py`. Read every page visually. Tell the user that annotation authors and dates are not available.
+- If the Read tool cannot show the PDF pages, render them with `render-pdf-pages.ps1` (see "PDF pages without poppler"). It needs only PowerShell.
 - Write the records as above. Apply the rules in "Rules in the scripts" by hand: merge duplicates, attach replies, flag conflicts, set priority and next step.
 - Write the tracker CSV with the columns `#, Sheet, Location, Markup text (verbatim), Request (interpreted), Type, Priority, Confidence, Source, Next step, Model check, Flags`. Write the same rows as `{"kind": "schedules", "schedules": [{"name": "Action tracker", "columns": [...], "rows": [[...]]}]}` and render it with `render-table.ps1`, which needs only PowerShell.
 
@@ -173,7 +189,7 @@ If the user's computer has no Python, do the same work in chat:
 
 ## Tests
 
-`python tests/test_markup_intake.py` runs the tests on the synthetic set in `tests/fixtures/` (no real project data; sheet, room and door numbers are from the Snowdon Towers sample). `python tests/mutate.py` breaks one rule at a time and checks that the tests fail. `tests/fixtures/make_fixtures.py` rebuilds the PDF and PNG.
+`python tests/test_markup_intake.py` runs the tests on the synthetic set in `tests/fixtures/` (no real project data; sheet, room and door numbers are from the Snowdon Towers sample). `python tests/mutate.py` breaks one rule at a time and checks that the tests fail. `tests/fixtures/make_fixtures.py` rebuilds the PDF and PNG. `py -3 -m pytest -q tests/test_render_pdf_pages.py` tests `render-pdf-pages.ps1` on a small generated PDF (Windows only; it skips on other systems).
 
 ## Compare a local project document with a Revit schedule
 

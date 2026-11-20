@@ -7,3 +7,5 @@ archi-magic rules (for Revit, pyRevit and am-* work in this session):
 - Under agent policy `auto`, Revit commits with no Keep/Discard prompt. Then the chat yes from am-safe-change is the approval. Name the undo entry.
 - IronPython gotchas: use .Value, not .IntegerValue; build ids with DB.ElementId(System.Int64(n)); wrap .NET numbers in int() or float() before result; read type names with SYMBOL_NAME_PARAM, not .Name.
 - Before the first raw run_query or run_modify, read "Most frequent script failures" in the am-revit-api-docs skill. It lists the exact errors and fixes (System import, ElementId, .Value, JSON results, slow scans).
+- Host Python: if `python` prints "Python was not found" (the Microsoft Store alias, exit 0 in Bash is possible), run helper scripts with `py -3` instead. Never use the CPython in the pyRevit folder; it has no pip. If openpyxl is missing, read .xlsx with zipfile and xml.etree.
+- Before a recursive file search on a network or mapped drive, read %LOCALAPPDATA%\archi-magic\office-paths.json, then tell the user the folder, depth limit and time estimate, and ask. Stop any search after about 1 minute.
