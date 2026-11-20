@@ -102,7 +102,7 @@ Optional add-ons, installed only when the user needs them:
 
 | The user says (or means) | Use | First action |
 |---|---|---|
-| "I'm new to archi-magic", "what is archi-magic", "what can you do in Revit" (not a bare "help") | `am-welcome` | Run its setup check, then show the skill table it builds |
+| "I'm new to archi-magic", "what is archi-magic", "what can you do in Revit" (not a bare "help"), "where is our office template" | `am-welcome` | Run its setup check, then show the skill table it builds. For an office file, read the saved location first (section "Office files"); never scan a network drive without asking |
 | "set up pyRevit", "connect Claude to Revit", Revit shows pyRevit 6.x | `am-pyrevit7-setup` | Data warning, then ask the user to close Revit, then run the script |
 | "Claude can't see my Revit", any setup error, after a pyRevit update | `am-doctor` | Run `doctor.ps1` (read-only) and explain each finding |
 | "time spent by model", "summarize Revit journal activity" | `am-revit-crash-doctor` | Run the local journal effort report for the date range and show coverage before interpreting estimated windows |
@@ -184,7 +184,7 @@ Logs: archi-magic writes one JSON line per event to `%LOCALAPPDATA%\archi-magic\
 
 | Skill | What it does |
 |---|---|
-| `am-welcome` | Introduces archi-magic in plain words for architects who are new to these tools. It lists what you can ask, checks your setup, and gives a safe first-run path. Ask "what is archi-magic?" or "I'm new, help me start". |
+| `am-welcome` | Introduces archi-magic in plain words for architects who are new to these tools. It lists what you can ask, checks your setup, and gives a safe first-run path. It also remembers where your office template and libraries live, on your computer only. Ask "what is archi-magic?" or "I'm new, help me start". |
 | `am-pyrevit7-setup` | Installs pyRevit 7 per-user **without admin rights** and repoints Revit 2024–2026 to it, even when IT installed pyRevit 6.x machine-wide. It also connects the pyRevit Agent Runtime to Claude Code. Ask Claude to "set up pyRevit 7". |
 | `am-doctor` | Finds and fixes problems with pyRevit 7, the Revit connection and archi-magic. It checks your setup and recent logs, explains each problem, runs the fix you approve, and can draft a bug report. Ask Claude to "run the doctor". |
 | `am-revit-crash-doctor` | Finds out why Revit crashed or froze. It reads Revit journals, crash dumps, Autodesk crash reports and the Windows event log, then explains the likely cause and the next step. It only reads, and works with Revit closed. Ask "why did Revit crash?" |

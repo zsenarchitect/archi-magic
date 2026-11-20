@@ -17,7 +17,7 @@ Files (paths relative to the am-family-tools skill folder):
 
 Ask only what the request leaves open. Use AskUserQuestion.
 
-1. **Which folder is the library?** Ask for the folder path. Do not guess. A local folder or a synced folder (OneDrive, Autodesk Desktop Connector) is fine.
+1. **Which folder is the library?** First read the saved office library location: `family_library` in `%LOCALAPPDATA%\archi-magic\office-paths.json` (see "Office files" in `am-welcome`). If it is saved, offer it as the first option. Otherwise ask for the folder path. Do not guess, and do not search a network drive for it. A local folder or a synced folder (OneDrive, Autodesk Desktop Connector) is fine.
 2. **Where does the index go?** Recommend a private work folder outside the library, for example `%LOCALAPPDATA%\archi-magic\family-index\<library name>\`. Never write into the library folder.
 
 ## Step 2: index
