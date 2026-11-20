@@ -13,7 +13,7 @@ Recipes (the task-specific parts):
 - Element transforms: [recipes/element-transforms.md](recipes/element-transforms.md). Use it to move or rotate elements, including changes copied from the 3D viewer (JSON with `"kind": "element-transforms"`), or "move this column 2 ft east and turn it 15 degrees".
 - Material colors: [recipes/material-colors.md](recipes/material-colors.md). Use it to let the user tune Shading and Surface Pattern colors by eye in a panel, then write them to Revit ("pick the colors for the floor materials by eye").
 - Texture image repathing: [recipes/repath-texture-images.md](recipes/repath-texture-images.md). Use it to find materials with missing texture images and repath what the project folder covers ("repath the missing textures from the ACC folder").
-- Detail views: [recipes/detail-views.md](recipes/detail-views.md). Use it to add section detail views to a sheet and match the existing viewports: copy the reference viewport's label settings and type, center each box with `SetBoxCenter`, propose detail numbers in the sheet's pattern, and verify with a fresh read ("add two section details to A401 and match the existing viewports").
+- Detail views: [recipes/detail-views.md](recipes/detail-views.md). Use it to add section detail views to a sheet and match the existing viewports: copy the reference viewport's label settings and type, center each box with `SetBoxCenter`, propose detail numbers in the sheet's pattern, and verify with a fresh read ("add two section details to A401 and match the existing viewports"). Its other paths: "Same condition check" (a placed detail already shows the condition, so point the marker to it first), "Point a marker to another detail" (retarget a plan marker or add a reference section), "Remove a detail view" (retarget the markers first, also after a viewport was deleted by hand), and the marker audit in step 8 (markers whose target view is on no sheet).
 
 - [Create named levels and grids](recipes/create-datums.md). Review project elevations, grid spacings and existing names before creating new datums.
 
@@ -62,9 +62,23 @@ For a change with no recipe yet, follow the same 8 steps. Write the read query, 
    - When the change reconciles two fields or two sources (for example a type name code and a Type Mark, or a model value and a legend sheet), ask which one is the source of truth before you compute the preview. Do not guess. Use AskUserQuestion with one option for each source. The other field follows the source of truth (issue #250).
 3. **Read.** Before the read query, say how many elements the plan may touch. If the plan may touch more than 5000 elements, say so and ask the user first. Tell the user to save or sync before the read. Keep the read inside the query budget in `am-revit-api-docs`. Run the recipe's read script with `run_query` (read-only). Save the result to a work folder, for example `$env:TEMP\am-safe-change\<yyyyMMdd-HHmmss>\read.json`. For destructive or bulk changes, record a baseline snapshot: element counts per target category and scheme, and a hash of target element IDs (issue #191).
 4. **Compute and check ownership.** Calculate the change outside Revit with the recipe's pure function. Write the change-preview JSON (format below) to the work folder. Do not change Revit in this step. Then check worksharing ownership (#97). In a workshared model, Revit refuses to change an element that another user borrows. "Borrow" means a user has the right to edit one element until they synchronize and relinquish it. One refused element rolls back the whole run, after the user approved the preview. Do this check for every recipe. The script paths are in this skill's folder.
-   1. Write the read inputs: `python scripts/ownership.py inputs --preview <preview.json> --out <own-inputs.json>`. For a change with no recipe, add the edited ids with `--ids 123,456`, or put them in the preview as `"ownership_ids"`.
-   2. Run `scripts/read_ownership.py` with `run_query` and these inputs. Save the result as `own.json`. It reads `WorksharingUtils.GetCheckoutStatus` for each target. For `OwnedByOtherUser` it reads the owner with `WorksharingUtils.GetWorksharingTooltipInfo(doc, id).Owner`.
-   3. Run `python scripts/ownership.py check --read <own.json> --preview <preview.json>`. It prints one line, for example "0 of 12 elements owned by others.", and the owner of each blocked element. It adds this line to the preview notes. For each element that another user owns, or that central has updated, it adds a blocking warning to the preview. Exit code 1 means blocked.
+   1. Write the read inputs: `python scripts/ownership.py inputs --preview <preview.json> --out <work>/own-inputs.json`. `<work>` is the absolute path of the work folder. For a change with no recipe, add the edited ids with `--ids 123,456`, or put them in the preview as `"ownership_ids"`. The command also prints the `inputs` object for the next step, with absolute paths.
+   2. Run `scripts/read_ownership.py` with `run_query`. Pass the two file paths that step 1 printed, not the ids (issue #278):
+      ```
+      run_query(
+        script=<full text of scripts/read_ownership.py>,
+        inputs={"inputs_path": "<work>/own-inputs.json", "out_path": "<work>/own.json"},
+        engine="ironpython"
+      )
+      ```
+      - The script reads the ids from `inputs_path`. It writes the full read to `out_path` (UTF-8 JSON). It returns only a short summary: the counts, the owners and `out_path`.
+      - Use absolute paths with forward slashes, for example `C:/.../own.json`. The script refuses a relative path or `%TEMP%`, because such a path resolves inside the Revit process (issue #85).
+      - If the result has `status` `bad_inputs` or `write_failed`, read its `error`, correct the path and run again.
+      - Never copy ownership data from the chat into a file by hand. The script writes `own.json` itself.
+      - The script reads `WorksharingUtils.GetCheckoutStatus` for each target. For `OwnedByOtherUser` it reads the owner with `WorksharingUtils.GetWorksharingTooltipInfo(doc, id).Owner`.
+      - The older call with `ids` in `inputs` and no `out_path` still works. It returns the full read in the tool result. Use it only for a few ids, because a large result can exceed the tool output limit (the result-size rule in `am-revit-api-docs`, "Query budget").
+   3. Run `python scripts/ownership.py check --read <work>/own.json --preview <preview.json>`. It prints one line, for example "0 of 12 elements owned by others.", and the owner of each blocked element. It adds this line to the preview notes. For each element that another user owns, or that central has updated, it adds a blocking warning to the preview. Exit code 1 means blocked. Exit code 2 means a bad or failed read: read the printed message.
+      - `--read` also accepts the run envelope (`{"status", "run_id", "result"}`, also when `result` is a JSON string) and a Claude Code tool-results file. It also accepts the short summary: the command then reads the file at its `out_path` and checks the element count. Do not unwrap these files by hand.
    4. If the model is not workshared, the command says so. Continue.
 5. **Preview.** Show the preview to the user two ways:
    - Render it as a web page with the schedule viewer, then open the page:
@@ -101,9 +115,9 @@ An agent run cannot synchronize with central. Revit blocks Synchronize with Cent
 
 1. Check `doc.IsWorkshared` (in the read result, or with one `run_query`). If it is false, there is no central model. Tell the user to save the model, and stop here.
 2. Report what the user now borrows. A change also borrows dependent elements, for example views and tags that show a changed type. So read the targets and the categories of the dry run:
-   1. `python scripts/ownership.py inputs --preview <preview.json> --dryrun <dryrun.json> --out <own-after-inputs.json>`
-   2. Run `scripts/read_ownership.py` with `run_query` and these inputs. Save the result as `own-after.json`. It checks at most 5000 elements in those categories (the query budget in `am-revit-api-docs`).
-   3. `python scripts/ownership.py borrowed --read <own-after.json>`. Show its line, for example "You now borrow 211 elements: Views 180, Text Notes 31. Synchronize with Central and tick Borrowed Elements to give them back." If the scan hit its limit, the line says the real count can be higher.
+   1. `python scripts/ownership.py inputs --preview <preview.json> --dryrun <dryrun.json> --out <work>/own-after-inputs.json`. It prints the `inputs` object for the next step: `{"inputs_path": "<work>/own-after-inputs.json", "out_path": "<work>/own-after.json"}`.
+   2. Run `scripts/read_ownership.py` with `run_query` and that `inputs` object, as in step 4.2. The script writes the full read to `<work>/own-after.json` and returns a short summary. It checks at most 5000 elements in those categories (the query budget in `am-revit-api-docs`).
+   3. `python scripts/ownership.py borrowed --read <work>/own-after.json`. Show its line, for example "You now borrow 211 elements: Views 180, Text Notes 31. Synchronize with Central and tick Borrowed Elements to give them back." If the scan hit its limit, the line says the real count can be higher.
 3. Give the user these exact steps:
    1. In Revit, click **Collaborate > Synchronize with Central > Synchronize and Modify Settings**.
    2. Tick **Borrowed Elements**. This gives back the elements that the change borrowed.
@@ -111,7 +125,7 @@ An agent run cannot synchronize with central. Revit blocks Synchronize with Cent
    4. Click **OK**.
    After a Discard, give only the Relinquish step: click **Collaborate > Relinquish All Mine**. Nothing changed, so there is nothing to synchronize.
 4. Offer a read-only check after the sync. Use AskUserQuestion: **Check the sync (Recommended)** / **Skip**.
-5. For the check, run the check on the changed model, not on `doc`. Before the check, compare the `get_context` document title with the step 1 title. If the titles differ, ask the user to switch windows to the changed model, then run the check. If the changed model is not open, report "cannot check, model closed". Run `scripts/read_ownership.py` again with the inputs from step 2. Its `elements` give `status` (`GetCheckoutStatus`) and `updates` (`GetModelUpdatesStatus`) for each changed id. Run `ownership.py borrowed` again for the dependents. Report the counts and the `document` title from the result. If the result title is not the changed model, discard the result. The check ran on the wrong model. Then act on each result:
+5. For the check, run the check on the changed model, not on `doc`. Before the check, compare the `get_context` document title with the step 1 title. If the titles differ, ask the user to switch windows to the changed model, then run the check. If the changed model is not open, report "cannot check, model closed". Run `scripts/read_ownership.py` again with the `inputs_path` from step 2 and a new `out_path`, for example `<work>/own-sync.json`. The `elements` in that file give `status` (`GetCheckoutStatus`) and `updates` (`GetModelUpdatesStatus`) for each changed id. Run `ownership.py borrowed --read <work>/own-sync.json` for the dependents. Report the counts and the `document` title from the result. If the result title is not the changed model, discard the result. The check ran on the wrong model. Then act on each result:
    - `CurrentWithCentral` and `NotOwned`: the sync is complete. Say so.
    - `OwnedByCurrentUser`: the elements are still borrowed. Tell the user to click **Collaborate > Relinquish All Mine**. Then offer the check again.
    - `NotYetInCentral`: the change is not in central yet. Tell the user to do the sync steps again.
@@ -177,11 +191,14 @@ The MCP tools (`run_query`, `run_modify`) are the normal path. For the exact `ru
 $pr = "$env:APPDATA\pyRevit-Master\bin\pyrevit.exe"
 & $pr agent run <script.py> --mode=query   --revit=2026
 & $pr agent run <script.py> --mode=dry_run --revit=2026 --inputs='{\"preview_path\":\"C:/work/x.preview.json\"}'
+& $pr agent run scripts/read_ownership.py --mode=query --revit=2026 --inputs='{\"inputs_path\":\"C:/work/own-inputs.json\",\"out_path\":\"C:/work/own.json\"}'
 ```
 
 In Windows PowerShell 5.1, write the inner quotes of `--inputs` as `\"` and use forward slashes in paths.
 
-Both engines work. Under IronPython, the agent runtime cannot return non-ASCII text (for example "Café"). The scripts then escape the text (`\u00e9`) and set `"escaped": true`. The compute and compare commands restore the original text.
+Give a script that writes a file an absolute path that you chose. A relative path or `%TEMP%` resolves inside the Revit process, not in your work folder (issue #85). Keep the returned `result` small and write a large result to a file, as `read_ownership.py` does with `out_path` (the result-size rule in `am-revit-api-docs`, "Query budget").
+
+Both engines work. Under IronPython, the agent runtime cannot return non-ASCII text (for example "Café"). The scripts then escape the text (`\u00e9`) and set `"escaped": true`. The compute and compare commands restore the original text. A file that `read_ownership.py` writes to `out_path` holds the real text and has `"escaped": false`.
 
 ## Model version compare: snapshot and diff (issue #183)
 

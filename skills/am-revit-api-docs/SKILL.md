@@ -49,6 +49,8 @@ Search these tables for the exact error text. A row that starts with "No error" 
 | A traceback that names line 1 (for example `from pyrevit.api import DB` or `import System`) | IronPython: the script has a bare `except:` or an `except BaseException:`. The runner then reports every line as line 1. | Use `except Exception:`. See "Find the failing line" below. |
 | `status: ok` and `decision: committed`, but `failures` has an entry with severity `Error` | Revit kept the change and reported an error | Do not report success. See "Committed with an error" below. |
 | `pipe_error`, a long silent run, `timed out`, or `timeout: The script ran longer than its <n> second limit` | A whole-model scan or a per-element loop is too slow, and may crash Revit | See "Slow scans" below. |
+| `result (<n> characters across 1 line) exceeds maximum allowed tokens. Output has been saved to <file>` (issue #278) | The `result` is too large for the tool output. Claude Code saved the MCP envelope to a tool-results file. In that file, `result` is a JSON string. | Read the saved file and parse `result` with `json.loads`. Do not copy values from it by hand. Next time, write the result to a file. See the result-size rule in "Query budget". |
+| `status: error` with `error.type: other_document_modified` from a read-only script that opened another model (issue #276) | Add-ins changed the document when it opened. The script did not change it. | See "Read another model: add-ins change it on open" below. |
 
 ### Element ids and numbers
 
@@ -255,6 +257,17 @@ Revit cannot place a material keynote tag on a cut floor layer. This limit cost 
 - The `TM_ADDBY_MATERIAL` mode creates a Material Tags tag that also reads empty.
 - The workaround from the field report is a text note. The note carries the keynote value from the floor type's `Keynote` parameter. Use text notes when the user asks for keynotes on cut layers.
 
+### CreateDetail look direction (issue #257)
+
+`ViewSection.CreateDetail(doc, view_family_type_id, box)` reads `box.Transform.BasisZ` as the look-into direction. A view's `CropBox.BasisZ` and `View.ViewDirection` point the other way, towards the viewer. In one session, all 20 new views looked the wrong way, and the fix took 4 dry runs.
+
+- New view `ViewDirection` = minus the input box `BasisZ`.
+- `BasisY` is up. Revit computes the right direction. The input `BoundingBoxXYZ` must be right-handed: `BasisX` = `BasisY` x `BasisZ`.
+- Do not pass an existing view's `CropBox` as it is. The copy then looks the other way. Turn the box 180 degrees about its up axis: reverse `BasisX` and `BasisZ`, and mirror `Min` and `Max` in x and z. `am-safe-change` `scripts/apply_detail_views.py` does this.
+- For a new cut, set `BasisZ` = the look direction (into the model), `BasisY` = up, `BasisX` = up x look. `am-safe-change` `scripts/lib/section_marks.py` (`detail_box`) builds this box.
+- In the dry run, read `ViewDirection` of each new view at once. It must be minus the planned look. If not, stop. Do not flip the view in a second run.
+- To copy an existing section at the same spot, `View.Duplicate(ViewDuplicateOption.Duplicate)` is simpler. It kept the crop, view direction, template, far clip and "Hide at scales coarser than" setting, with no flip (one section view type, Revit 2026). Check `CanViewBeDuplicated` first. The copy is named "<source> Copy 1". Set the name yourself.
+
 ### Detail groups, view delete, and filled-region boundaries (issue #89)
 
 These three traps cost a full session on a department diagram in Revit 2026. They come from issue #89.
@@ -417,6 +430,33 @@ A `run_query` script does not see the agent's `%TEMP%` folder. It sees the `%TEM
 
 Do not guess where a written file went. Make the script return the full path of each file it writes in the `result` dict. Then read the files from those returned paths on the first try.
 
+Better: choose the path yourself. Pass an absolute path in your own work folder in `inputs` (for example `"out_path": "C:/.../read.json"`), and make the script write there. A script can read and write a file by absolute path in the agent's work folder (issue #278). Never pass a relative path or `%TEMP%`: the script resolves it inside the Revit process. `am-safe-change/scripts/read_ownership.py` (`out_path`) shows the pattern and refuses a path that is not absolute.
+
+## Read another model: add-ins change it on open (issue #276)
+
+A read-only `run_query` script can open another model with `app.OpenDocumentFile(path, opts)`, read it, and close it with `Close(False)`. The run can still end with `status: error` and `error.type: other_document_modified`. The script did not change the model.
+
+Cause: add-ins and updaters run when Revit opens a document. They can add and modify elements in it, for example a structural updater or a content add-in that binds parameters or updates a view template. The pyRevit agent runtime counts those changes as a change by the run. An upgrade from an older Revit year can also change the document. This is pyRevit runtime behavior, not a script error.
+
+Check the error before you trust the read. The read is valid only when all of these are true:
+
+- The script started no transaction on that document and set no parameter.
+- `changes.other_documents` for that file has `discarded_on_close: true`.
+- Each name in its `transactions` list comes from an add-in or an updater, not from the script.
+
+Then use the `result`. It is complete. Tell the user: "The run reported an error because add-ins changed the other model when it opened. The script only read it. Nothing was saved: the model closed without saving." If one of the three checks fails, do not use the result. Report the error.
+
+Workaround to lower the noise:
+
+- Close the file with `Close(False)` in a `finally` block, so it never stays open.
+- Open a detached copy with `DetachAndPreserveWorksets` and `CloseAllWorksets` (an `OpenOptions` with a `WorksetConfiguration` that closes all worksets). This loads less of the model. It does not stop add-in changes: the field run in issue #276 used these options and still had 8 added and 43 modified elements from add-ins.
+- After the run, call `get_context` once. Check that the other model is not in the open documents.
+- Do not disable add-ins for the user. Do not save the other model.
+
+Field note: `opened_during_run` showed `false` for a file the script opened. That run used a detached open, and the document title had a `_detached` suffix. Do not rely on `opened_during_run` to decide whether the script opened the file.
+
+Not verified: whether the version upgrade alone, with no add-ins, counts as a change, and whether a model that is not workshared behaves the same. Upstream request (pyRevit agent runtime): report changes to a document that the run opened and discarded on close as a warning, not an error, when the script started no transaction on it; and set `opened_during_run` for detached opens.
+
 ## Natural-language element selection recipe (issue #129)
 
 Translate descriptive queries (for example: "doors on Level 3 with an empty Fire Rating") into precise selection and isolation:
@@ -455,8 +495,36 @@ A read query can run for many minutes on a large model. Keep each query inside a
 - Split large work into batches. Report progress between batches.
 - Test on one category or one view. Widen the scope only after the test works.
 - Use `inspect_elements` (max 50 elements) for spot checks.
+- Keep the `result` small: about 20,000 characters or less (see "Result size" below).
 - Set `timeout_s` for long reads. The default is 300 seconds. Use `engine: "cpython"` for large loops. The IronPython engine can hit the 900-second timeout in `json.dumps`.
 - Tell the user to save or sync before any heavy query.
+
+### Result size (issue #278)
+
+The tool output has a size limit. Keep the `result` of each `run_query` at about 20,000 characters or less. The exact limit is not known.
+
+- Evidence: an ownership read of 145 elements returned about 26,000 characters. A read of about 460 sheets with their revision ids returned 68,774 characters. Claude Code refused it ("exceeds maximum allowed tokens") and saved the MCP envelope to a tool-results file.
+- Rough size: one element row with id, name, category and two or three values is about 150 to 200 characters. So 100 rows is near the limit.
+- For a larger result, write the full JSON to a file and return only a short summary (counts and the file path). Choose the path yourself: an absolute path in your work folder, passed in `inputs` as `out_path`. Never use a relative path or `%TEMP%` in the script. Such a path resolves inside the Revit process (see "MCP output traps").
+- Pass a long list of ids the same way. Write it to a JSON file, and pass the absolute path in `inputs` (for example `inputs_path`). Do not paste hundreds of ids into the call.
+- Then read the file with a local command. Never copy values from the chat into a file by hand.
+- `am-safe-change/scripts/read_ownership.py` (`inputs_path`, `out_path`) is the reference pattern. A short form:
+
+```python
+# inputs: {"out_path": "C:/.../read.json"}  (absolute; chosen by the agent)
+import io
+import json
+
+rows = []  # the full read, one dict per element
+text = json.dumps({"rows": rows}, indent=1)  # ASCII: non-ASCII text becomes \uXXXX
+if not isinstance(text, type(u"")):
+    text = text.decode("ascii")
+with io.open(inputs["out_path"], "w", encoding="utf-8") as f:
+    f.write(text)
+result = {"out_path": inputs["out_path"], "count": len(rows)}
+```
+
+- If a result was already saved to a tool-results file, read that file. Its `result` is a JSON string: parse it with `json.loads`.
 
 ## Rules
 

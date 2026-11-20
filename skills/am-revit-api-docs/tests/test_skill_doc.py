@@ -242,7 +242,29 @@ def test_no_f_strings_in_snippets():
         "BoundingBoxIntersectsFilter",
         "ElementIntersectsSolidFilter",
         "One level first?",
+        "exceeds maximum allowed tokens",
+        "other_document_modified",
+        "discarded_on_close",
     ],
 )
 def test_field_error_texts_are_searchable(error_text):
     assert error_text in _skill_text()
+
+
+def test_result_size_snippet_writes_the_file_and_returns_a_summary(tmp_path):
+    """The "Result size" snippet (issue #278) writes real text to out_path."""
+    import json
+    block = _block_with('inputs["out_path"]')
+    block = block.replace("rows = []", "rows = [{'id': 1, 'name': 'Caf\u00e9'}]")
+    out = tmp_path / "read.json"
+    names = {"inputs": {"out_path": str(out)}}
+    exec(compile(block, "<snippet>", "exec"), names)
+    assert names["result"] == {"out_path": str(out), "count": 1}
+    assert json.loads(out.read_text(encoding="utf-8")) == {"rows": [{"id": 1, "name": "Café"}]}
+
+
+def test_query_budget_has_the_result_size_rule():
+    text = _skill_text()
+    budget = text[text.index("## Query budget"):text.index("## Rules")]
+    assert "20,000 characters" in budget
+    assert "absolute path" in budget and "%TEMP%" in budget
