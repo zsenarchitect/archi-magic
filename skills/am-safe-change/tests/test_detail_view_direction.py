@@ -35,15 +35,18 @@ def load_pure_functions():
     """detail_box_frame and same_direction from the apply script itself."""
     with open(SCRIPT, "rb") as f:
         tree = ast.parse(f.read())
-    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-            and n.name in ("detail_box_frame", "same_direction")]
+    names = ("detail_box_frame", "same_direction", "step_method", "same_box")
+    keep = [n for n in tree.body
+            if (isinstance(n, ast.FunctionDef) and n.name in names)
+            or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None)
+                in ("CREATE_DETAIL", "DUPLICATE"))]
     module = ast.Module(body=keep, type_ignores=[])
     scope = {}
     exec(compile(module, SCRIPT, "exec"), scope)
-    return scope["detail_box_frame"], scope["same_direction"]
+    return [scope[n] for n in names]
 
 
-detail_box_frame, same_direction = load_pure_functions()
+detail_box_frame, same_direction, step_method, same_box = load_pure_functions()
 
 
 # --- vector helpers -------------------------------------------------------
@@ -191,6 +194,15 @@ class Section(object):
         self.Id, self._frame, self._low, self._high = Id(eid), frame, low, high
         self.ViewDirection = XYZ(*view_direction)
         self.ViewTemplateId = Id(-1)
+        self.Name = "Floor transition A"
+        self.can_duplicate = True
+        self.duplicate_fake = None
+
+    def CanViewBeDuplicated(self, option):
+        return self.can_duplicate
+
+    def Duplicate(self, option):
+        return self.duplicate_fake(self, option)
 
     @property
     def CropBox(self):  # Revit returns a new copy on every read
@@ -257,12 +269,13 @@ class Transaction(object):
         return self.state in ("committed", "rolled back")
 
 
-def make_fake(monkeypatch, documented=True):
+def make_fake(monkeypatch, documented=True, method=None, duplicate_shift=0.0):
     look = [math.cos(math.radians(30)), math.sin(math.radians(30)), 0.0]
     src = crop_frame(look)
     source = Section(50, src, LOW, HIGH, src["basis_z"])
     sheet = type("ViewSheet", (), {})()
-    doc = NS(viewports=[Viewport(100, Id(11), 10)], transactions=[], boxes=[], created=[])
+    doc = NS(viewports=[Viewport(100, Id(11), 10)], transactions=[], boxes=[], created=[],
+             views=[source], duplicated=[])
     reference = doc.viewports[0]
     elements = {50: source, 100: sheet, 1: reference}
     doc.GetElement = lambda i: elements.get(i.Value)
@@ -272,14 +285,29 @@ def make_fake(monkeypatch, documented=True):
                  "basis_y": lst(box.Transform.BasisY), "basis_z": lst(box.Transform.BasisZ)}
         doc.boxes.append((frame, lst(box.Min), lst(box.Max)))
         view_direction = neg(frame["basis_z"]) if documented else frame["basis_z"]
-        view = NS(Id=Id(900 + len(doc.boxes)), ViewDirection=XYZ(*view_direction))
+        view = NS(Id=Id(900 + len(doc.boxes)), ViewDirection=XYZ(*view_direction), Name="Detail 0")
         doc.created.append(view)
         return view
 
+    def duplicate_fake(view, option):
+        """What the field report saw: the same crop, direction and template."""
+        assert option == "duplicate option"
+        frame = dict(view._frame, origin=add(view._frame["origin"], [duplicate_shift, 0.0, 0.0]))
+        copy = Section(950 + len(doc.duplicated), frame, view._low, view._high,
+                       lst(view.ViewDirection))
+        copy.Name = view.Name + " Copy 1"
+        doc.duplicated.append(copy)
+        doc.created.append(copy)
+        elements[copy.Id.Value] = copy
+        return copy.Id
+
+    source.duplicate_fake = duplicate_fake
     db = NS(ElementId=Id, XYZ=XYZ, Transform=Transform, Transaction=Transaction,
-            ViewSheet=type(sheet), Viewport=Viewport, ViewSection=type(source),
+            ViewSheet=type(sheet), Viewport=Viewport, ViewSection=type(source), View=object,
+            ViewDuplicateOption=NS(Duplicate="duplicate option"),
             BuiltInParameter=NS(VIEWPORT_DETAIL_NUMBER="detail number"),
-            FilteredElementCollector=lambda d: NS(OfClass=lambda cls: list(d.viewports)))
+            FilteredElementCollector=lambda d: NS(
+                OfClass=lambda cls: list(d.viewports) if cls is Viewport else list(d.views)))
     db.ViewSection.CreateDetail = staticmethod(create_detail_fake)
     monkeypatch.setitem(sys.modules, "System", NS(Int64=int))
     monkeypatch.setitem(sys.modules, "pyrevit", NS(api=NS(DB=db)))
@@ -290,6 +318,8 @@ def make_fake(monkeypatch, documented=True):
                "steps": [{"name": "North transition", "detail_number": 22, "source_view_id": 50,
                           "box_center": [1.5, 2.5], "viewport_type_id": 800,
                           "label_offset": [0.01, 0.01], "label_line_length": 0.81}]}
+    if method:
+        preview["steps"][0]["method"] = method
     return doc, source, src, preview
 
 
@@ -312,6 +342,86 @@ def test_apply_script_stops_when_the_copy_looks_the_other_way(monkeypatch):
         runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})
     assert "looks the other way" in str(err.value)
     assert doc.transactions[0].state == "rolled back"
+
+
+def test_step_method():
+    assert step_method({"name": "A"}) == "create_detail"
+    assert step_method({"name": "A", "method": None}) == "create_detail"
+    assert step_method({"name": "A", "method": "duplicate"}) == "duplicate"
+    with pytest.raises(ValueError):
+        step_method({"name": "A", "method": "copy"})
+
+
+def test_same_box():
+    a = {"origin": [1, 2, 3], "basis_x": [1, 0, 0], "basis_y": [0, 0, 1], "basis_z": [0, -1, 0],
+         "min": [-3, -1.5, -12], "max": [7, 9, 0]}
+    assert same_box(a, dict(a))
+    assert same_box(a, dict(a, origin=[1.00001, 2, 3]))
+    assert not same_box(a, dict(a, origin=[1.01, 2, 3]))
+    assert not same_box(a, dict(a, basis_z=[0, 1, 0]))
+    assert not same_box(a, dict(a, max=[7, 9, 1]))
+
+
+def test_create_detail_names_the_new_view(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch)
+    out = runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})["result"]
+    assert doc.created[0].Name == "North transition"
+    assert out["directions"][0]["method"] == "create_detail"
+    assert out["directions"][0]["same_crop"] is None
+
+
+def test_duplicate_copies_the_cut(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch, method="duplicate")
+    out = runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})["result"]
+    assert doc.boxes == []                      # CreateDetail was not called
+    copy = doc.duplicated[0]
+    assert copy.Name == "North transition"      # not "<source> Copy 1"
+    assert close(lst(copy.ViewDirection), lst(source.ViewDirection))
+    d = out["directions"][0]
+    assert d["method"] == "duplicate" and d["same_direction"] is True and d["same_crop"] is True
+    vp = doc.viewports[-1]
+    assert vp.ViewId.Value == copy.Id.Value and vp.param.value == 22
+    assert out["rows"][0][:2] == ["North transition", 22]
+    assert doc.transactions[0].state == "committed"
+
+
+def test_duplicate_stops_when_the_crop_moved(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch, method="duplicate", duplicate_shift=0.5)
+    with pytest.raises(ValueError) as err:
+        runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})
+    assert "another crop box" in str(err.value)
+    assert doc.transactions[0].state == "rolled back"
+
+
+def test_duplicate_stops_before_the_transaction_when_not_allowed(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch, method="duplicate")
+    source.can_duplicate = False
+    with pytest.raises(ValueError) as err:
+        runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})
+    assert "cannot be duplicated" in str(err.value)
+    assert doc.transactions == []
+
+
+def test_stops_before_the_transaction_when_the_name_is_used(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch, method="duplicate")
+    source.Name = "North transition"
+    with pytest.raises(ValueError) as err:
+        runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})
+    assert "already exists" in str(err.value)
+    assert doc.transactions == []
+
+
+def test_unknown_method_stops_before_the_transaction(monkeypatch):
+    doc, source, src, preview = make_fake(monkeypatch, method="copy")
+    with pytest.raises(ValueError):
+        runpy.run_path(SCRIPT, init_globals={"doc": doc, "inputs": {"preview": preview}})
+    assert doc.transactions == []
+
+
+def test_apply_script_has_no_f_strings():
+    with open(SCRIPT, "rb") as f:
+        tree = ast.parse(f.read())
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)]
 
 
 if __name__ == "__main__":

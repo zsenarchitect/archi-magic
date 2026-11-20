@@ -21,10 +21,42 @@ envelope under "result"):
 
 A detail number is an integer. Text that is not an integer is skipped,
 and the preview warns about it.
+
+Copy method (issue #257): each new detail copies its source section in
+one of two ways. "create_detail" (the default) calls
+ViewSection.CreateDetail with the turned source crop box.
+"duplicate" calls View.Duplicate(ViewDuplicateOption.Duplicate), which
+in the field report kept the crop, view direction, template, far clip
+and "Hide at scales coarser than" setting of the source.
 """
 
 import json
 import re
+
+CREATE_DETAIL = "create_detail"
+DUPLICATE = "duplicate"
+COPY_METHODS = (CREATE_DETAIL, DUPLICATE)
+COPY_METHOD_API = {CREATE_DETAIL: "ViewSection.CreateDetail",
+                   DUPLICATE: "View.Duplicate"}
+
+
+def normalize_copy_method(text):
+    """A copy method name from user text, or None when it is not known.
+
+    Empty text means the default, "create_detail". Case, spaces and
+    dashes do not matter: "Duplicate", "create-detail" and "CreateDetail"
+    are all accepted.
+    """
+    if text is None:
+        return CREATE_DETAIL
+    key = str(text).strip().lower().replace("-", "_").replace(" ", "_")
+    if key == "":
+        return CREATE_DETAIL
+    if key == "createdetail":
+        key = CREATE_DETAIL
+    if key in COPY_METHODS:
+        return key
+    return None
 
 
 def parse_detail_number(text):
@@ -124,7 +156,8 @@ def compute_detail_plan(read, sheet_id, reference_id, details, title=None):
                        {"name": str,
                         "x": float, "y": float,   (requested box center, feet)
                         "source_view_id": int,    (section to copy bbox/template from)
-                        "source_view_name": str}
+                        "source_view_name": str,
+                        "method": "create_detail" or "duplicate"}  (optional)
     title        : preview title. Default names the sheet.
 
     Returns the change-preview dict (same shape as the other recipes).
@@ -179,11 +212,18 @@ def compute_detail_plan(read, sheet_id, reference_id, details, title=None):
     before = []
     after = []
     steps = []
+    methods = []
     for detail, number in zip(details, proposed):
         src = sections.get(detail["source_view_id"])
         if src is None:
             warn("Source section %s is not in the read result." % detail["source_view_id"], True)
             continue
+        method = normalize_copy_method(detail.get("method"))
+        if method is None:
+            warn("%s: copy method %r is not known. Use %s." % (
+                detail["name"], detail.get("method"), " or ".join(COPY_METHODS)), True)
+            continue
+        methods.append((detail["name"], method))
         center = [detail["x"], detail["y"], 0.0]
         before.append([detail["name"], "-", "-", "-", "-"])
         after.append([detail["name"], number, _fmt_offset(reference["label_offset"]),
@@ -191,6 +231,7 @@ def compute_detail_plan(read, sheet_id, reference_id, details, title=None):
         steps.append({"name": detail["name"],
                       "sheet_id": sheet_id,
                       "source_view_id": detail["source_view_id"],
+                      "method": method,
                       "viewport_type_id": reference["viewport_type_id"],
                       "detail_number": number,
                       "label_offset": list(reference["label_offset"]),
@@ -202,6 +243,7 @@ def compute_detail_plan(read, sheet_id, reference_id, details, title=None):
     notes = ["%d new detail view(s) on sheet %s." % (len(steps), sheet["number"]),
              "Label settings are copied from viewport %s." % reference.get("view_name", reference_id),
              "Detail numbers follow the sheet pattern, not the next free number."]
+    notes.extend(copy_method_notes(methods))
     return {"kind": "change-preview",
             "title": title or "Add detail views to sheet %s" % sheet["number"],
             "keyColumn": "Detail view",
@@ -217,6 +259,20 @@ def compute_detail_plan(read, sheet_id, reference_id, details, title=None):
                        "label_line_length": reference["label_line_length"]},
             "steps": steps,
             "expected_dependent_categories": ["Views"]}
+
+
+def copy_method_notes(methods):
+    """Preview notes that say how each new detail copies its source.
+
+    methods : list of (detail name, copy method) pairs.
+    One note per method that is used, so the user sees the API name.
+    """
+    notes = []
+    for method in COPY_METHODS:
+        names = [n for n, m in methods if m == method]
+        if names:
+            notes.append("Copy method %s (%s): %s." % (method, COPY_METHOD_API[method], ", ".join(names)))
+    return notes
 
 
 def _blocked_preview(title, warnings):
