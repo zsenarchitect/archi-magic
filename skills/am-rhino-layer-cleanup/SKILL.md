@@ -18,7 +18,7 @@ Scripts (in this skill's `scripts/` folder). Read the file and pass its full tex
 
 ## Steps
 
-1. If the Rhino tools are missing, use am-rhino-setup first. Call `get_context` to confirm the document. If more than one Rhino is open, ask which one, and pass its `slot`.
+1. If the Rhino tools are missing, use am-rhino-setup first. Call `get_context` to confirm the document. If more than one Rhino is open, ask which one, and pass its `slot`. Run `list_slots` first, and use the slot id that it shows (slot names can change; see `references/rhino-gotchas.md` in am-rhino-setup). If a call times out, do not run it again at once: read that page's timeout checklist.
 2. Ask the user to **save the file** first.
 3. Run `rhino_layer_plan.py`. Show:
    - `empty_layers`: the paths that would be deleted.

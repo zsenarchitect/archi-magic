@@ -43,7 +43,7 @@ Ask rules prompt in every permission mode, also in auto mode. Tools that only re
 
 ## Script switches
 
-`rhino-setup.ps1 [-Install] [-AskRules] [-Verify] [-Force] [-RhinoVersion 8|9] [-SettingsPath <file>]`. With no switch, it runs all three steps. `-Force` runs `yak install` again. `-SettingsPath` changes the settings file (default `%USERPROFILE%\.claude\settings.json`). `-Verify` only reads.
+`rhino-setup.ps1 [-Install] [-AskRules] [-Verify] [-NoAsk] [-Force] [-RhinoVersion 8|9] [-SettingsPath <file>]`. With no switch, it runs Install, AskRules and Verify. `-NoAsk` turns on do-not-ask mode: it removes the Rhino ask rules and adds allow rules for the two Rhino server names. Use it only when you ask for it. A later default run keeps this choice. `-AskRules` turns the prompts back on. Long rule lists print as a count and the first 3 names; the full list is in a text file in the log folder. `-Force` runs `yak install` again. `-SettingsPath` changes the settings file (default `%USERPROFILE%\.claude\settings.json`). `-Verify` only reads.
 
 Exit codes:
 
@@ -52,6 +52,6 @@ Exit codes:
 | 0 | OK |
 | 2 | Rhino 8 (or the selected version) is not installed |
 | 3 | Rhino package install failed |
-| 5 | settings.json not changed (invalid JSON or unexpected shape) |
-| 6 | Verify found problems |
+| 5 | settings.json not changed (invalid JSON, unexpected shape, or `-NoAsk` together with `-AskRules`) |
+| 6 | Verify found problems. Normal on a machine that is not set up yet. Each problem is one WARNING line. |
 | 7 | Node.js not found |

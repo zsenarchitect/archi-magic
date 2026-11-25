@@ -16,6 +16,15 @@
                Backup first, never drops existing keys or rules, no write when nothing
                changes. The file is re-serialized (formatting can change, content cannot).
     -Verify    Print the final state. Read-only.
+    -NoAsk     Do-not-ask mode (issue #290). Only when the user asks for it in their own words.
+               Removes this script's Rhino ask rules from permissions.ask and adds one allow rule
+               per Rhino server name (mcp__plugin_rhino-mcp_rhino, mcp__rhino) to
+               permissions.allow. Same backup and self-check as -AskRules. A later default run
+               sees the allow rule and does not add the ask rules again. An explicit -AskRules
+               turns asking back on (adds the ask rules, removes those two allow rules).
+
+  Long rule lists print as a count and the first names only. The full list goes to a text
+  file in the log folder.
 
   The MCP layer itself is McNeel's plugin (github.com/mcneel/RhinoAI, cc-plugin), installed
   in Claude Code with: /plugin install rhino-mcp@archi-magic
@@ -24,19 +33,22 @@
   Never needs admin. Never starts, stops or kills Rhino.
 
   Exit codes: 0 ok, 2 required Rhino version not installed, 3 package install failed,
-  5 settings.json not changed (invalid JSON or unexpected shape), 6 verify found
-  problems, 7 Node.js not found. (4 is not used.)
+  5 settings.json not changed (invalid JSON, unexpected shape, or -NoAsk with -AskRules),
+  6 verify found problems (normal on a machine that is not set up yet; each problem is one
+  WARNING line), 7 Node.js not found. (4 is not used.)
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\rhino-setup.ps1
   powershell -NoProfile -ExecutionPolicy Bypass -File .\rhino-setup.ps1 -Verify
   powershell -NoProfile -ExecutionPolicy Bypass -File .\rhino-setup.ps1 -AskRules -SettingsPath C:\temp\settings.json
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\rhino-setup.ps1 -NoAsk
 #>
 [CmdletBinding()]
 param(
     [switch]$Install,
     [switch]$AskRules,
     [switch]$Verify,
+    [switch]$NoAsk,
     [switch]$Force,
     [ValidateSet('8', '9')][string]$RhinoVersion = '8',
     # Claude Code's config folder: CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude.
@@ -45,7 +57,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-if (-not ($Install -or $AskRules -or $Verify)) {
+if ($NoAsk -and $AskRules) {
+    Write-Host '[rhino-setup] FAILED: -NoAsk and -AskRules ask for opposite things. Use one of them.' -ForegroundColor Red
+    exit 5
+}
+# An explicit -AskRules turns asking back on, also in do-not-ask mode. The default run respects that mode.
+$ExplicitAskRules = [bool]$AskRules
+if (-not ($Install -or $AskRules -or $Verify -or $NoAsk)) {
     $Install = $true; $AskRules = $true; $Verify = $true
 }
 
@@ -78,6 +96,9 @@ $WriteTools = @(
 # Manual registration as 'rhino' (McNeel's MCPConnect): mcp__rhino__<tool>.
 $AskList = @($WriteTools | ForEach-Object { "mcp__plugin_${PluginName}_rhino__$_" }) +
            @($WriteTools | ForEach-Object { "mcp__rhino__$_" })
+# Do-not-ask mode: a server-level rule (no tool name) allows every tool of that server.
+# Ask rules win over allow rules in Claude Code, so -NoAsk must also remove the ask rules.
+$AllowList = @("mcp__plugin_${PluginName}_rhino", 'mcp__rhino')
 $RhinoData = Join-Path $env:APPDATA 'McNeel\Rhinoceros'
 $StagedExe = Join-Path $RhinoData 'ai\bin\rhino-mcp-router.exe'
 $script:Problems = New-Object System.Collections.Generic.List[string]
@@ -159,64 +180,84 @@ function Read-JsonFile([string]$Path) {
     return @{ Ok = $true; Obj = $obj; Text = $text }
 }
 
-function Get-AskRules($obj) {
+function Get-PermList($obj, [string]$Key) {
     if (-not $obj) { return @() }
     $p = $obj.PSObject.Properties['permissions']
-    if (-not $p -or -not $p.Value) { return @() }
-    $a = $p.Value.PSObject.Properties['ask']
+    if (-not $p -or -not ($p.Value -is [System.Management.Automation.PSCustomObject])) { return @() }
+    $a = $p.Value.PSObject.Properties[$Key]
     if (-not $a -or $null -eq $a.Value) { return @() }
     return @($a.Value)
 }
+function Get-AskRules($obj) { return @(Get-PermList $obj 'ask') }
 
-function Merge-AskRules([string]$Path, [string[]]$Rules) {
+# Issue #305: 56 rule names in the console drown the one fact. Print a count and the first names.
+function Format-Short([string[]]$Names, [int]$Show = 3) {
+    $Names = @($Names)
+    if ($Names.Count -le $Show) { return ($Names -join ', ') }
+    return "$(($Names[0..($Show - 1)]) -join ', ') and $($Names.Count - $Show) more"
+}
+function Save-FullList([string]$Name, [string[]]$Names) {
+    $f = Join-Path $WorkDir $Name
+    [IO.File]::WriteAllText($f, ((@($Names) -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding $false))
+    return $f
+}
+
+function Update-Permissions([string]$Path, [hashtable]$Add, [hashtable]$Remove) {
+    # Changes only permissions.ask and permissions.allow. $Add / $Remove: @{ ask = @(..); allow = @(..) }.
+    # Returns $true when the file was written, $false when nothing had to change.
     Say "Settings file: $Path"
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
     $exists = Test-Path $Path
     if ($exists) {
         $r = Read-JsonFile $Path
-        if (-not $r.Ok) { Fail 5 "Not valid JSON ($($r.Error)). Nothing was written. Fix the file, then run -AskRules again." }
+        if (-not $r.Ok) { Fail 5 "Not valid JSON ($($r.Error)). Nothing was written. Fix the file, then run the script again." }
         $obj = $r.Obj
     } else {
         $obj = New-Object PSObject
     }
     $before = $obj | ConvertTo-Json -Depth 100 -Compress
 
-    $createdPerm = $false; $createdAsk = $false
     $permProp = $obj.PSObject.Properties['permissions']
+    if ($permProp -and -not ($permProp.Value -is [System.Management.Automation.PSCustomObject])) {
+        Fail 5 "'permissions' is not a JSON object. Nothing was written."
+    }
+    # Plan first, so a run with nothing to do never creates keys.
+    $plan = [ordered]@{}
+    foreach ($key in @('ask', 'allow')) {
+        $toAdd = @($Add[$key] | Where-Object { $_ }); $toRemove = @($Remove[$key] | Where-Object { $_ })
+        $prop = if ($permProp) { $permProp.Value.PSObject.Properties[$key] } else { $null }
+        if ($prop -and -not ($prop.Value -is [System.Array])) { Fail 5 "'permissions.$key' is not a JSON array. Nothing was written." }
+        $current = if ($prop) { @($prop.Value) } else { @() }
+        $removed = @($current | Where-Object { $toRemove -contains $_ })
+        $kept = @($current | Where-Object { $toRemove -notcontains $_ })
+        $added = @($toAdd | Where-Object { $kept -notcontains $_ })
+        if ($added.Count -eq 0 -and $removed.Count -eq 0) { continue }
+        $plan[$key] = @{ Original = $current; New = [object[]]($kept + $added); Added = $added; Removed = $removed; Created = (-not $prop) }
+    }
+    if ($plan.Count -eq 0) { return $false }
+
+    $createdPerm = $false
     if (-not $permProp) {
         $obj | Add-Member -NotePropertyName permissions -NotePropertyValue (New-Object PSObject)
         $createdPerm = $true
-    } elseif (-not ($permProp.Value -is [System.Management.Automation.PSCustomObject])) {
-        Fail 5 "'permissions' is not a JSON object. Nothing was written."
     }
     $perm = $obj.permissions
-    $askProp = $perm.PSObject.Properties['ask']
-    if (-not $askProp) {
-        $perm | Add-Member -NotePropertyName ask -NotePropertyValue @()
-        $createdAsk = $true
-        $current = @()
-    } elseif (-not ($askProp.Value -is [System.Array])) {
-        Fail 5 "'permissions.ask' is not a JSON array. Nothing was written."
-    } else {
-        $current = @($askProp.Value)
+    foreach ($key in $plan.Keys) {
+        if ($plan[$key].Created) { $perm | Add-Member -NotePropertyName $key -NotePropertyValue $plan[$key].New }
+        else { $perm.$key = $plan[$key].New }
     }
-
-    $missing = @($Rules | Where-Object { $current -notcontains $_ })
-    if ($missing.Count -eq 0) {
-        Say "All $($Rules.Count) ask rules already present. settings.json not changed."
-        return
-    }
-    $perm.ask = [object[]]($current + $missing)
     $newText = $obj | ConvertTo-Json -Depth 100
 
-    # Semantic guard: the new JSON minus our additions must equal the original.
+    # Semantic guard: the new JSON with the two arrays put back must equal the original.
     $check = $newText | ConvertFrom-Json
-    $left = @($check.permissions.ask | Where-Object { $missing -notcontains $_ })
-    if ($createdAsk) { $check.permissions.PSObject.Properties.Remove('ask') } else { $check.permissions.ask = [object[]]$left }
+    foreach ($key in $plan.Keys) {
+        if ($plan[$key].Created) { $check.permissions.PSObject.Properties.Remove($key) }
+        else { $check.permissions.$key = [object[]]$plan[$key].Original }
+    }
     if ($createdPerm) { $check.PSObject.Properties.Remove('permissions') }
     $after = $check | ConvertTo-Json -Depth 100 -Compress
-    if ($after -ne $before) { Fail 5 'Merge self-check failed: the new JSON would change more than permissions.ask. Nothing was written.' }
+    if ($after -ne $before) { Fail 5 'Merge self-check failed: the new JSON would change more than permissions.ask and permissions.allow. Nothing was written.' }
 
     $backup = $null
     if ($exists) {
@@ -236,9 +277,20 @@ function Merge-AskRules([string]$Path, [string[]]$Rules) {
 
     $re = Read-JsonFile $Path
     if (-not $re.Ok) { Fail 5 "After write, $Path does not parse ($($re.Error)). Restore it from $backup." }
-    $now = Get-AskRules $re.Obj
-    foreach ($rule in $Rules) { if ($now -notcontains $rule) { Fail 5 "After write, ask rule '$rule' is missing." } }
-    Say "Added $($missing.Count) ask rule(s): $($missing -join ', ')"
+    foreach ($key in $plan.Keys) {
+        $now = @(Get-PermList $re.Obj $key)
+        foreach ($rule in $plan[$key].Added) { if ($now -notcontains $rule) { Fail 5 "After write, $key rule '$rule' is missing." } }
+        foreach ($rule in $plan[$key].Removed) { if ($now -contains $rule) { Fail 5 "After write, $key rule '$rule' is still there." } }
+        if ($plan[$key].Added.Count -gt 0) {
+            $full = Save-FullList "$key-rules-added.txt" $plan[$key].Added
+            Say "Added $($plan[$key].Added.Count) $key rule(s): $(Format-Short $plan[$key].Added). Full list: $full"
+        }
+        if ($plan[$key].Removed.Count -gt 0) {
+            $full = Save-FullList "$key-rules-removed.txt" $plan[$key].Removed
+            Say "Removed $($plan[$key].Removed.Count) $key rule(s): $(Format-Short $plan[$key].Removed). Full list: $full"
+        }
+    }
+    return $true
 }
 
 Say "Log file: $LogFile"
@@ -285,10 +337,33 @@ if ($Install) {
     }
 }
 
-# ---------------------------------------------------------------- AskRules
-if ($AskRules) {
-    Say '== Ask before Rhino tools that change a file or the model =='
-    Merge-AskRules $SettingsPath $AskList
+# ---------------------------------------------------------------- AskRules / NoAsk
+# Do-not-ask mode is on when a Rhino server allow rule is in permissions.allow (set by -NoAsk or by hand).
+$noAskMode = $false
+if (Test-Path $SettingsPath) {
+    $s0 = Read-JsonFile $SettingsPath
+    if ($s0.Ok) {
+        $allow0 = @(Get-PermList $s0.Obj 'allow')
+        $noAskMode = @($AllowList | Where-Object { $allow0 -contains $_ }).Count -gt 0
+    }
+}
+if ($NoAsk) {
+    Say '== Do-not-ask mode: Rhino tools run without a Claude Code prompt =='
+    if (-not (Update-Permissions $SettingsPath @{ allow = $AllowList } @{ ask = $AskList })) {
+        Say 'Do-not-ask mode is already on. settings.json not changed.'
+    }
+    Say 'Claude no longer asks before Rhino tools. Save the file before each change. Use Undo in Rhino to reverse a change.'
+    Say 'To turn asking back on, run this script with -AskRules.'
+} elseif ($AskRules) {
+    if ($noAskMode -and -not $ExplicitAskRules) {
+        Say '== Ask rules skipped: do-not-ask mode is on (a Rhino allow rule is in settings.json) =='
+        Say 'The user chose this mode. To turn asking back on, run this script with -AskRules.'
+    } else {
+        Say '== Ask before Rhino tools that change a file or the model =='
+        if (-not (Update-Permissions $SettingsPath @{ ask = $AskList } @{ allow = $AllowList })) {
+            Say "All $($AskList.Count) ask rules already present. settings.json not changed."
+        }
+    }
 }
 
 # ---------------------------------------------------------------- Verify
@@ -322,6 +397,11 @@ if ($Verify) {
     $installed = @(Test-PluginInstalled)
     if ($installed.Count -gt 0) { Say "Claude Code plugin: $($installed -join ', ')" }
     else { Warn "Claude Code plugin '$PluginName' is not installed. In Claude Code, type: $PluginInstall" }
+    # Issue #305: without Node.js or the plugin, the RhinoCode CLI can still reach a running Rhino.
+    if ((-not $node -or $installed.Count -eq 0) -and $rhinoDirs.Count -gt 0) {
+        $rhinoCode = Join-Path $rhinoDirs[0] 'System\RhinoCode.exe'
+        if (Test-Path $rhinoCode) { Say "RhinoCode fallback (info): $rhinoCode works without Node.js and the plugin. See 'Fallback: RhinoCode CLI' in am-rhino-setup." }
+    }
 
     $claude = Find-ClaudeCli
     if ($claude) {
@@ -337,10 +417,19 @@ if ($Verify) {
         $s = Read-JsonFile $SettingsPath
         if (-not $s.Ok) { Warn "$SettingsPath is not valid JSON ($($s.Error))." }
         else {
-            $ask = Get-AskRules $s.Obj
+            $ask = @(Get-AskRules $s.Obj)
+            $allow = @(Get-PermList $s.Obj 'allow')
+            $allowOn = @($AllowList | Where-Object { $allow -contains $_ })
+            $present = @($AskList | Where-Object { $ask -contains $_ })
             $miss = @($AskList | Where-Object { $ask -notcontains $_ })
-            if ($miss.Count -eq 0) { Say "Ask rules: all $($AskList.Count) present in $SettingsPath" }
-            else { Warn "$($miss.Count) of $($AskList.Count) ask rules missing in $SettingsPath. Run -AskRules. Missing: $($miss -join ', ')" }
+            if ($allowOn.Count -gt 0) {
+                Say "Do-not-ask mode: on ($($allowOn -join ', ') in permissions.allow). Rhino tools run without a prompt. Run -AskRules to turn asking back on."
+                if ($present.Count -gt 0) { Warn "Do-not-ask mode is on, but $($present.Count) Rhino ask rule(s) remain and still prompt ($(Format-Short $present)). Run -NoAsk again." }
+            } elseif ($miss.Count -eq 0) { Say "Ask rules: all $($AskList.Count) present in $SettingsPath" }
+            else {
+                $full = Save-FullList 'ask-rules-missing.txt' $miss
+                Warn "$($miss.Count) of $($AskList.Count) ask rules missing ($(Format-Short $miss)). Run -AskRules. Full list: $full"
+            }
         }
     } else { Warn "$SettingsPath not found: no ask rules. Run -AskRules." }
     Say 'Check by hand in Rhino: run SetDotNetRuntime and make sure it says NETCore (the plugin does not load on .NET Framework).'
@@ -349,9 +438,8 @@ if ($Verify) {
 Say "Log: $LogFile"
 Stop-Transcript | Out-Null
 if ($script:Problems.Count -gt 0) {
-    Write-Host ''
-    Write-Host "[rhino-setup] Finished with $($script:Problems.Count) problem(s):" -ForegroundColor Yellow
-    $script:Problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+    # Issue #305: name each problem once. The WARNING lines above already hold the details.
+    Write-Host "[rhino-setup] Finished with $($script:Problems.Count) problem(s), one per WARNING line above. Exit code 6." -ForegroundColor Yellow
     exit 6
 }
 Write-Host '[rhino-setup] Done. No problems found.' -ForegroundColor Green

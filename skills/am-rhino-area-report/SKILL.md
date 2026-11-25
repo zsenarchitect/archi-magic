@@ -17,7 +17,7 @@ What counts as an area:
 ## Before you start
 
 1. If the Rhino tools are missing, use am-rhino-setup first.
-2. Call `get_context` to confirm the document. If more than one Rhino is open, ask which one, and pass its `slot`.
+2. Call `get_context` to confirm the document. If more than one Rhino is open, ask which one, and pass its `slot`. Run `list_slots` first, and use the slot id that it shows (slot names can change; see `references/rhino-gotchas.md` in am-rhino-setup). If a call times out, do not run it again at once: read that page's timeout checklist.
 3. Claude Code asks before every `run_python` call. Tell the user this script only reads the model.
 
 ## Steps
